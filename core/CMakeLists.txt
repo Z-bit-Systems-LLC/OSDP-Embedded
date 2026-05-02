@@ -6,6 +6,7 @@
 add_library(osdp_core STATIC
     src/shared/crc16.c
     src/shared/checksum.c
+    src/shared/frame.c
 )
 
 target_include_directories(osdp_core

@@ -24,3 +24,4 @@ endfunction()
 
 osdp_add_test(test_crc)
 osdp_add_test(test_checksum)
+osdp_add_test(test_frame)
