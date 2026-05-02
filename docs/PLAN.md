@@ -91,14 +91,31 @@ typed message structs. Foundation for both PD and ACU work later.
 - ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic
   capture playback for testing PD/ACU state machines.
 
-## Iteration 3 — Secure Channel (planned)
+## Iteration 3 — Secure Channel (in progress)
 
-- AES-128-CBC session, SCBK / SCBK-D handling, MAC, secure pairing.
-- Crypto behind a HAL: software fallback (mbedTLS) on host; hardware AES
-  on MCU targets.
-- Touches framing (SCB block in control byte), every command/reply path,
-  and PD/ACU state machines. Plan a clean migration of existing per-message
-  TUs rather than a fork.
+- ☑ **Crypto HAL** (`osdp_sc_crypto.h`). Single-block AES-128 ECB
+  encrypt + optional decrypt vtable, supplied by the consumer (mbedTLS
+  on host, hardware AES on MCU, tiny-AES-c for tests). Per CLAUDE.md
+  the core never vendors a crypto implementation.
+- ☑ **SC primitives** (`osdp_sc.h` + `core/src/sc/`). Built on top of
+  the HAL: session key derivation per spec D.4.1; client/server
+  cryptograms per D.4.3-4; initial R-MAC per D.3.2; custom CBC-MAC
+  per D.5 (S-MAC1 for blocks 1..n-1, S-MAC2 for block n, 0x80-pad
+  only when needed); AES-128 CBC encrypt/decrypt with arbitrary IV.
+- ☐ **SC session state machine.** Track current session keys, rolling
+  MAC chain, encryption state. Drive the SCS_11..14 handshake from
+  either role.
+- ☐ **Frame integration.** Extend osdp_frame_decode/build to validate
+  and append the 4-byte truncated MAC for SCS_15..18 frames; encrypt
+  and decrypt SCS_17/18 payloads; expose the `mac` slice as a separate
+  field of `osdp_frame_t`.
+- ☐ **PD-side SC integration.** Extend `osdp::pd` to optionally accept
+  SCB-bearing frames: handle CHLNG → CCRYPT → SCRYPT → RMAC_I, then
+  validate inbound MACs and produce outbound MACs for SCS_15..18.
+- ☐ **ACU-side SC integration.** Extend `osdp::acu` to initiate the
+  handshake and drive SCS_15..18 traffic.
+- ☐ **Capture validation.** With SCBK in hand, decode the encrypted
+  SCS_17/18 frames in `tests/captures/sc-monitor-current.osdpcap`.
 
 ## Iteration 4+ — Optional extensions (not yet planned)
 

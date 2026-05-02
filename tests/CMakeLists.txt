@@ -50,6 +50,35 @@ target_link_libraries(test_loopback PRIVATE
     osdp_core osdp_messages osdp_pd osdp_acu unity)
 add_test(NAME test_loopback COMMAND test_loopback)
 
+# ---- Secure Channel tests --------------------------------------------------
+# A small test-side AES adapter wraps tiny-AES-c (vendored at
+# tests/vendor/tiny-aes/) and exposes it as osdp_sc_crypto_t.
+add_library(sc_test_aes STATIC
+    sc_test_aes.c
+    vendor/tiny-aes/aes.c
+)
+target_include_directories(sc_test_aes
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tiny-aes
+)
+target_link_libraries(sc_test_aes PUBLIC osdp_core)
+if(NOT MSVC)
+    # tiny-AES-c emits a few warnings on -Wconversion / -Wsign-conversion.
+    target_compile_options(sc_test_aes PRIVATE -w)
+endif()
+
+function(osdp_add_sc_test test_name)
+    add_executable(${test_name} ${test_name}.c)
+    target_link_libraries(${test_name} PRIVATE
+        osdp_core sc_test_aes unity)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+osdp_add_sc_test(test_sc_aes)
+osdp_add_sc_test(test_sc_keys)
+osdp_add_sc_test(test_sc_cbc)
+osdp_add_sc_test(test_sc_mac)
+
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.
 if(TARGET osdpcap_reader)
