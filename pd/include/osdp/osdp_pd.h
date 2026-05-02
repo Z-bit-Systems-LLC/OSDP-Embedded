@@ -40,13 +40,17 @@ extern "C" {
  *   - Refuses Secure Channel frames with NAK 0x05 (SC arrives in
  *     iteration 3).
  *
+ * Iteration 2 phase 2 scope (this commit):
+ *   - Sequence number policing per spec 5.9 Table 2: when the ACU
+ *     retransmits a command with the same non-zero SQN, the PD
+ *     resends its cached reply without re-invoking the application
+ *     handler. SQN zero always processes fresh (session reset).
+ *
  * Deferred for subsequent commits:
- *   - Sequence number policing (re-transmit detection).
  *   - Online / offline state tracking + 8-second-without-comm reset.
  *   - Inter-character timeout policing.
- *   - Multi-record reply types (OUT/LED/PDCAP) — handled, but the
- *     application is responsible for marshalling them into a flat
- *     payload buffer for now.
+ *   - Multi-record reply convenience helpers (currently the app
+ *     flat-buffers).
  */
 
 /* ---- Transport HAL ------------------------------------------------------*/
@@ -119,6 +123,14 @@ typedef struct osdp_pd {
     osdp_pd_command_cb         cmd_cb;      /* app command handler   */
     void                      *cmd_user;
     uint8_t                    tx_buf[OSDP_PD_TX_BUF_LEN];
+
+    /* Sequence-number policing cache (spec 5.9 Table 2). When a
+     * retransmit arrives with the same non-zero SQN, the PD resends
+     * `last_reply[0..last_reply_len]` without invoking cmd_cb. */
+    uint8_t                    last_reply[OSDP_PD_TX_BUF_LEN];
+    size_t                     last_reply_len;
+    uint8_t                    last_seq;     /* 0..3 */
+    bool                       have_last;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/

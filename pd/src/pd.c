@@ -24,15 +24,14 @@ static osdp_status_t build_reply(osdp_pd_t                *pd,
     out.reply       = true;
     out.sequence    = cmd->sequence;
     out.integrity   = cmd->integrity;
-    /* Iteration 2 phase 1 does not transmit SCB-bearing replies. The
-     * has_scb flag stays false; SCB-aware replies arrive with SC. */
+    /* SCB-bearing replies are deferred to iteration 3 with SC. */
     out.code        = reply->code;
     out.payload     = reply->payload;
     out.payload_len = reply->payload_len;
     return osdp_frame_build(&out, pd->tx_buf, sizeof(pd->tx_buf), out_len);
 }
 
-/* Build a NAK reply with the given error code. */
+/* Build a NAK reply with the given error code into pd->tx_buf. */
 static osdp_status_t build_nak(osdp_pd_t          *pd,
                                const osdp_frame_t *cmd,
                                uint8_t             error_code,
@@ -46,46 +45,44 @@ static osdp_status_t build_nak(osdp_pd_t          *pd,
     return build_reply(pd, cmd, &reply, out_len);
 }
 
-/* Send `len` bytes of pd->tx_buf via the transport, all at once. Short
- * writes are reported as send errors. */
-static void send_tx(osdp_pd_t *pd, size_t len)
+/* Send `len` bytes from `buf` via the bound transport. Short writes
+ * are dropped on the floor for now; future iterations may queue or
+ * report a transmission error. */
+static void send_bytes(osdp_pd_t *pd, const uint8_t *buf, size_t len)
 {
     if (pd->transport.write == NULL || len == 0) {
         return;
     }
-    const int written = pd->transport.write(pd->transport.user,
-                                             pd->tx_buf, len);
-    /* For now we don't have a place to surface a partial-write error;
-     * future iterations may queue, retry, or expose a status field. */
+    const int written = pd->transport.write(pd->transport.user, buf, len);
     (void)written;
 }
 
-/* Process one accepted command frame: dispatch to the application
- * handler, build the appropriate reply, transmit it. */
-static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
+/* Compute the reply for a fresh command into pd->tx_buf and return
+ * the byte count (or 0 if the command should produce no reply at all
+ * — e.g. an internal handler error). */
+static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
-    /* Iteration 2 phase 1: refuse Secure Channel framing entirely.
-     * The spec expects NAK with error code 0x05 (SCB unsupported). */
+    /* Refuse Secure Channel framing with NAK 0x05 until SC arrives. */
     if (cmd->has_scb) {
         size_t n = 0;
-        if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) == OSDP_OK) {
-            send_tx(pd, n);
+        if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) != OSDP_OK) {
+            return 0;
         }
-        return;
+        return n;
     }
 
-    osdp_pd_reply_t reply = { .code = OSDP_REPLY_ACK,
-                              .payload = NULL, .payload_len = 0 };
+    osdp_pd_reply_t reply = {
+        .code        = OSDP_REPLY_ACK,
+        .payload     = NULL,
+        .payload_len = 0,
+    };
 
-    osdp_status_t app_status = OSDP_OK;
+    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
     if (pd->cmd_cb != NULL) {
         app_status = pd->cmd_cb(pd->cmd_user,
                                 cmd->code,
                                 cmd->payload, cmd->payload_len,
                                 &reply);
-    } else {
-        /* No handler bound — treat every code as unsupported. */
-        app_status = OSDP_ERR_NOT_SUPPORTED;
     }
 
     size_t built = 0;
@@ -95,12 +92,52 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
         br = build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &built);
     } else {
-        /* Internal handler error — drop silently in iteration 2.1. */
+        /* Internal handler error — drop silently. */
+        return 0;
+    }
+
+    return (br == OSDP_OK) ? built : 0;
+}
+
+/* Cache `pd->tx_buf[0..len]` as the reply we just sent for sequence
+ * number `seq`, so a retransmit can replay it. */
+static void cache_reply(osdp_pd_t *pd, uint8_t seq, size_t len)
+{
+    if (len > sizeof(pd->last_reply)) {
+        /* Should be impossible — tx_buf and last_reply are the same
+         * size — but guard anyway. */
+        len = sizeof(pd->last_reply);
+    }
+    if (len > 0) {
+        (void)memcpy(pd->last_reply, pd->tx_buf, len);
+    }
+    pd->last_reply_len = len;
+    pd->last_seq       = seq;
+    pd->have_last      = true;
+}
+
+/* Process one accepted command frame: dispatch, build reply, cache,
+ * transmit. Honours the SQN retransmit semantics from spec 5.9. */
+static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
+{
+    /* Retransmit detection: same non-zero SQN as the previous accepted
+     * command means the ACU is asking us to repeat our last reply
+     * without re-executing the command. SQN zero is the session-reset
+     * sentinel and is always processed fresh. */
+    if (cmd->sequence != 0 &&
+        pd->have_last &&
+        cmd->sequence == pd->last_seq)
+    {
+        if (pd->last_reply_len > 0) {
+            send_bytes(pd, pd->last_reply, pd->last_reply_len);
+        }
         return;
     }
 
-    if (br == OSDP_OK) {
-        send_tx(pd, built);
+    const size_t built = handle_command_into_tx(pd, cmd);
+    cache_reply(pd, cmd->sequence, built);
+    if (built > 0) {
+        send_bytes(pd, pd->tx_buf, built);
     }
 }
 
@@ -141,9 +178,7 @@ void osdp_pd_tick(osdp_pd_t *pd)
         return;
     }
 
-    /* Drain everything the transport currently has. We pull in a
-     * loop until the transport reports zero bytes, bounded by buffer
-     * capacity to avoid hogging the CPU on a hostile peer. */
+    /* Drain whatever the transport has now. */
     uint8_t chunk[128];
     for (;;) {
         const int n = pd->transport.read(pd->transport.user,
@@ -153,7 +188,7 @@ void osdp_pd_tick(osdp_pd_t *pd)
         }
         (void)osdp_stream_feed(&pd->rx, chunk, (size_t)n);
         if ((size_t)n < sizeof(chunk)) {
-            break; /* transport had less than a full chunk; done */
+            break;
         }
     }
 
@@ -165,20 +200,13 @@ void osdp_pd_tick(osdp_pd_t *pd)
             break;
         }
         if (r != OSDP_OK) {
-            /* Bad frame: stream has already advanced past it. Skip. */
-            continue;
+            continue;  /* stream auto-advanced past the bad frame */
         }
-
-        /* PD only responds to commands (reply flag clear). Frames in
-         * the reply direction are ignored — they aren't addressed to
-         * us in our role. */
         if (cmd.reply) {
-            continue;
+            continue;  /* wrong direction for a PD */
         }
-
-        /* Address filtering: own address or broadcast. */
-        const bool ours       = (cmd.address == pd->address);
-        const bool broadcast  = (cmd.address == OSDP_BROADCAST_ADDR);
+        const bool ours      = (cmd.address == pd->address);
+        const bool broadcast = (cmd.address == OSDP_BROADCAST_ADDR);
         if (!ours && !broadcast) {
             continue;
         }

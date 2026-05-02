@@ -352,6 +352,159 @@ static void test_bad_crc_command_is_silently_ignored(void)
     TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
 }
 
+/* ---- Sequence number policing (spec 5.9 Table 2) ----------------------- */
+
+static void test_retransmit_replays_cached_reply_without_handler_call(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    /* First command at SQN=1: handler called, ACK sent. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_UINT(1, counter.call_count);
+    const size_t first_reply_len = m.outgoing_len;
+    TEST_ASSERT_GREATER_THAN(0, first_reply_len);
+
+    /* Snapshot the first reply so we can compare. */
+    uint8_t first_reply[64];
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(sizeof(first_reply), first_reply_len);
+    (void)memcpy(first_reply, m.outgoing, first_reply_len);
+
+    /* Retransmit: same SQN=1. Handler must NOT be called again. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1, counter.call_count,
+        "handler invoked twice on retransmit");
+
+    /* The replayed reply bytes match the original. */
+    TEST_ASSERT_EQUAL_size_t(first_reply_len * 2, m.outgoing_len);
+    TEST_ASSERT_EQUAL_MEMORY(first_reply,
+                             &m.outgoing[first_reply_len],
+                             first_reply_len);
+}
+
+static void test_new_sequence_invokes_handler_again(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 2);
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 3);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_EQUAL_UINT(3, counter.call_count);
+}
+
+static void test_sequence_zero_always_processes_fresh(void)
+{
+    /* Per spec: SQN zero is the session-reset sentinel; it must be
+     * processed every time, not deduplicated. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 0);
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 0);
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_EQUAL_UINT(3, counter.call_count);
+}
+
+static void test_retransmit_replays_nak_too(void)
+{
+    /* Caching applies to NAKs as well: if the first command got
+     * NAK'd because the handler said NOT_SUPPORTED, the retransmit
+     * should replay the same NAK without consulting the handler. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    /* counting_cb always returns OK with ACK; we want NOT_SUPPORTED.
+     * Use the default_handler instead, which only knows POLL. */
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    static const uint8_t buz[] = { 0, 2, 1, 1, 3 };
+    inject_command(&m, 0x05, OSDP_CMD_BUZ, buz, sizeof(buz),
+                   OSDP_INTEGRITY_CRC, 2);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t first_reply;
+    decode_first_outgoing(&m, &first_reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, first_reply.code);
+    const size_t len_first = m.outgoing_len;
+
+    /* Retransmit. */
+    inject_command(&m, 0x05, OSDP_CMD_BUZ, buz, sizeof(buz),
+                   OSDP_INTEGRITY_CRC, 2);
+    osdp_pd_tick(&pd);
+
+    /* Outgoing buffer now contains the NAK twice. */
+    TEST_ASSERT_EQUAL_size_t(len_first * 2, m.outgoing_len);
+    TEST_ASSERT_EQUAL_MEMORY(m.outgoing, &m.outgoing[len_first], len_first);
+}
+
+static void test_retransmit_after_other_seq_does_not_replay(void)
+{
+    /* Once a command at SQN=2 has been processed, a retransmit at SQN=1
+     * (the previous one) should be treated as fresh — only the most
+     * recent SQN is cached. (Spec 5.9 supports this: the ACU only ever
+     * repeats the immediately-previous SQN.) */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 2);
+    /* "Stale" retransmit of SQN=1 — should be processed fresh, since
+     * our cache is now SQN=2. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_EQUAL_UINT(3, counter.call_count);
+}
+
 static void test_reply_direction_frames_are_ignored(void)
 {
     /* A frame with the reply flag set is going the wrong direction —
@@ -391,5 +544,10 @@ int main(void)
     RUN_TEST(test_handler_receives_command_payload);
     RUN_TEST(test_bad_crc_command_is_silently_ignored);
     RUN_TEST(test_reply_direction_frames_are_ignored);
+    RUN_TEST(test_retransmit_replays_cached_reply_without_handler_call);
+    RUN_TEST(test_new_sequence_invokes_handler_again);
+    RUN_TEST(test_sequence_zero_always_processes_fresh);
+    RUN_TEST(test_retransmit_replays_nak_too);
+    RUN_TEST(test_retransmit_after_other_seq_does_not_replay);
     return UNITY_END();
 }
