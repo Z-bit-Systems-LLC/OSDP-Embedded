@@ -43,6 +43,13 @@ target_link_libraries(test_acu PRIVATE
     osdp_core osdp_messages osdp_acu unity)
 add_test(NAME test_acu COMMAND test_acu)
 
+# PD↔ACU loopback integration: both real state machines, shared wire
+# buffer between them. Strongest correctness check for iteration 2.
+add_executable(test_loopback test_loopback.c)
+target_link_libraries(test_loopback PRIVATE
+    osdp_core osdp_messages osdp_pd osdp_acu unity)
+add_test(NAME test_loopback COMMAND test_loopback)
+
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.
 if(TARGET osdpcap_reader)
