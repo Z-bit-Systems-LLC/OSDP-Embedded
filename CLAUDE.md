@@ -59,6 +59,16 @@ core/src/
   replies/            # reply_<name>.c — model + decode + build per reply
   dispatch/           # opt-in bulk routing; references every codec
 
+pd/                   # role-specific state machine for the PD side
+  include/osdp/osdp_pd.h
+  src/pd.c
+  CMakeLists.txt      # exports osdp::pd
+
+acu/                  # role-specific state machine for the ACU side
+  include/osdp/osdp_acu.h
+  src/acu.c
+  CMakeLists.txt      # exports osdp::acu
+
 tools/
   osdp-parser/        # host-side CLI: OSDPCAP reader + Monitor pipeline
                       # (osdpcap.{c,h} + main.c). Built when
@@ -77,9 +87,13 @@ tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
 | `osdp::core`      | framing, stream, CRC, checksum                            | everything               |
 | `osdp::messages`  | all command + reply codec TUs                             | PD, ACU, Monitor         |
 | `osdp::dispatch`  | bulk decode helpers; references every codec               | Monitor only             |
+| `osdp::pd`        | PD-side state machine + transport HAL                     | PD applications          |
+| `osdp::acu`       | ACU-side state machine + transport HAL                    | ACU applications         |
 
-A PD or ACU links `core + messages` and uses linker GC to keep flash usage
-tight. A Monitor adds `dispatch` for one-call bulk routing.
+A PD application links `core + messages + pd`; an ACU application links
+`core + messages + acu`. A Monitor adds `dispatch` for one-call bulk
+routing. Linker GC keeps each binary's flash usage tight by dropping
+codecs the application doesn't reference.
 
 ## Per-message API shape
 

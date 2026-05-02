@@ -25,11 +25,13 @@ tools) and prints a one-line summary per frame. Drop captures into
 
 The core library is split by **message direction**, not by role:
 
-| Layer            | Contents                                                           | Always linked? |
-| ---------------- | ------------------------------------------------------------------ | -------------- |
-| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API           | yes            |
-| `osdp::messages` | One TU per command and per reply, each containing model + decoder + builder | yes      |
-| `osdp::dispatch` | Optional switch-router from frame → typed message; pulls all codecs | Monitor only  |
+| Target           | Contents                                                           | Linked by         |
+| ---------------- | ------------------------------------------------------------------ | ----------------- |
+| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API           | everything        |
+| `osdp::messages` | One TU per command and per reply, each containing model + decoder + builder | PD, ACU, Monitor |
+| `osdp::dispatch` | Optional switch-router from frame → typed message; pulls all codecs | Monitor only      |
+| `osdp::pd`       | PD-side state machine: address filtering, command handler dispatch, sequence-number policing, online/offline tracking | PD applications |
+| `osdp::acu`      | ACU-side state machine: multi-PD registration, command issuance, reply/timeout callbacks, sequence-number progression | ACU applications |
 
 A PD or ACU application calls per-message codec functions directly
 (`osdp_led_decode`, `osdp_pdid_build`, etc.) and lets the linker garbage-collect
@@ -47,7 +49,7 @@ coding rules.
 ## Repository layout
 
 ```
-core/                         # C11 portable library
+core/                         # C11 portable library, framing + codecs
 ├── include/osdp/             # public headers (consumers #include <osdp/...>)
 ├── src/
 │   ├── shared/               # framing, integrity, stream — always linked
@@ -55,6 +57,10 @@ core/                         # C11 portable library
 │   ├── replies/              # PD→ACU message codecs (one TU per reply)
 │   └── dispatch/             # optional bulk dispatch helpers
 └── CMakeLists.txt
+pd/                           # PD-side state machine + transport HAL
+└── ...                       # exports osdp::pd
+acu/                          # ACU-side state machine + transport HAL
+└── ...                       # exports osdp::acu
 tools/
 └── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
 tests/

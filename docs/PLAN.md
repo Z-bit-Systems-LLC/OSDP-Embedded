@@ -75,11 +75,17 @@ typed message structs. Foundation for both PD and ACU work later.
   per-message builder are now validated by a real-world Secure Channel
   capture (`tests/captures/sc-monitor-current.osdpcap`): all 592 frames
   decode → rebuild → byte-compare without any mismatches.
-- ☐ **PD peer tree** (`pd/`). Role-specific state machine, transport HAL,
+- ☑ **PD peer tree** (`pd/`). Role-specific state machine, transport HAL,
   application command handler, sequence number management, online/
   offline tracking, address filtering. Builds on top of `osdp::core`.
-- ☐ **ACU peer tree** (`acu/`). Polling schedule, retry logic, multi-PD
-  registration, sequence-number generation.
+  *Remaining nice-to-haves: inter-character timeout policing (spec 5.8)
+  and multi-record reply convenience helpers.*
+- ☑ **ACU peer tree** (`acu/`). Multi-PD registration via caller-allocated
+  slots, explicit `osdp_acu_send_command` API with one outstanding
+  command per PD, sequence-number progression (0 → 1 → 2 → 3 → 1 → ...),
+  per-PD reply timeout (200 ms) with retry-friendly SQN retention, per-PD
+  online tracking. *Remaining nice-to-haves: auto-poll scheduling, in-
+  process PD↔ACU integration tests.*
 - ☐ First end-to-end PD example on host (loopback) and on a target MCU
   (TBD — likely STM32 or Nordic).
 - ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic

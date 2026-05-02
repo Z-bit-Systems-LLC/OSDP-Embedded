@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Z-bit Systems, LLC
+
+#include "osdp/osdp_acu.h"
+
+#include "osdp/osdp_frame.h"
+
+#include <string.h>
+
+/* ---- Internal helpers --------------------------------------------------*/
+
+static osdp_acu_pd_slot_t *find_slot_by_address(osdp_acu_t *acu,
+                                                uint8_t address)
+{
+    for (size_t i = 0; i < acu->pd_count; i++) {
+        if (acu->pds[i].in_use && acu->pds[i].address == address) {
+            return &acu->pds[i];
+        }
+    }
+    return NULL;
+}
+
+static const osdp_acu_pd_slot_t *find_slot_by_address_const(
+    const osdp_acu_t *acu, uint8_t address)
+{
+    for (size_t i = 0; i < acu->pd_count; i++) {
+        if (acu->pds[i].in_use && acu->pds[i].address == address) {
+            return &acu->pds[i];
+        }
+    }
+    return NULL;
+}
+
+/* Sequence number progression per spec 5.9 Table 2: 0, 1, 2, 3, 1, 2, 3,
+ * ... — SQN zero used only for the very first command on a fresh slot. */
+static uint8_t advance_sqn(uint8_t current)
+{
+    if (current >= 3U) {
+        return 1U;
+    }
+    return (uint8_t)(current + 1U);
+}
+
+static uint32_t now_ms_or_zero(const osdp_acu_t *acu)
+{
+    if (acu->transport.now_ms == NULL) {
+        return 0U;
+    }
+    return acu->transport.now_ms(acu->transport.user);
+}
+
+/* ---- Reply ingestion ---------------------------------------------------*/
+
+static void process_reply(osdp_acu_t *acu, const osdp_frame_t *frame)
+{
+    /* Reply must be addressed to a registered PD. */
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, frame->address);
+    if (slot == NULL) {
+        return;
+    }
+
+    /* If we are not waiting for a reply from this PD, the reply is
+     * unsolicited or stale — drop it. */
+    if (!slot->waiting) {
+        return;
+    }
+
+    /* Sequence number must match the command we sent. */
+    if (frame->sequence != slot->pending_seq) {
+        return;
+    }
+
+    /* Refresh online tracking. */
+    slot->online        = true;
+    slot->last_reply_ms = now_ms_or_zero(acu);
+
+    /* Capture the command we had pending so the application sees it. */
+    const uint8_t cmd_code = slot->pending_code;
+
+    /* Slot transitions out of "waiting"; advance SQN for the next
+     * command we'll issue to this PD. */
+    slot->waiting   = false;
+    slot->next_seq  = advance_sqn(slot->pending_seq);
+
+    /* Fire the application callback. */
+    if (acu->reply_cb != NULL) {
+        const osdp_acu_reply_event_t event = {
+            .pd_address  = frame->address,
+            .cmd_code    = cmd_code,
+            .reply_code  = frame->code,
+            .payload     = frame->payload,
+            .payload_len = frame->payload_len,
+        };
+        acu->reply_cb(acu->reply_user, &event);
+    }
+}
+
+/* ---- Timeout / online tracking ----------------------------------------*/
+
+static void scan_timeouts_and_offline(osdp_acu_t *acu)
+{
+    if (acu->transport.now_ms == NULL) {
+        return;
+    }
+    const uint32_t now = acu->transport.now_ms(acu->transport.user);
+
+    for (size_t i = 0; i < acu->pd_count; i++) {
+        osdp_acu_pd_slot_t *slot = &acu->pds[i];
+        if (!slot->in_use) {
+            continue;
+        }
+
+        /* Reply timeout. */
+        if (slot->waiting) {
+            const uint32_t elapsed = now - slot->pending_sent_ms;
+            if (elapsed > OSDP_ACU_REPLY_TIMEOUT_MS) {
+                const uint8_t addr = slot->address;
+                const uint8_t code = slot->pending_code;
+                const uint8_t seq  = slot->pending_seq;
+                slot->waiting = false;
+                /* Per spec retry semantics: keep next_seq pointing at
+                 * the same SQN so the caller's retry uses it. */
+                slot->next_seq = seq;
+                if (acu->timeout_cb != NULL) {
+                    const osdp_acu_timeout_event_t event = {
+                        .pd_address = addr,
+                        .cmd_code   = code,
+                        .cmd_seq    = seq,
+                    };
+                    acu->timeout_cb(acu->timeout_user, &event);
+                }
+            }
+        }
+
+        /* Online window. */
+        if (slot->online) {
+            const uint32_t since = now - slot->last_reply_ms;
+            if (since > OSDP_ACU_OFFLINE_TIMEOUT_MS) {
+                slot->online = false;
+            }
+        }
+    }
+}
+
+/* ---- API ---------------------------------------------------------------*/
+
+void osdp_acu_init(osdp_acu_t          *acu,
+                   osdp_acu_pd_slot_t  *pd_slots,
+                   size_t               pd_count)
+{
+    if (acu == NULL) {
+        return;
+    }
+    (void)memset(acu, 0, sizeof(*acu));
+    acu->pds       = pd_slots;
+    acu->pd_count  = (pd_slots != NULL) ? pd_count : 0U;
+    acu->integrity = OSDP_INTEGRITY_CRC;
+    osdp_stream_init(&acu->rx);
+    if (acu->pds != NULL) {
+        (void)memset(acu->pds, 0, sizeof(*acu->pds) * acu->pd_count);
+    }
+}
+
+void osdp_acu_set_transport(osdp_acu_t *acu,
+                            const osdp_acu_transport_t *transport)
+{
+    if (acu == NULL || transport == NULL) {
+        return;
+    }
+    acu->transport = *transport;
+}
+
+void osdp_acu_set_reply_handler(osdp_acu_t *acu,
+                                osdp_acu_reply_cb cb, void *user)
+{
+    if (acu == NULL) {
+        return;
+    }
+    acu->reply_cb   = cb;
+    acu->reply_user = user;
+}
+
+void osdp_acu_set_timeout_handler(osdp_acu_t *acu,
+                                  osdp_acu_timeout_cb cb, void *user)
+{
+    if (acu == NULL) {
+        return;
+    }
+    acu->timeout_cb   = cb;
+    acu->timeout_user = user;
+}
+
+void osdp_acu_set_integrity(osdp_acu_t *acu, osdp_integrity_t integrity)
+{
+    if (acu == NULL) {
+        return;
+    }
+    acu->integrity = integrity;
+}
+
+osdp_status_t osdp_acu_register_pd(osdp_acu_t *acu,
+                                   size_t      slot_index,
+                                   uint8_t     pd_address)
+{
+    if (acu == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (slot_index >= acu->pd_count) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (pd_address > OSDP_BROADCAST_ADDR) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    osdp_acu_pd_slot_t *slot = &acu->pds[slot_index];
+    (void)memset(slot, 0, sizeof(*slot));
+    slot->in_use   = true;
+    slot->address  = pd_address;
+    slot->next_seq = 0U;       /* spec: first command on a fresh PD = 0 */
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
+                                    uint8_t        pd_address,
+                                    uint8_t        cmd_code,
+                                    const uint8_t *payload,
+                                    size_t         payload_len)
+{
+    if (acu == NULL || (payload_len > 0 && payload == NULL)) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (slot->waiting) {
+        return OSDP_ERR_NOT_SUPPORTED;  /* one outstanding cmd per PD */
+    }
+    if (acu->transport.write == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    osdp_frame_t frame = {0};
+    frame.address     = pd_address;
+    frame.reply       = false;
+    frame.sequence    = (uint8_t)(slot->next_seq & 0x03U);
+    frame.integrity   = acu->integrity;
+    frame.code        = cmd_code;
+    frame.payload     = payload;
+    frame.payload_len = payload_len;
+
+    size_t written = 0;
+    const osdp_status_t br = osdp_frame_build(&frame, acu->tx_buf,
+                                              sizeof(acu->tx_buf), &written);
+    if (br != OSDP_OK) {
+        return br;
+    }
+    const int tx = acu->transport.write(acu->transport.user,
+                                        acu->tx_buf, written);
+    if (tx < 0 || (size_t)tx != written) {
+        return OSDP_ERR_NOT_SUPPORTED;  /* short write — TX layer issue */
+    }
+
+    slot->waiting        = true;
+    slot->pending_seq    = frame.sequence;
+    slot->pending_code   = cmd_code;
+    slot->pending_sent_ms = now_ms_or_zero(acu);
+    return OSDP_OK;
+}
+
+void osdp_acu_tick(osdp_acu_t *acu)
+{
+    if (acu == NULL || acu->transport.read == NULL) {
+        return;
+    }
+
+    /* Examine timeouts before consuming new bytes — a reply that
+     * arrives during this tick won't undo the timeout decision (we
+     * already missed the deadline). */
+    scan_timeouts_and_offline(acu);
+
+    uint8_t chunk[128];
+    for (;;) {
+        const int n = acu->transport.read(acu->transport.user,
+                                          chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        (void)osdp_stream_feed(&acu->rx, chunk, (size_t)n);
+        if ((size_t)n < sizeof(chunk)) {
+            break;
+        }
+    }
+
+    for (;;) {
+        osdp_frame_t frame;
+        const osdp_status_t r = osdp_stream_next(&acu->rx, &frame);
+        if (r == OSDP_ERR_TRUNCATED) {
+            break;
+        }
+        if (r != OSDP_OK) {
+            continue;  /* stream advanced past a bad frame */
+        }
+        /* ACU only consumes replies. */
+        if (!frame.reply) {
+            continue;
+        }
+        /* Iteration 2 phase 4 does not handle SCB-bearing replies. */
+        if (frame.has_scb) {
+            continue;
+        }
+        process_reply(acu, &frame);
+    }
+}
+
+bool osdp_acu_is_pd_online(const osdp_acu_t *acu, uint8_t pd_address)
+{
+    if (acu == NULL) {
+        return false;
+    }
+    const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
+                                                                pd_address);
+    return slot != NULL && slot->online;
+}
+
+bool osdp_acu_is_pd_busy(const osdp_acu_t *acu, uint8_t pd_address)
+{
+    if (acu == NULL) {
+        return false;
+    }
+    const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
+                                                                pd_address);
+    return slot != NULL && slot->waiting;
+}
