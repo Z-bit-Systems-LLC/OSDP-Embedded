@@ -45,11 +45,18 @@ typed message structs. Foundation for both PD and ACU work later.
    - Stream resync behavior.
    - Per-message decode + re-build round-trip with byte-compare.
 8. **README + CLAUDE + PLAN** docs (this set).
+9. **OSDPCAP support** (added late in iteration 1):
+   - `tools/osdp-parser/` — host-side CLI that reads OSDPCAP-format
+     captures and prints decoded frames via the streaming decoder +
+     dispatch classifier. Functions as the canonical Monitor consumer.
+   - `tests/captures/` — drop-in directory for OSDPCAP files; CMake
+     globs them at configure time and registers a CTest entry per
+     capture, backed by `test_captures.c`.
+   - `test_osdpcap.c` — unit tests for the OSDPCAP reader itself.
 
 ### Out of scope for Iteration 1
 
 - Rust crates (directories may be scaffolded, but no code yet).
-- `osdp-dump` CLI tool — comes after iteration 1's core is solid.
 - PD, ACU, or Monitor application code (state machines, transports).
 - Secure Channel.
 
@@ -70,7 +77,8 @@ typed message structs. Foundation for both PD and ACU work later.
   machines and transport HALs.
 - First end-to-end PD example on host (loopback) and on a target MCU
   (TBD — likely STM32 or Nordic).
-- Stand up the `osdp-dump` CLI as the canonical Monitor consumer.
+- Extend `osdp-parser` (or add a sibling tool) to drive synthetic
+  capture playback for testing PD/ACU state machines.
 
 ## Iteration 3 — Secure Channel (planned)
 

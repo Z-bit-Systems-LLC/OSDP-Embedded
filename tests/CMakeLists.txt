@@ -30,3 +30,29 @@ osdp_add_test(test_commands)
 osdp_add_test(test_replies)
 osdp_add_test(test_stream)
 osdp_add_test(test_dispatch)
+
+# OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
+# osdpcap_reader library exists; skip silently otherwise.
+if(TARGET osdpcap_reader)
+    add_executable(test_osdpcap test_osdpcap.c)
+    target_link_libraries(test_osdpcap PRIVATE osdpcap_reader unity)
+    add_test(NAME test_osdpcap COMMAND test_osdpcap)
+
+    # Capture-driven integration tests. CMake globs every *.osdpcap
+    # under tests/captures/ at configure time and registers one CTest
+    # entry per file, all backed by the same test_captures executable.
+    add_executable(test_captures test_captures.c)
+    target_link_libraries(test_captures PRIVATE
+        osdp_core osdp_messages osdp_dispatch osdpcap_reader unity)
+    target_include_directories(test_captures PRIVATE
+        ${CMAKE_SOURCE_DIR}/core/src
+    )
+
+    file(GLOB OSDP_CAPTURE_FILES
+         "${CMAKE_CURRENT_SOURCE_DIR}/captures/*.osdpcap")
+    foreach(_capture ${OSDP_CAPTURE_FILES})
+        get_filename_component(_capture_name "${_capture}" NAME_WE)
+        add_test(NAME capture_${_capture_name}
+                 COMMAND test_captures "${_capture}")
+    endforeach()
+endif()

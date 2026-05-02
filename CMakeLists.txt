@@ -14,6 +14,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 option(OSDP_BUILD_TESTS "Build unit tests" ON)
+option(OSDP_BUILD_TOOLS "Build host-side developer tools (osdp-parser, ...)" ON)
 
 # Strict warnings + per-function/data sections so consumers can use
 # --gc-sections to drop any unused per-message codecs.
@@ -39,6 +40,10 @@ else()
 endif()
 
 add_subdirectory(core)
+
+if(OSDP_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
 
 if(OSDP_BUILD_TESTS)
     enable_testing()

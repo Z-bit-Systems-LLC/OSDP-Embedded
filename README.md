@@ -15,6 +15,12 @@ sniffer or logic analyzer) and decode them into typed message structs. No
 transmit path, no state machine, no Secure Channel yet. See [docs/PLAN.md](docs/PLAN.md)
 for the phased roadmap.
 
+The included `osdp-parser` CLI consumes
+[OSDPCAP-format](https://github.com/Security-Industry-Association/libosdp-conformance/blob/master/doc/doc-src/osdpcap-format.md)
+captures (JSON-Lines, as produced by `libosdp-conformance` and similar
+tools) and prints a one-line summary per frame. Drop captures into
+`tests/captures/` to register them as integration tests automatically.
+
 ## Architecture at a glance
 
 The core library is split by **message direction**, not by role:
@@ -49,17 +55,46 @@ core/                         # C11 portable library
 │   ├── replies/              # PD→ACU message codecs (one TU per reply)
 │   └── dispatch/             # optional bulk dispatch helpers
 └── CMakeLists.txt
-tests/                        # Unity-based unit tests, run on host
+tools/
+└── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
+tests/
+├── vendor/unity/             # vendored Unity test framework
+├── captures/                 # drop *.osdpcap files here for integration tests
+└── test_*.c                  # Unity-based unit tests, run on host
 rust/                         # planned: osdp-sys + osdp Rust crates
-tools/                        # planned: osdp-dump CLI sniffer
 docs/                         # design docs and plan; spec/ is gitignored
 ```
 
 ## Building
 
 CMake-based; targets Windows host first (MSVC, clang, MinGW) and any
-embedded toolchain with a C11 compiler. Build instructions and CMake target
-names will land alongside the first code drop in iteration 1.
+embedded toolchain with a C11 compiler.
+
+```sh
+cmake -S . -B build
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Useful CMake options:
+
+| Option              | Default | Effect                                           |
+| ------------------- | ------- | ------------------------------------------------ |
+| `OSDP_BUILD_TESTS`  | `ON`    | Build the Unity test suites under `tests/`.      |
+| `OSDP_BUILD_TOOLS`  | `ON`    | Build host-side tools (`osdp-parser`).           |
+
+For a tight embedded build (core only), set both options to `OFF` and
+link the `osdp::core` and `osdp::messages` (and optionally
+`osdp::dispatch`) targets only — no compiler-options or test framework
+get pulled in.
+
+### Inspecting a capture
+
+```sh
+build/tools/osdp-parser/osdp-parser my-capture.osdpcap
+# or via stdin:
+cat my-capture.osdpcap | build/tools/osdp-parser/osdp-parser
+```
 
 ## Reference material
 

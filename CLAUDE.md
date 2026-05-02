@@ -58,6 +58,16 @@ core/src/
   commands/           # cmd_<name>.c — model + decode + build per command
   replies/            # reply_<name>.c — model + decode + build per reply
   dispatch/           # opt-in bulk routing; references every codec
+
+tools/
+  osdp-parser/        # host-side CLI: OSDPCAP reader + Monitor pipeline
+                      # (osdpcap.{c,h} + main.c). Built when
+                      # OSDP_BUILD_TOOLS=ON.
+
+tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
+                      # configure time and registers a CTest entry per
+                      # capture, all backed by the test_captures
+                      # executable. Re-run cmake after adding a file.
 ```
 
 ## CMake targets
@@ -132,6 +142,13 @@ references only one of them, the other gets GC'd.
 - **OSDP.Net repo**: <https://github.com/Z-bit-Systems-LLC/OSDP.Net>.
   Behavioral oracle. Mine for command/reply enums, payload layouts, and
   test vectors. Do not copy code.
+- **OSDPCAP capture format**: SIA's libosdp-conformance project,
+  <https://github.com/Security-Industry-Association/libosdp-conformance/blob/master/doc/doc-src/osdpcap-format.md>.
+  JSON-Lines, one record per line, fields: `timeSec`, `timeNano`, `io`
+  (input/output/trace), `data` (hex bytes with optional spaces, may
+  carry leading 0xFF marking bytes), `osdpTraceVersion`, `osdpSource`.
+  The `data` field is "usually but not always a whole OSDP message" —
+  the streaming decoder is the right way to consume it.
 
 ## Testing
 
