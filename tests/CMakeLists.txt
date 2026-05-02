@@ -15,7 +15,7 @@ endif()
 # Tests can include private core headers via the PRIVATE include path.
 function(osdp_add_test test_name)
     add_executable(${test_name} ${test_name}.c)
-    target_link_libraries(${test_name} PRIVATE osdp_core unity)
+    target_link_libraries(${test_name} PRIVATE osdp_core osdp_messages unity)
     target_include_directories(${test_name} PRIVATE
         ${CMAKE_SOURCE_DIR}/core/src
     )
@@ -25,3 +25,5 @@ endfunction()
 osdp_add_test(test_crc)
 osdp_add_test(test_checksum)
 osdp_add_test(test_frame)
+osdp_add_test(test_commands)
+osdp_add_test(test_replies)
