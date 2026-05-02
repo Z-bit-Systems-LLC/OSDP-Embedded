@@ -1,0 +1,16 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+This file should contain the verbatim text of GNU GPL v3.0 as published by
+the Free Software Foundation, available at:
+
+    https://www.gnu.org/licenses/gpl-3.0.txt
+
+The text is intentionally not duplicated inline in this commit; before the
+first public release of OSDP-Embedded, drop the canonical GPL-3.0 text
+into this file (replacing this notice). It must be the exact upstream
+text; do not modify it.
+
+Until then, recipients of this repository should treat the canonical GPL
+v3.0 text at the URL above as the operative license text, in conjunction
+with LICENSE.md in this repository.
