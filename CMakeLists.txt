@@ -40,6 +40,7 @@ else()
 endif()
 
 add_subdirectory(core)
+add_subdirectory(pd)
 
 if(OSDP_BUILD_TOOLS)
     add_subdirectory(tools)

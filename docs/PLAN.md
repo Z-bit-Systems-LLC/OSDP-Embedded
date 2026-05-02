@@ -69,15 +69,20 @@ typed message structs. Foundation for both PD and ACU work later.
   and successfully decode a baseline OSDP frame in fewer than 20 lines of
   code.
 
-## Iteration 2 — Encoder TX paths and applications (planned)
+## Iteration 2 — Encoder TX paths and applications (in progress)
 
-- Promote the per-message builders from "incidentally compiled" to
-  first-class with their own test suite.
-- Introduce `pd/`, `acu/`, `monitor/` peer trees with role-specific state
-  machines and transport HALs.
-- First end-to-end PD example on host (loopback) and on a target MCU
+- ☑ **Encoder promotion to first-class.** `osdp_frame_build` and every
+  per-message builder are now validated by a real-world Secure Channel
+  capture (`tests/captures/sc-monitor-current.osdpcap`): all 592 frames
+  decode → rebuild → byte-compare without any mismatches.
+- ☐ **PD peer tree** (`pd/`). Role-specific state machine, transport HAL,
+  application command handler, sequence number management, online/
+  offline tracking, address filtering. Builds on top of `osdp::core`.
+- ☐ **ACU peer tree** (`acu/`). Polling schedule, retry logic, multi-PD
+  registration, sequence-number generation.
+- ☐ First end-to-end PD example on host (loopback) and on a target MCU
   (TBD — likely STM32 or Nordic).
-- Extend `osdp-parser` (or add a sibling tool) to drive synthetic
+- ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic
   capture playback for testing PD/ACU state machines.
 
 ## Iteration 3 — Secure Channel (planned)

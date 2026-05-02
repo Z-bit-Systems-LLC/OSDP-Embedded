@@ -31,6 +31,12 @@ osdp_add_test(test_replies)
 osdp_add_test(test_stream)
 osdp_add_test(test_dispatch)
 
+# PD-side tests need the osdp_pd library in addition to the core.
+add_executable(test_pd test_pd.c)
+target_link_libraries(test_pd PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd COMMAND test_pd)
+
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.
 if(TARGET osdpcap_reader)
