@@ -31,7 +31,13 @@ extern "C" {
 #define OSDP_REPLY_RMAC_I    0x78U
 #define OSDP_REPLY_BUSY      0x79U
 #define OSDP_REPLY_FTSTAT    0x7AU
+#define OSDP_REPLY_PIVDATAR  0x80U
+#define OSDP_REPLY_GENAUTHR  0x81U
+#define OSDP_REPLY_CRAUTHR   0x82U
+#define OSDP_REPLY_MFGSTATR  0x83U
+#define OSDP_REPLY_MFGERRR   0x84U
 #define OSDP_REPLY_MFGREP    0x90U
+#define OSDP_REPLY_XRD       0xB1U
 
 /* NAK error codes per spec Table 47. */
 #define OSDP_NAK_NO_ERROR              0x00U

@@ -26,12 +26,20 @@ extern "C" {
 #define OSDP_CMD_BUZ      0x6AU
 #define OSDP_CMD_TEXT     0x6BU
 #define OSDP_CMD_COMSET   0x6EU
-#define OSDP_CMD_BIOREAD  0x73U
-#define OSDP_CMD_BIOMATCH 0x74U
-#define OSDP_CMD_KEYSET   0x75U
-#define OSDP_CMD_CHLNG    0x76U
-#define OSDP_CMD_SCRYPT   0x77U
-#define OSDP_CMD_MFG      0x80U
+#define OSDP_CMD_BIOREAD      0x73U
+#define OSDP_CMD_BIOMATCH     0x74U
+#define OSDP_CMD_KEYSET       0x75U
+#define OSDP_CMD_CHLNG        0x76U
+#define OSDP_CMD_SCRYPT       0x77U
+#define OSDP_CMD_ACURXSIZE    0x7BU
+#define OSDP_CMD_FILETRANSFER 0x7CU
+#define OSDP_CMD_MFG          0x80U
+#define OSDP_CMD_XWR          0xA1U
+#define OSDP_CMD_ABORT        0xA2U
+#define OSDP_CMD_PIVDATA      0xA3U
+#define OSDP_CMD_GENAUTH      0xA4U
+#define OSDP_CMD_CRAUTH       0xA5U
+#define OSDP_CMD_KEEPACTIVE   0xA7U
 
 /* ========================================================================
  * osdp_POLL (0x60) — empty payload

@@ -39,10 +39,18 @@ static void test_classify_baseline_commands(void)
         { OSDP_CMD_BUZ,     OSDP_MSG_CMD_BUZ     },
         { OSDP_CMD_TEXT,    OSDP_MSG_CMD_TEXT    },
         { OSDP_CMD_COMSET,  OSDP_MSG_CMD_COMSET  },
-        { OSDP_CMD_KEYSET,  OSDP_MSG_CMD_KEYSET  },
-        { OSDP_CMD_CHLNG,   OSDP_MSG_CMD_CHLNG   },
-        { OSDP_CMD_SCRYPT,  OSDP_MSG_CMD_SCRYPT  },
-        { OSDP_CMD_MFG,     OSDP_MSG_CMD_MFG     },
+        { OSDP_CMD_KEYSET,       OSDP_MSG_CMD_KEYSET       },
+        { OSDP_CMD_CHLNG,        OSDP_MSG_CMD_CHLNG        },
+        { OSDP_CMD_SCRYPT,       OSDP_MSG_CMD_SCRYPT       },
+        { OSDP_CMD_ACURXSIZE,    OSDP_MSG_CMD_ACURXSIZE    },
+        { OSDP_CMD_FILETRANSFER, OSDP_MSG_CMD_FILETRANSFER },
+        { OSDP_CMD_MFG,          OSDP_MSG_CMD_MFG          },
+        { OSDP_CMD_XWR,          OSDP_MSG_CMD_XWR          },
+        { OSDP_CMD_ABORT,        OSDP_MSG_CMD_ABORT        },
+        { OSDP_CMD_PIVDATA,      OSDP_MSG_CMD_PIVDATA      },
+        { OSDP_CMD_GENAUTH,      OSDP_MSG_CMD_GENAUTH      },
+        { OSDP_CMD_CRAUTH,       OSDP_MSG_CMD_CRAUTH       },
+        { OSDP_CMD_KEEPACTIVE,   OSDP_MSG_CMD_KEEPACTIVE   },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         TEST_ASSERT_EQUAL(cases[i].kind, classify(cases[i].code, false));
@@ -65,9 +73,15 @@ static void test_classify_baseline_replies(void)
         { OSDP_REPLY_KEYPAD,  OSDP_MSG_REPLY_KEYPAD  },
         { OSDP_REPLY_COM,     OSDP_MSG_REPLY_COM     },
         { OSDP_REPLY_CCRYPT,  OSDP_MSG_REPLY_CCRYPT  },
-        { OSDP_REPLY_BUSY,    OSDP_MSG_REPLY_BUSY    },
-        { OSDP_REPLY_FTSTAT,  OSDP_MSG_REPLY_FTSTAT  },
-        { OSDP_REPLY_MFGREP,  OSDP_MSG_REPLY_MFGREP  },
+        { OSDP_REPLY_BUSY,     OSDP_MSG_REPLY_BUSY     },
+        { OSDP_REPLY_FTSTAT,   OSDP_MSG_REPLY_FTSTAT   },
+        { OSDP_REPLY_PIVDATAR, OSDP_MSG_REPLY_PIVDATAR },
+        { OSDP_REPLY_GENAUTHR, OSDP_MSG_REPLY_GENAUTHR },
+        { OSDP_REPLY_CRAUTHR,  OSDP_MSG_REPLY_CRAUTHR  },
+        { OSDP_REPLY_MFGSTATR, OSDP_MSG_REPLY_MFGSTATR },
+        { OSDP_REPLY_MFGERRR,  OSDP_MSG_REPLY_MFGERRR  },
+        { OSDP_REPLY_MFGREP,   OSDP_MSG_REPLY_MFGREP   },
+        { OSDP_REPLY_XRD,      OSDP_MSG_REPLY_XRD      },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         TEST_ASSERT_EQUAL(cases[i].kind, classify(cases[i].code, true));
@@ -96,10 +110,9 @@ static void test_classify_disambiguates_by_reply_flag(void)
     TEST_ASSERT_EQUAL(OSDP_MSG_CMD_CHLNG,    classify(0x76, false));
     TEST_ASSERT_EQUAL(OSDP_MSG_REPLY_CCRYPT, classify(0x76, true));
 
-    /* 0x80: command osdp_MFG vs reply osdp_PIVDATAR (not in our
-     * baseline, classifies as UNKNOWN_REPLY). */
-    TEST_ASSERT_EQUAL(OSDP_MSG_CMD_MFG,        classify(0x80, false));
-    TEST_ASSERT_EQUAL(OSDP_MSG_UNKNOWN_REPLY,  classify(0x80, true));
+    /* 0x80: command osdp_MFG vs reply osdp_PIVDATAR. */
+    TEST_ASSERT_EQUAL(OSDP_MSG_CMD_MFG,       classify(0x80, false));
+    TEST_ASSERT_EQUAL(OSDP_MSG_REPLY_PIVDATAR, classify(0x80, true));
 }
 
 static void test_dispatch_name_returns_non_null_for_every_kind(void)
@@ -115,7 +128,10 @@ static void test_dispatch_name_returns_non_null_for_every_kind(void)
         OSDP_MSG_CMD_BUZ, OSDP_MSG_CMD_TEXT, OSDP_MSG_CMD_COMSET,
         OSDP_MSG_CMD_BIOREAD, OSDP_MSG_CMD_BIOMATCH,
         OSDP_MSG_CMD_KEYSET, OSDP_MSG_CMD_CHLNG, OSDP_MSG_CMD_SCRYPT,
-        OSDP_MSG_CMD_MFG,
+        OSDP_MSG_CMD_ACURXSIZE, OSDP_MSG_CMD_FILETRANSFER,
+        OSDP_MSG_CMD_MFG, OSDP_MSG_CMD_XWR, OSDP_MSG_CMD_ABORT,
+        OSDP_MSG_CMD_PIVDATA, OSDP_MSG_CMD_GENAUTH,
+        OSDP_MSG_CMD_CRAUTH, OSDP_MSG_CMD_KEEPACTIVE,
         OSDP_MSG_REPLY_ACK, OSDP_MSG_REPLY_NAK, OSDP_MSG_REPLY_PDID,
         OSDP_MSG_REPLY_PDCAP, OSDP_MSG_REPLY_LSTATR,
         OSDP_MSG_REPLY_ISTATR, OSDP_MSG_REPLY_OSTATR,
@@ -124,7 +140,10 @@ static void test_dispatch_name_returns_non_null_for_every_kind(void)
         OSDP_MSG_REPLY_BIOREADR, OSDP_MSG_REPLY_BIOMATCHR,
         OSDP_MSG_REPLY_CCRYPT, OSDP_MSG_REPLY_RMAC_I,
         OSDP_MSG_REPLY_BUSY, OSDP_MSG_REPLY_FTSTAT,
-        OSDP_MSG_REPLY_MFGREP,
+        OSDP_MSG_REPLY_PIVDATAR, OSDP_MSG_REPLY_GENAUTHR,
+        OSDP_MSG_REPLY_CRAUTHR, OSDP_MSG_REPLY_MFGSTATR,
+        OSDP_MSG_REPLY_MFGERRR, OSDP_MSG_REPLY_MFGREP,
+        OSDP_MSG_REPLY_XRD,
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
         const char *name = osdp_dispatch_name(kinds[i]);

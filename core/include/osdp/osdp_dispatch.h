@@ -44,7 +44,15 @@ typedef enum osdp_message_kind {
     OSDP_MSG_CMD_KEYSET,
     OSDP_MSG_CMD_CHLNG,
     OSDP_MSG_CMD_SCRYPT,
+    OSDP_MSG_CMD_ACURXSIZE,
+    OSDP_MSG_CMD_FILETRANSFER,
     OSDP_MSG_CMD_MFG,
+    OSDP_MSG_CMD_XWR,
+    OSDP_MSG_CMD_ABORT,
+    OSDP_MSG_CMD_PIVDATA,
+    OSDP_MSG_CMD_GENAUTH,
+    OSDP_MSG_CMD_CRAUTH,
+    OSDP_MSG_CMD_KEEPACTIVE,
 
     /* Replies (PD → ACU) */
     OSDP_MSG_REPLY_ACK,
@@ -65,7 +73,13 @@ typedef enum osdp_message_kind {
     OSDP_MSG_REPLY_RMAC_I,
     OSDP_MSG_REPLY_BUSY,
     OSDP_MSG_REPLY_FTSTAT,
-    OSDP_MSG_REPLY_MFGREP
+    OSDP_MSG_REPLY_PIVDATAR,
+    OSDP_MSG_REPLY_GENAUTHR,
+    OSDP_MSG_REPLY_CRAUTHR,
+    OSDP_MSG_REPLY_MFGSTATR,
+    OSDP_MSG_REPLY_MFGERRR,
+    OSDP_MSG_REPLY_MFGREP,
+    OSDP_MSG_REPLY_XRD
 } osdp_message_kind_t;
 
 /* Classify a decoded frame to its message kind based on the code byte
