@@ -7,6 +7,7 @@ add_library(osdp_core STATIC
     src/shared/crc16.c
     src/shared/checksum.c
     src/shared/frame.c
+    src/shared/stream.c
 )
 
 target_include_directories(osdp_core
@@ -52,5 +53,19 @@ target_compile_features(osdp_messages PUBLIC c_std_11)
 
 add_library(osdp::messages ALIAS osdp_messages)
 
-# osdp::dispatch will be added in a subsequent phase as the bulk-routing
-# helper TUs come online.
+# osdp::dispatch — optional bulk-routing helpers. Iteration 1 ships a
+# pure classifier (no per-message decoder references) so consumers can
+# link this without dragging every codec into the binary; richer routing
+# helpers may follow in later iterations.
+add_library(osdp_dispatch STATIC
+    src/dispatch/dispatch_classify.c
+)
+
+target_include_directories(osdp_dispatch
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_features(osdp_dispatch PUBLIC c_std_11)
+
+add_library(osdp::dispatch ALIAS osdp_dispatch)
