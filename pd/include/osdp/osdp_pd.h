@@ -40,14 +40,22 @@ extern "C" {
  *   - Refuses Secure Channel frames with NAK 0x05 (SC arrives in
  *     iteration 3).
  *
- * Iteration 2 phase 2 scope (this commit):
+ * Iteration 2 phase 2 scope:
  *   - Sequence number policing per spec 5.9 Table 2: when the ACU
  *     retransmits a command with the same non-zero SQN, the PD
  *     resends its cached reply without re-invoking the application
  *     handler. SQN zero always processes fresh (session reset).
  *
+ * Iteration 2 phase 3 scope (this commit):
+ *   - Online / offline state tracking per spec 5.7: the PD considers
+ *     itself offline after OSDP_PD_OFFLINE_TIMEOUT_MS without a
+ *     successfully transmitted reply. On the offline transition the
+ *     sequence-number cache is cleared so a reconnect begins cleanly.
+ *     Requires the transport to provide a `now_ms` callback; without
+ *     one the timeout is disabled and the PD is "online" after first
+ *     successful reply.
+ *
  * Deferred for subsequent commits:
- *   - Online / offline state tracking + 8-second-without-comm reset.
  *   - Inter-character timeout policing.
  *   - Multi-record reply convenience helpers (currently the app
  *     flat-buffers).
@@ -69,6 +77,12 @@ typedef struct osdp_pd_transport {
      * caller indefinitely. Returns the number of bytes accepted; the
      * PD treats a short write as a transmission error. */
     int (*write)(void *user, const uint8_t *buf, size_t len);
+
+    /* Monotonic millisecond clock. Optional; if NULL, online/offline
+     * timeout tracking is disabled (the PD is considered "online" as
+     * soon as it has sent a reply, and stays so forever). 32-bit wrap
+     * (every ~49.7 days) is handled via unsigned subtraction. */
+    uint32_t (*now_ms)(void *user);
 
     /* Opaque pointer threaded back into every callback. */
     void *user;
@@ -116,6 +130,10 @@ typedef osdp_status_t (*osdp_pd_command_cb)(
  * templates) become first-class. */
 #define OSDP_PD_TX_BUF_LEN 256U
 
+/* Spec 5.7: PD considers itself offline if the gap between messages
+ * to which it responds exceeds 8 seconds. */
+#define OSDP_PD_OFFLINE_TIMEOUT_MS 8000U
+
 typedef struct osdp_pd {
     uint8_t                    address;     /* this PD's 7-bit addr  */
     osdp_stream_t              rx;          /* inbound byte buffer   */
@@ -131,6 +149,12 @@ typedef struct osdp_pd {
     size_t                     last_reply_len;
     uint8_t                    last_seq;     /* 0..3 */
     bool                       have_last;
+
+    /* Online/offline tracking (spec 5.7). `online` flips false when
+     * `now_ms - last_comm_ms` exceeds OSDP_PD_OFFLINE_TIMEOUT_MS, and
+     * back true on the next successful reply. */
+    bool                       online;
+    uint32_t                   last_comm_ms;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/
@@ -155,6 +179,13 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
  * command handler, and send any reply. Idempotent and non-blocking;
  * call from your main loop. */
 void osdp_pd_tick(osdp_pd_t *pd);
+
+/* True iff the PD has successfully replied within the past
+ * OSDP_PD_OFFLINE_TIMEOUT_MS. Always false for a freshly-initialized
+ * PD; flips true after the first reply is transmitted. If the
+ * transport doesn't supply a now_ms callback, the timeout is disabled
+ * and the PD remains online once it has sent a reply. */
+bool osdp_pd_is_online(const osdp_pd_t *pd);
 
 #ifdef __cplusplus
 }

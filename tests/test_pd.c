@@ -22,11 +22,12 @@ void tearDown(void) {}
 #define MOCK_BUF_LEN 1024U
 
 typedef struct mock_transport {
-    uint8_t incoming[MOCK_BUF_LEN];
-    size_t  incoming_len;
-    size_t  incoming_off;
-    uint8_t outgoing[MOCK_BUF_LEN];
-    size_t  outgoing_len;
+    uint8_t  incoming[MOCK_BUF_LEN];
+    size_t   incoming_len;
+    size_t   incoming_off;
+    uint8_t  outgoing[MOCK_BUF_LEN];
+    size_t   outgoing_len;
+    uint32_t now_ms;       /* bumped manually by tests */
 } mock_transport_t;
 
 static int mock_read(void *user, uint8_t *buf, size_t cap)
@@ -53,12 +54,18 @@ static int mock_write(void *user, const uint8_t *buf, size_t len)
     return (int)n;
 }
 
+static uint32_t mock_now_ms(void *user)
+{
+    return ((const mock_transport_t *)user)->now_ms;
+}
+
 static void mock_init(mock_transport_t *m, osdp_pd_transport_t *t)
 {
     (void)memset(m, 0, sizeof(*m));
-    t->read  = mock_read;
-    t->write = mock_write;
-    t->user  = m;
+    t->read   = mock_read;
+    t->write  = mock_write;
+    t->now_ms = mock_now_ms;
+    t->user   = m;
 }
 
 /* Append a built command frame to the mock transport's `incoming`
@@ -477,6 +484,145 @@ static void test_retransmit_replays_nak_too(void)
     TEST_ASSERT_EQUAL_MEMORY(m.outgoing, &m.outgoing[len_first], len_first);
 }
 
+/* ---- Online/offline tracking (spec 5.7) -------------------------------- */
+
+static void test_freshly_initialized_pd_is_offline(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    TEST_ASSERT_FALSE(osdp_pd_is_online(&pd));
+}
+
+static void test_first_reply_transitions_pd_to_online(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    TEST_ASSERT_FALSE(osdp_pd_is_online(&pd));
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+}
+
+static void test_silence_beyond_eight_seconds_transitions_offline(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* Establish online with a reply at t=1000 ms. */
+    m.now_ms = 1000;
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+
+    /* Jump just past the 8-second window. No incoming traffic. The
+     * tick should observe the timeout and transition offline. */
+    m.now_ms = 1000 + OSDP_PD_OFFLINE_TIMEOUT_MS + 1;
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_FALSE(osdp_pd_is_online(&pd));
+}
+
+static void test_offline_clears_sequence_cache(void)
+{
+    /* Simulate an ACU that polls, the PD goes offline, then a fresh
+     * connection re-uses the same SQN. The PD must process the new
+     * command, not replay the old reply. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    counting_handler_t counter = {0};
+    osdp_pd_set_command_handler(&pd, counting_cb, &counter);
+
+    m.now_ms = 1000;
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_UINT(1, counter.call_count);
+
+    /* Long silence → offline → cache cleared. */
+    m.now_ms = 1000 + OSDP_PD_OFFLINE_TIMEOUT_MS + 100;
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_FALSE(osdp_pd_is_online(&pd));
+
+    /* Same SQN comes in. Without cache clearing, this would replay the
+     * old ACK without invoking the handler — which would be a bug. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(2, counter.call_count,
+        "PD replayed cached reply across an offline transition");
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+}
+
+static void test_continuous_traffic_keeps_pd_online(void)
+{
+    /* Steady-state polling: every reply refreshes the timeout, so the
+     * PD never transitions to offline. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    for (uint8_t seq = 1; seq <= 3; seq++) {
+        m.now_ms += 5000;   /* 5 seconds between commands; well inside 8 */
+        inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                       OSDP_INTEGRITY_CRC, seq);
+        osdp_pd_tick(&pd);
+        TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+    }
+
+    /* Bump 5 seconds further — still online because the most recent
+     * reply was less than 8 seconds ago. */
+    m.now_ms += 5000;
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+}
+
+static void test_no_clock_callback_means_online_after_first_reply_forever(void)
+{
+    /* Without now_ms, the PD can't measure silence — degrade
+     * gracefully by staying online once it has replied. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    t.now_ms = NULL;   /* explicitly disable the clock */
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+
+    /* Many ticks with no traffic — the PD stays online (no timeout
+     * mechanism available). */
+    for (int i = 0; i < 100; i++) {
+        osdp_pd_tick(&pd);
+    }
+    TEST_ASSERT_TRUE(osdp_pd_is_online(&pd));
+}
+
 static void test_retransmit_after_other_seq_does_not_replay(void)
 {
     /* Once a command at SQN=2 has been processed, a retransmit at SQN=1
@@ -549,5 +695,12 @@ int main(void)
     RUN_TEST(test_sequence_zero_always_processes_fresh);
     RUN_TEST(test_retransmit_replays_nak_too);
     RUN_TEST(test_retransmit_after_other_seq_does_not_replay);
+    /* Online/offline tracking */
+    RUN_TEST(test_freshly_initialized_pd_is_offline);
+    RUN_TEST(test_first_reply_transitions_pd_to_online);
+    RUN_TEST(test_silence_beyond_eight_seconds_transitions_offline);
+    RUN_TEST(test_offline_clears_sequence_cache);
+    RUN_TEST(test_continuous_traffic_keeps_pd_online);
+    RUN_TEST(test_no_clock_callback_means_online_after_first_reply_forever);
     return UNITY_END();
 }

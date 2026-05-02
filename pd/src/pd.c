@@ -47,7 +47,11 @@ static osdp_status_t build_nak(osdp_pd_t          *pd,
 
 /* Send `len` bytes from `buf` via the bound transport. Short writes
  * are dropped on the floor for now; future iterations may queue or
- * report a transmission error. */
+ * report a transmission error.
+ *
+ * On a successful (non-empty) send, the PD is considered to have just
+ * communicated: refresh last_comm_ms and set online = true so spec
+ * 5.7's 8-second silence window starts over. */
 static void send_bytes(osdp_pd_t *pd, const uint8_t *buf, size_t len)
 {
     if (pd->transport.write == NULL || len == 0) {
@@ -55,6 +59,30 @@ static void send_bytes(osdp_pd_t *pd, const uint8_t *buf, size_t len)
     }
     const int written = pd->transport.write(pd->transport.user, buf, len);
     (void)written;
+
+    if (pd->transport.now_ms != NULL) {
+        pd->last_comm_ms = pd->transport.now_ms(pd->transport.user);
+    }
+    pd->online = true;
+}
+
+/* If the PD has been online but no reply has been sent for longer than
+ * OSDP_PD_OFFLINE_TIMEOUT_MS, transition to offline and clear the
+ * sequence-number cache so the next reconnect starts cleanly. No-op
+ * when the transport does not provide a now_ms callback. */
+static void check_offline_timeout(osdp_pd_t *pd)
+{
+    if (!pd->online || pd->transport.now_ms == NULL) {
+        return;
+    }
+    const uint32_t now = pd->transport.now_ms(pd->transport.user);
+    /* Unsigned subtraction wraps cleanly modulo 2^32, so a 49.7-day
+     * monotonic wraparound doesn't spuriously trigger an offline. */
+    const uint32_t elapsed = now - pd->last_comm_ms;
+    if (elapsed > OSDP_PD_OFFLINE_TIMEOUT_MS) {
+        pd->online    = false;
+        pd->have_last = false;  /* drop SQN cache; ACU will reset SQN */
+    }
 }
 
 /* Compute the reply for a fresh command into pd->tx_buf and return
@@ -172,11 +200,24 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
     pd->cmd_user = user;
 }
 
+bool osdp_pd_is_online(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return false;
+    }
+    return pd->online;
+}
+
 void osdp_pd_tick(osdp_pd_t *pd)
 {
     if (pd == NULL || pd->transport.read == NULL) {
         return;
     }
+
+    /* Check the offline timeout BEFORE consuming new bytes — keeps
+     * is_online() honest even when the caller is ticking only to
+     * check timing without expecting incoming traffic. */
+    check_offline_timeout(pd);
 
     /* Drain whatever the transport has now. */
     uint8_t chunk[128];
