@@ -27,11 +27,16 @@ static const char *g_capture_path = NULL;
  *    (whitespace / comment).
  *  - The streaming decoder accepts every byte without an INVALID_ARG
  *    return (which would indicate we mis-fed it).
+ *  - Every successfully-decoded frame round-trips through
+ *    osdp_frame_build to a byte-identical copy of the original wire
+ *    bytes. This is the encoder's strongest correctness check: real
+ *    third-party traffic (libosdp-conformance, in this case) goes
+ *    through both directions of the framing layer and comes out
+ *    unchanged.
  *  - Frame-level decode errors (bad CRC, bad length, etc) are
  *    permitted: real captures legitimately contain malformed bytes
  *    (e.g. line-idle 0xFF runs, partial frames split across records,
- *    deliberately corrupt test traffic). The test reports the counts
- *    via stderr but does not fail on them. */
+ *    deliberately corrupt test traffic). Reported but non-fatal. */
 static void test_capture_file_can_be_consumed(void)
 {
     TEST_ASSERT_NOT_NULL_MESSAGE(g_capture_path,
@@ -44,10 +49,16 @@ static void test_capture_file_can_be_consumed(void)
     osdp_stream_init(&stream);
 
     char line[16384];
-    unsigned long parse_errors = 0;
-    unsigned long records      = 0;
-    unsigned long frames       = 0;
-    unsigned long decode_errs  = 0;
+    unsigned long parse_errors  = 0;
+    unsigned long records       = 0;
+    unsigned long frames        = 0;
+    unsigned long decode_errs   = 0;
+    unsigned long roundtrip_ok  = 0;
+
+    /* Local copy buffer for the rebuilt frame bytes. The frame slice
+     * pointers in osdp_frame_t reference the stream's internal buffer,
+     * which we MUST NOT touch — so build into a separate scratch. */
+    uint8_t rebuilt[OSDP_FRAME_MAX_LEN];
 
     while (fgets(line, sizeof(line), f) != NULL) {
         osdpcap_record_t rec;
@@ -73,9 +84,26 @@ static void test_capture_file_can_be_consumed(void)
             const osdp_status_t r = osdp_stream_next(&stream, &fr);
             if (r == OSDP_OK) {
                 frames++;
-                /* Sanity: the classifier must always return SOMETHING. */
+                /* Classifier must always return SOMETHING. */
                 const osdp_message_kind_t k = osdp_dispatch_classify(&fr);
                 TEST_ASSERT_NOT_NULL(osdp_dispatch_name(k));
+
+                /* Encoder round-trip: rebuild the frame from the
+                 * decoded struct and compare with the original wire
+                 * bytes. Any mismatch is a hard failure — it would
+                 * mean the encoder produces different bytes than what
+                 * a real OSDP implementation emitted for the same
+                 * logical message. */
+                size_t built = 0;
+                const osdp_status_t br =
+                    osdp_frame_build(&fr, rebuilt, sizeof(rebuilt), &built);
+                TEST_ASSERT_EQUAL_MESSAGE(OSDP_OK, br,
+                    "frame_build refused a frame the decoder accepted");
+                TEST_ASSERT_EQUAL_size_t_MESSAGE(fr.raw_len, built,
+                    "rebuilt frame length differs from wire frame");
+                TEST_ASSERT_EQUAL_MEMORY_MESSAGE(fr.raw, rebuilt, built,
+                    "rebuilt frame bytes differ from wire frame");
+                roundtrip_ok++;
             } else if (r == OSDP_ERR_TRUNCATED) {
                 break;
             } else {
@@ -86,13 +114,18 @@ static void test_capture_file_can_be_consumed(void)
     (void)fclose(f);
 
     fprintf(stderr,
-            "\n  capture summary: %lu records, %lu frames, %lu decode "
-            "errors, %lu parse errors\n",
-            records, frames, decode_errs, parse_errors);
+            "\n  capture summary: %lu records, %lu frames "
+            "(%lu round-tripped byte-identical), %lu decode errors, "
+            "%lu parse errors\n",
+            records, frames, roundtrip_ok, decode_errs, parse_errors);
 
-    /* The hard requirement: every non-blank line was a valid OSDPCAP
-     * record. Frame-level decode errors are permitted. */
+    /* Hard requirements:
+     *   - every non-blank line was a valid OSDPCAP record
+     *   - every successfully-decoded frame rebuilt to byte-identical
+     *     output (asserted inline above)
+     */
     TEST_ASSERT_EQUAL_UINT(0, parse_errors);
+    TEST_ASSERT_EQUAL_UINT(frames, roundtrip_ok);
 }
 
 int main(int argc, char **argv)
