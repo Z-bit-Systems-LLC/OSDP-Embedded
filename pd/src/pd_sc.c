@@ -241,12 +241,89 @@ static size_t handle_scrypt(osdp_pd_t *pd, const osdp_frame_t *cmd)
     return built;
 }
 
+/* ---- SCS_15 / SCS_17: operational traffic ---------------------------- */
+
+static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
+{
+    if (!pd->sc.session.established) {
+        size_t n = 0;
+        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        return n;
+    }
+
+    /* Unwrap: verify MAC and (for SCS_17) decrypt the payload. */
+    uint8_t plaintext[OSDP_PD_TX_BUF_LEN];
+    size_t  plaintext_len = 0;
+    osdp_status_t s = osdp_sc_unwrap_frame(
+        &pd->sc.crypto, &pd->sc.session, cmd,
+        plaintext, sizeof(plaintext), &plaintext_len);
+    if (s != OSDP_OK) {
+        /* MAC mismatch or decrypt failure: silent drop. The ACU will
+         * time out and re-issue, which is the protocol's expected
+         * recovery path (spec D.6). Sending a NAK with a wrong MAC
+         * would only confuse the chain further. */
+        return 0;
+    }
+
+    /* Dispatch the plaintext payload to the application handler. */
+    osdp_pd_reply_t reply = {
+        .code        = OSDP_REPLY_ACK,
+        .payload     = NULL,
+        .payload_len = 0,
+    };
+    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
+    if (pd->cmd_cb != NULL) {
+        app_status = pd->cmd_cb(pd->cmd_user, cmd->code,
+                                plaintext, plaintext_len, &reply);
+    }
+
+    /* Reply SCB type mirrors the inbound: SCS_15 → SCS_16,
+     * SCS_17 → SCS_18. The reply pairs the same encryption mode the
+     * ACU chose for the command. */
+    const uint8_t reply_scb_type =
+        (cmd->scb_type == OSDP_SCS_17) ? OSDP_SCS_18 : OSDP_SCS_16;
+
+    osdp_frame_t reply_template;
+    (void)memset(&reply_template, 0, sizeof(reply_template));
+    reply_template.address     = pd->address;
+    reply_template.reply       = true;
+    reply_template.sequence    = cmd->sequence;
+    reply_template.integrity   = cmd->integrity;
+    reply_template.has_scb     = true;
+    reply_template.scb_length  = OSDP_SCB_MIN_LEN;
+    reply_template.scb_type    = reply_scb_type;
+
+    /* Stack storage that lives across the wrap call below; the wrap
+     * routine copies the bytes into the output buffer so the lifetime
+     * is sufficient. */
+    uint8_t nak_byte = OSDP_NAK_UNKNOWN_CMD;
+    if (app_status == OSDP_OK) {
+        reply_template.code        = reply.code;
+        reply_template.payload     = reply.payload;
+        reply_template.payload_len = reply.payload_len;
+    } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
+        reply_template.code        = OSDP_REPLY_NAK;
+        reply_template.payload     = &nak_byte;
+        reply_template.payload_len = 1;
+    } else {
+        return 0;  /* internal handler error — drop */
+    }
+
+    size_t built = 0;
+    s = osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session,
+                           &reply_template,
+                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built);
+    if (s != OSDP_OK) {
+        return 0;
+    }
+    return built;
+}
+
 /* ---- Dispatch --------------------------------------------------------- */
 
 size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
                                           const osdp_frame_t *cmd)
 {
-    /* Only the ACU→PD SCB types should ever reach us. */
     switch (cmd->scb_type) {
     case OSDP_SCS_11:
         return handle_chlng(pd, cmd);
@@ -254,11 +331,11 @@ size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
         return handle_scrypt(pd, cmd);
     case OSDP_SCS_15:
     case OSDP_SCS_17:
-        /* Operational SC traffic — handler integration arrives in the
-         * next commit. For now, NAK with unsupported-SCB so the ACU
-         * sees a defined failure rather than silence. */
-        /* fallthrough */
+        return handle_operational(pd, cmd);
     default: {
+        /* SCB types we never expect on the ACU→PD direction
+         * (SCS_12/14/16/18 are reply-direction; anything else is
+         * out-of-spec). NAK with unsupported-SCB. */
         size_t n = 0;
         (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;

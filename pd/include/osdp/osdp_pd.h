@@ -57,7 +57,7 @@ extern "C" {
  *     one the timeout is disabled and the PD is "online" after first
  *     successful reply.
  *
- * Iteration 3 phase 3a scope (this commit):
+ * Iteration 3 phase 3a scope:
  *   - Optional Secure Channel handshake (SCS_11 → SCS_12, SCS_13 →
  *     SCS_14). When the application has supplied a crypto vtable, an
  *     SCBK and/or SCBK-D, and a cUID, the PD accepts inbound CHLNG /
@@ -68,10 +68,16 @@ extern "C" {
  *     SC configuration the PD continues to NAK SCB-bearing frames
  *     with code 0x05 as before.
  *
+ * Iteration 3 phase 3b scope (this commit):
+ *   - SCS_15..18 operational traffic. With an established session,
+ *     SCS_15 and SCS_17 commands are unwrapped (MAC verified, payload
+ *     decrypted for SCS_17) and dispatched through the existing
+ *     osdp_pd_command_cb. Replies are wrapped to the matching reply
+ *     SCB type (SCS_15 → SCS_16, SCS_17 → SCS_18). The application
+ *     handler is unchanged from the non-SC case — it sees plaintext
+ *     command codes and payload bytes either way.
+ *
  * Deferred for subsequent commits:
- *   - SCS_15..18 operational traffic (PD invokes the application
- *     handler on plaintext payloads, wraps replies via
- *     osdp_sc_wrap_frame).
  *   - Session loss / reset handling per spec D.1.4.
  *   - Inter-character timeout policing.
  *   - Multi-record reply convenience helpers (currently the app

@@ -11,6 +11,7 @@
  * for SCS_15..18 traffic in subsequent commits. */
 
 #include "osdp/osdp_commands.h"
+#include "osdp/osdp_crc.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_pd.h"
 #include "osdp/osdp_replies.h"
@@ -43,6 +44,12 @@ typedef struct mock_transport {
 static int mock_read(void *user, uint8_t *buf, size_t cap)
 {
     mock_transport_t *m = (mock_transport_t *)user;
+    /* Defensive: if a test resets incoming_len without resetting
+     * incoming_off, the unsigned subtraction would wrap and we'd
+     * read past the end of m->incoming. Clamp here. */
+    if (m->incoming_off > m->incoming_len) {
+        return 0;
+    }
     const size_t avail = m->incoming_len - m->incoming_off;
     const size_t n = (cap < avail) ? cap : avail;
     if (n > 0) {
@@ -50,6 +57,14 @@ static int mock_read(void *user, uint8_t *buf, size_t cap)
         m->incoming_off += n;
     }
     return (int)n;
+}
+
+/* Reset the mock's incoming buffer to a clean slate before pushing
+ * fresh bytes for the next test step. */
+static void mock_reset_incoming(mock_transport_t *m)
+{
+    m->incoming_len = 0;
+    m->incoming_off = 0;
 }
 
 static int mock_write(void *user, const uint8_t *buf, size_t len)
@@ -375,9 +390,8 @@ static void test_scrypt_with_bad_cryptogram_yields_status_failure(void)
 
 static void test_scs_15_pre_established_returns_unsupported(void)
 {
-    /* Until phase 3b lands, SCS_15..18 traffic returns NAK 0x05 even
-     * when SC is configured but the session isn't established. This
-     * keeps the PD's handshake-only first cut clean. */
+    /* Without an established session, SCS_15..18 traffic NAKs (the
+     * handshake must complete first). */
     mock_transport_t m;
     osdp_pd_transport_t t;
     osdp_pd_t pd;
@@ -408,6 +422,280 @@ static void test_scs_15_pre_established_returns_unsupported(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNSUPPORTED_SCB, reply.payload[0]);
 }
 
+/* ---- Phase 3b: operational SCS_15..18 ---------------------------------- */
+
+/* Run a full handshake on the PD and return the simulated ACU's
+ * mirror session afterward. Useful as a setup for operational tests. */
+static void perform_handshake(osdp_pd_t *pd, mock_transport_t *m,
+                              uint8_t selector,
+                              osdp_sc_session_t *acu_session_out)
+{
+    /* CHLNG → CCRYPT */
+    inject_sc_command(m, OSDP_SCS_11, selector,
+                      OSDP_CMD_CHLNG, kRndA, sizeof(kRndA), 1);
+    osdp_pd_tick(pd);
+    osdp_frame_t ccrypt;
+    decode_first_outgoing(m, &ccrypt);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_CCRYPT, ccrypt.code);
+    uint8_t rnd_b[OSDP_SC_RND_LEN];
+    (void)memcpy(rnd_b, &ccrypt.payload[OSDP_SC_CUID_LEN], OSDP_SC_RND_LEN);
+
+    /* Compute Server Cryptogram on the ACU side. */
+    const uint8_t *key = (selector == 1) ? kSCBK : kSCBK_D;
+    osdp_sc_session_keys_t keys;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_derive_session_keys(sc_test_crypto_tiny_aes(),
+                                    key, kRndA, &keys));
+    uint8_t server_crypto[OSDP_SC_CRYPTOGRAM_LEN];
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_server_cryptogram(sc_test_crypto_tiny_aes(),
+                                  keys.s_enc, kRndA, rnd_b, server_crypto));
+
+    /* SCRYPT → RMAC_I */
+    m->outgoing_len = 0;
+    inject_sc_command(m, OSDP_SCS_13, selector,
+                      OSDP_CMD_SCRYPT, server_crypto,
+                      sizeof(server_crypto), 2);
+    osdp_pd_tick(pd);
+    osdp_frame_t rmac_i;
+    decode_first_outgoing(m, &rmac_i);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RMAC_I, rmac_i.code);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(pd));
+
+    /* Build the ACU's mirror session: same keys, both MAC chain
+     * entries seeded with the same Initial R-MAC. */
+    osdp_sc_session_init(acu_session_out);
+    acu_session_out->keys = keys;
+    (void)memcpy(acu_session_out->last_outbound_mac,
+                 rmac_i.payload, OSDP_SC_MAC_LEN);
+    (void)memcpy(acu_session_out->last_inbound_mac,
+                 rmac_i.payload, OSDP_SC_MAC_LEN);
+    acu_session_out->established = true;
+
+    /* Clear outgoing for clean per-test setup. */
+    m->outgoing_len = 0;
+}
+
+/* Application handler for SC operational tests: ACK for POLL,
+ * a fixed osdp_PDID-style payload for ID, otherwise NOT_SUPPORTED. */
+static const uint8_t kSamplePdid[12] = {
+    0xCA, 0xFE, 0x00, 0x10, 0x01,
+    0xEF, 0xBE, 0xAD, 0xDE,
+    0x01, 0x02, 0x03,
+};
+
+static osdp_status_t sc_app_handler(void *user, uint8_t cmd_code,
+                                    const uint8_t *payload,
+                                    size_t payload_len,
+                                    osdp_pd_reply_t *reply)
+{
+    (void)user; (void)payload; (void)payload_len;
+    switch (cmd_code) {
+    case OSDP_CMD_POLL:
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
+    case OSDP_CMD_ID:
+        reply->code        = OSDP_REPLY_PDID;
+        reply->payload     = kSamplePdid;
+        reply->payload_len = sizeof(kSamplePdid);
+        return OSDP_OK;
+    default:
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static void test_scs_15_round_trip_yields_scs_16_ack(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* ACU builds a SCS_15 POLL: empty payload, MAC over header+code. */
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_15;
+    cmd_template.code        = OSDP_CMD_POLL;
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    /* Decode the PD's reply and verify it's a well-formed SCS_16 ACK. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_TRUE(reply.reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN, reply.mac_len);
+
+    /* Unwrap on the ACU side; expect the inner code to be ACK. */
+    uint8_t plain[64]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(0, plain_len);
+}
+
+static void test_scs_17_encrypted_round_trip(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* ACU builds a SCS_17 ID command (1-byte ID type payload). */
+    static const uint8_t id_payload = 0x00;
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_ID;
+    cmd_template.payload     = &id_payload;
+    cmd_template.payload_len = 1;
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+
+    uint8_t plain[64]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
+    TEST_ASSERT_EQUAL_size_t(sizeof(kSamplePdid), plain_len);
+    TEST_ASSERT_EQUAL_MEMORY(kSamplePdid, plain, sizeof(kSamplePdid));
+}
+
+static void test_scs_15_unknown_command_yields_scs_16_nak(void)
+{
+    /* Send a TEXT command under SCS_15. The default handler doesn't
+     * know TEXT, so the PD wraps a NAK reply under SCS_16. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 0, &acu);
+
+    static const uint8_t text_payload[] = {0,1,0,1,1,0};
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_15;
+    cmd_template.code        = OSDP_CMD_TEXT;
+    cmd_template.payload     = text_payload;
+    cmd_template.payload_len = sizeof(text_payload);
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, plain_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNKNOWN_CMD, plain[0]);
+}
+
+static void test_scs_15_with_tampered_mac_drops_silently(void)
+{
+    /* Per spec D.6, MAC mismatch on inbound frames is recovered by
+     * the ACU re-issuing — the PD shouldn't talk back with a wrong-
+     * chain MAC. Verify: corrupt the inbound MAC byte; PD writes no
+     * outgoing bytes. */
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address    = 0x05;
+    cmd_template.integrity  = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence   = 3;
+    cmd_template.has_scb    = true;
+    cmd_template.scb_length = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type   = OSDP_SCS_15;
+    cmd_template.code       = OSDP_CMD_POLL;
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    /* Flip a bit in the MAC and recompute CRC so the frame still
+     * decodes at Layer 1. */
+    const size_t crc_offset = cmd_wire_len - 2;
+    const size_t mac_offset = crc_offset - OSDP_FRAME_MAC_LEN;
+    cmd_wire[mac_offset] ^= 0x10;
+    const uint16_t crc = osdp_crc16(cmd_wire, crc_offset);
+    cmd_wire[crc_offset]     = (uint8_t)(crc & 0xFFu);
+    cmd_wire[crc_offset + 1] = (uint8_t)((crc >> 8) & 0xFFu);
+
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -419,5 +707,10 @@ int main(void)
     RUN_TEST(test_chlng_with_wrong_payload_length_naks);
     RUN_TEST(test_scrypt_with_bad_cryptogram_yields_status_failure);
     RUN_TEST(test_scs_15_pre_established_returns_unsupported);
+    /* Phase 3b: operational SCS_15..18. */
+    RUN_TEST(test_scs_15_round_trip_yields_scs_16_ack);
+    RUN_TEST(test_scs_17_encrypted_round_trip);
+    RUN_TEST(test_scs_15_unknown_command_yields_scs_16_nak);
+    RUN_TEST(test_scs_15_with_tampered_mac_drops_silently);
     return UNITY_END();
 }
