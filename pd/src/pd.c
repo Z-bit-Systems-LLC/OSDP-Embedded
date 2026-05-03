@@ -6,6 +6,8 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
 
+#include "pd_internal.h"
+
 #include <string.h>
 
 /* ---- Helpers ------------------------------------------------------------*/
@@ -43,6 +45,17 @@ static osdp_status_t build_nak(osdp_pd_t          *pd,
         .payload_len = 1,
     };
     return build_reply(pd, cmd, &reply, out_len);
+}
+
+/* Exposed under a stable name so the SC handlers (in pd_sc.c) can
+ * build NAKs without duplicating the helper. Same signature as the
+ * static `build_nak` above. */
+osdp_status_t pd_build_nak(osdp_pd_t          *pd,
+                           const osdp_frame_t *cmd,
+                           uint8_t             error_code,
+                           size_t             *out_len)
+{
+    return build_nak(pd, cmd, error_code, out_len);
 }
 
 /* Send `len` bytes from `buf` via the bound transport. Short writes
@@ -90,8 +103,13 @@ static void check_offline_timeout(osdp_pd_t *pd)
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
-    /* Refuse Secure Channel framing with NAK 0x05 until SC arrives. */
+    /* Secure Channel: dispatch to the SC handler if the application
+     * has supplied enough configuration; otherwise fall back to the
+     * historical "NAK 0x05" behaviour. */
     if (cmd->has_scb) {
+        if (osdp_pd_internal_sc_configured(pd)) {
+            return osdp_pd_internal_handle_sc_into_tx(pd, cmd);
+        }
         size_t n = 0;
         if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) != OSDP_OK) {
             return 0;
@@ -206,6 +224,58 @@ bool osdp_pd_is_online(const osdp_pd_t *pd)
         return false;
     }
     return pd->online;
+}
+
+/* ---- Secure Channel configuration ---------------------------------------*/
+
+void osdp_pd_set_sc_crypto(osdp_pd_t              *pd,
+                           const osdp_sc_crypto_t *crypto)
+{
+    if (pd == NULL || crypto == NULL) {
+        return;
+    }
+    pd->sc.crypto     = *crypto;
+    pd->sc.crypto_set = true;
+    osdp_sc_session_init(&pd->sc.session);
+    pd->sc.got_chlng  = false;
+}
+
+void osdp_pd_set_sc_scbk(osdp_pd_t       *pd,
+                         const uint8_t    scbk[OSDP_SC_KEY_LEN])
+{
+    if (pd == NULL || scbk == NULL) {
+        return;
+    }
+    (void)memcpy(pd->sc.scbk, scbk, OSDP_SC_KEY_LEN);
+    pd->sc.scbk_set = true;
+}
+
+void osdp_pd_set_sc_scbk_d(osdp_pd_t     *pd,
+                           const uint8_t  scbk_d[OSDP_SC_KEY_LEN])
+{
+    if (pd == NULL || scbk_d == NULL) {
+        return;
+    }
+    (void)memcpy(pd->sc.scbk_d, scbk_d, OSDP_SC_KEY_LEN);
+    pd->sc.scbk_d_set = true;
+}
+
+void osdp_pd_set_sc_cuid(osdp_pd_t     *pd,
+                         const uint8_t  cuid[OSDP_SC_CUID_LEN])
+{
+    if (pd == NULL || cuid == NULL) {
+        return;
+    }
+    (void)memcpy(pd->sc.cuid, cuid, OSDP_SC_CUID_LEN);
+    pd->sc.cuid_set = true;
+}
+
+bool osdp_pd_sc_established(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return false;
+    }
+    return pd->sc.session.established;
 }
 
 void osdp_pd_tick(osdp_pd_t *pd)

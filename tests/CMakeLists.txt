@@ -81,6 +81,13 @@ osdp_add_sc_test(test_sc_mac)
 osdp_add_sc_test(test_sc_payload)
 osdp_add_sc_test(test_sc_wrap)
 
+# PD-side SC handshake test needs both osdp_pd and the SC test
+# crypto adapter.
+add_executable(test_pd_sc test_pd_sc.c)
+target_link_libraries(test_pd_sc PRIVATE
+    osdp_core osdp_messages osdp_pd sc_test_aes unity)
+add_test(NAME test_pd_sc COMMAND test_pd_sc)
+
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.
 if(TARGET osdpcap_reader)

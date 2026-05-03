@@ -4,6 +4,8 @@
 #ifndef OSDP_PD_H
 #define OSDP_PD_H
 
+#include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
 #include "osdp/osdp_types.h"
 
@@ -46,7 +48,7 @@ extern "C" {
  *     resends its cached reply without re-invoking the application
  *     handler. SQN zero always processes fresh (session reset).
  *
- * Iteration 2 phase 3 scope (this commit):
+ * Iteration 2 phase 3 scope:
  *   - Online / offline state tracking per spec 5.7: the PD considers
  *     itself offline after OSDP_PD_OFFLINE_TIMEOUT_MS without a
  *     successfully transmitted reply. On the offline transition the
@@ -55,7 +57,22 @@ extern "C" {
  *     one the timeout is disabled and the PD is "online" after first
  *     successful reply.
  *
+ * Iteration 3 phase 3a scope (this commit):
+ *   - Optional Secure Channel handshake (SCS_11 → SCS_12, SCS_13 →
+ *     SCS_14). When the application has supplied a crypto vtable, an
+ *     SCBK and/or SCBK-D, and a cUID, the PD accepts inbound CHLNG /
+ *     SCRYPT commands, generates RND.B, derives session keys, and
+ *     computes the Client Cryptogram and Initial R-MAC. After SCS_14
+ *     the session struct's `established` flag flips true and both
+ *     MAC chain entries are seeded with the Initial R-MAC. Without
+ *     SC configuration the PD continues to NAK SCB-bearing frames
+ *     with code 0x05 as before.
+ *
  * Deferred for subsequent commits:
+ *   - SCS_15..18 operational traffic (PD invokes the application
+ *     handler on plaintext payloads, wraps replies via
+ *     osdp_sc_wrap_frame).
+ *   - Session loss / reset handling per spec D.1.4.
  *   - Inter-character timeout policing.
  *   - Multi-record reply convenience helpers (currently the app
  *     flat-buffers).
@@ -134,6 +151,36 @@ typedef osdp_status_t (*osdp_pd_command_cb)(
  * to which it responds exceeds 8 seconds. */
 #define OSDP_PD_OFFLINE_TIMEOUT_MS 8000U
 
+/* ---- Secure Channel state (embedded in osdp_pd_t) ----------------------
+ *
+ * The PD treats SC as fully optional: leave the fields below at their
+ * zeroed defaults and the PD continues to refuse SCB-bearing frames
+ * with NAK 0x05 exactly as before. Configure them via the
+ * osdp_pd_set_sc_* setters and the PD will accept the SCS_11..14
+ * handshake and (in subsequent commits) SCS_15..18 operational
+ * traffic. The crypto callbacks remain caller-supplied — `osdp::core`
+ * never vendors a crypto implementation. */
+typedef struct osdp_pd_sc {
+    osdp_sc_crypto_t       crypto;
+    bool                   crypto_set;
+
+    uint8_t                scbk  [OSDP_SC_KEY_LEN];
+    bool                   scbk_set;
+    uint8_t                scbk_d[OSDP_SC_KEY_LEN];
+    bool                   scbk_d_set;
+    uint8_t                cuid  [OSDP_SC_CUID_LEN];
+    bool                   cuid_set;
+
+    osdp_sc_session_t      session;
+
+    /* Mid-handshake state: populated by SCS_11 (CHLNG) handler and
+     * consumed by SCS_13 (SCRYPT) handler. */
+    bool                   got_chlng;
+    uint8_t                rnd_a       [OSDP_SC_RND_LEN];
+    uint8_t                rnd_b       [OSDP_SC_RND_LEN];
+    uint8_t                key_selector; /* 0 = SCBK-D, 1 = SCBK */
+} osdp_pd_sc_t;
+
 typedef struct osdp_pd {
     uint8_t                    address;     /* this PD's 7-bit addr  */
     osdp_stream_t              rx;          /* inbound byte buffer   */
@@ -155,6 +202,9 @@ typedef struct osdp_pd {
      * back true on the next successful reply. */
     bool                       online;
     uint32_t                   last_comm_ms;
+
+    /* Secure Channel state (optional; opt-in via the set_sc_* APIs). */
+    osdp_pd_sc_t               sc;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/
@@ -186,6 +236,35 @@ void osdp_pd_tick(osdp_pd_t *pd);
  * transport doesn't supply a now_ms callback, the timeout is disabled
  * and the PD remains online once it has sent a reply. */
 bool osdp_pd_is_online(const osdp_pd_t *pd);
+
+/* ---- Secure Channel configuration --------------------------------------
+ *
+ * All four setters are independent and opt-in. The PD only accepts
+ * SCB-bearing frames once the crypto vtable has been bound AND at
+ * least one of (SCBK, SCBK-D) has been set AND the cUID is known. */
+
+/* Bind the crypto HAL the PD will use for AES + RNG during SC. */
+void osdp_pd_set_sc_crypto(osdp_pd_t              *pd,
+                           const osdp_sc_crypto_t *crypto);
+
+/* Set the per-PD Secure Channel Base Key (SCBK), used when the ACU
+ * requests SCS_11 with the SCBK selector (1). */
+void osdp_pd_set_sc_scbk(osdp_pd_t       *pd,
+                         const uint8_t    scbk[OSDP_SC_KEY_LEN]);
+
+/* Set the default install key (SCBK-D), used when the ACU requests
+ * SCS_11 with the SCBK-D selector (0). */
+void osdp_pd_set_sc_scbk_d(osdp_pd_t     *pd,
+                           const uint8_t  scbk_d[OSDP_SC_KEY_LEN]);
+
+/* Set the PD's cUID — the first 8 bytes of the PDID byte stream
+ * (vendor[3] + model + version + serial[0..2]) per spec D.4.3. */
+void osdp_pd_set_sc_cuid(osdp_pd_t     *pd,
+                         const uint8_t  cuid[OSDP_SC_CUID_LEN]);
+
+/* True iff the SCS_11..14 handshake has completed successfully and
+ * the PD is ready to handle SCS_15..18 operational traffic. */
+bool osdp_pd_sc_established(const osdp_pd_t *pd);
 
 #ifdef __cplusplus
 }

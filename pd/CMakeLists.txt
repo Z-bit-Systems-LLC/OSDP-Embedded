@@ -7,6 +7,7 @@
 # own replies). No new dependencies on the rest of the system.
 add_library(osdp_pd STATIC
     src/pd.c
+    src/pd_sc.c
 )
 
 target_include_directories(osdp_pd

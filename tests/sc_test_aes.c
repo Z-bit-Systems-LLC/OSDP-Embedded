@@ -5,6 +5,7 @@
 
 #include "aes.h"   /* tests/vendor/tiny-aes/aes.h */
 
+#include <stdint.h>
 #include <string.h>
 
 static osdp_status_t adapter_encrypt(
@@ -39,9 +40,29 @@ static osdp_status_t adapter_decrypt(
     return OSDP_OK;
 }
 
+/* Deterministic LCG so tests get reproducible RND values. Reset via
+ * sc_test_crypto_seed_prng() at the start of each test. */
+static uint32_t g_prng_state = 0xCAFEBABEu;
+
+static osdp_status_t adapter_rand(void *user, uint8_t *out, size_t len)
+{
+    (void)user;
+    for (size_t i = 0; i < len; i++) {
+        g_prng_state = g_prng_state * 1103515245u + 12345u;
+        out[i] = (uint8_t)(g_prng_state >> 16);
+    }
+    return OSDP_OK;
+}
+
+void sc_test_crypto_seed_prng(uint32_t seed)
+{
+    g_prng_state = seed;
+}
+
 static const osdp_sc_crypto_t k_tiny_aes_vtable = {
     .aes128_ecb_encrypt = adapter_encrypt,
     .aes128_ecb_decrypt = adapter_decrypt,
+    .rand_bytes         = adapter_rand,
     .user               = NULL,
 };
 

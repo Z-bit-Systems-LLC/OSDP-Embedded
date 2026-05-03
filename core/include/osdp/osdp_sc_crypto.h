@@ -63,7 +63,16 @@ typedef struct osdp_sc_crypto {
         const uint8_t  in [OSDP_AES_BLOCK_LEN],
         uint8_t        out[OSDP_AES_BLOCK_LEN]);
 
-    /* Opaque pointer threaded back into both callbacks. */
+    /* Fill `out` with `len` cryptographically-random bytes. Required
+     * by either role for the side that generates randomness during
+     * the SC handshake — the PD generates 8-byte RND.B; the ACU
+     * generates 8-byte RND.A. May be NULL on roles that only consume
+     * randomness from the peer (e.g. a Monitor) or that supply
+     * randomness through a separate channel. Returns OSDP_OK on
+     * success. */
+    osdp_status_t (*rand_bytes)(void *user, uint8_t *out, size_t len);
+
+    /* Opaque pointer threaded back into all callbacks. */
     void *user;
 } osdp_sc_crypto_t;
 

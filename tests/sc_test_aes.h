@@ -12,4 +12,10 @@
  * single instance can be reused freely across tests. */
 const osdp_sc_crypto_t *sc_test_crypto_tiny_aes(void);
 
+/* Reset the deterministic PRNG used by the tiny-AES adapter's
+ * rand_bytes callback. After this, the PRNG produces a fixed,
+ * reproducible sequence. Tests that depend on specific RND values
+ * call this in setUp. */
+void sc_test_crypto_seed_prng(uint32_t seed);
+
 #endif /* SC_TEST_AES_H */
