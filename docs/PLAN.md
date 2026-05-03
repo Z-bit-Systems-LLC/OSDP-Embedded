@@ -93,32 +93,55 @@ typed message structs. Foundation for both PD and ACU work later.
 
 ## Iteration 3 — Secure Channel (in progress)
 
-- ☑ **Crypto HAL** (`osdp_sc_crypto.h`). Single-block AES-128 ECB
-  encrypt + optional decrypt vtable, supplied by the consumer (mbedTLS
-  on host, hardware AES on MCU, tiny-AES-c for tests). Per CLAUDE.md
-  the core never vendors a crypto implementation.
-- ☑ **SC primitives** (`osdp_sc.h` + `core/src/sc/`). Built on top of
-  the HAL: session key derivation per spec D.4.1; client/server
-  cryptograms per D.4.3-4; initial R-MAC per D.3.2; custom CBC-MAC
-  per D.5 (S-MAC1 for blocks 1..n-1, S-MAC2 for block n, 0x80-pad
-  only when needed); AES-128 CBC encrypt/decrypt with arbitrary IV.
-- ☐ **SC session state machine.** Track current session keys, rolling
-  MAC chain, encryption state. Drive the SCS_11..14 handshake from
-  either role.
-- ☐ **Frame integration.** Extend osdp_frame_decode/build to validate
-  and append the 4-byte truncated MAC for SCS_15..18 frames; encrypt
-  and decrypt SCS_17/18 payloads; expose the `mac` slice as a separate
-  field of `osdp_frame_t`.
-- ☐ **PD-side SC integration.** Extend `osdp::pd` to optionally accept
-  SCB-bearing frames: handle CHLNG → CCRYPT → SCRYPT → RMAC_I, then
-  validate inbound MACs and produce outbound MACs for SCS_15..18.
-- ☐ **ACU-side SC integration.** Extend `osdp::acu` to initiate the
-  handshake and drive SCS_15..18 traffic.
-- ☐ **Capture validation.** With SCBK in hand, decode the encrypted
-  SCS_17/18 frames in `tests/captures/sc-monitor-current.osdpcap`.
+- ☑ **Phase 1: Crypto HAL** (`osdp_sc_crypto.h`). Single-block AES-128
+  ECB encrypt + optional decrypt + optional `rand_bytes`, supplied by
+  the consumer (mbedTLS on host, hardware AES on MCU, tiny-AES-c for
+  tests). Per CLAUDE.md the core never vendors a crypto implementation.
+- ☑ **Phase 1: SC primitives** (`osdp_sc.h` + `core/src/sc/keys.c`,
+  `mac.c`, `cbc.c`). Built on top of the HAL: session key derivation
+  per spec D.4.1; client/server cryptograms per D.4.3-4; initial
+  R-MAC per D.3.2; custom CBC-MAC per D.5 (S-MAC1 for blocks 1..n-1,
+  S-MAC2 for block n, 0x80-pad only when needed); AES-128 CBC
+  encrypt/decrypt with arbitrary IV.
+- ☑ **Phase 2a: Payload encryption** (`core/src/sc/payload.c`).
+  SCS_17/18 encrypt/decrypt with the always-pads 0x80 || 0x00* rule
+  per spec D.4.5, IV = ones-complement of the chain MAC per D.5.1-2.
+- ☑ **Phase 2b: Frame MAC fields + session state struct.**
+  `osdp_frame_t` gained `mac` / `mac_len`, decoder splits the
+  trailing 4 bytes for SCS_15..18, builder appends them. Capture
+  round-trip still byte-identical. `osdp_sc_session_t` added with
+  the rolling MAC chain entries.
+- ☑ **Phase 2c: Frame wrap/unwrap helpers** (`core/src/sc/wrap.c`).
+  End-to-end build of an outbound SCS_15..18 frame; verify-and-decrypt
+  of an inbound one; both update the session's rolling MAC chain.
+- ☑ **Phase 3a: PD handshake.** PD now responds to inbound CHLNG
+  (SCS_11) and SCRYPT (SCS_13) with correctly-derived CCRYPT
+  (SCS_12) and RMAC_I (SCS_14). Optional via the
+  `osdp_pd_set_sc_*` API; un-configured PDs continue to NAK 0x05.
+- ☑ **Phase 3b: PD operational SC.** SCS_15..18 commands are
+  unwrapped, dispatched to the existing `osdp_pd_command_cb` with
+  plaintext, and replies are wrapped back as SCS_16/SCS_18.
+- ☐ **Phase 4: Capture-replay validation** (BUMPED FORWARD from the
+  original phase 6 slot). Drive our PD with the ACU→PD frames extracted
+  from `tests/captures/sc-monitor-current.osdpcap`, and verify byte-
+  for-byte that our PD's responses match the captured PD→ACU frames.
+  Validates phases 1-3 against an independent, hardware-validated OSDP
+  stack (`libosdp-conformance 1.38-4`) before we double the surface
+  area with ACU code. Requires extracting RND.A / RND.B / cUID from the
+  capture and seeding the test PRNG to match the captured RND.B; the
+  SCBK is a libosdp-conformance default to dig out of their source.
+- ☐ **Phase 5a: ACU handshake.** Extend `osdp::acu` to initiate the
+  SCS_11..14 sequence; generate RND.A; verify CCRYPT and Initial R-MAC.
+- ☐ **Phase 5b: ACU operational SC.** Wrap outbound SCS_15..18,
+  unwrap inbound SCS_16/18 replies.
+- ☐ **Phase 6: PD↔ACU SC loopback integration test.** Both real state
+  machines wired together, full handshake plus operational traffic
+  in-process.
 
 ## Iteration 4+ — Optional extensions (not yet planned)
 
 - File transfer, biometric, keypad extensions, manufacturer-specific
   commands, multi-part messages, certifiable test harness.
 - Rust wrapper crate hardening + publishing.
+- Live interop testing against `OSDP.Net` over a virtual serial / TCP
+  bridge, complementing the static capture-replay test.
