@@ -12,6 +12,7 @@ add_library(osdp_core STATIC
     src/sc/keys.c
     src/sc/mac.c
     src/sc/payload.c
+    src/sc/session.c
 )
 
 target_include_directories(osdp_core

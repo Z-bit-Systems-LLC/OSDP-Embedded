@@ -29,6 +29,39 @@ extern "C" {
 
 #define OSDP_SCB_MIN_LEN          2U   /* SEC_BLK_LEN + SEC_BLK_TYPE     */
 
+/* Security Block (SB) type values from SIA OSDP v2.2.2 Annex D.1.3.
+ * Only the byte values are defined here — the framing layer needs
+ * them to decide whether to split a 4-byte MAC out of the payload
+ * (and, eventually, whether the data block is encrypted). The actual
+ * crypto and session-state handling lives in osdp::core's SC code. */
+#define OSDP_SCS_11  0x11U   /* ACU→PD: SC initiation challenge   */
+#define OSDP_SCS_12  0x12U   /* PD→ACU: client cryptogram         */
+#define OSDP_SCS_13  0x13U   /* ACU→PD: server cryptogram         */
+#define OSDP_SCS_14  0x14U   /* PD→ACU: initial R-MAC             */
+#define OSDP_SCS_15  0x15U   /* ACU→PD: plain data + MAC          */
+#define OSDP_SCS_16  0x16U   /* PD→ACU: plain data + MAC          */
+#define OSDP_SCS_17  0x17U   /* ACU→PD: encrypted data + MAC      */
+#define OSDP_SCS_18  0x18U   /* PD→ACU: encrypted data + MAC      */
+
+/* Truncated MAC byte count appended to SCS_15..18 frames before the
+ * trailing CRC/checksum (spec D.5.1 step 1). */
+#define OSDP_FRAME_MAC_LEN  4U
+
+/* SCB type carries a 4-byte truncated MAC at the end of the data
+ * area. True for SCS_15 .. SCS_18. */
+static inline bool osdp_scb_has_mac(uint8_t scb_type)
+{
+    return scb_type >= OSDP_SCS_15 && scb_type <= OSDP_SCS_18;
+}
+
+/* SCB type indicates the data block is encrypted (S-ENC, CBC, IV =
+ * complement of the last MAC in the opposite direction). True for
+ * SCS_17 and SCS_18. */
+static inline bool osdp_scb_is_encrypted(uint8_t scb_type)
+{
+    return scb_type == OSDP_SCS_17 || scb_type == OSDP_SCS_18;
+}
+
 /* ---- Frame model --------------------------------------------------------*/
 
 /* Whether the trailing integrity bytes are an 8-bit checksum or a
@@ -39,14 +72,17 @@ typedef enum osdp_integrity {
 } osdp_integrity_t;
 
 /* Decoded representation of a single OSDP frame. The pointer fields
- * (`scb_data`, `payload`, `raw`) reference slices inside the input
- * buffer when produced by `osdp_frame_decode`; the input buffer must
- * outlive the frame. They are ignored by `osdp_frame_build`.
+ * (`scb_data`, `payload`, `mac`, `raw`) reference slices inside the
+ * input buffer when produced by `osdp_frame_decode`; the input buffer
+ * must outlive the frame. The pointer fields are read by
+ * `osdp_frame_build` from caller-supplied storage. The `raw` /
+ * `raw_len` decode-only fields are ignored by build.
  *
- * NOTE: For Secure Channel frames whose security block carries a MAC
- * (SCB types SCS_15..18), the `payload` slice currently INCLUDES the
- * trailing 4-byte MAC. Iteration 1 does not split the MAC out — the
- * dedicated SC support in iteration 3 will. */
+ * For Secure Channel frames whose security block carries a MAC (SCB
+ * types SCS_15..18), the trailing 4 bytes of the post-code area are
+ * exposed via `mac` / `mac_len` and are NOT included in the
+ * `payload` slice. Higher-level SC code in osdp::core consumes the
+ * MAC and (for SCS_17/18) decrypts the payload. */
 typedef struct osdp_frame {
     /* Header fields. */
     uint8_t           address;       /* 7-bit address (0x00-0x7E, 0x7F=bcast) */
@@ -65,6 +101,13 @@ typedef struct osdp_frame {
     uint8_t           code;
     const uint8_t    *payload;       /* may be NULL when payload_len == 0     */
     size_t            payload_len;
+
+    /* Truncated MAC for SCS_15..18 frames. mac_len is OSDP_FRAME_MAC_LEN
+     * (4) for those SCB types and 0 otherwise. The build path requires
+     * a non-NULL `mac` whenever the SCB type implies a MAC; the decode
+     * path always populates it for those SCB types. */
+    const uint8_t    *mac;
+    size_t            mac_len;
 
     /* Decode-only: the full frame slice within the input buffer.
      * Ignored by `osdp_frame_build`. */

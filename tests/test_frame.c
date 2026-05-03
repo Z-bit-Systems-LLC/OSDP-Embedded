@@ -405,6 +405,169 @@ static void test_build_rejects_inconsistent_scb(void)
                       osdp_frame_build(&f, buf, sizeof(buf), &n));
 }
 
+/* ---- SCS_15..18 MAC handling -------------------------------------------*/
+
+static void test_decode_splits_mac_for_scs_15_frame(void)
+{
+    /* Build an SCS_15 (ACU→PD plain+MAC) frame with a known MAC and
+     * decode it; the four trailing bytes before CRC must come back
+     * via `mac` / `mac_len`, NOT inside `payload`. */
+    static const uint8_t mac_bytes[OSDP_FRAME_MAC_LEN] = {
+        0xCA, 0xFE, 0xBA, 0xBE
+    };
+    static const uint8_t inner_payload[3] = { 0x11, 0x22, 0x33 };
+
+    osdp_frame_t built = {0};
+    built.address      = 0x05;
+    built.integrity    = OSDP_INTEGRITY_CRC;
+    built.has_scb      = true;
+    built.scb_length   = OSDP_SCB_MIN_LEN;
+    built.scb_type     = OSDP_SCS_15;
+    built.code         = 0x60;     /* osdp_POLL */
+    built.payload      = inner_payload;
+    built.payload_len  = sizeof(inner_payload);
+    built.mac          = mac_bytes;
+    built.mac_len      = OSDP_FRAME_MAC_LEN;
+
+    uint8_t buf[64];
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
+
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_TRUE(got.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_15, got.scb_type);
+    TEST_ASSERT_EQUAL_size_t(sizeof(inner_payload), got.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(inner_payload, got.payload, sizeof(inner_payload));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN, got.mac_len);
+    TEST_ASSERT_EQUAL_MEMORY(mac_bytes, got.mac, OSDP_FRAME_MAC_LEN);
+}
+
+static void test_decode_handles_scs_15_with_zero_inner_payload(void)
+{
+    /* osdp_POLL under SCS_15 has empty data; the post-code area is
+     * exactly 4 bytes of MAC. */
+    static const uint8_t mac_bytes[OSDP_FRAME_MAC_LEN] = {
+        0x11, 0x22, 0x33, 0x44
+    };
+    osdp_frame_t built = {0};
+    built.address      = 0x10;
+    built.integrity    = OSDP_INTEGRITY_CRC;
+    built.has_scb      = true;
+    built.scb_length   = OSDP_SCB_MIN_LEN;
+    built.scb_type     = OSDP_SCS_16;  /* PD→ACU variant */
+    built.reply        = true;
+    built.code         = 0x40;     /* osdp_ACK */
+    built.mac          = mac_bytes;
+    built.mac_len      = OSDP_FRAME_MAC_LEN;
+
+    uint8_t buf[64];
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
+
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_EQUAL_size_t(0, got.payload_len);
+    TEST_ASSERT_NULL(got.payload);
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN, got.mac_len);
+    TEST_ASSERT_EQUAL_MEMORY(mac_bytes, got.mac, OSDP_FRAME_MAC_LEN);
+}
+
+static void test_decode_rejects_scs_17_with_room_for_mac_only(void)
+{
+    /* SCS_17 (encrypted+MAC) without enough bytes for both encrypted
+     * data AND a 4-byte MAC. Concretely: post-code area is 3 bytes,
+     * which is shorter than the minimum 4-byte MAC. */
+    uint8_t buf[16];
+    /* Manually craft a frame: SOM, ADDR, LEN(2), CTRL with SCB+CRC,
+     * SCB len/type, code, 3 trailing bytes, 2-byte CRC. */
+    const uint16_t total = 12;
+    buf[0] = OSDP_SOM;
+    buf[1] = 0x05;
+    buf[2] = (uint8_t)(total & 0xFF);
+    buf[3] = (uint8_t)(total >> 8);
+    buf[4] = (uint8_t)(OSDP_CTRL_USE_CRC | OSDP_CTRL_SCB);
+    buf[5] = OSDP_SCB_MIN_LEN;
+    buf[6] = OSDP_SCS_17;
+    buf[7] = 0x60;             /* code */
+    buf[8] = 0xAA;             /* would be MAC byte 0 ... */
+    buf[9] = 0xBB;             /* but only 3 trailing bytes */
+    buf[10] = 0xCC;
+    /* Compute CRC over bytes 0..9 inclusive. */
+    extern uint16_t osdp_crc16(const uint8_t *data, size_t len);
+    const uint16_t crc = osdp_crc16(buf, total - 2);
+    buf[total - 2] = (uint8_t)(crc & 0xFF);
+    buf[total - 1] = (uint8_t)((crc >> 8) & 0xFF);
+
+    osdp_frame_t f;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_frame_decode(buf, total, &f));
+}
+
+static void test_build_rejects_missing_mac_for_scs_15(void)
+{
+    osdp_frame_t f = {0};
+    f.address    = 0x05;
+    f.integrity  = OSDP_INTEGRITY_CRC;
+    f.has_scb    = true;
+    f.scb_length = OSDP_SCB_MIN_LEN;
+    f.scb_type   = OSDP_SCS_15;
+    f.code       = 0x60;
+    /* mac_len intentionally 0 */
+    uint8_t buf[32]; size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_build(&f, buf, sizeof(buf), &n));
+}
+
+static void test_build_rejects_unexpected_mac_for_scs_11(void)
+{
+    /* SCS_11 is a handshake frame and must NOT carry a MAC. */
+    static const uint8_t mac_bytes[OSDP_FRAME_MAC_LEN] = {1,2,3,4};
+    osdp_frame_t f = {0};
+    f.address    = 0x05;
+    f.integrity  = OSDP_INTEGRITY_CRC;
+    f.has_scb    = true;
+    f.scb_length = OSDP_SCB_MIN_LEN;
+    f.scb_type   = OSDP_SCS_11;
+    f.code       = 0x76;
+    f.mac        = mac_bytes;
+    f.mac_len    = OSDP_FRAME_MAC_LEN;
+    uint8_t buf[32]; size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_build(&f, buf, sizeof(buf), &n));
+}
+
+static void test_build_rejects_mac_when_scb_absent(void)
+{
+    /* No SCB at all but caller sets a MAC — invalid. */
+    static const uint8_t mac_bytes[OSDP_FRAME_MAC_LEN] = {1,2,3,4};
+    osdp_frame_t f = {0};
+    f.address   = 0x05;
+    f.integrity = OSDP_INTEGRITY_CRC;
+    f.code      = 0x60;
+    f.mac       = mac_bytes;
+    f.mac_len   = OSDP_FRAME_MAC_LEN;
+    uint8_t buf[32]; size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_build(&f, buf, sizeof(buf), &n));
+}
+
+static void test_scs_helpers_classify_correctly(void)
+{
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(OSDP_SCS_11));
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(OSDP_SCS_14));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_15));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_16));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_17));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_18));
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(0x19));   /* unallocated */
+
+    TEST_ASSERT_FALSE(osdp_scb_is_encrypted(OSDP_SCS_15));
+    TEST_ASSERT_FALSE(osdp_scb_is_encrypted(OSDP_SCS_16));
+    TEST_ASSERT_TRUE (osdp_scb_is_encrypted(OSDP_SCS_17));
+    TEST_ASSERT_TRUE (osdp_scb_is_encrypted(OSDP_SCS_18));
+}
+
 /* ---- Symmetry: build → decode → build is byte-identical -----------------*/
 
 static void test_build_decode_build_is_symmetric(void)
@@ -477,6 +640,14 @@ int main(void)
     RUN_TEST(test_build_rejects_address_out_of_range);
     RUN_TEST(test_build_rejects_sequence_out_of_range);
     RUN_TEST(test_build_rejects_inconsistent_scb);
+    /* SCS MAC handling. */
+    RUN_TEST(test_decode_splits_mac_for_scs_15_frame);
+    RUN_TEST(test_decode_handles_scs_15_with_zero_inner_payload);
+    RUN_TEST(test_decode_rejects_scs_17_with_room_for_mac_only);
+    RUN_TEST(test_build_rejects_missing_mac_for_scs_15);
+    RUN_TEST(test_build_rejects_unexpected_mac_for_scs_11);
+    RUN_TEST(test_build_rejects_mac_when_scb_absent);
+    RUN_TEST(test_scs_helpers_classify_correctly);
     /* Symmetry. */
     RUN_TEST(test_build_decode_build_is_symmetric);
     return UNITY_END();

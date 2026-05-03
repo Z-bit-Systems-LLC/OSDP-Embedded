@@ -119,6 +119,41 @@ osdp_status_t osdp_sc_cbc_encrypt(
     size_t                   len,
     uint8_t                 *ciphertext);
 
+/* ---- Session state ------------------------------------------------------
+ *
+ * Both PD and ACU embed an osdp_sc_session_t per peer. The struct is
+ * pure data: the higher-level state machines (osdp::pd, osdp::acu)
+ * are responsible for advancing the chain on every send / verify.
+ *
+ *   keys              — derived once at handshake completion.
+ *   last_outbound_mac — full 16-byte MAC of the most recent message
+ *                       this peer sent. ICV for verifying the next
+ *                       inbound MAC; basis (after one's-complement
+ *                       inversion) for the IV when DECRYPTING the
+ *                       next inbound SCS_17/18 payload.
+ *   last_inbound_mac  — full 16-byte MAC of the most recent message
+ *                       this peer received and verified. ICV for
+ *                       computing the next outbound MAC; basis for
+ *                       the IV when ENCRYPTING the next outbound
+ *                       SCS_17/18 payload.
+ *   established       — true after the SCS_11..14 handshake completes.
+ *                       SCS_15..18 traffic is only valid while true.
+ *
+ * On both sides, both MAC fields are initialised to the Initial R-MAC
+ * generated during the handshake (spec D.3.2 / D.4 / D.5). After that,
+ * each successful send updates last_outbound_mac and each successful
+ * verify updates last_inbound_mac. */
+typedef struct osdp_sc_session {
+    osdp_sc_session_keys_t keys;
+    uint8_t                last_outbound_mac[OSDP_SC_MAC_LEN];
+    uint8_t                last_inbound_mac [OSDP_SC_MAC_LEN];
+    bool                   established;
+} osdp_sc_session_t;
+
+/* Initialise an SC session struct to a clean, un-established state.
+ * Required before first use; equivalent to memset-zero. */
+void osdp_sc_session_init(osdp_sc_session_t *session);
+
 /* AES-128 CBC decrypt of `len` ciphertext bytes. `len` must be a
  * non-zero multiple of OSDP_AES_BLOCK_LEN (16). Output buffer must be
  * at least `len` bytes. Returns OSDP_ERR_NOT_SUPPORTED if the supplied

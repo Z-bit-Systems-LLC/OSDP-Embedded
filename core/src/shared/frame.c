@@ -88,14 +88,28 @@ osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
     const uint8_t code = buf[cursor];
     cursor += 1u;
 
-    /* Remaining bytes (excluding integrity) are the payload. */
+    /* Remaining bytes (excluding integrity, and excluding any
+     * trailing truncated MAC for SCS_15..18) are the payload. */
     const size_t payload_start = cursor;
     const size_t payload_end   = len - integrity_size;
     if (payload_end < payload_start) {
         /* Should be unreachable given the checks above, but be explicit. */
         return OSDP_ERR_TRUNCATED;
     }
-    const size_t payload_len = payload_end - payload_start;
+    size_t payload_len = payload_end - payload_start;
+
+    const uint8_t *mac = NULL;
+    size_t         mac_len = 0;
+    if (has_scb && osdp_scb_has_mac(scb_type)) {
+        if (payload_len < OSDP_FRAME_MAC_LEN) {
+            /* SCS_15..18 require at least a 4-byte MAC after the
+             * code byte. Anything shorter is a malformed frame. */
+            return OSDP_ERR_BAD_PAYLOAD;
+        }
+        payload_len -= OSDP_FRAME_MAC_LEN;
+        mac     = &buf[payload_end - OSDP_FRAME_MAC_LEN];
+        mac_len = OSDP_FRAME_MAC_LEN;
+    }
     const uint8_t *payload = (payload_len > 0) ? &buf[payload_start] : NULL;
 
     /* Integrity check. */
@@ -128,6 +142,8 @@ osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
     out->code         = code;
     out->payload      = payload;
     out->payload_len  = payload_len;
+    out->mac          = mac;
+    out->mac_len      = mac_len;
     out->raw          = buf;
     out->raw_len      = len;
 
@@ -177,12 +193,24 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         return OSDP_ERR_INVALID_ARG;
     }
 
+    /* Validate MAC presence vs SCB type. SCS_15..18 require a MAC;
+     * other SCB types (or no SCB at all) must not carry one. */
+    const bool need_mac = in->has_scb && osdp_scb_has_mac(in->scb_type);
+    if (need_mac) {
+        if (in->mac_len != OSDP_FRAME_MAC_LEN || in->mac == NULL) {
+            return OSDP_ERR_INVALID_ARG;
+        }
+    } else if (in->mac_len != 0) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    const size_t mac_total = need_mac ? OSDP_FRAME_MAC_LEN : 0u;
+
     const size_t integrity_size =
         (in->integrity == OSDP_INTEGRITY_CRC) ? 2u : 1u;
 
-    /* Total frame length = header + SCB + code + payload + integrity. */
+    /* Total frame length = header + SCB + code + payload + MAC + integrity. */
     const size_t total = OSDP_FRAME_HEADER_LEN + scb_total + 1u +
-                         in->payload_len + integrity_size;
+                         in->payload_len + mac_total + integrity_size;
 
     if (total > OSDP_FRAME_MAX_LEN) {
         return OSDP_ERR_INVALID_ARG;
@@ -218,6 +246,12 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
     if (in->payload_len > 0) {
         (void)memcpy(&buf[off], in->payload, in->payload_len);
         off += in->payload_len;
+    }
+
+    /* Truncated MAC for SCS_15..18, before integrity bytes. */
+    if (mac_total > 0) {
+        (void)memcpy(&buf[off], in->mac, mac_total);
+        off += mac_total;
     }
 
     /* Integrity. */
