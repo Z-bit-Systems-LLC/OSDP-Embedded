@@ -33,6 +33,12 @@ typedef struct mock_transport {
 static int mock_read(void *user, uint8_t *buf, size_t cap)
 {
     mock_transport_t *m = (mock_transport_t *)user;
+    /* Defensive: clamp before the unsigned subtraction so a test
+     * that resets incoming_len without also clearing incoming_off
+     * doesn't underflow into a huge avail and read past the buffer. */
+    if (m->incoming_off > m->incoming_len) {
+        return 0;
+    }
     const size_t available = m->incoming_len - m->incoming_off;
     const size_t n = (cap < available) ? cap : available;
     if (n > 0) {

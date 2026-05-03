@@ -88,6 +88,23 @@ Useful CMake options:
 | ------------------- | ------- | ------------------------------------------------ |
 | `OSDP_BUILD_TESTS`  | `ON`    | Build the Unity test suites under `tests/`.      |
 | `OSDP_BUILD_TOOLS`  | `ON`    | Build host-side tools (`osdp-parser`).           |
+| `OSDP_SANITIZE`     | `OFF`   | Build with AddressSanitizer (and UBSan on GCC/Clang) for memory-error debugging. Use a separate build directory; sanitizer-instrumented objects don't mix with the regular cache. |
+
+### Debugging with sanitizers
+
+To investigate a crash or suspected memory bug, configure a separate
+build directory with `OSDP_SANITIZE=ON`:
+
+```sh
+cmake -S . -B build-asan -DOSDP_SANITIZE=ON
+cmake --build build-asan --config Debug
+ctest --test-dir build-asan -C Debug
+```
+
+On Windows, ASan needs `clang_rt.asan_dynamic-x86_64.dll` on PATH.
+The DLL ships with Visual Studio under
+`VC\Tools\MSVC\<version>\bin\Hostx64\x64\` — add it to PATH or run from
+a Developer PowerShell.
 
 For a tight embedded build (core only), set both options to `OFF` and
 link the `osdp::core` and `osdp::messages` (and optionally

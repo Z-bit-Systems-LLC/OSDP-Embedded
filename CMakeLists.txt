@@ -15,6 +15,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(OSDP_BUILD_TESTS "Build unit tests" ON)
 option(OSDP_BUILD_TOOLS "Build host-side developer tools (osdp-parser, ...)" ON)
+option(OSDP_SANITIZE    "Build with AddressSanitizer (and UBSan on GCC/Clang)" OFF)
 
 # Strict warnings + per-function/data sections so consumers can use
 # --gc-sections to drop any unused per-message codecs.
@@ -37,6 +38,33 @@ else()
         -ffunction-sections
         -fdata-sections
     )
+endif()
+
+# AddressSanitizer (+ UBSan on GCC/Clang) for catching memory bugs
+# during iterative debugging. Off by default; flip on with
+# `-DOSDP_SANITIZE=ON` and rebuild from scratch — sanitizers don't
+# mix well with non-sanitised cached object files.
+if(OSDP_SANITIZE)
+    if(MSVC)
+        # MSVC 16.9+ supports /fsanitize=address. Sanitiser-instrumented
+        # code requires the dynamic CRT (default for Debug is /MDd, so
+        # this just works) and full debug info (/Zi, also default).
+        add_compile_options(/fsanitize=address)
+        # Disable optimisations that fight ASan diagnostics; harmless
+        # for Debug, helpful when someone flips ASan on with Release.
+        add_compile_options(/Od)
+        # Editing-and-continuing breaks ASan link-time instrumentation;
+        # CMake injects /ZI for Debug by default — replace with /Zi.
+        string(REPLACE "/ZI" "/Zi" CMAKE_C_FLAGS_DEBUG
+               "${CMAKE_C_FLAGS_DEBUG}")
+        string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG
+               "${CMAKE_C_FLAGS_DEBUG}")
+    else()
+        add_compile_options(-fsanitize=address,undefined
+                            -fno-omit-frame-pointer)
+        add_link_options   (-fsanitize=address,undefined)
+    endif()
+    message(STATUS "OSDP: AddressSanitizer build enabled")
 endif()
 
 add_subdirectory(core)
