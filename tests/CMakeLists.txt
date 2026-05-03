@@ -79,6 +79,7 @@ osdp_add_sc_test(test_sc_keys)
 osdp_add_sc_test(test_sc_cbc)
 osdp_add_sc_test(test_sc_mac)
 osdp_add_sc_test(test_sc_payload)
+osdp_add_sc_test(test_sc_wrap)
 
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.

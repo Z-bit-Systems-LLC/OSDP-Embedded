@@ -6,6 +6,8 @@
 #include "osdp/osdp_frame.h"
 #include "unity.h"
 
+#include <stdint.h>
+
 #include <string.h>
 
 void setUp(void) {}
@@ -494,7 +496,6 @@ static void test_decode_rejects_scs_17_with_room_for_mac_only(void)
     buf[9] = 0xBB;             /* but only 3 trailing bytes */
     buf[10] = 0xCC;
     /* Compute CRC over bytes 0..9 inclusive. */
-    extern uint16_t osdp_crc16(const uint8_t *data, size_t len);
     const uint16_t crc = osdp_crc16(buf, total - 2);
     buf[total - 2] = (uint8_t)(crc & 0xFF);
     buf[total - 1] = (uint8_t)((crc >> 8) & 0xFF);

@@ -4,6 +4,7 @@
 #ifndef OSDP_SC_H
 #define OSDP_SC_H
 
+#include "osdp/osdp_frame.h"
 #include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_types.h"
 
@@ -214,6 +215,76 @@ osdp_status_t osdp_sc_decrypt_payload(
     uint8_t                 *plaintext,
     size_t                   plaintext_cap,
     size_t                  *plaintext_len);
+
+/* ---- Frame wrap / unwrap -------------------------------------------------
+ *
+ * Build or consume a complete OSDP-SC operational frame (SCS_15..18).
+ * These compose the lower-level primitives:
+ *
+ *   wrap   = optional payload encryption + frame_build with placeholder
+ *            MAC + MAC computation + integrity recomputation. Updates
+ *            session->last_outbound_mac on success.
+ *
+ *   unwrap = MAC verification on the already-decoded frame's `raw`
+ *            slice + optional payload decryption. Updates
+ *            session->last_inbound_mac on success.
+ *
+ * Both honour the spec D.5 ICV chain rules: outbound MAC ICV is the
+ * peer's last-sent MAC (which from our perspective is
+ * session->last_inbound_mac), inbound MAC ICV is our last-sent MAC
+ * (session->last_outbound_mac). For SCS_17/18 payload encrypt/decrypt
+ * the IV is the bit-wise complement of the same chain entry per
+ * D.5.1 step 5 / D.5.2 step 4.
+ *
+ * Handshake frames (SCS_11..14) do NOT carry a MAC — those go through
+ * osdp_frame_decode/build directly. Pre-handshake (un-established)
+ * sessions cannot wrap/unwrap; the routines return
+ * OSDP_ERR_INVALID_ARG until session->established is true. */
+
+/* Build an outbound SCS_15..18 frame.
+ *
+ * `plain_template` carries the frame's headers, code, scb_type, and
+ * (for the encrypted variants) the *plaintext* payload. The function
+ * encrypts internally if scb_type is SCS_17/18, computes the MAC,
+ * appends it before the trailing integrity bytes, and writes the
+ * complete wire bytes to `out_buf`. `out_buf` may NOT alias the
+ * template's payload pointer.
+ *
+ * On success, updates session->last_outbound_mac with the freshly-
+ * computed full 16-byte MAC. */
+osdp_status_t osdp_sc_wrap_frame(
+    const osdp_sc_crypto_t  *crypto,
+    osdp_sc_session_t       *session,
+    const osdp_frame_t      *plain_template,
+    uint8_t                 *out_buf,
+    size_t                   out_cap,
+    size_t                  *out_len);
+
+/* Verify and unwrap an inbound SCS_15..18 frame.
+ *
+ * `frame` must already have come from a successful osdp_frame_decode
+ * (so its CRC is valid and `mac` / `mac_len` are populated). The
+ * function recomputes the expected MAC over `frame->raw[0..mac_offset)`
+ * and compares the leading 4 bytes with the truncated MAC the peer
+ * sent; on mismatch it returns OSDP_ERR_BAD_CRC. (Re-using the
+ * existing error code rather than introducing a new one keeps the
+ * caller's error-handling path uniform: any integrity failure means
+ * "this frame should be ignored.")
+ *
+ * For SCS_15/16 the plaintext is just `frame->payload`; for SCS_17/18
+ * the function decrypts and removes 0x80 padding. The decrypted /
+ * copied result lands in `plaintext_out`; `*plaintext_len` receives
+ * the byte count.
+ *
+ * On success, updates session->last_inbound_mac with the freshly-
+ * computed full 16-byte MAC. */
+osdp_status_t osdp_sc_unwrap_frame(
+    const osdp_sc_crypto_t  *crypto,
+    osdp_sc_session_t       *session,
+    const osdp_frame_t      *frame,
+    uint8_t                 *plaintext_out,
+    size_t                   plain_cap,
+    size_t                  *plain_len);
 
 #ifdef __cplusplus
 }
