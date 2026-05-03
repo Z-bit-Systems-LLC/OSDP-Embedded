@@ -131,6 +131,55 @@ osdp_status_t osdp_sc_cbc_decrypt(
     size_t                   len,
     uint8_t                 *plaintext);
 
+/* ---- SCS_17 / SCS_18 payload encryption ----------------------------------
+ *
+ * For Secure Channel commands and replies that carry encrypted data
+ * (SEC_BLK_TYPE = SCS_17 or SCS_18), the data block is:
+ *
+ *   1. 0x80-padded to a multiple of 16. Per spec D.4.5, this padding
+ *      is ALWAYS applied even on inputs whose length is already an
+ *      exact multiple — distinct from the MAC padding rule.
+ *   2. Encrypted with AES-128 CBC, key = S-ENC, IV = ones-complement
+ *      of "the MAC of the last message received from the device the
+ *      message is being prepared for" (spec D.5.1 step 5).
+ *
+ * On the receiving side, decrypt then trim padding. */
+
+/* Encrypt a plaintext payload into ciphertext. Output is guaranteed
+ * to be a multiple of OSDP_AES_BLOCK_LEN; specifically, output length =
+ * plaintext_len rounded UP to the next multiple of 16, with at least
+ * one pad byte (so even multiple-of-16 inputs grow by 16).
+ *
+ *   `last_inbound_mac` is the full 16-byte MAC most recently verified
+ *   on a frame from the peer. The IV is the bit-wise complement of
+ *   that value. */
+osdp_status_t osdp_sc_encrypt_payload(
+    const osdp_sc_crypto_t  *crypto,
+    const uint8_t            s_enc           [OSDP_SC_KEY_LEN],
+    const uint8_t            last_inbound_mac[OSDP_SC_MAC_LEN],
+    const uint8_t           *plaintext,
+    size_t                   plaintext_len,
+    uint8_t                 *ciphertext,
+    size_t                   ciphertext_cap,
+    size_t                  *ciphertext_len);
+
+/* Decrypt and depad. `last_outbound_mac` is the full 16-byte MAC most
+ * recently sent to the peer; IV is its bit-wise complement.
+ *
+ * Returns OSDP_ERR_BAD_PAYLOAD if the depad step cannot find a 0x80
+ * marker — typically a sign of MAC mismatch upstream or a corrupt
+ * key. Returns OSDP_ERR_NOT_SUPPORTED if the crypto vtable lacks an
+ * AES decrypt function. */
+osdp_status_t osdp_sc_decrypt_payload(
+    const osdp_sc_crypto_t  *crypto,
+    const uint8_t            s_enc            [OSDP_SC_KEY_LEN],
+    const uint8_t            last_outbound_mac[OSDP_SC_MAC_LEN],
+    const uint8_t           *ciphertext,
+    size_t                   ciphertext_len,
+    uint8_t                 *plaintext,
+    size_t                   plaintext_cap,
+    size_t                  *plaintext_len);
+
 #ifdef __cplusplus
 }
 #endif
