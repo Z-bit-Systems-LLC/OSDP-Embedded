@@ -7,6 +7,7 @@
 # dependencies on the rest of the system.
 add_library(osdp_acu STATIC
     src/acu.c
+    src/acu_sc.c
 )
 
 target_include_directories(osdp_acu

@@ -5,6 +5,8 @@
 #define OSDP_ACU_H
 
 #include "osdp/osdp_frame.h"
+#include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
 #include "osdp/osdp_types.h"
 
@@ -40,11 +42,25 @@ extern "C" {
  *   - Per-PD online tracking: PD is online while it has produced a
  *     reply within OSDP_ACU_OFFLINE_TIMEOUT_MS.
  *
+ * Iteration 3 phase 5a scope (this commit):
+ *   - Optional Secure Channel handshake initiation. With one shared
+ *     crypto vtable bound on the ACU and per-PD key material (SCBK or
+ *     SCBK-D), the application can call osdp_acu_start_sc_handshake()
+ *     to drive the SCS_11..14 sequence. The ACU sends CHLNG, consumes
+ *     the CCRYPT reply (validates Client Cryptogram, captures cUID +
+ *     RND.B), sends SCRYPT, consumes the RMAC_I reply (validates the
+ *     Initial R-MAC), and fires the application's sc_event callback
+ *     with OSDP_ACU_SC_EVENT_ESTABLISHED on success or
+ *     OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED on any cryptographic
+ *     mismatch. CCRYPT and RMAC_I never reach the reply_cb — they're
+ *     consumed by the handshake state machine internally.
+ *
  * Deferred for subsequent commits:
  *   - Auto-poll scheduling (ACU sending POLL on a per-PD interval).
  *   - In-process PD<->ACU integration tests.
  *   - Multi-command queueing per PD.
- *   - Secure Channel session management. */
+ *   - Phase 5b: ACU operational SC. Wrap outbound SCS_15/SCS_17,
+ *     unwrap inbound SCS_16/SCS_18, after the handshake completes. */
 
 /* ---- Tuning constants ---------------------------------------------------*/
 
@@ -79,6 +95,16 @@ typedef struct osdp_acu_transport {
  * freestanding and lets the caller decide where the per-PD state lives
  * (e.g. in a static array sized by deployment). */
 
+/* Secure Channel handshake phase tracker. IDLE = no handshake active;
+ * the other states are intermediate steps the tick() state machine
+ * walks through internally. */
+typedef enum osdp_acu_sc_phase {
+    OSDP_ACU_SC_IDLE = 0,
+    OSDP_ACU_SC_AWAITING_CCRYPT,   /* sent CHLNG, waiting on CCRYPT (SCS_12) */
+    OSDP_ACU_SC_AWAITING_RMAC_I,   /* sent SCRYPT, waiting on RMAC_I (SCS_14) */
+    OSDP_ACU_SC_ESTABLISHED        /* handshake complete; SCS_15..18 OK     */
+} osdp_acu_sc_phase_t;
+
 typedef struct osdp_acu_pd_slot {
     bool     in_use;
     uint8_t  address;          /* 7-bit PD address                       */
@@ -89,6 +115,23 @@ typedef struct osdp_acu_pd_slot {
     uint32_t pending_sent_ms;  /* timestamp at which command was written */
     bool     online;           /* PD has answered within timeout window  */
     uint32_t last_reply_ms;    /* timestamp of most recent valid reply   */
+
+    /* ---- Secure Channel state (opt-in via osdp_acu_set_pd_sc_*) ---- */
+    bool                  scbk_set;
+    uint8_t               scbk  [OSDP_SC_KEY_LEN];
+    bool                  scbk_d_set;
+    uint8_t               scbk_d[OSDP_SC_KEY_LEN];
+
+    /* Phase + mid-handshake scratch. */
+    osdp_acu_sc_phase_t   sc_phase;
+    uint8_t               sc_key_selector;   /* 0 = SCBK-D, 1 = SCBK    */
+    uint8_t               sc_rnd_a[OSDP_SC_RND_LEN];
+    uint8_t               sc_rnd_b[OSDP_SC_RND_LEN];
+    uint8_t               sc_cuid [OSDP_SC_CUID_LEN];
+
+    /* Operational session. Populated when sc_phase becomes ESTABLISHED;
+     * keys + rolling MAC chain live in here. Phase 5b will use it. */
+    osdp_sc_session_t     sc_session;
 } osdp_acu_pd_slot_t;
 
 /* ---- Reply / timeout events --------------------------------------------*/
@@ -115,6 +158,39 @@ typedef void (*osdp_acu_timeout_cb)(
     void                            *user,
     const osdp_acu_timeout_event_t  *event);
 
+/* ---- Secure Channel events ---------------------------------------------
+ *
+ * When a handshake started by osdp_acu_start_sc_handshake() resolves —
+ * either successfully or with a cryptographic mismatch — the ACU fires
+ * an event of this type to the application, separate from the normal
+ * reply_cb / timeout_cb stream. CCRYPT (SCS_12) and RMAC_I (SCS_14)
+ * replies are consumed by the handshake state machine and never
+ * delivered as ordinary replies. */
+
+typedef enum osdp_acu_sc_event_kind {
+    /* Handshake completed successfully; the PD slot's sc_session is
+     * established and SCS_15..18 traffic is now permitted (phase 5b). */
+    OSDP_ACU_SC_EVENT_ESTABLISHED = 0,
+
+    /* Handshake failed cryptographically. Either:
+     *   - the PD's Client Cryptogram in CCRYPT didn't match what we
+     *     would compute from RND.A + RND.B + the chosen key, or
+     *   - the PD's RMAC_I came back with the failure status byte
+     *     (sec_blk_data[0] == 0xFF), per spec D.1.3.4.
+     * The PD slot remains in the IDLE phase; the application may
+     * retry by calling osdp_acu_start_sc_handshake again. */
+    OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED,
+} osdp_acu_sc_event_kind_t;
+
+typedef struct osdp_acu_sc_event {
+    uint8_t                  pd_address;
+    osdp_acu_sc_event_kind_t kind;
+} osdp_acu_sc_event_t;
+
+typedef void (*osdp_acu_sc_event_cb)(
+    void                       *user,
+    const osdp_acu_sc_event_t  *event);
+
 /* ---- Context -----------------------------------------------------------*/
 
 typedef struct osdp_acu {
@@ -128,6 +204,16 @@ typedef struct osdp_acu {
     osdp_stream_t               rx;
     uint8_t                     tx_buf[OSDP_ACU_TX_BUF_LEN];
     osdp_integrity_t            integrity; /* CRC by default; CKSUM legacy */
+
+    /* Secure Channel HAL — one shared crypto vtable across all PD slots.
+     * The ACU process has one AES implementation; per-PD state lives in
+     * the slot. */
+    osdp_sc_crypto_t            sc_crypto;
+    bool                        sc_crypto_set;
+
+    /* SC event callback — fires on handshake completion or failure. */
+    osdp_acu_sc_event_cb        sc_event_cb;
+    void                       *sc_event_user;
 } osdp_acu_t;
 
 /* ---- API ---------------------------------------------------------------*/
@@ -179,6 +265,63 @@ void osdp_acu_tick(osdp_acu_t *acu);
 
 bool osdp_acu_is_pd_online(const osdp_acu_t *acu, uint8_t pd_address);
 bool osdp_acu_is_pd_busy  (const osdp_acu_t *acu, uint8_t pd_address);
+
+/* ---- Secure Channel API -------------------------------------------------
+ *
+ * All four setters are independent and opt-in. The ACU only initiates
+ * SC handshakes for PDs that have at least one of (SCBK, SCBK-D)
+ * configured AND a crypto vtable bound. Calling these before
+ * osdp_acu_register_pd is OK as long as the PD address is registered
+ * before the handshake starts. */
+
+/* Bind the AES + RNG primitives the ACU uses for every SC operation
+ * across every PD it manages. The vtable is copied; the source can be
+ * stack-allocated or read-only. */
+void osdp_acu_set_sc_crypto(osdp_acu_t              *acu,
+                            const osdp_sc_crypto_t  *crypto);
+
+/* Set the per-PD Secure Channel Base Key (SCBK). Used when the
+ * application calls osdp_acu_start_sc_handshake with use_default_key
+ * = false. */
+osdp_status_t osdp_acu_set_pd_scbk  (osdp_acu_t   *acu,
+                                     uint8_t       pd_address,
+                                     const uint8_t scbk  [OSDP_SC_KEY_LEN]);
+
+/* Set the per-PD default install key (SCBK-D). Used when the
+ * application calls osdp_acu_start_sc_handshake with use_default_key
+ * = true. */
+osdp_status_t osdp_acu_set_pd_scbk_d(osdp_acu_t   *acu,
+                                     uint8_t       pd_address,
+                                     const uint8_t scbk_d[OSDP_SC_KEY_LEN]);
+
+/* Bind the SC event handler. Called when a handshake completes or
+ * fails cryptographically. May be NULL to detach. */
+void osdp_acu_set_sc_event_handler(osdp_acu_t           *acu,
+                                   osdp_acu_sc_event_cb  cb,
+                                   void                 *user);
+
+/* Initiate a Secure Channel handshake with the given PD. Sends CHLNG
+ * (SCS_11) immediately; subsequent ticks drive the rest of the
+ * handshake (CCRYPT consumed → SCRYPT sent → RMAC_I consumed → event
+ * fired). The PD slot's sc_phase advances through the IDLE →
+ * AWAITING_CCRYPT → AWAITING_RMAC_I → ESTABLISHED states.
+ *
+ * Returns:
+ *   OSDP_OK                — CHLNG sent, awaiting CCRYPT.
+ *   OSDP_ERR_INVALID_ARG   — pd_address not registered, or no crypto
+ *                            vtable bound, or no key configured for
+ *                            the requested mode.
+ *   OSDP_ERR_NOT_SUPPORTED — slot already has an outstanding command
+ *                            (a non-SC reply, or a handshake already
+ *                            in progress). Caller must wait. */
+osdp_status_t osdp_acu_start_sc_handshake(osdp_acu_t *acu,
+                                          uint8_t     pd_address,
+                                          bool        use_default_key);
+
+/* True iff the PD slot's SC session has reached the ESTABLISHED
+ * phase (both peers have valid keys and a matching Initial R-MAC). */
+bool osdp_acu_is_pd_sc_established(const osdp_acu_t *acu,
+                                   uint8_t           pd_address);
 
 #ifdef __cplusplus
 }

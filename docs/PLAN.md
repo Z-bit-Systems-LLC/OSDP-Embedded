@@ -142,8 +142,15 @@ typed message structs. Foundation for both PD and ACU work later.
   the serial path is pending an AES-vendoring decision (likely
   promoting tiny-AES-c to a top-level vendor dir so both tests and
   tools share one copy).
-- ☐ **Phase 5a: ACU handshake.** Extend `osdp::acu` to initiate the
-  SCS_11..14 sequence; generate RND.A; verify CCRYPT and Initial R-MAC.
+- ☑ **Phase 5a: ACU handshake.** `osdp::acu` initiates SCS_11..14 via
+  `osdp_acu_start_sc_handshake(pd_addr, use_default_key)` — fire-and-
+  forget. The ACU sends CHLNG, consumes CCRYPT (validates the Client
+  Cryptogram), sends SCRYPT, consumes RMAC_I (validates Initial R-MAC
+  + status byte), and fires `osdp_acu_sc_event_cb` with either
+  `OSDP_ACU_SC_EVENT_ESTABLISHED` or `OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED`.
+  CCRYPT and RMAC_I are consumed by the internal state machine and
+  never surface in the application's reply_cb. One shared crypto
+  vtable per ACU; per-PD SCBK / SCBK-D state lives in the slot.
 - ☐ **Phase 5b: ACU operational SC.** Wrap outbound SCS_15..18,
   unwrap inbound SCS_16/18 replies.
 - ☐ **Phase 6: PD↔ACU SC loopback integration test.** Both real state

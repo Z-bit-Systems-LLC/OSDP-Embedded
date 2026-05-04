@@ -3,6 +3,8 @@
 
 #include "osdp/osdp_acu.h"
 
+#include "acu_internal.h"
+
 #include "osdp/osdp_frame.h"
 
 #include <string.h>
@@ -304,8 +306,31 @@ void osdp_acu_tick(osdp_acu_t *acu)
         if (!frame.reply) {
             continue;
         }
-        /* Iteration 2 phase 4 does not handle SCB-bearing replies. */
+
+        /* Route SCB-bearing replies. The SC handshake replies (SCS_12
+         * CCRYPT, SCS_14 RMAC_I) are consumed internally and never
+         * surface in the application's reply_cb. Operational SC
+         * replies (SCS_16, SCS_18) will be routed here too in phase
+         * 5b; for now they're unrecognized and dropped. */
         if (frame.has_scb) {
+            osdp_acu_pd_slot_t *slot = find_slot_by_address(acu,
+                                                            frame.address);
+            if (slot == NULL) continue;
+            switch (frame.scb_type) {
+            case OSDP_SCS_12:
+                if (slot->sc_phase == OSDP_ACU_SC_AWAITING_CCRYPT) {
+                    osdp_acu_internal_handle_ccrypt(acu, slot, &frame);
+                }
+                break;
+            case OSDP_SCS_14:
+                if (slot->sc_phase == OSDP_ACU_SC_AWAITING_RMAC_I) {
+                    osdp_acu_internal_handle_rmac_i(acu, slot, &frame);
+                }
+                break;
+            default:
+                /* SCS_16 / SCS_18 will be handled in phase 5b. */
+                break;
+            }
             continue;
         }
         process_reply(acu, &frame);
@@ -330,4 +355,79 @@ bool osdp_acu_is_pd_busy(const osdp_acu_t *acu, uint8_t pd_address)
     const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
                                                                 pd_address);
     return slot != NULL && slot->waiting;
+}
+
+/* ---- Secure Channel API -------------------------------------------------*/
+
+void osdp_acu_set_sc_crypto(osdp_acu_t              *acu,
+                            const osdp_sc_crypto_t  *crypto)
+{
+    if (acu == NULL || crypto == NULL) {
+        return;
+    }
+    acu->sc_crypto     = *crypto;
+    acu->sc_crypto_set = true;
+}
+
+osdp_status_t osdp_acu_set_pd_scbk(osdp_acu_t   *acu,
+                                   uint8_t       pd_address,
+                                   const uint8_t scbk[OSDP_SC_KEY_LEN])
+{
+    if (acu == NULL || scbk == NULL) return OSDP_ERR_INVALID_ARG;
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) return OSDP_ERR_INVALID_ARG;
+    (void)memcpy(slot->scbk, scbk, OSDP_SC_KEY_LEN);
+    slot->scbk_set = true;
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_acu_set_pd_scbk_d(osdp_acu_t   *acu,
+                                     uint8_t       pd_address,
+                                     const uint8_t scbk_d[OSDP_SC_KEY_LEN])
+{
+    if (acu == NULL || scbk_d == NULL) return OSDP_ERR_INVALID_ARG;
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) return OSDP_ERR_INVALID_ARG;
+    (void)memcpy(slot->scbk_d, scbk_d, OSDP_SC_KEY_LEN);
+    slot->scbk_d_set = true;
+    return OSDP_OK;
+}
+
+void osdp_acu_set_sc_event_handler(osdp_acu_t           *acu,
+                                   osdp_acu_sc_event_cb  cb,
+                                   void                 *user)
+{
+    if (acu == NULL) return;
+    acu->sc_event_cb   = cb;
+    acu->sc_event_user = user;
+}
+
+osdp_status_t osdp_acu_start_sc_handshake(osdp_acu_t *acu,
+                                          uint8_t     pd_address,
+                                          bool        use_default_key)
+{
+    if (acu == NULL) return OSDP_ERR_INVALID_ARG;
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) return OSDP_ERR_INVALID_ARG;
+    if (acu->transport.write == NULL) return OSDP_ERR_INVALID_ARG;
+    if (!osdp_acu_internal_sc_configured(acu, slot, use_default_key)) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (slot->waiting) {
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+    /* Reset any prior session state — we're starting fresh. */
+    osdp_sc_session_init(&slot->sc_session);
+    slot->sc_phase = OSDP_ACU_SC_IDLE;
+
+    return osdp_acu_internal_send_chlng(acu, slot, use_default_key);
+}
+
+bool osdp_acu_is_pd_sc_established(const osdp_acu_t *acu,
+                                   uint8_t           pd_address)
+{
+    if (acu == NULL) return false;
+    const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
+                                                                pd_address);
+    return slot != NULL && slot->sc_phase == OSDP_ACU_SC_ESTABLISHED;
 }
