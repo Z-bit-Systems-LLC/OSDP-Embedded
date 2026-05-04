@@ -258,6 +258,15 @@ osdp_status_t osdp_sc_decrypt_payload(
  * complete wire bytes to `out_buf`. `out_buf` may NOT alias the
  * template's payload pointer.
  *
+ * Project convention (spec D.1.4 interpretation): SCS_17 and SCS_18
+ * are reserved for messages that carry actual encrypted data. If the
+ * caller passes payload_len == 0 with scb_type SCS_17 or SCS_18, the
+ * wrap step automatically coerces to SCS_15 / SCS_16 respectively
+ * before encrypting. Callers (osdp::pd, osdp::acu, anyone using these
+ * primitives directly) can therefore always select the SCB type by
+ * direction-and-encryption-mode without having to special-case empty
+ * payloads.
+ *
  * On success, updates session->last_outbound_mac with the freshly-
  * computed full 16-byte MAC. */
 osdp_status_t osdp_sc_wrap_frame(

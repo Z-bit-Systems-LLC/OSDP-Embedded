@@ -45,8 +45,25 @@ osdp_status_t osdp_sc_wrap_frame(
     built.mac     = mac_placeholder;
     built.mac_len = OSDP_FRAME_MAC_LEN;
 
+    /* Project convention (spec D.1.4 interpretation): SCS_17/18 are
+     * reserved for messages with actual encrypted DATA. An empty
+     * payload has nothing to encrypt and the all-padding ciphertext
+     * confuses some ACUs (notably OSDP.Net's ACUConsole, whose depad
+     * step rejects a "fully padded" decrypted block). Coerce
+     * SCS_17→SCS_15 and SCS_18→SCS_16 when the caller passed an empty
+     * payload, so this rule is enforced once for every consumer
+     * (osdp::pd, future osdp::acu, direct callers) instead of being
+     * re-asserted at every call site. */
+    if (built.payload_len == 0) {
+        if (built.scb_type == OSDP_SCS_17) {
+            built.scb_type = OSDP_SCS_15;
+        } else if (built.scb_type == OSDP_SCS_18) {
+            built.scb_type = OSDP_SCS_16;
+        }
+    }
+
     uint8_t encrypt_scratch[OSDP_SC_WRAP_SCRATCH_LEN];
-    if (osdp_scb_is_encrypted(plain_template->scb_type)) {
+    if (osdp_scb_is_encrypted(built.scb_type)) {
         size_t enc_len = 0;
         const osdp_status_t s = osdp_sc_encrypt_payload(
             crypto, session->keys.s_enc, session->last_inbound_mac,
