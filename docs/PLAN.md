@@ -151,8 +151,15 @@ typed message structs. Foundation for both PD and ACU work later.
   CCRYPT and RMAC_I are consumed by the internal state machine and
   never surface in the application's reply_cb. One shared crypto
   vtable per ACU; per-PD SCBK / SCBK-D state lives in the slot.
-- ☐ **Phase 5b: ACU operational SC.** Wrap outbound SCS_15..18,
-  unwrap inbound SCS_16/18 replies.
+- ☑ **Phase 5b: ACU operational SC.** Once a slot's session is
+  ESTABLISHED, every `osdp_acu_send_command` is automatically wrapped
+  — SCS_17 by default, coerced to SCS_15 for empty payloads. Inbound
+  SCS_16 / SCS_18 replies are unwrapped before being delivered via
+  `reply_cb` (plaintext). The application sees plaintext throughout;
+  encryption/MAC are transparent. Per spec D.1.4, an established
+  session terminates on either MAC verification failure or a non-BUSY
+  plaintext reply, firing `OSDP_ACU_SC_EVENT_SESSION_LOST`; the slot
+  returns to IDLE and the application may re-handshake at will.
 - ☐ **Phase 6: PD↔ACU SC loopback integration test.** Both real state
   machines wired together, full handshake plus operational traffic
   in-process.

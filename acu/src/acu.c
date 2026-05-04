@@ -6,6 +6,8 @@
 #include "acu_internal.h"
 
 #include "osdp/osdp_frame.h"
+#include "osdp/osdp_replies.h"
+#include "osdp/osdp_sc.h"
 
 #include <string.h>
 
@@ -53,11 +55,46 @@ static uint32_t now_ms_or_zero(const osdp_acu_t *acu)
 
 /* ---- Reply ingestion ---------------------------------------------------*/
 
+void osdp_acu_internal_deliver_reply(osdp_acu_t           *acu,
+                                     osdp_acu_pd_slot_t   *slot,
+                                     const osdp_frame_t   *frame,
+                                     const uint8_t        *payload,
+                                     size_t                payload_len)
+{
+    slot->online        = true;
+    slot->last_reply_ms = now_ms_or_zero(acu);
+    const uint8_t cmd_code = slot->pending_code;
+    slot->waiting   = false;
+    slot->next_seq  = advance_sqn(slot->pending_seq);
+
+    if (acu->reply_cb != NULL) {
+        const osdp_acu_reply_event_t event = {
+            .pd_address  = frame->address,
+            .cmd_code    = cmd_code,
+            .reply_code  = frame->code,
+            .payload     = payload,
+            .payload_len = payload_len,
+        };
+        acu->reply_cb(acu->reply_user, &event);
+    }
+}
+
 static void process_reply(osdp_acu_t *acu, const osdp_frame_t *frame)
 {
     /* Reply must be addressed to a registered PD. */
     osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, frame->address);
     if (slot == NULL) {
+        return;
+    }
+
+    /* Spec D.1.4: once the secure channel is established, a non-BUSY
+     * plaintext reply terminates the session. The PD is misbehaving
+     * (or the session got out of sync); reset and let the application
+     * re-handshake. BUSY (0x79) is exempted by the spec because the
+     * PD signals "I can't reply right now" without exiting SC. */
+    if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED &&
+        frame->code != OSDP_REPLY_BUSY) {
+        osdp_acu_internal_terminate_sc(acu, slot);
         return;
     }
 
@@ -72,29 +109,8 @@ static void process_reply(osdp_acu_t *acu, const osdp_frame_t *frame)
         return;
     }
 
-    /* Refresh online tracking. */
-    slot->online        = true;
-    slot->last_reply_ms = now_ms_or_zero(acu);
-
-    /* Capture the command we had pending so the application sees it. */
-    const uint8_t cmd_code = slot->pending_code;
-
-    /* Slot transitions out of "waiting"; advance SQN for the next
-     * command we'll issue to this PD. */
-    slot->waiting   = false;
-    slot->next_seq  = advance_sqn(slot->pending_seq);
-
-    /* Fire the application callback. */
-    if (acu->reply_cb != NULL) {
-        const osdp_acu_reply_event_t event = {
-            .pd_address  = frame->address,
-            .cmd_code    = cmd_code,
-            .reply_code  = frame->code,
-            .payload     = frame->payload,
-            .payload_len = frame->payload_len,
-        };
-        acu->reply_cb(acu->reply_user, &event);
-    }
+    osdp_acu_internal_deliver_reply(acu, slot, frame,
+                                    frame->payload, frame->payload_len);
 }
 
 /* ---- Timeout / online tracking ----------------------------------------*/
@@ -251,8 +267,24 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
     frame.payload_len = payload_len;
 
     size_t written = 0;
-    const osdp_status_t br = osdp_frame_build(&frame, acu->tx_buf,
-                                              sizeof(acu->tx_buf), &written);
+    osdp_status_t br;
+
+    /* Once Secure Channel is established for this slot, every command
+     * is automatically wrapped — no per-command opt-in. The SCB type
+     * is keyed off the inbound payload: SCS_17 by default; the wrap
+     * helper coerces SCS_17→SCS_15 for empty payloads (project
+     * convention from spec D.1.4). */
+    if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+        frame.has_scb     = true;
+        frame.scb_length  = OSDP_SCB_MIN_LEN;
+        frame.scb_type    = OSDP_SCS_17;
+        br = osdp_sc_wrap_frame(&acu->sc_crypto, &slot->sc_session,
+                                &frame, acu->tx_buf, sizeof(acu->tx_buf),
+                                &written);
+    } else {
+        br = osdp_frame_build(&frame, acu->tx_buf,
+                              sizeof(acu->tx_buf), &written);
+    }
     if (br != OSDP_OK) {
         return br;
     }
@@ -310,8 +342,8 @@ void osdp_acu_tick(osdp_acu_t *acu)
         /* Route SCB-bearing replies. The SC handshake replies (SCS_12
          * CCRYPT, SCS_14 RMAC_I) are consumed internally and never
          * surface in the application's reply_cb. Operational SC
-         * replies (SCS_16, SCS_18) will be routed here too in phase
-         * 5b; for now they're unrecognized and dropped. */
+         * replies (SCS_16, SCS_18) are unwrapped and the plaintext
+         * delivered through the normal reply_cb path. */
         if (frame.has_scb) {
             osdp_acu_pd_slot_t *slot = find_slot_by_address(acu,
                                                             frame.address);
@@ -327,8 +359,13 @@ void osdp_acu_tick(osdp_acu_t *acu)
                     osdp_acu_internal_handle_rmac_i(acu, slot, &frame);
                 }
                 break;
+            case OSDP_SCS_16:
+            case OSDP_SCS_18:
+                if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+                    osdp_acu_internal_handle_sc_reply(acu, slot, &frame);
+                }
+                break;
             default:
-                /* SCS_16 / SCS_18 will be handled in phase 5b. */
                 break;
             }
             continue;

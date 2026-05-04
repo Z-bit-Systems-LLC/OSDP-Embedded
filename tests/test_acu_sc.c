@@ -18,6 +18,7 @@
 
 #include "osdp/osdp_acu.h"
 #include "osdp/osdp_commands.h"
+#include "osdp/osdp_crc.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
@@ -151,16 +152,30 @@ static void capture_sc_event(void *user, const osdp_acu_sc_event_t *e)
     c->last = *e;
 }
 
-/* Reply-cb counter so we can assert handshake replies are NOT
- * delivered as ordinary replies. */
+/* Reply-cb counter and payload-snapshot so we can assert plaintext
+ * delivery for SC-unwrapped replies. The payload pointer in the event
+ * may alias scratch memory, so we copy locally. */
 typedef struct reply_capture {
-    unsigned int call_count;
+    unsigned int           call_count;
+    uint8_t                last_pd_address;
+    uint8_t                last_cmd_code;
+    uint8_t                last_reply_code;
+    uint8_t                last_payload[64];
+    size_t                 last_payload_len;
 } reply_capture_t;
 
 static void capture_reply(void *user, const osdp_acu_reply_event_t *e)
 {
-    (void)e;
-    ((reply_capture_t *)user)->call_count++;
+    reply_capture_t *c = (reply_capture_t *)user;
+    c->call_count++;
+    c->last_pd_address  = e->pd_address;
+    c->last_cmd_code    = e->cmd_code;
+    c->last_reply_code  = e->reply_code;
+    c->last_payload_len = (e->payload_len < sizeof(c->last_payload))
+                              ? e->payload_len : sizeof(c->last_payload);
+    if (c->last_payload_len > 0) {
+        (void)memcpy(c->last_payload, e->payload, c->last_payload_len);
+    }
 }
 
 /* ---- Test fixtures ---------------------------------------------------- */
@@ -527,9 +542,432 @@ static void test_handshake_fails_on_pd_status_0xff(void)
     TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
 }
 
+/* ---- Phase 5b: operational SC ----------------------------------------- */
+
+/* Drive the ACU through a full successful handshake using SCBK and
+ * synthesize the matching mock-PD session so the caller can wrap
+ * replies / unwrap commands on the PD side using the same key
+ * material. */
+static void run_handshake_and_mirror_pd(osdp_acu_t           *acu,
+                                        osdp_acu_pd_slot_t   *slots,
+                                        osdp_acu_transport_t *t,
+                                        mock_transport_t     *m,
+                                        sc_event_capture_t   *events,
+                                        reply_capture_t      *replies,
+                                        osdp_sc_session_t    *pd_session_out)
+{
+    configure_acu_sc(acu, slots, t, m, events, replies);
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_start_sc_handshake(acu, PD_ADDRESS,
+                                    /*use_default_key*/ false));
+
+    uint8_t rnd_a[OSDP_SC_RND_LEN];
+    uint8_t chlng_seq;
+    consume_chlng(m, /*selector*/ 1U, rnd_a, &chlng_seq);
+
+    mock_reset_incoming(m);
+    build_and_inject_ccrypt(m, chlng_seq, /*selector*/ 1U,
+                            kSCBK, rnd_a, NULL);
+    m->outgoing_len = 0;
+    osdp_acu_tick(acu);
+
+    uint8_t server_crypto[OSDP_SC_CRYPTOGRAM_LEN];
+    uint8_t scrypt_seq;
+    consume_scrypt(m, 1U, server_crypto, &scrypt_seq);
+
+    mock_reset_incoming(m);
+    build_and_inject_rmac_i(m, scrypt_seq, /*ok*/ 0x01U,
+                            kSCBK, rnd_a, server_crypto);
+    m->outgoing_len = 0;
+    osdp_acu_tick(acu);
+
+    TEST_ASSERT_TRUE(osdp_acu_is_pd_sc_established(acu, PD_ADDRESS));
+
+    /* Build the mock PD's mirror session: same keys, both MAC chain
+     * entries seeded with the same Initial R-MAC the real ACU just
+     * settled on. */
+    osdp_sc_session_keys_t keys;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_derive_session_keys(sc_test_crypto_tiny_aes(),
+                                    kSCBK, rnd_a, &keys));
+    uint8_t initial_rmac[OSDP_SC_MAC_LEN];
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_initial_rmac(sc_test_crypto_tiny_aes(),
+                             keys.s_mac1, keys.s_mac2,
+                             server_crypto, initial_rmac));
+
+    osdp_sc_session_init(pd_session_out);
+    pd_session_out->keys = keys;
+    (void)memcpy(pd_session_out->last_outbound_mac,
+                 initial_rmac, OSDP_SC_MAC_LEN);
+    (void)memcpy(pd_session_out->last_inbound_mac,
+                 initial_rmac, OSDP_SC_MAC_LEN);
+    pd_session_out->established = true;
+}
+
+/* Build a SCS_16/SCS_18 reply on the mock PD side using `pd_session`
+ * (which has chain state mirroring the ACU's), inject it into the
+ * mock transport. The mock-PD's last_inbound_mac will be updated by
+ * the wrap helper because we feed it through the inverse direction
+ * of what the chain rules normally expect; do the bookkeeping here
+ * so the test stays simple. */
+static void mock_pd_inject_sc_reply(mock_transport_t  *m,
+                                    osdp_sc_session_t *pd_session,
+                                    uint8_t            cmd_we_replied_to_seq,
+                                    uint8_t            reply_code,
+                                    uint8_t            scb_type,
+                                    const uint8_t     *plaintext,
+                                    size_t             plaintext_len,
+                                    /* The mock PD's "last_inbound_mac" was
+                                     * updated when it (notionally) received
+                                     * the ACU's command; pass that in so
+                                     * the wrap uses the right ICV. */
+                                    const uint8_t      acu_cmd_full_mac
+                                                       [OSDP_SC_MAC_LEN])
+{
+    /* Sync the PD's last_inbound_mac with the ACU's last_outbound_mac
+     * (= the ACU command's MAC). */
+    (void)memcpy(pd_session->last_inbound_mac, acu_cmd_full_mac,
+                 OSDP_SC_MAC_LEN);
+
+    osdp_frame_t reply;
+    (void)memset(&reply, 0, sizeof(reply));
+    reply.address     = PD_ADDRESS;
+    reply.reply       = true;
+    reply.sequence    = cmd_we_replied_to_seq;
+    reply.integrity   = OSDP_INTEGRITY_CRC;
+    reply.has_scb     = true;
+    reply.scb_length  = OSDP_SCB_MIN_LEN;
+    reply.scb_type    = scb_type;
+    reply.code        = reply_code;
+    reply.payload     = plaintext;
+    reply.payload_len = plaintext_len;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN]; size_t built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), pd_session,
+                           &reply, buf, sizeof(buf), &built));
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(MOCK_BUF_LEN - m->incoming_len, built);
+    (void)memcpy(&m->incoming[m->incoming_len], buf, built);
+    m->incoming_len += built;
+}
+
+/* Decode the next outgoing frame the ACU sent under SC, and unwrap
+ * it on the mock-PD side so the test can inspect the plaintext code +
+ * payload. Updates pd_session->last_inbound_mac with the cmd's MAC. */
+static void mock_pd_consume_sc_command(mock_transport_t   *m,
+                                       osdp_sc_session_t  *pd_session,
+                                       uint8_t            *out_plain,
+                                       size_t              out_plain_cap,
+                                       size_t             *out_plain_len,
+                                       uint8_t            *out_seq,
+                                       uint8_t            *out_scb_type,
+                                       uint8_t            *out_code,
+                                       uint8_t             out_full_mac
+                                                           [OSDP_SC_MAC_LEN])
+{
+    osdp_frame_t frame;
+    decode_next_outgoing(m, &frame, NULL);
+    TEST_ASSERT_FALSE(frame.reply);
+    TEST_ASSERT_TRUE(frame.has_scb);
+    *out_seq      = frame.sequence;
+    *out_scb_type = frame.scb_type;
+    *out_code     = frame.code;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), pd_session,
+                             &frame, out_plain, out_plain_cap, out_plain_len));
+    /* Grab the MAC that wrap_frame just computed/verified — i.e. the
+     * just-updated last_inbound_mac of the mock PD. */
+    (void)memcpy(out_full_mac, pd_session->last_inbound_mac,
+                 OSDP_SC_MAC_LEN);
+}
+
+static void test_send_command_after_handshake_empty_payload_uses_scs_15(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    m.outgoing_len = 0;
+
+    /* POLL: no payload → must wrap as SCS_15 (per project convention). */
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+
+    uint8_t plain[16]; size_t plain_len = 0;
+    uint8_t seq, scb_type, code, mac_full[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, plain, sizeof(plain),
+                               &plain_len, &seq, &scb_type, &code, mac_full);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_15, scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, code);
+    TEST_ASSERT_EQUAL_size_t(0, plain_len);
+}
+
+static void test_send_command_after_handshake_with_payload_uses_scs_17(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    m.outgoing_len = 0;
+
+    /* CAP request: 1-byte reply-type payload. Should wrap as SCS_17. */
+    static const uint8_t cap_payload = 0x00U;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_CAP,
+                              &cap_payload, 1));
+
+    uint8_t plain[16]; size_t plain_len = 0;
+    uint8_t seq, scb_type, code, mac_full[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, plain, sizeof(plain),
+                               &plain_len, &seq, &scb_type, &code, mac_full);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_17, scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_CAP, code);
+    TEST_ASSERT_EQUAL_size_t(1, plain_len);
+    TEST_ASSERT_EQUAL_HEX8(0x00U, plain[0]);
+}
+
+static void test_inbound_scs_16_ack_reaches_reply_cb_as_plaintext(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    m.outgoing_len = 0;
+    replies.call_count = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+
+    /* Mock PD side: read the SCS_15 POLL, capture its full MAC, build
+     * a SCS_16 ACK reply, inject. */
+    uint8_t plain[16]; size_t plain_len = 0;
+    uint8_t seq, scb_type, code, cmd_mac[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, plain, sizeof(plain),
+                               &plain_len, &seq, &scb_type, &code, cmd_mac);
+
+    mock_reset_incoming(&m);
+    mock_pd_inject_sc_reply(&m, &pd_session, seq,
+                            OSDP_REPLY_ACK, OSDP_SCS_16,
+                            NULL, 0, cmd_mac);
+    m.outgoing_len = 0;
+    osdp_acu_tick(&acu);
+
+    /* Application got a plain ACK, no payload. */
+    TEST_ASSERT_EQUAL(1U, replies.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, replies.last_reply_code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, replies.last_cmd_code);
+    TEST_ASSERT_EQUAL_size_t(0, replies.last_payload_len);
+}
+
+static void test_inbound_scs_18_reply_decrypts_into_reply_cb(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    m.outgoing_len = 0;
+    replies.call_count = 0;
+
+    /* Send CAP (SCS_17, 1-byte payload). */
+    static const uint8_t cap_payload = 0x00U;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_CAP,
+                              &cap_payload, 1));
+
+    uint8_t cmd_plain[16]; size_t cmd_plain_len = 0;
+    uint8_t seq, scb_type, code, cmd_mac[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, cmd_plain, sizeof(cmd_plain),
+                               &cmd_plain_len, &seq, &scb_type, &code, cmd_mac);
+
+    /* Build a SCS_18 PDCAP-shaped reply with 12 bytes of payload. */
+    static const uint8_t pdcap_payload[12] = {
+        1, 1, 1, 2, 1, 1, 3, 1, 1, 4, 1, 1
+    };
+    mock_reset_incoming(&m);
+    mock_pd_inject_sc_reply(&m, &pd_session, seq,
+                            OSDP_REPLY_PDCAP, OSDP_SCS_18,
+                            pdcap_payload, sizeof(pdcap_payload), cmd_mac);
+    m.outgoing_len = 0;
+    osdp_acu_tick(&acu);
+
+    /* Application got plaintext PDCAP with the right payload. */
+    TEST_ASSERT_EQUAL(1U, replies.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDCAP, replies.last_reply_code);
+    TEST_ASSERT_EQUAL_size_t(sizeof(pdcap_payload), replies.last_payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(pdcap_payload, replies.last_payload,
+                             sizeof(pdcap_payload));
+}
+
+static void test_mac_failure_terminates_session_and_fires_event(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    /* Reset the established-event we already captured. */
+    events.call_count = 0;
+    m.outgoing_len = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+
+    uint8_t plain[16]; size_t plain_len = 0;
+    uint8_t seq, scb_type, code, cmd_mac[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, plain, sizeof(plain),
+                               &plain_len, &seq, &scb_type, &code, cmd_mac);
+
+    /* Build a valid SCS_16 ACK on the mock-PD side, then corrupt one
+     * MAC byte and recompute CRC so it still passes Layer 1. */
+    osdp_frame_t reply_template;
+    (void)memset(&reply_template, 0, sizeof(reply_template));
+    reply_template.address     = PD_ADDRESS;
+    reply_template.reply       = true;
+    reply_template.sequence    = seq;
+    reply_template.integrity   = OSDP_INTEGRITY_CRC;
+    reply_template.has_scb     = true;
+    reply_template.scb_length  = OSDP_SCB_MIN_LEN;
+    reply_template.scb_type    = OSDP_SCS_16;
+    reply_template.code        = OSDP_REPLY_ACK;
+    /* Mirror the chain manually: pd_session->last_inbound_mac was just
+     * updated in mock_pd_consume_sc_command; that's the right ICV. */
+
+    uint8_t buf[64]; size_t built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &pd_session,
+                           &reply_template, buf, sizeof(buf), &built));
+    /* Flip a MAC byte and recompute CRC. */
+    const size_t crc_off = built - 2;
+    const size_t mac_off = crc_off - OSDP_FRAME_MAC_LEN;
+    buf[mac_off] ^= 0x10;
+    const uint16_t crc = osdp_crc16(buf, crc_off);
+    buf[crc_off]     = (uint8_t)(crc & 0xFFu);
+    buf[crc_off + 1] = (uint8_t)((crc >> 8) & 0xFFu);
+
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, buf, built);
+    m.incoming_len = built;
+    osdp_acu_tick(&acu);
+
+    /* Session lost; no reply delivered to the application. */
+    TEST_ASSERT_EQUAL(0U, replies.call_count);
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_SESSION_LOST, events.last.kind);
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+}
+
+static void test_plain_reply_during_established_terminates_session(void)
+{
+    /* Spec D.1.4: a non-BUSY plaintext reply during an established
+     * session terminates the session. */
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    events.call_count = 0;
+    m.outgoing_len = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+
+    /* Read the outbound POLL just so we know the SQN. */
+    osdp_frame_t out_frame;
+    decode_next_outgoing(&m, &out_frame, NULL);
+    const uint8_t seq = out_frame.sequence;
+
+    /* Now inject a plaintext ACK (no SCB) — spec violation. */
+    osdp_frame_t plain_reply;
+    (void)memset(&plain_reply, 0, sizeof(plain_reply));
+    plain_reply.address   = PD_ADDRESS;
+    plain_reply.reply     = true;
+    plain_reply.sequence  = seq;
+    plain_reply.integrity = OSDP_INTEGRITY_CRC;
+    plain_reply.code      = OSDP_REPLY_ACK;
+    uint8_t buf[16]; size_t built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_frame_build(&plain_reply, buf, sizeof(buf), &built));
+
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, buf, built);
+    m.incoming_len = built;
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_EQUAL(0U, replies.call_count);
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_SESSION_LOST, events.last.kind);
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+}
+
+static void test_send_command_after_session_loss_uses_plaintext(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+
+    /* Force a session loss the cheap way: inject a tampered SCS_16. */
+    m.outgoing_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+    uint8_t plain[16]; size_t plain_len = 0;
+    uint8_t seq, scb_type, code, cmd_mac[OSDP_SC_MAC_LEN];
+    mock_pd_consume_sc_command(&m, &pd_session, plain, sizeof(plain),
+                               &plain_len, &seq, &scb_type, &code, cmd_mac);
+    osdp_frame_t reply;
+    (void)memset(&reply, 0, sizeof(reply));
+    reply.address     = PD_ADDRESS;
+    reply.reply       = true;
+    reply.sequence    = seq;
+    reply.integrity   = OSDP_INTEGRITY_CRC;
+    reply.has_scb     = true;
+    reply.scb_length  = OSDP_SCB_MIN_LEN;
+    reply.scb_type    = OSDP_SCS_16;
+    reply.code        = OSDP_REPLY_ACK;
+    uint8_t bad_buf[64]; size_t bad_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &pd_session,
+                           &reply, bad_buf, sizeof(bad_buf), &bad_len));
+    const size_t crc_off = bad_len - 2;
+    const size_t mac_off = crc_off - OSDP_FRAME_MAC_LEN;
+    bad_buf[mac_off] ^= 0x10;
+    const uint16_t crc = osdp_crc16(bad_buf, crc_off);
+    bad_buf[crc_off]     = (uint8_t)(crc & 0xFFu);
+    bad_buf[crc_off + 1] = (uint8_t)((crc >> 8) & 0xFFu);
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, bad_buf, bad_len);
+    m.incoming_len = bad_len;
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+
+    /* Now send another command — should go plaintext (no SCB). */
+    m.outgoing_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+    osdp_frame_t outframe;
+    decode_next_outgoing(&m, &outframe, NULL);
+    TEST_ASSERT_FALSE(outframe.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, outframe.code);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    /* Phase 5a: handshake initiation. */
     RUN_TEST(test_start_handshake_emits_chlng_with_scbkd_selector);
     RUN_TEST(test_start_handshake_with_scbk_selector_one);
     RUN_TEST(test_start_handshake_rejected_without_crypto);
@@ -538,5 +976,13 @@ int main(void)
     RUN_TEST(test_full_handshake_fires_established_event);
     RUN_TEST(test_handshake_fails_on_bad_client_cryptogram);
     RUN_TEST(test_handshake_fails_on_pd_status_0xff);
+    /* Phase 5b: operational SC. */
+    RUN_TEST(test_send_command_after_handshake_empty_payload_uses_scs_15);
+    RUN_TEST(test_send_command_after_handshake_with_payload_uses_scs_17);
+    RUN_TEST(test_inbound_scs_16_ack_reaches_reply_cb_as_plaintext);
+    RUN_TEST(test_inbound_scs_18_reply_decrypts_into_reply_cb);
+    RUN_TEST(test_mac_failure_terminates_session_and_fires_event);
+    RUN_TEST(test_plain_reply_during_established_terminates_session);
+    RUN_TEST(test_send_command_after_session_loss_uses_plaintext);
     return UNITY_END();
 }

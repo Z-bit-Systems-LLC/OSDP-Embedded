@@ -42,7 +42,7 @@ extern "C" {
  *   - Per-PD online tracking: PD is online while it has produced a
  *     reply within OSDP_ACU_OFFLINE_TIMEOUT_MS.
  *
- * Iteration 3 phase 5a scope (this commit):
+ * Iteration 3 phase 5a scope:
  *   - Optional Secure Channel handshake initiation. With one shared
  *     crypto vtable bound on the ACU and per-PD key material (SCBK or
  *     SCBK-D), the application can call osdp_acu_start_sc_handshake()
@@ -55,12 +55,25 @@ extern "C" {
  *     mismatch. CCRYPT and RMAC_I never reach the reply_cb — they're
  *     consumed by the handshake state machine internally.
  *
+ * Iteration 3 phase 5b scope (this commit):
+ *   - Operational SCS_15..18 traffic. Once a slot's handshake has
+ *     completed, every osdp_acu_send_command toward that PD is
+ *     automatically wrapped: under SCS_17 when the command carries a
+ *     payload, under SCS_15 when it's empty (the SCB selection is
+ *     enforced by osdp_sc_wrap_frame). The application sends and
+ *     receives plaintext; the SCB type, MAC, and payload encryption
+ *     are transparent. Inbound SCS_16 / SCS_18 replies are unwrapped
+ *     before being delivered via reply_cb.
+ *   - Session-loss detection. Per spec D.1.4, an established session
+ *     terminates if a reply arrives with a valid CRC but a MAC
+ *     mismatch, or if a non-BUSY plaintext reply arrives. The slot
+ *     transitions back to IDLE and OSDP_ACU_SC_EVENT_SESSION_LOST
+ *     fires; the application may re-handshake at will.
+ *
  * Deferred for subsequent commits:
  *   - Auto-poll scheduling (ACU sending POLL on a per-PD interval).
- *   - In-process PD<->ACU integration tests.
- *   - Multi-command queueing per PD.
- *   - Phase 5b: ACU operational SC. Wrap outbound SCS_15/SCS_17,
- *     unwrap inbound SCS_16/SCS_18, after the handshake completes. */
+ *   - In-process PD<->ACU integration tests (phase 6).
+ *   - Multi-command queueing per PD. */
 
 /* ---- Tuning constants ---------------------------------------------------*/
 
@@ -169,7 +182,7 @@ typedef void (*osdp_acu_timeout_cb)(
 
 typedef enum osdp_acu_sc_event_kind {
     /* Handshake completed successfully; the PD slot's sc_session is
-     * established and SCS_15..18 traffic is now permitted (phase 5b). */
+     * established and SCS_15..18 traffic is now permitted. */
     OSDP_ACU_SC_EVENT_ESTABLISHED = 0,
 
     /* Handshake failed cryptographically. Either:
@@ -180,6 +193,17 @@ typedef enum osdp_acu_sc_event_kind {
      * The PD slot remains in the IDLE phase; the application may
      * retry by calling osdp_acu_start_sc_handshake again. */
     OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED,
+
+    /* An established session was lost mid-flight. Per spec D.1.4 the
+     * session terminates whenever:
+     *   - a SCB-bearing reply has a valid CRC but a MAC mismatch
+     *     (encryption synchronization lost), or
+     *   - a non-BUSY plaintext reply arrives while the session is
+     *     active ("any message sent without a SCB other than
+     *     osdp_BUSY terminates the session").
+     * The slot transitions back to IDLE; the application may
+     * re-handshake by calling osdp_acu_start_sc_handshake again. */
+    OSDP_ACU_SC_EVENT_SESSION_LOST,
 } osdp_acu_sc_event_kind_t;
 
 typedef struct osdp_acu_sc_event {
@@ -246,7 +270,20 @@ osdp_status_t osdp_acu_register_pd(osdp_acu_t *acu,
                                    uint8_t     pd_address);
 
 /* Send a command to a registered PD. Builds the OSDP frame in the
- * shared TX scratch and writes it to the transport. Returns:
+ * shared TX scratch and writes it to the transport.
+ *
+ * If the slot's Secure Channel session is ESTABLISHED, the frame is
+ * automatically wrapped under SCS_17 (or SCS_15 for empty payloads,
+ * per the spec D.1.4 convention enforced inside osdp_sc_wrap_frame).
+ * The application always passes plaintext bytes; encryption + MAC
+ * are transparent. Once SC is established, every command on that
+ * slot uses the secure channel — there is no per-command opt-out.
+ *
+ * If the slot's session is not yet established (pre-handshake or
+ * after a session-lost event), the command is sent without an SCB,
+ * matching the original phase 4 behaviour.
+ *
+ * Returns:
  *   OSDP_OK           — frame transmitted, awaiting reply.
  *   OSDP_ERR_INVALID_ARG  — pd_address not registered.
  *   OSDP_ERR_NOT_SUPPORTED — slot already has an outstanding reply

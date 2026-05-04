@@ -339,3 +339,48 @@ void osdp_acu_internal_handle_rmac_i(osdp_acu_t          *acu,
     slot->sc_phase = OSDP_ACU_SC_ESTABLISHED;
     fire_sc_event(acu, slot->address, OSDP_ACU_SC_EVENT_ESTABLISHED);
 }
+
+/* ---- Session termination + operational SC reply handling -------------- */
+
+void osdp_acu_internal_terminate_sc(osdp_acu_t          *acu,
+                                    osdp_acu_pd_slot_t  *slot)
+{
+    if (slot == NULL) return;
+    /* Drop any in-flight command and reset the SQN cache. The next
+     * command on this slot will go out plaintext (sc_phase == IDLE)
+     * with SQN starting fresh, so the application can re-handshake
+     * cleanly. */
+    slot->waiting = false;
+    slot->next_seq = 0U;
+    reset_sc_handshake(slot, /*clear_session*/ true);
+    fire_sc_event(acu, slot->address, OSDP_ACU_SC_EVENT_SESSION_LOST);
+}
+
+void osdp_acu_internal_handle_sc_reply(osdp_acu_t          *acu,
+                                       osdp_acu_pd_slot_t  *slot,
+                                       const osdp_frame_t  *frame)
+{
+    /* Must be the reply to the command we sent. */
+    if (!slot->waiting || frame->sequence != slot->pending_seq) {
+        return;
+    }
+
+    /* Verify MAC and (for SCS_18) decrypt the payload. */
+    uint8_t plaintext[OSDP_ACU_TX_BUF_LEN];
+    size_t  plaintext_len = 0;
+    osdp_status_t s = osdp_sc_unwrap_frame(&acu->sc_crypto,
+                                           &slot->sc_session, frame,
+                                           plaintext, sizeof(plaintext),
+                                           &plaintext_len);
+    if (s != OSDP_OK) {
+        /* Spec D.1.4: a SCB-bearing reply with valid CRC but invalid
+         * MAC indicates encryption synchronization is lost — tear
+         * down the session and let the application re-handshake. */
+        osdp_acu_internal_terminate_sc(acu, slot);
+        return;
+    }
+
+    /* Deliver plaintext through the same path a non-SC reply would. */
+    osdp_acu_internal_deliver_reply(acu, slot, frame,
+                                    plaintext, plaintext_len);
+}
