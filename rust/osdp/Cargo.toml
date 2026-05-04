@@ -22,6 +22,14 @@ std     = []
 [dependencies]
 osdp-sys = { path = "../osdp-sys", version = "0.1.0" }
 
+# Examples and integration tests use a real AES backend so the loopback
+# Secure-Channel example exercises the full handshake. The `aes` crate
+# (RustCrypto, MIT/Apache-2.0) is a well-trusted constant-time AES
+# implementation and only pulled in for examples + tests, never the
+# library proper.
+[dev-dependencies]
+aes = "0.8"
+
 [lib]
 name = "osdp"
 path = "src/lib.rs"

@@ -16,12 +16,12 @@
 //!   [`pd::CommandHandler`] traits.
 //! - [`acu::Acu`] — ACU-side state machine, with [`acu::Transport`],
 //!   [`acu::ReplyHandler`], and [`acu::TimeoutHandler`] traits.
+//! - [`sc::ScCrypto`] for application-supplied AES + RNG, plus the
+//!   PD-side SCBK / SCBK-D / cUID setters and the ACU-side
+//!   `start_sc_handshake` + [`sc::ScEventHandler`].
 //!
 //! # Not covered (yet)
 //!
-//! - Secure Channel. The FFI bindings exist in [`osdp_sys`] but the
-//!   safe wrapper for SC (the `Aes128` trait, key configuration, the
-//!   handshake-event handler) is deferred to a follow-up.
 //! - Per-message codec wrappers. The C codecs are exposed via
 //!   `osdp_sys` (e.g. `osdp_sys::osdp_pdid_build`) but no typesafe
 //!   sugar yet.
@@ -41,5 +41,6 @@ pub mod acu;
 pub mod error;
 pub mod frame;
 pub mod pd;
+pub mod sc;
 
 pub use error::{Error, Result};

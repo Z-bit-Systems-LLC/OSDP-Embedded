@@ -202,9 +202,15 @@ typed message structs. Foundation for both PD and ACU work later.
   `CommandHandler` / `ReplyHandler` / `TimeoutHandler` traits.
   `examples/loopback.rs` demonstrates a full Pd↔Acu round-trip
   in-process (POLL→ACK and ID→PDID, byte-identical end to end).
-- ☐ **Secure Channel in the safe wrapper.** Add an `Aes128` trait,
-  per-PD key configuration, and the SC event handler. FFI is already
-  in `osdp-sys`; the wrapper just needs the trait-object glue.
+- ☑ **Secure Channel in the safe wrapper.** `osdp::sc::ScCrypto`
+  trait (AES-128 encrypt + decrypt + RNG) plus PD-side
+  `set_sc_crypto`/`set_sc_scbk`/`set_sc_scbk_d`/`set_sc_cuid`/
+  `sc_established`, ACU-side `set_sc_crypto`/`set_pd_scbk*`/
+  `start_sc_handshake`/`set_sc_event_handler`/`is_pd_sc_established`
+  with an `ScEventKind` enum (`Established` / `HandshakeFailed` /
+  `SessionLost`). Validated via `examples/loopback_sc.rs` which
+  runs the full SCS_11..14 handshake and POLL→ACK + ID→PDID under
+  SCS_15..18 in process, with the `aes` crate as the AES backend.
 - ☐ **Per-message codec wrappers.** `osdp::messages::Pdid::decode`
   etc., on top of the existing `osdp_*_decode` / `osdp_*_build` FFI.
 - ☐ **Publishing** to crates.io (post-stabilization).

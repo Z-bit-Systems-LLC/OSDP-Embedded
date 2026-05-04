@@ -54,6 +54,7 @@ use core::slice;
 use osdp_sys as sys;
 
 use crate::error::{Error, Result};
+use crate::sc::{self, ScCrypto, SC_CUID_LEN, SC_KEY_LEN};
 
 /// Wire-side I/O. The PD calls these from inside [`Pd::tick`].
 ///
@@ -120,6 +121,11 @@ pub struct Pd {
     /// `*mut c_void` derived from this box's heap address.
     transport:    Option<Box<TransportBox>>,
     cmd_handler:  Option<Box<CommandHandlerBox>>,
+    /// Secure-channel crypto vtable. The C side embedded a copy of
+    /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
+    /// keep the trait-object box alive so the user pointer in that
+    /// copy stays valid.
+    sc_crypto:    Option<Box<sc::ScCryptoBox>>,
 }
 
 impl Pd {
@@ -132,6 +138,7 @@ impl Pd {
             inner,
             transport: None,
             cmd_handler: None,
+            sc_crypto: None,
         }
     }
 
@@ -185,6 +192,54 @@ impl Pd {
     /// 8 seconds. Always false for a fresh `Pd` until a reply lands.
     pub fn is_online(&self) -> bool {
         unsafe { sys::osdp_pd_is_online(&*self.inner) }
+    }
+
+    // ---- Secure Channel configuration ---------------------------------
+    //
+    // Secure Channel is fully optional. The PD only accepts SCB-bearing
+    // frames once the application has bound a crypto vtable AND at
+    // least one of (SCBK, SCBK-D) AND the cUID. Without all three the
+    // PD continues to NAK SCB frames with code 0x05.
+
+    /// Bind the crypto provider (AES + RNG) the PD will use for
+    /// Secure Channel. Replaces any previously-bound provider.
+    pub fn set_sc_crypto<C: ScCrypto>(&mut self, crypto: C) {
+        let boxed: sc::ScCryptoBox = Box::new(crypto);
+        let (vtable, user) = sc::build_vtable(boxed);
+        unsafe {
+            sys::osdp_pd_set_sc_crypto(&mut *self.inner, &vtable);
+        }
+        // Reclaim ownership of the heap-allocated trait object box so
+        // it lives as long as `self` does. The C-side `sc.crypto.user`
+        // points at the same allocation.
+        self.sc_crypto = Some(unsafe { Box::from_raw(user as *mut sc::ScCryptoBox) });
+    }
+
+    /// Set the Secure Channel Base Key (SCBK), the per-installation
+    /// 16-byte key used when the ACU starts a handshake with the
+    /// SCBK selector.
+    pub fn set_sc_scbk(&mut self, scbk: &[u8; SC_KEY_LEN]) {
+        unsafe { sys::osdp_pd_set_sc_scbk(&mut *self.inner, scbk.as_ptr()) };
+    }
+
+    /// Set the default install-time key (SCBK-D), used when the ACU
+    /// starts a handshake with the SCBK-D selector. The well-known
+    /// constant from the spec is available as
+    /// [`sc::scbk_default()`](crate::sc::scbk_default).
+    pub fn set_sc_scbk_d(&mut self, scbk_d: &[u8; SC_KEY_LEN]) {
+        unsafe { sys::osdp_pd_set_sc_scbk_d(&mut *self.inner, scbk_d.as_ptr()) };
+    }
+
+    /// Set the cUID — first 8 bytes of the PDID byte stream
+    /// (vendor[3] + model + version + serial[0..2]) per spec D.4.3.
+    pub fn set_sc_cuid(&mut self, cuid: &[u8; SC_CUID_LEN]) {
+        unsafe { sys::osdp_pd_set_sc_cuid(&mut *self.inner, cuid.as_ptr()) };
+    }
+
+    /// True iff the SCS_11..14 handshake completed successfully and
+    /// the PD is ready to handle SCS_15..18 operational traffic.
+    pub fn sc_established(&self) -> bool {
+        unsafe { sys::osdp_pd_sc_established(&*self.inner) }
     }
 }
 

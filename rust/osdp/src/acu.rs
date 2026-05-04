@@ -48,6 +48,7 @@ use core::slice;
 use osdp_sys as sys;
 
 use crate::error::{Error, Result};
+use crate::sc::{self, ScCrypto, ScEventHandler, SC_KEY_LEN};
 
 // ---- Public traits ------------------------------------------------------
 
@@ -100,6 +101,8 @@ pub struct Acu {
     transport:    Option<Box<TransportBox>>,
     reply_h:      Option<Box<ReplyBox>>,
     timeout_h:    Option<Box<TimeoutBox>>,
+    sc_crypto:    Option<Box<sc::ScCryptoBox>>,
+    sc_event_h:   Option<Box<sc::ScEventBox>>,
 }
 
 impl Acu {
@@ -122,6 +125,8 @@ impl Acu {
             transport: None,
             reply_h: None,
             timeout_h: None,
+            sc_crypto: None,
+            sc_event_h: None,
         }
     }
 
@@ -221,6 +226,77 @@ impl Acu {
     pub fn pd_count(&self) -> usize {
         self.slots.len()
     }
+
+    // ---- Secure Channel ------------------------------------------------
+    //
+    // One shared crypto provider drives every PD this ACU manages — the
+    // controller process has one AES implementation, even if it talks
+    // to dozens of PDs. Per-PD state (SCBK, SCBK-D, session keys, MAC
+    // chain) lives inside the slot the PD was registered into.
+
+    /// Bind the crypto provider (AES + RNG) the ACU will use across
+    /// every Secure Channel session it negotiates.
+    pub fn set_sc_crypto<C: ScCrypto>(&mut self, crypto: C) {
+        let boxed: sc::ScCryptoBox = Box::new(crypto);
+        let (vtable, user) = sc::build_vtable(boxed);
+        unsafe { sys::osdp_acu_set_sc_crypto(&mut *self.inner, &vtable) };
+        self.sc_crypto = Some(unsafe { Box::from_raw(user as *mut sc::ScCryptoBox) });
+    }
+
+    /// Set the SCBK for the registered PD at `pd_address`. Used when
+    /// `start_sc_handshake` is invoked with `use_default_key = false`.
+    pub fn set_pd_scbk(&mut self, pd_address: u8, scbk: &[u8; SC_KEY_LEN]) -> Result<()> {
+        let s = unsafe { sys::osdp_acu_set_pd_scbk(&mut *self.inner, pd_address, scbk.as_ptr()) };
+        Error::from_status(s)
+    }
+
+    /// Set the SCBK-D for the registered PD at `pd_address`. Used
+    /// when `start_sc_handshake` is invoked with `use_default_key =
+    /// true`.
+    pub fn set_pd_scbk_d(&mut self, pd_address: u8, scbk_d: &[u8; SC_KEY_LEN]) -> Result<()> {
+        let s = unsafe { sys::osdp_acu_set_pd_scbk_d(&mut *self.inner, pd_address, scbk_d.as_ptr()) };
+        Error::from_status(s)
+    }
+
+    /// Bind the SC event handler. Fires on handshake completion,
+    /// cryptographic failure, or session loss. Replaces any
+    /// previously-set handler.
+    pub fn set_sc_event_handler<H: ScEventHandler>(&mut self, handler: H) {
+        let boxed: sc::ScEventBox = Box::new(handler);
+        let outer: Box<sc::ScEventBox> = Box::new(boxed);
+        let user = Box::into_raw(outer) as *mut c_void;
+        unsafe {
+            sys::osdp_acu_set_sc_event_handler(
+                &mut *self.inner,
+                Some(sc::sc_event_thunk),
+                user,
+            );
+        }
+        self.sc_event_h = Some(unsafe { Box::from_raw(user as *mut sc::ScEventBox) });
+    }
+
+    /// Initiate a Secure Channel handshake with `pd_address`. Sends
+    /// CHLNG immediately; subsequent ticks drive the rest of the
+    /// handshake. The outcome is delivered via the SC event handler.
+    ///
+    /// `use_default_key = true` selects SCBK-D; `false` selects SCBK.
+    /// Errors:
+    ///   - `Err(InvalidArg)` — PD not registered, no crypto bound,
+    ///     or no key configured for the requested mode.
+    ///   - `Err(NotSupported)` — the slot has an outstanding command
+    ///     (a prior reply, or another handshake already in progress).
+    pub fn start_sc_handshake(&mut self, pd_address: u8, use_default_key: bool) -> Result<()> {
+        let s = unsafe {
+            sys::osdp_acu_start_sc_handshake(&mut *self.inner, pd_address, use_default_key)
+        };
+        Error::from_status(s)
+    }
+
+    /// True iff `pd_address`'s slot has a fully-established Secure
+    /// Channel session (SCS_15..18 traffic permitted).
+    pub fn is_pd_sc_established(&self, pd_address: u8) -> bool {
+        unsafe { sys::osdp_acu_is_pd_sc_established(&*self.inner, pd_address) }
+    }
 }
 
 // ---- Thunks ------------------------------------------------------------
@@ -283,8 +359,9 @@ unsafe extern "C" fn timeout_thunk(
 impl Drop for Acu {
     fn drop(&mut self) {
         unsafe {
-            sys::osdp_acu_set_reply_handler  (&mut *self.inner, None, ptr::null_mut());
-            sys::osdp_acu_set_timeout_handler(&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_acu_set_reply_handler   (&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_acu_set_timeout_handler (&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_acu_set_sc_event_handler(&mut *self.inner, None, ptr::null_mut());
             let dead = sys::osdp_acu_transport_t {
                 read: None, write: None, now_ms: None, user: ptr::null_mut(),
             };
