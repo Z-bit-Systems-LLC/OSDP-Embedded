@@ -211,8 +211,16 @@ typed message structs. Foundation for both PD and ACU work later.
   `SessionLost`). Validated via `examples/loopback_sc.rs` which
   runs the full SCS_11..14 handshake and POLL→ACK + ID→PDID under
   SCS_15..18 in process, with the `aes` crate as the AES backend.
-- ☐ **Per-message codec wrappers.** `osdp::messages::Pdid::decode`
-  etc., on top of the existing `osdp_*_decode` / `osdp_*_build` FFI.
+- ☑ **Per-message codec wrappers.** `osdp::messages` provides typed
+  `decode` / `build` for every command (`Poll`, `IdRequest`,
+  `CapRequest`, `Out`, `Led`, `BuzCmd`, `Text<'a>`, `ComsetCmd`) and
+  every reply (`Ack`, `Nak<'a>`, `Pdid`, `Pdcap`, `Raw<'a>`,
+  `Keypad<'a>`, `Com`) in the v2.2.2 baseline set, on top of the
+  matching `osdp_*_decode` / `osdp_*_build` FFI. Variable-length
+  payloads (`Pdcap`, `Out`, `Led`) are exposed as `Vec<...>`;
+  borrowed-slice payloads (`Nak`, `Text`, `Raw`, `Keypad`) carry a
+  lifetime back to the input. Eight unit tests cover round-trip plus
+  a representative truncated-decode negative.
 - ☐ **Publishing** to crates.io (post-stabilization).
 
 ## Iteration 5+ — Optional extensions (not yet planned)

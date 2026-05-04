@@ -19,12 +19,8 @@
 //! - [`sc::ScCrypto`] for application-supplied AES + RNG, plus the
 //!   PD-side SCBK / SCBK-D / cUID setters and the ACU-side
 //!   `start_sc_handshake` + [`sc::ScEventHandler`].
-//!
-//! # Not covered (yet)
-//!
-//! - Per-message codec wrappers. The C codecs are exposed via
-//!   `osdp_sys` (e.g. `osdp_sys::osdp_pdid_build`) but no typesafe
-//!   sugar yet.
+//! - [`messages`] — typed decoders and builders for every command
+//!   and reply in the OSDP v2.2.2 baseline set.
 //!
 //! # Threading
 //!
@@ -40,6 +36,7 @@ extern crate alloc;
 pub mod acu;
 pub mod error;
 pub mod frame;
+pub mod messages;
 pub mod pd;
 pub mod sc;
 
