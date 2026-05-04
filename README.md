@@ -62,7 +62,9 @@ pd/                           # PD-side state machine + transport HAL
 acu/                          # ACU-side state machine + transport HAL
 └── ...                       # exports osdp::acu
 tools/
-└── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
+├── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
+└── osdp-pd-mock/             # live PD on a serial port; pair with any ACU
+                              # for interop validation
 tests/
 ├── vendor/unity/             # vendored Unity test framework
 ├── captures/                 # drop *.osdpcap files here for integration tests
@@ -118,6 +120,32 @@ build/tools/osdp-parser/osdp-parser my-capture.osdpcap
 # or via stdin:
 cat my-capture.osdpcap | build/tools/osdp-parser/osdp-parser
 ```
+
+### Live interop on a serial port
+
+`osdp-pd-mock` runs a real PD on a serial port so you can validate
+this stack against an independent ACU implementation (Z-bit Systems'
+[OSDP.Net](https://github.com/Z-bit-Systems-LLC/OSDP.Net) `ACUConsole`,
+a hardware controller, etc.). The PD library itself stays freestanding;
+the tool supplies a Win32 (`CreateFile` / `ReadFile`) or POSIX
+(`termios` / `O_NONBLOCK`) serial transport adapter selected at build
+time by CMake.
+
+```sh
+# Windows (com0com pair, ACUConsole on COM4):
+$env:OSDP_INTEROP_PD_PORT = "COM3"
+build\tools\osdp-pd-mock\Debug\osdp-pd-mock.exe --address 0 -v
+
+# Linux (USB-RS485 dongle):
+export OSDP_INTEROP_PD_PORT=/dev/ttyUSB0
+build/tools/osdp-pd-mock/osdp-pd-mock --address 0 -v
+```
+
+The mock answers POLL with ACK, ID with a placeholder PDID, CAP with a
+small default capability set, and ACKs LED / BUZ / OUT / TEXT /
+COMSET / KEYSET. Run with `--help` for the full flag set. Secure
+Channel mode (`--sc=scbkd`) is pending an AES-vendoring decision in
+this build of the tool.
 
 ## Reference material
 

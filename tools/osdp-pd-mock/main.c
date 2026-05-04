@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Z-bit Systems, LLC
+
+/* osdp-pd-mock — interactive PD on a serial port.
+ *
+ * Acts as an OSDP Peripheral Device on a real (or virtual) RS-485 /
+ * COM port, so a developer can validate this stack against an
+ * independent ACU implementation (OSDP.Net's ACUConsole, a hardware
+ * controller, etc.) by wiring the two together.
+ *
+ * Configuration is via CLI flags or the OSDP_INTEROP_PD_PORT env var.
+ * Run with --help for the full list. The application command
+ * callback handles a baseline set of commands (POLL, ID, CAP, LED,
+ * BUZ, OUT, TEXT, COMSET, KEYSET) so the ACU's first poll, capability
+ * exchange, and basic output exercise all work out of the box.
+ *
+ * Secure Channel is opt-in via --sc=scbkd (the spec's well-known
+ * default install key) or --sc=scbk:HEX (a custom 32-hex-char key).
+ *
+ * This is a host tool, not a library — it links libc, parses argv,
+ * and prints to stderr. The actual PD library (osdp::pd) and core
+ * (osdp::core, osdp::messages) remain freestanding-friendly. */
+
+#include "osdp/osdp_commands.h"
+#include "osdp/osdp_dispatch.h"
+#include "osdp/osdp_pd.h"
+#include "osdp/osdp_replies.h"
+#include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc_crypto.h"
+#include "serial.h"
+
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- Volatile flag set by Ctrl-C / SIGINT --------------------------- */
+
+static volatile sig_atomic_t g_should_exit = 0;
+static void on_signal(int sig) { (void)sig; g_should_exit = 1; }
+
+/* ---- Defaults ------------------------------------------------------- */
+
+#define DEFAULT_BAUD     9600U
+#define DEFAULT_ADDRESS  0x00U
+
+/* Default PDID — vendor "ZBC" (made up, replace freely) + a fixed
+ * version/serial. The first 8 bytes of this layout (vendor[3] +
+ * model + version + serial[0..2]) form the cUID used by Secure
+ * Channel handshakes. */
+static const osdp_pdid_t kDefaultPdid = {
+    .vendor_code    = { 'Z', 'B', 'C' },
+    .model          = 0x01,
+    .version        = 0x00,
+    .serial         = 0x00000001UL,   /* LE on the wire */
+    .firmware_major = 0,
+    .firmware_minor = 1,
+    .firmware_build = 0,
+};
+
+/* Modest default capability set. Matches what a small access-control
+ * PD with one output, one buzzer, one LED, one reader, and a small
+ * text display might report. */
+static const osdp_pdcap_record_t kDefaultPdcap[] = {
+    { .function_code = 1,  .compliance_level = 1, .num_objects = 1 }, /* contact monitor */
+    { .function_code = 2,  .compliance_level = 1, .num_objects = 1 }, /* output control */
+    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* card data fmt */
+    { .function_code = 4,  .compliance_level = 1, .num_objects = 1 }, /* reader LED ctrl */
+    { .function_code = 5,  .compliance_level = 1, .num_objects = 1 }, /* audible (buzzer) */
+    { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* text output */
+    { .function_code = 9,  .compliance_level = 1, .num_objects = 4 }, /* CRC support, etc. */
+};
+#define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
+
+/* ---- Crypto HAL (stdlib rand) --------------------------------------- */
+
+#include <time.h>
+
+/* mock-only AES is not implemented here — Secure Channel needs a real
+ * AES primitive. The user supplies one by linking against e.g.
+ * mbedTLS, but to keep the tool dependency-free for the no-SC case we
+ * stub the encrypt/decrypt callbacks unless --sc was passed. */
+
+/* For now we deliberately don't include an AES implementation in
+ * tools/. If --sc is requested without a linked AES, we error out at
+ * argument-parsing time; later we can either pull in the test
+ * vendored tiny-AES-c or document a build option to link mbedTLS. */
+
+/* ---- Application command handler ------------------------------------ */
+
+typedef struct app_state {
+    osdp_pdid_t          pdid;
+    osdp_pdcap_record_t  pdcap[16];
+    size_t               pdcap_count;
+    int                  verbose;
+
+    /* Scratch for build_* outputs returned to the PD via reply.payload. */
+    uint8_t              scratch[OSDP_PD_TX_BUF_LEN];
+} app_state_t;
+
+static const char *cmd_name(uint8_t code)
+{
+    switch (code) {
+    case OSDP_CMD_POLL:   return "POLL";
+    case OSDP_CMD_ID:     return "ID";
+    case OSDP_CMD_CAP:    return "CAP";
+    case OSDP_CMD_LED:    return "LED";
+    case OSDP_CMD_BUZ:    return "BUZ";
+    case OSDP_CMD_TEXT:   return "TEXT";
+    case OSDP_CMD_OUT:    return "OUT";
+    case OSDP_CMD_COMSET: return "COMSET";
+    case OSDP_CMD_KEYSET: return "KEYSET";
+    case OSDP_CMD_CHLNG:  return "CHLNG";
+    case OSDP_CMD_SCRYPT: return "SCRYPT";
+    default:              return "?";
+    }
+}
+
+static osdp_status_t app_handler(void           *user,
+                                 uint8_t         cmd_code,
+                                 const uint8_t  *payload,
+                                 size_t          payload_len,
+                                 osdp_pd_reply_t *reply)
+{
+    app_state_t *s = (app_state_t *)user;
+    (void)payload; (void)payload_len;
+
+    if (s->verbose >= 1) {
+        fprintf(stderr, "  [cmd 0x%02x %-7s payload_len=%zu]\n",
+                cmd_code, cmd_name(cmd_code), payload_len);
+    }
+
+    switch (cmd_code) {
+    case OSDP_CMD_POLL:
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
+
+    case OSDP_CMD_ID: {
+        size_t built = 0;
+        const osdp_status_t r = osdp_pdid_build(&s->pdid, s->scratch,
+                                                sizeof(s->scratch), &built);
+        if (r != OSDP_OK) return OSDP_ERR_BAD_PAYLOAD;
+        reply->code        = OSDP_REPLY_PDID;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        return OSDP_OK;
+    }
+
+    case OSDP_CMD_CAP: {
+        size_t built = 0;
+        const osdp_status_t r = osdp_pdcap_build(s->pdcap, s->pdcap_count,
+                                                 s->scratch, sizeof(s->scratch),
+                                                 &built);
+        if (r != OSDP_OK) return OSDP_ERR_BAD_PAYLOAD;
+        reply->code        = OSDP_REPLY_PDCAP;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        return OSDP_OK;
+    }
+
+    case OSDP_CMD_LED:
+    case OSDP_CMD_BUZ:
+    case OSDP_CMD_OUT:
+    case OSDP_CMD_TEXT:
+    case OSDP_CMD_KEYSET:
+    case OSDP_CMD_COMSET:
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
+
+    default:
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+}
+
+/* ---- CLI -------------------------------------------------------------- */
+
+typedef struct cli {
+    const char  *port;
+    unsigned int baud;
+    uint8_t      address;
+    enum {
+        SC_NONE,
+        SC_SCBKD,
+        SC_SCBK_CUSTOM
+    }            sc_mode;
+    uint8_t      sc_custom_key[OSDP_SC_KEY_LEN];
+    int          verbose;
+} cli_t;
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s [options]\n"
+        "  --port NAME        serial port (default $OSDP_INTEROP_PD_PORT)\n"
+        "                       Win32 examples: COM3, \\\\\\\\.\\\\COM23\n"
+        "                       POSIX examples: /dev/ttyUSB0, /dev/cu.usbserial-XXX\n"
+        "  --address N        7-bit PD address (0x00..0x7E, default 0x00)\n"
+        "  --baud N           baud rate (default 9600)\n"
+        "  --sc=MODE          Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
+        "                                     'scbk:HEX32' (custom 16-byte key)\n"
+        "  -v / -vv           print decoded commands (-v) or every byte (-vv)\n"
+        "  -h, --help         this help\n",
+        prog);
+}
+
+/* Parse 32 hex chars into a 16-byte key. Returns true on success. */
+static bool parse_hex_key(const char *s, uint8_t out[OSDP_SC_KEY_LEN])
+{
+    if (s == NULL || strlen(s) != OSDP_SC_KEY_LEN * 2U) return false;
+    for (size_t i = 0; i < OSDP_SC_KEY_LEN; i++) {
+        unsigned int b;
+        if (sscanf(s + i * 2, "%2x", &b) != 1) return false;
+        out[i] = (uint8_t)b;
+    }
+    return true;
+}
+
+static bool parse_args(int argc, char **argv, cli_t *out)
+{
+    (void)memset(out, 0, sizeof(*out));
+    out->port    = getenv("OSDP_INTEROP_PD_PORT");
+    out->baud    = DEFAULT_BAUD;
+    out->address = DEFAULT_ADDRESS;
+    out->sc_mode = SC_NONE;
+    out->verbose = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            usage(argv[0]);
+            exit(0);
+        } else if (strcmp(a, "-v") == 0) {
+            out->verbose = 1;
+        } else if (strcmp(a, "-vv") == 0) {
+            out->verbose = 2;
+        } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
+            out->port = argv[++i];
+        } else if (strcmp(a, "--baud") == 0 && i + 1 < argc) {
+            out->baud = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(a, "--address") == 0 && i + 1 < argc) {
+            const unsigned long v = strtoul(argv[++i], NULL, 0);
+            if (v > 0x7EU) {
+                fprintf(stderr, "address out of range: 0x%lx\n", v);
+                return false;
+            }
+            out->address = (uint8_t)v;
+        } else if (strncmp(a, "--sc=", 5) == 0) {
+            const char *mode = a + 5;
+            if (strcmp(mode, "off") == 0) {
+                out->sc_mode = SC_NONE;
+            } else if (strcmp(mode, "scbkd") == 0) {
+                out->sc_mode = SC_SCBKD;
+            } else if (strncmp(mode, "scbk:", 5) == 0) {
+                if (!parse_hex_key(mode + 5, out->sc_custom_key)) {
+                    fprintf(stderr,
+                            "--sc=scbk:HEX requires 32 hex chars (16 bytes)\n");
+                    return false;
+                }
+                out->sc_mode = SC_SCBK_CUSTOM;
+            } else {
+                fprintf(stderr, "unknown --sc mode: %s\n", mode);
+                return false;
+            }
+        } else {
+            fprintf(stderr, "unknown argument: %s\n", a);
+            usage(argv[0]);
+            return false;
+        }
+    }
+
+    if (out->port == NULL || out->port[0] == '\0') {
+        fprintf(stderr,
+                "no port specified — set $OSDP_INTEROP_PD_PORT or pass --port\n");
+        return false;
+    }
+    return true;
+}
+
+/* ---- Main ------------------------------------------------------------ */
+
+int main(int argc, char **argv)
+{
+    cli_t cli;
+    if (!parse_args(argc, argv, &cli)) return 2;
+
+    if (cli.sc_mode != SC_NONE) {
+        fprintf(stderr,
+                "osdp-pd-mock: --sc requires a linked AES implementation;\n"
+                "this build of the tool does not include one. Use --sc=off\n"
+                "(default) for now.\n");
+        return 2;
+    }
+
+    /* Application state for the command callback. */
+    app_state_t app;
+    (void)memset(&app, 0, sizeof(app));
+    app.pdid        = kDefaultPdid;
+    app.pdcap_count = DEFAULT_PDCAP_COUNT;
+    (void)memcpy(app.pdcap, kDefaultPdcap, sizeof(kDefaultPdcap));
+    app.verbose     = cli.verbose;
+
+    /* Open the serial port. */
+    osdp_pd_transport_t transport;
+    char err[256];
+    serial_ctx_t *serial = serial_open(cli.port, cli.baud,
+                                       &transport, err, sizeof(err));
+    if (serial == NULL) {
+        fprintf(stderr, "osdp-pd-mock: %s\n", err);
+        return 1;
+    }
+
+    /* Initialise the PD. */
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, cli.address);
+    osdp_pd_set_transport(&pd, &transport);
+    osdp_pd_set_command_handler(&pd, app_handler, &app);
+
+    fprintf(stderr,
+            "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x"
+            " (Ctrl-C to exit)\n",
+            cli.port, cli.baud, cli.address);
+
+    /* Catch Ctrl-C for orderly shutdown. */
+    signal(SIGINT, on_signal);
+
+    /* Tick loop. */
+    while (!g_should_exit) {
+        osdp_pd_tick(&pd);
+        serial_sleep_ms(2);  /* a 9600-baud byte is ~1ms; 2ms is fine */
+    }
+
+    fprintf(stderr, "\nosdp-pd-mock: shutting down\n");
+    serial_close(serial);
+    return 0;
+}

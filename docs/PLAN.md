@@ -121,15 +121,27 @@ typed message structs. Foundation for both PD and ACU work later.
 - ☑ **Phase 3b: PD operational SC.** SCS_15..18 commands are
   unwrapped, dispatched to the existing `osdp_pd_command_cb` with
   plaintext, and replies are wrapped back as SCS_16/SCS_18.
-- ☐ **Phase 4: Capture-replay validation** (BUMPED FORWARD from the
-  original phase 6 slot). Drive our PD with the ACU→PD frames extracted
-  from `tests/captures/sc-monitor-current.osdpcap`, and verify byte-
-  for-byte that our PD's responses match the captured PD→ACU frames.
-  Validates phases 1-3 against an independent, hardware-validated OSDP
-  stack (`libosdp-conformance 1.38-4`) before we double the surface
-  area with ACU code. Requires extracting RND.A / RND.B / cUID from the
-  capture and seeding the test PRNG to match the captured RND.B; the
-  SCBK is a libosdp-conformance default to dig out of their source.
+- ☑ **Phase 4a: Capture-replay validation** (BUMPED FORWARD from the
+  original phase 6 slot). Drives our PD with the SCS_11 / SCS_13
+  frames extracted from `tests/captures/sc-monitor-current.osdpcap`
+  (recorded by `libosdp-conformance 1.38-4`) and asserts the PD's
+  CCRYPT and RMAC_I replies are byte-identical to the captured
+  PD→ACU bytes. Configured with SCBK-D (the spec's well-known default
+  install key, now exposed as `OSDP_SCBK_DEFAULT` from `osdp_sc.h`),
+  the captured cUID, and a PRNG pinned to emit the captured
+  RND.B = `"abcdefgh"`. Validates phases 1-3 against an independent,
+  hardware-validated OSDP stack before we add ACU-side SC code. Test:
+  `tests/test_capture_replay.c`.
+- ☑ **Phase 4b: Live interop tool** (`tools/osdp-pd-mock/`). Host CLI
+  that runs an `osdp::pd` instance on a real (or virtual) serial
+  port, configurable via CLI flags or `OSDP_INTEROP_PD_PORT`.
+  Pluggable Win32 (`serial_win.c`) and POSIX (`serial_posix.c`)
+  serial adapters selected by CMake; the `pd/` library itself stays
+  freestanding. Intended pairing: Z-bit Systems' OSDP.Net `ACUConsole`
+  over a null-modem cable or a com0com pair. Secure-channel mode over
+  the serial path is pending an AES-vendoring decision (likely
+  promoting tiny-AES-c to a top-level vendor dir so both tests and
+  tools share one copy).
 - ☐ **Phase 5a: ACU handshake.** Extend `osdp::acu` to initiate the
   SCS_11..14 sequence; generate RND.A; verify CCRYPT and Initial R-MAC.
 - ☐ **Phase 5b: ACU operational SC.** Wrap outbound SCS_15..18,
@@ -143,5 +155,6 @@ typed message structs. Foundation for both PD and ACU work later.
 - File transfer, biometric, keypad extensions, manufacturer-specific
   commands, multi-part messages, certifiable test harness.
 - Rust wrapper crate hardening + publishing.
-- Live interop testing against `OSDP.Net` over a virtual serial / TCP
-  bridge, complementing the static capture-replay test.
+- Full-capture replay: extend `test_capture_replay` from the handshake
+  alone (SCS_11..14) to all 592 frames in `sc-monitor-current.osdpcap`,
+  including SCS_15..18 operational traffic.
