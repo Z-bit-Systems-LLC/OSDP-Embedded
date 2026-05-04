@@ -196,10 +196,20 @@ typedef struct osdp_pd {
     uint8_t                    tx_buf[OSDP_PD_TX_BUF_LEN];
 
     /* Sequence-number policing cache (spec 5.9 Table 2). When a
-     * retransmit arrives with the same non-zero SQN, the PD resends
-     * `last_reply[0..last_reply_len]` without invoking cmd_cb. */
+     * retransmit arrives — defined by the spec as a frame BYTE-
+     * IDENTICAL to the previous accepted command — the PD resends
+     * `last_reply[0..last_reply_len]` without invoking cmd_cb.
+     *
+     * SQN ALONE is not a sufficient discriminator: the cyclic
+     * progression 1→2→3→1 plus certain ACU error-recovery paths
+     * (observed in OSDP.Net's ACUConsole on a SC MAC-validation
+     * failure) can re-use the same SQN for a NEW command. We
+     * therefore also cache the previous command's wire bytes and
+     * memcmp them on every incoming frame. */
     uint8_t                    last_reply[OSDP_PD_TX_BUF_LEN];
     size_t                     last_reply_len;
+    uint8_t                    last_cmd  [OSDP_PD_TX_BUF_LEN];
+    size_t                     last_cmd_len;
     uint8_t                    last_seq;     /* 0..3 */
     bool                       have_last;
 

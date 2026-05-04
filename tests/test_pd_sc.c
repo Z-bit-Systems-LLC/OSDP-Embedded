@@ -696,6 +696,201 @@ static void test_scs_15_with_tampered_mac_drops_silently(void)
     TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
 }
 
+/* ---- Regression: SQN-cache must compare bytes, not just SQN -------------
+ *
+ * Reproduces the failure observed against OSDP.Net's ACUConsole on
+ * 2026-05-04: under certain conditions the ACU sends two consecutive
+ * commands with the SAME SQN — once after the wraparound 3→1, then
+ * again with 1 because its own state-reset path doesn't increment SQN.
+ * The PD's retransmit cache (spec 5.9) was matching on SQN ALONE, so
+ * the second frame (a different command with the same SQN) hit the
+ * cache and replayed the stale reply from the previous command. The
+ * ACU saw a wrong-type reply and the SC chain broke for ~8 seconds
+ * until its offline timeout fired and it restarted the handshake.
+ *
+ * Spec 5.9: a retransmit has IDENTICAL wire bytes to the original.
+ * Two different commands with the same SQN are NOT retransmits; the
+ * PD must process the second one fresh. The cache must therefore
+ * compare wire bytes (or at minimum the command code + SCB), not
+ * just SQN. */
+static void test_scs_15_different_cmd_same_sqn_processes_fresh(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* Command #1: POLL under SCS_15 with SQN=1. */
+    osdp_frame_t poll1;
+    (void)memset(&poll1, 0, sizeof(poll1));
+    poll1.address    = 0x05;
+    poll1.integrity  = OSDP_INTEGRITY_CRC;
+    poll1.sequence   = 1;
+    poll1.has_scb    = true;
+    poll1.scb_length = OSDP_SCB_MIN_LEN;
+    poll1.scb_type   = OSDP_SCS_15;
+    poll1.code       = OSDP_CMD_POLL;
+
+    uint8_t poll1_wire[64]; size_t poll1_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll1,
+                           poll1_wire, sizeof(poll1_wire), &poll1_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, poll1_wire, poll1_wire_len);
+    m.incoming_len = poll1_wire_len;
+    osdp_pd_tick(&pd);
+    /* Decode and verify-unwrap the ACK so the simulated ACU's chain
+     * advances exactly as a real ACU's would. */
+    osdp_frame_t poll1_reply;
+    decode_first_outgoing(&m, &poll1_reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, poll1_reply.scb_type);
+    uint8_t ack1_plain[16]; size_t ack1_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu,
+                             &poll1_reply, ack1_plain, sizeof(ack1_plain),
+                             &ack1_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, poll1_reply.code);
+    m.outgoing_len = 0;
+
+    /* Command #2: same SQN=1 but different code (LSTAT instead of POLL).
+     * This simulates the ACUConsole behaviour: same SQN as the previous
+     * command, but the bytes are clearly different. The PD must NOT
+     * treat this as a retransmit — it must process LSTAT fresh and
+     * emit a SCS_16 NAK 0x03. */
+    osdp_frame_t lstat;
+    (void)memset(&lstat, 0, sizeof(lstat));
+    lstat.address    = 0x05;
+    lstat.integrity  = OSDP_INTEGRITY_CRC;
+    lstat.sequence   = 1;       /* same SQN as the prior POLL */
+    lstat.has_scb    = true;
+    lstat.scb_length = OSDP_SCB_MIN_LEN;
+    lstat.scb_type   = OSDP_SCS_15;
+    lstat.code       = OSDP_CMD_LSTAT;
+
+    uint8_t lstat_wire[64]; size_t lstat_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &lstat,
+                           lstat_wire, sizeof(lstat_wire), &lstat_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, lstat_wire, lstat_wire_len);
+    m.incoming_len = lstat_wire_len;
+    osdp_pd_tick(&pd);
+
+    /* The PD must speak — and must not parrot the cached POLL/ACK. */
+    TEST_ASSERT_GREATER_THAN_size_t(0, m.outgoing_len);
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    /* If the SQN-only cache fired, this would still be ACK (the cached
+     * POLL reply). With the bytes-comparison fix, it's a fresh NAK 0x03
+     * for the unknown LSTAT command. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK,        reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNKNOWN_CMD,  plain[0]);
+}
+
+/* ---- Regression: post-NAK chain stays in sync ----------------------------
+ *
+ * Companion to the bytes-vs-SQN test above. After the PD emits a NAK
+ * for an unknown command, the rolling MAC chain has to be in sync for
+ * the NEXT (different) command — same scenario, different angle. */
+static void test_scs_15_nak_then_valid_poll_chains_correctly(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* Step 1: send an unknown command — TEXT — under SCS_15 with SQN=3.
+     * The handler does not implement TEXT, so we expect a SCS_16 NAK. */
+    static const uint8_t text_payload[] = {0,1,0,1,1,0};
+    osdp_frame_t bad_cmd;
+    (void)memset(&bad_cmd, 0, sizeof(bad_cmd));
+    bad_cmd.address     = 0x05;
+    bad_cmd.integrity   = OSDP_INTEGRITY_CRC;
+    bad_cmd.sequence    = 3;
+    bad_cmd.has_scb     = true;
+    bad_cmd.scb_length  = OSDP_SCB_MIN_LEN;
+    bad_cmd.scb_type    = OSDP_SCS_15;
+    bad_cmd.code        = OSDP_CMD_TEXT;
+    bad_cmd.payload     = text_payload;
+    bad_cmd.payload_len = sizeof(text_payload);
+
+    uint8_t bad_wire[64]; size_t bad_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &bad_cmd,
+                           bad_wire, sizeof(bad_wire), &bad_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, bad_wire, bad_wire_len);
+    m.incoming_len = bad_wire_len;
+    osdp_pd_tick(&pd);
+
+    /* Decode and unwrap the NAK on the ACU side so its chain advances. */
+    osdp_frame_t nak_reply;
+    decode_first_outgoing(&m, &nak_reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, nak_reply.scb_type);
+    uint8_t nak_plain[16]; size_t nak_plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &nak_reply,
+                             nak_plain, sizeof(nak_plain), &nak_plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK,        nak_reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNKNOWN_CMD,  nak_plain[0]);
+
+    /* Clear the outgoing buffer so the next assertion sees only the
+     * follow-up reply, not the NAK we just consumed. */
+    m.outgoing_len = 0;
+
+    /* Step 2: send a valid POLL with SQN=0 (next SQN per spec wraparound
+     * 3 → 0 → 1 ...; ACUConsole observed in the wild uses SQN bits
+     * 0x0e here, which is SQN=2 — the absolute value doesn't matter
+     * for this test, only that it differs from the NAK's SQN). The
+     * PD must reply SCS_16 ACK and the wrap chain must verify. */
+    osdp_frame_t poll_cmd;
+    (void)memset(&poll_cmd, 0, sizeof(poll_cmd));
+    poll_cmd.address    = 0x05;
+    poll_cmd.integrity  = OSDP_INTEGRITY_CRC;
+    poll_cmd.sequence   = 0;
+    poll_cmd.has_scb    = true;
+    poll_cmd.scb_length = OSDP_SCB_MIN_LEN;
+    poll_cmd.scb_type   = OSDP_SCS_15;
+    poll_cmd.code       = OSDP_CMD_POLL;
+
+    uint8_t poll_wire[64]; size_t poll_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll_cmd,
+                           poll_wire, sizeof(poll_wire), &poll_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, poll_wire, poll_wire_len);
+    m.incoming_len = poll_wire_len;
+    osdp_pd_tick(&pd);
+
+    /* The PD must speak. If we silently drop here, the live ACU times
+     * out and restarts the whole SC session. */
+    TEST_ASSERT_GREATER_THAN_size_t(0, m.outgoing_len);
+
+    osdp_frame_t ack_reply;
+    decode_first_outgoing(&m, &ack_reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, ack_reply.scb_type);
+
+    uint8_t ack_plain[16]; size_t ack_plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &ack_reply,
+                             ack_plain, sizeof(ack_plain), &ack_plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, ack_reply.code);
+    TEST_ASSERT_EQUAL_size_t(0, ack_plain_len);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -712,5 +907,9 @@ int main(void)
     RUN_TEST(test_scs_17_encrypted_round_trip);
     RUN_TEST(test_scs_15_unknown_command_yields_scs_16_nak);
     RUN_TEST(test_scs_15_with_tampered_mac_drops_silently);
+    /* Regression: same-SQN-different-bytes must process fresh. */
+    RUN_TEST(test_scs_15_different_cmd_same_sqn_processes_fresh);
+    /* Regression: post-NAK chain. */
+    RUN_TEST(test_scs_15_nak_then_valid_poll_chains_correctly);
     return UNITY_END();
 }

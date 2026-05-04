@@ -145,35 +145,65 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
     return (br == OSDP_OK) ? built : 0;
 }
 
-/* Cache `pd->tx_buf[0..len]` as the reply we just sent for sequence
- * number `seq`, so a retransmit can replay it. */
-static void cache_reply(osdp_pd_t *pd, uint8_t seq, size_t len)
+/* Cache the command we just accepted alongside the reply we just
+ * built, so a future byte-identical retransmit can replay the reply
+ * without re-executing the command (spec 5.9). Frames whose raw
+ * bytes don't fit in our cache (oversized commands) are simply not
+ * cached — they'll always be processed fresh, which is conservative
+ * and correct. */
+static void cache_reply(osdp_pd_t          *pd,
+                        const osdp_frame_t *cmd,
+                        size_t              reply_len)
 {
-    if (len > sizeof(pd->last_reply)) {
+    if (reply_len > sizeof(pd->last_reply)) {
         /* Should be impossible — tx_buf and last_reply are the same
          * size — but guard anyway. */
-        len = sizeof(pd->last_reply);
+        reply_len = sizeof(pd->last_reply);
     }
-    if (len > 0) {
-        (void)memcpy(pd->last_reply, pd->tx_buf, len);
+    if (reply_len > 0) {
+        (void)memcpy(pd->last_reply, pd->tx_buf, reply_len);
     }
-    pd->last_reply_len = len;
-    pd->last_seq       = seq;
-    pd->have_last      = true;
+    pd->last_reply_len = reply_len;
+
+    /* Cache the inbound command's wire bytes for retransmit detection.
+     * If raw isn't available or is too large, skip caching the cmd —
+     * the next frame will then bypass the cache and process fresh. */
+    if (cmd->raw != NULL && cmd->raw_len > 0 &&
+        cmd->raw_len <= sizeof(pd->last_cmd)) {
+        (void)memcpy(pd->last_cmd, cmd->raw, cmd->raw_len);
+        pd->last_cmd_len = cmd->raw_len;
+    } else {
+        pd->last_cmd_len = 0;
+    }
+
+    pd->last_seq  = cmd->sequence;
+    pd->have_last = true;
+}
+
+/* True iff `cmd` is byte-identical to the previously accepted command,
+ * which per spec 5.9 is the unambiguous marker of a retransmit. SQN
+ * zero is the session-reset sentinel and never counts as a retransmit
+ * regardless of cache contents. */
+static bool is_retransmit(const osdp_pd_t    *pd,
+                          const osdp_frame_t *cmd)
+{
+    if (cmd->sequence == 0 || !pd->have_last) {
+        return false;
+    }
+    if (pd->last_cmd_len == 0 || cmd->raw == NULL) {
+        return false;
+    }
+    if (cmd->raw_len != pd->last_cmd_len) {
+        return false;
+    }
+    return memcmp(pd->last_cmd, cmd->raw, cmd->raw_len) == 0;
 }
 
 /* Process one accepted command frame: dispatch, build reply, cache,
- * transmit. Honours the SQN retransmit semantics from spec 5.9. */
+ * transmit. Honours the byte-identical retransmit rule from spec 5.9. */
 static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
-    /* Retransmit detection: same non-zero SQN as the previous accepted
-     * command means the ACU is asking us to repeat our last reply
-     * without re-executing the command. SQN zero is the session-reset
-     * sentinel and is always processed fresh. */
-    if (cmd->sequence != 0 &&
-        pd->have_last &&
-        cmd->sequence == pd->last_seq)
-    {
+    if (is_retransmit(pd, cmd)) {
         if (pd->last_reply_len > 0) {
             send_bytes(pd, pd->last_reply, pd->last_reply_len);
         }
@@ -181,7 +211,7 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     }
 
     const size_t built = handle_command_into_tx(pd, cmd);
-    cache_reply(pd, cmd->sequence, built);
+    cache_reply(pd, cmd, built);
     if (built > 0) {
         send_bytes(pd, pd->tx_buf, built);
     }
