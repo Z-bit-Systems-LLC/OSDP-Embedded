@@ -39,6 +39,14 @@ extern "C" {
 #define OSDP_SC_MAC_LEN          16U
 #define OSDP_SC_MAC_TRUNCATED    4U   /* sent on the wire             */
 
+/* Default install-time SCBK ("SCBK-D") per spec section D.4 / page 4090.
+ * "Define the Default SCBK (SCBK-D) for use during installation as the
+ * constant 0x30, 0x31 ... 0x3F (16 bytes inclusive). The SCBK-D shall
+ * be supported by all implementations of OSDP-SC. The SCBK-D will be
+ * known to anyone with the public spec; only PDs in installation mode
+ * are allowed to use the SCBK-D." Linkage is in core/src/sc/keys.c. */
+extern const uint8_t OSDP_SCBK_DEFAULT[OSDP_SC_KEY_LEN];
+
 /* Trio of session keys derived from SCBK + RND.A at the start of an
  * SC session (spec D.4.1). All three are AES-128 keys; the consumer
  * is expected to keep them in memory only as long as the session is

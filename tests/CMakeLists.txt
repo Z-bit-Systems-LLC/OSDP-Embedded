@@ -88,6 +88,14 @@ target_link_libraries(test_pd_sc PRIVATE
     osdp_core osdp_messages osdp_pd sc_test_aes unity)
 add_test(NAME test_pd_sc COMMAND test_pd_sc)
 
+# Capture-replay regression: drive our PD with frames extracted from a
+# real RS-485 SC capture (libosdp-conformance 1.38-4) and require
+# byte-identical responses. Independent-implementation cross-check.
+add_executable(test_capture_replay test_capture_replay.c)
+target_link_libraries(test_capture_replay PRIVATE
+    osdp_core osdp_messages osdp_pd sc_test_aes unity)
+add_test(NAME test_capture_replay COMMAND test_capture_replay)
+
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.
 if(TARGET osdpcap_reader)

@@ -5,6 +5,14 @@
 
 #include <string.h>
 
+/* SCBK-D, the install-time default key, declared extern in osdp_sc.h
+ * and defined here so the linker has exactly one copy. Per spec section
+ * D.4 / page 4090: 0x30, 0x31, 0x32, ... 0x3F (16 bytes inclusive). */
+const uint8_t OSDP_SCBK_DEFAULT[OSDP_SC_KEY_LEN] = {
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+};
+
 /* Build the 16-byte derivation input for a session key. Per spec
  * D.4.1, the layout is:
  *
