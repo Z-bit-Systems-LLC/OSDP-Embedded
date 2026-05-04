@@ -796,6 +796,74 @@ static void test_scs_15_different_cmd_same_sqn_processes_fresh(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNKNOWN_CMD,  plain[0]);
 }
 
+/* ---- Regression: empty reply to SCS_17 cmd uses SCS_16 ------------------
+ *
+ * Reproduces the failure observed against OSDP.Net's ACUConsole on
+ * 2026-05-04: the ACU sends an osdp_OUT under SCS_17 (encrypted, with
+ * the 16-byte output-control payload), expecting an osdp_ACK reply.
+ * Our PD was wrapping the empty ACK as SCS_18, which produces 16 bytes
+ * of all-padding ciphertext (one 0x80 byte plus 15 zero bytes,
+ * encrypted). OSDP.Net's depad logic in IncomingMessage.cs treats that
+ * 0-byte case as a depad failure and rejects the reply, freezing the
+ * SCS chain at the previous SQN.
+ *
+ * Per spec D.1.4 ("SCS_17 and SCS_18 also include encrypted message
+ * DATA"), the encrypted-payload SCB types are reserved for messages
+ * with actual data to encrypt. Empty replies (ACK, etc.) belong under
+ * SCS_16 even when the command came in under SCS_17. The PD's MAC
+ * chain still rolls correctly either way, but SCS_16 is more spec-
+ * aligned and interoperates with OSDP.Net. */
+static void test_scs_17_cmd_with_empty_reply_uses_scs_16(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* SCS_17-wrapped POLL: SQN=3, no payload from the cmd side either,
+     * but the SCB type is SCS_17 (encrypted). Our default test handler
+     * returns ACK with no payload — the empty case. */
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address    = 0x05;
+    cmd_template.integrity  = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence   = 3;
+    cmd_template.has_scb    = true;
+    cmd_template.scb_length = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type   = OSDP_SCS_17;
+    cmd_template.code       = OSDP_CMD_POLL;
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+    osdp_pd_tick(&pd);
+
+    /* Decode the reply. The PD must have used SCS_16 (not SCS_18) for
+     * the empty ACK, even though the inbound was SCS_17. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    /* Plain (no encryption): payload is right there as the wire bytes,
+     * and for an ACK that means zero. */
+    TEST_ASSERT_EQUAL_size_t(0, reply.payload_len);
+
+    /* And the chain still works — verify the ACU side can unwrap it. */
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(0, plain_len);
+}
+
 /* ---- Regression: post-NAK chain stays in sync ----------------------------
  *
  * Companion to the bytes-vs-SQN test above. After the PD emits a NAK
@@ -909,6 +977,8 @@ int main(void)
     RUN_TEST(test_scs_15_with_tampered_mac_drops_silently);
     /* Regression: same-SQN-different-bytes must process fresh. */
     RUN_TEST(test_scs_15_different_cmd_same_sqn_processes_fresh);
+    /* Regression: empty reply to SCS_17 cmd uses SCS_16, not SCS_18. */
+    RUN_TEST(test_scs_17_cmd_with_empty_reply_uses_scs_16);
     /* Regression: post-NAK chain. */
     RUN_TEST(test_scs_15_nak_then_valid_poll_chains_correctly);
     return UNITY_END();

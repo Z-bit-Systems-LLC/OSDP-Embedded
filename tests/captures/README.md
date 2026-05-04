@@ -78,3 +78,23 @@ spec-mandated NAK 0x05 ("unsupported SCB") rejection path:
 
 Useful as a regression test that an SC-unconfigured PD continues to
 refuse SCB-bearing frames cleanly when paired with an independent ACU.
+
+### `acuconsole-out-empty-reply-failure.osdpcap`
+
+Live `osdp-pd-mock` (with `--sc=scbkd`) ↔ `ACUConsole` capture. SC
+handshake completes; ID and CAP exchanges succeed; then the ACU sends
+an `osdp_OUT` (output-control, code 0x68) under SCS_17. Our PD wraps
+the empty-payload `osdp_ACK` reply under SCS_18 (16 bytes of all-
+padding ciphertext). OSDP.Net's depad logic in `IncomingMessage.cs`
+treats that as a depad failure and rejects the reply, so its
+sequence number doesn't advance — the capture shows the PD locked at
+SQN=2 with the ACU retransmitting the same POLL frame ~35 times until
+it times out and restarts the SC handshake.
+
+The fix lives on the PD side: per spec D.1.4 ("SCS_17 and SCS_18 also
+include encrypted message DATA"), empty replies belong under SCS_16
+even when the inbound was SCS_17. With the fix landed in
+`pd/src/pd_sc.c`, the same OUT command produces a SCS_16 ACK that
+OSDP.Net accepts cleanly. Captured here as a regression artefact;
+test coverage is in `tests/test_pd_sc.c
+::test_scs_17_cmd_with_empty_reply_uses_scs_16`.

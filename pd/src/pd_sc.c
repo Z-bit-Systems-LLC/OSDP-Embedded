@@ -277,12 +277,6 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
                                 plaintext, plaintext_len, &reply);
     }
 
-    /* Reply SCB type mirrors the inbound: SCS_15 → SCS_16,
-     * SCS_17 → SCS_18. The reply pairs the same encryption mode the
-     * ACU chose for the command. */
-    const uint8_t reply_scb_type =
-        (cmd->scb_type == OSDP_SCS_17) ? OSDP_SCS_18 : OSDP_SCS_16;
-
     osdp_frame_t reply_template;
     (void)memset(&reply_template, 0, sizeof(reply_template));
     reply_template.address     = pd->address;
@@ -291,7 +285,6 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     reply_template.integrity   = cmd->integrity;
     reply_template.has_scb     = true;
     reply_template.scb_length  = OSDP_SCB_MIN_LEN;
-    reply_template.scb_type    = reply_scb_type;
 
     /* Stack storage that lives across the wrap call below; the wrap
      * routine copies the bytes into the output buffer so the lifetime
@@ -308,6 +301,25 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     } else {
         return 0;  /* internal handler error — drop */
     }
+
+    /* Reply SCB type:
+     *
+     *   inbound  payload_len > 0  →  SCS_18 (encrypted reply)
+     *   inbound  payload_len == 0 →  SCS_16 (plain reply with MAC)
+     *   inbound SCS_15            →  SCS_16 (plain reply with MAC)
+     *
+     * Spec D.1.4: "SCS_17 and SCS_18 also include encrypted message
+     * DATA" — i.e. the encrypted-payload SCB types are reserved for
+     * messages that actually carry data. Empty replies (ACK and
+     * similar) belong under SCS_16 even when the command came under
+     * SCS_17. This is more spec-aligned than always pairing
+     * SCS_17→SCS_18, and matches what real-world ACUs (e.g. OSDP.Net's
+     * ACUConsole) accept; some ACUs reject a "fully-padded" decrypted
+     * payload on the depad step. The MAC chain is unaffected by which
+     * SCB type we pick — it rolls regardless. */
+    reply_template.scb_type =
+        (cmd->scb_type == OSDP_SCS_17 && reply_template.payload_len > 0)
+            ? OSDP_SCS_18 : OSDP_SCS_16;
 
     size_t built = 0;
     s = osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session,
