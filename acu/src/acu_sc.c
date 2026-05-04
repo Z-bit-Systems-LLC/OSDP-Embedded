@@ -346,6 +346,33 @@ void osdp_acu_internal_terminate_sc(osdp_acu_t          *acu,
                                     osdp_acu_pd_slot_t  *slot)
 {
     if (slot == NULL) return;
+
+    /* Pick the right event for the slot's prior phase BEFORE we reset
+     * sc_phase below:
+     *
+     *   ESTABLISHED            → SESSION_LOST     (D.1.4 conditions)
+     *   AWAITING_CCRYPT/RMAC_I → HANDSHAKE_FAILED (handshake aborted)
+     *   IDLE                   → no event         (nothing to lose)
+     *
+     * This makes osdp_acu_internal_terminate_sc safe to call from the
+     * 8-second offline handler regardless of the slot's current state. */
+    osdp_acu_sc_event_kind_t kind = OSDP_ACU_SC_EVENT_SESSION_LOST;
+    bool fire = false;
+    switch (slot->sc_phase) {
+    case OSDP_ACU_SC_ESTABLISHED:
+        kind = OSDP_ACU_SC_EVENT_SESSION_LOST;
+        fire = true;
+        break;
+    case OSDP_ACU_SC_AWAITING_CCRYPT:
+    case OSDP_ACU_SC_AWAITING_RMAC_I:
+        kind = OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED;
+        fire = true;
+        break;
+    case OSDP_ACU_SC_IDLE:
+    default:
+        break;
+    }
+
     /* Drop any in-flight command and reset the SQN cache. The next
      * command on this slot will go out plaintext (sc_phase == IDLE)
      * with SQN starting fresh, so the application can re-handshake
@@ -353,13 +380,24 @@ void osdp_acu_internal_terminate_sc(osdp_acu_t          *acu,
     slot->waiting = false;
     slot->next_seq = 0U;
     reset_sc_handshake(slot, /*clear_session*/ true);
-    fire_sc_event(acu, slot->address, OSDP_ACU_SC_EVENT_SESSION_LOST);
+    if (fire) {
+        fire_sc_event(acu, slot->address, kind);
+    }
 }
 
 void osdp_acu_internal_handle_sc_reply(osdp_acu_t          *acu,
                                        osdp_acu_pd_slot_t  *slot,
                                        const osdp_frame_t  *frame)
 {
+    /* Spec 5.9: a SQN=0 reply during an established session signals
+     * the PD wants the ACU to reset (both SQN counter and SC). The
+     * pending_seq mismatch check below would otherwise silently drop
+     * such a frame; catch it explicitly and terminate the session. */
+    if (frame->sequence == 0U) {
+        osdp_acu_internal_terminate_sc(acu, slot);
+        return;
+    }
+
     /* Must be the reply to the command we sent. */
     if (!slot->waiting || frame->sequence != slot->pending_seq) {
         return;

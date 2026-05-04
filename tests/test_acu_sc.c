@@ -964,6 +964,155 @@ static void test_send_command_after_session_loss_uses_plaintext(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, outframe.code);
 }
 
+/* ---- Additional session-loss triggers (spec 5.9 + 5.7) --------------- */
+
+/* Spec 5.9: a PD reply with SQN=0 signals "reset the sequence and
+ * clear any active SC session". Verify a plaintext SQN=0 reply during
+ * an established session tears it down. */
+static void test_sqn_zero_plain_reply_during_established_resets(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    events.call_count = 0;
+    m.outgoing_len = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_send_command(&acu, PD_ADDRESS, OSDP_CMD_POLL, NULL, 0));
+    /* Drain the SCS_15 POLL we just sent so we know the SQN advanced. */
+    osdp_frame_t outframe;
+    decode_next_outgoing(&m, &outframe, NULL);
+
+    /* PD replies with SQN=0 (spec-defined reset signal). Build a
+     * plaintext ACK with sequence=0 and inject it. */
+    osdp_frame_t reply;
+    (void)memset(&reply, 0, sizeof(reply));
+    reply.address   = PD_ADDRESS;
+    reply.reply     = true;
+    reply.sequence  = 0U;          /* the reset sentinel */
+    reply.integrity = OSDP_INTEGRITY_CRC;
+    reply.code      = OSDP_REPLY_ACK;
+    uint8_t buf[16]; size_t built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_frame_build(&reply, buf, sizeof(buf), &built));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, buf, built);
+    m.incoming_len = built;
+    osdp_acu_tick(&acu);
+
+    /* No reply delivered; SESSION_LOST event fired; phase reset. */
+    TEST_ASSERT_EQUAL(0U, replies.call_count);
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_SESSION_LOST, events.last.kind);
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+}
+
+/* Spec 5.9 also applies under SC: a SCS_16/18 reply with SQN=0 during
+ * an established session must terminate the session. The MAC chain
+ * has effectively desynchronized and we have no business continuing. */
+static void test_sqn_zero_sc_reply_during_established_resets(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    events.call_count = 0;
+    m.outgoing_len = 0;
+
+    /* Forge a SCS_16 ACK with sequence=0. We don't bother computing a
+     * matching MAC since we expect the SQN=0 check to fire first,
+     * before MAC verification. */
+    osdp_frame_t reply;
+    (void)memset(&reply, 0, sizeof(reply));
+    reply.address     = PD_ADDRESS;
+    reply.reply       = true;
+    reply.sequence    = 0U;
+    reply.integrity   = OSDP_INTEGRITY_CRC;
+    reply.has_scb     = true;
+    reply.scb_length  = OSDP_SCB_MIN_LEN;
+    reply.scb_type    = OSDP_SCS_16;
+    reply.code        = OSDP_REPLY_ACK;
+    static const uint8_t zero_mac[OSDP_FRAME_MAC_LEN] = {0};
+    reply.mac         = zero_mac;
+    reply.mac_len     = OSDP_FRAME_MAC_LEN;
+    uint8_t buf[64]; size_t built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_frame_build(&reply, buf, sizeof(buf), &built));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, buf, built);
+    m.incoming_len = built;
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_EQUAL(0U, replies.call_count);
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_SESSION_LOST, events.last.kind);
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+}
+
+/* Spec 5.7: 8s without a reply marks the PD offline. If a Secure
+ * Channel session was active, that session also ends and we fire
+ * SESSION_LOST so the application knows to re-handshake. */
+static void test_offline_during_established_fires_session_lost(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0}; reply_capture_t replies = {0};
+    osdp_sc_session_t pd_session;
+    run_handshake_and_mirror_pd(&acu, slots, &t, &m, &events, &replies,
+                                &pd_session);
+    events.call_count = 0;
+
+    /* The mock transport's now_ms is read from m.now_ms; the run-
+     * handshake helper above used now_ms == 0 throughout, so the
+     * slot's last_reply_ms is 0. Advance the clock past the offline
+     * threshold (8000 ms) and tick. */
+    TEST_ASSERT_TRUE(osdp_acu_is_pd_online(&acu, PD_ADDRESS));
+    m.now_ms = OSDP_ACU_OFFLINE_TIMEOUT_MS + 1U;
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_online(&acu, PD_ADDRESS));
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_SESSION_LOST, events.last.kind);
+}
+
+/* If the line goes silent mid-handshake (after CHLNG, before CCRYPT
+ * arrives), the timeout should fire HANDSHAKE_FAILED rather than
+ * SESSION_LOST — there was nothing established to lose. */
+static void test_offline_during_handshake_fires_handshake_failed(void)
+{
+    osdp_acu_t acu; osdp_acu_pd_slot_t slots[1];
+    osdp_acu_transport_t t; mock_transport_t m;
+    sc_event_capture_t events = {0};
+    configure_acu_sc(&acu, slots, &t, &m, &events, NULL);
+
+    /* Send CHLNG so phase becomes AWAITING_CCRYPT. */
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_acu_start_sc_handshake(&acu, PD_ADDRESS, false));
+    /* Mark the slot online by faking a successful prior reply — the
+     * offline scan only fires when the slot was online to begin with.
+     * configure_acu_sc leaves online=false, but the handshake itself
+     * doesn't transition us online (we haven't received any reply
+     * yet). To exercise the offline path we need to flip online=true
+     * directly. The test reaches into the slot here; that's fine for
+     * an internal-state regression check. */
+    slots[0].online        = true;
+    slots[0].last_reply_ms = 0U;
+
+    m.now_ms = OSDP_ACU_OFFLINE_TIMEOUT_MS + 1U;
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_online(&acu, PD_ADDRESS));
+    TEST_ASSERT_FALSE(osdp_acu_is_pd_sc_established(&acu, PD_ADDRESS));
+    TEST_ASSERT_EQUAL(1U, events.call_count);
+    TEST_ASSERT_EQUAL(OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED, events.last.kind);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -984,5 +1133,10 @@ int main(void)
     RUN_TEST(test_mac_failure_terminates_session_and_fires_event);
     RUN_TEST(test_plain_reply_during_established_terminates_session);
     RUN_TEST(test_send_command_after_session_loss_uses_plaintext);
+    /* Additional session-loss triggers (spec 5.9 + 5.7). */
+    RUN_TEST(test_sqn_zero_plain_reply_during_established_resets);
+    RUN_TEST(test_sqn_zero_sc_reply_during_established_resets);
+    RUN_TEST(test_offline_during_established_fires_session_lost);
+    RUN_TEST(test_offline_during_handshake_fires_handshake_failed);
     return UNITY_END();
 }

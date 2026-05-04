@@ -87,6 +87,19 @@ static void process_reply(osdp_acu_t *acu, const osdp_frame_t *frame)
         return;
     }
 
+    /* Spec 5.9: "a PD may respond with SQN zero to indicate the ACU
+     * shall reset the sequence including clearing any secure channel
+     * session that is currently active." A SQN=0 reply during an
+     * ESTABLISHED session is a session-reset signal; tear down. We
+     * gate on ESTABLISHED so the handshake's own SQN=0 echo (CHLNG
+     * → CCRYPT, both at SQN=0 on a fresh slot) doesn't loop back as
+     * a reset. */
+    if (frame->sequence == 0U &&
+        slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+        osdp_acu_internal_terminate_sc(acu, slot);
+        return;
+    }
+
     /* Spec D.1.4: once the secure channel is established, a non-BUSY
      * plaintext reply terminates the session. The PD is misbehaving
      * (or the session got out of sync); reset and let the application
@@ -150,11 +163,21 @@ static void scan_timeouts_and_offline(osdp_acu_t *acu)
             }
         }
 
-        /* Online window. */
+        /* Online window. Spec 5.7: a PD that hasn't responded for
+         * OSDP_ACU_OFFLINE_TIMEOUT_MS is considered offline. If a
+         * Secure Channel session was active, that session also
+         * terminates — encryption synchronization can't be assumed
+         * after a multi-second silence — and we fire SESSION_LOST
+         * (or HANDSHAKE_FAILED, if the slot was mid-handshake when
+         * the line went silent) so the application knows to re-
+         * initialize before resuming traffic. */
         if (slot->online) {
             const uint32_t since = now - slot->last_reply_ms;
             if (since > OSDP_ACU_OFFLINE_TIMEOUT_MS) {
                 slot->online = false;
+                if (slot->sc_phase != OSDP_ACU_SC_IDLE) {
+                    osdp_acu_internal_terminate_sc(acu, slot);
+                }
             }
         }
     }
