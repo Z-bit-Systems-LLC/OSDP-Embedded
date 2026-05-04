@@ -12,6 +12,7 @@
 
 add_executable(osdp-pd-mock
     main.c
+    aes_adapter.c
 )
 
 if(WIN32)
@@ -26,6 +27,7 @@ target_link_libraries(osdp-pd-mock PRIVATE
     osdp_core
     osdp_messages
     osdp_pd
+    tiny_aes
 )
 
 target_include_directories(osdp-pd-mock PRIVATE

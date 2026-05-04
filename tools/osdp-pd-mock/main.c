@@ -21,6 +21,7 @@
  * and prints to stderr. The actual PD library (osdp::pd) and core
  * (osdp::core, osdp::messages) remain freestanding-friendly. */
 
+#include "aes_adapter.h"
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_dispatch.h"
 #include "osdp/osdp_pd.h"
@@ -73,20 +74,6 @@ static const osdp_pdcap_record_t kDefaultPdcap[] = {
     { .function_code = 9,  .compliance_level = 1, .num_objects = 4 }, /* CRC support, etc. */
 };
 #define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
-
-/* ---- Crypto HAL (stdlib rand) --------------------------------------- */
-
-#include <time.h>
-
-/* mock-only AES is not implemented here — Secure Channel needs a real
- * AES primitive. The user supplies one by linking against e.g.
- * mbedTLS, but to keep the tool dependency-free for the no-SC case we
- * stub the encrypt/decrypt callbacks unless --sc was passed. */
-
-/* For now we deliberately don't include an AES implementation in
- * tools/. If --sc is requested without a linked AES, we error out at
- * argument-parsing time; later we can either pull in the test
- * vendored tiny-AES-c or document a build option to link mbedTLS. */
 
 /* ---- Application command handler ------------------------------------ */
 
@@ -284,18 +271,26 @@ static bool parse_args(int argc, char **argv, cli_t *out)
 
 /* ---- Main ------------------------------------------------------------ */
 
+/* Derive the 8-byte cUID from a PDID per spec D.4.3: cUID is the first
+ * 8 bytes of the PDID byte stream (vendor[3] + model + version +
+ * serial[0..2]). */
+static void cuid_from_pdid(const osdp_pdid_t *pdid,
+                           uint8_t out[OSDP_SC_CUID_LEN])
+{
+    uint8_t pdid_bytes[OSDP_PDID_PAYLOAD_BYTES];
+    size_t  built = 0;
+    if (osdp_pdid_build(pdid, pdid_bytes, sizeof(pdid_bytes), &built)
+            != OSDP_OK || built < OSDP_SC_CUID_LEN) {
+        (void)memset(out, 0, OSDP_SC_CUID_LEN);
+        return;
+    }
+    (void)memcpy(out, pdid_bytes, OSDP_SC_CUID_LEN);
+}
+
 int main(int argc, char **argv)
 {
     cli_t cli;
     if (!parse_args(argc, argv, &cli)) return 2;
-
-    if (cli.sc_mode != SC_NONE) {
-        fprintf(stderr,
-                "osdp-pd-mock: --sc requires a linked AES implementation;\n"
-                "this build of the tool does not include one. Use --sc=off\n"
-                "(default) for now.\n");
-        return 2;
-    }
 
     /* Application state for the command callback. */
     app_state_t app;
@@ -321,10 +316,28 @@ int main(int argc, char **argv)
     osdp_pd_set_transport(&pd, &transport);
     osdp_pd_set_command_handler(&pd, app_handler, &app);
 
+    /* Optionally configure Secure Channel. The crypto vtable, the cUID
+     * (derived from our PDID), and the requested key all need to be
+     * set before the first inbound CHLNG / SCRYPT. */
+    if (cli.sc_mode != SC_NONE) {
+        uint8_t cuid[OSDP_SC_CUID_LEN];
+        cuid_from_pdid(&app.pdid, cuid);
+        osdp_pd_set_sc_crypto(&pd, pd_mock_aes_crypto());
+        osdp_pd_set_sc_cuid  (&pd, cuid);
+        if (cli.sc_mode == SC_SCBKD) {
+            osdp_pd_set_sc_scbk_d(&pd, OSDP_SCBK_DEFAULT);
+        } else { /* SC_SCBK_CUSTOM */
+            osdp_pd_set_sc_scbk(&pd, cli.sc_custom_key);
+        }
+    }
+
     fprintf(stderr,
-            "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x"
-            " (Ctrl-C to exit)\n",
-            cli.port, cli.baud, cli.address);
+            "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x,"
+            " SC=%s (Ctrl-C to exit)\n",
+            cli.port, cli.baud, cli.address,
+            cli.sc_mode == SC_NONE   ? "off"
+          : cli.sc_mode == SC_SCBKD  ? "SCBK-D"
+                                     : "SCBK (custom)");
 
     /* Catch Ctrl-C for orderly shutdown. */
     signal(SIGINT, on_signal);

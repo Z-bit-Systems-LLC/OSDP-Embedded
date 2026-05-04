@@ -71,6 +71,15 @@ add_subdirectory(core)
 add_subdirectory(pd)
 add_subdirectory(acu)
 
+# Vendored 3rd-party code shared between tools and tests. Currently
+# just tiny-AES-c (Unlicense / public domain), used as the AES-128 ECB
+# primitive behind osdp_sc_crypto_t for both the SC unit tests and the
+# osdp-pd-mock interop tool. Skipped when neither tests nor tools are
+# being built; embedded targets that bring their own AES never see it.
+if(OSDP_BUILD_TESTS OR OSDP_BUILD_TOOLS)
+    add_subdirectory(vendor)
+endif()
+
 if(OSDP_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()

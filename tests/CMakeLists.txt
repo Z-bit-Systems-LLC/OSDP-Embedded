@@ -51,21 +51,17 @@ target_link_libraries(test_loopback PRIVATE
 add_test(NAME test_loopback COMMAND test_loopback)
 
 # ---- Secure Channel tests --------------------------------------------------
-# A small test-side AES adapter wraps tiny-AES-c (vendored at
-# tests/vendor/tiny-aes/) and exposes it as osdp_sc_crypto_t.
+# A small test-side AES adapter wraps tiny-AES-c (vendored at the
+# top-level vendor/tiny-aes/) and exposes it as osdp_sc_crypto_t.
+# The same tiny_aes static lib is shared with osdp-pd-mock so we don't
+# compile aes.c twice into the same build.
 add_library(sc_test_aes STATIC
     sc_test_aes.c
-    vendor/tiny-aes/aes.c
 )
 target_include_directories(sc_test_aes
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tiny-aes
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(sc_test_aes PUBLIC osdp_core)
-if(NOT MSVC)
-    # tiny-AES-c emits a few warnings on -Wconversion / -Wsign-conversion.
-    target_compile_options(sc_test_aes PRIVATE -w)
-endif()
+target_link_libraries(sc_test_aes PUBLIC osdp_core tiny_aes)
 
 function(osdp_add_sc_test test_name)
     add_executable(${test_name} ${test_name}.c)

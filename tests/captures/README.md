@@ -43,3 +43,38 @@ All 16 distinct OSDP message kinds present in the capture classify with
 known names; every frame validates its CRC. Useful as a regression test
 that the framing layer continues to handle real-world traffic without
 errors as the codebase evolves.
+
+### `acuconsole-poll-id-cap.osdpcap`
+
+Live recording of `osdp-pd-mock` (this repo's tool) running on COM3
+talking to OSDP.Net's `ACUConsole` on COM4 over a com0com pair, no
+Secure Channel. The capture covers the steady-state insecure protocol:
+
+- `osdp_POLL` / `osdp_ACK` loop with proper SQN progression (0 → 1 → 2
+  → 3 → 1 → ...).
+- `osdp_CAP` / `osdp_PDCAP` exchange: `ACUConsole` requests capabilities
+  with `62 00`; the mock responds with its 7-record default cap set
+  (contact monitor, output, card data, LED, audible, text, CRC).
+- `osdp_ID` / `osdp_PDID` exchange: `ACUConsole` requests with `61 00`;
+  the mock responds with its default PDID (vendor "ZBC", model 1,
+  serial 1, firmware 0.1.0).
+
+Recorded by `ACUConsole` 's built-in OSDPCAP writer, so the file uses
+the dash-separated hex dialect (`53-80-08-00-...`) rather than the
+libosdp-conformance space-separated convention. Both dialects parse
+through `tools/osdp-parser/osdpcap.c`.
+
+### `acuconsole-sc-no-key.osdpcap`
+
+Same `osdp-pd-mock` ↔ `ACUConsole` setup, but with `ACUConsole`
+configured to attempt Secure Channel using SCBK-D, while the PD was
+launched WITHOUT `--sc=scbkd`. The capture documents the
+spec-mandated NAK 0x05 ("unsupported SCB") rejection path:
+
+- Bare `osdp_POLL` / `osdp_ACK` warm-up.
+- `osdp_CHLNG` (SCS_11) sent by `ACUConsole`; PD replies with
+  `osdp_NAK` payload `0x05`.
+- `ACUConsole` retries CHLNG several times; PD keeps NAKing.
+
+Useful as a regression test that an SC-unconfigured PD continues to
+refuse SCB-bearing frames cleanly when paired with an independent ACU.
