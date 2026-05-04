@@ -1,8 +1,8 @@
 # OSDP-Embedded
 
 A portable, embedded-friendly implementation of the SIA OSDP (Open Supervised
-Device Protocol) v2.2.2, written in freestanding C11 with a planned Rust
-(`no_std`-compatible) wrapper.
+Device Protocol) v2.2.2, written in freestanding C11 with a `no_std`-compatible
+Rust wrapper on top.
 
 The library is structured so that a Peripheral Device (PD), an Access Control
 Unit (ACU/CP), or a passive bus Monitor can each pull in **only the code they
@@ -112,7 +112,9 @@ tests/
 vendor/                       # 3rd-party code shared between tools and tests
 └── tiny-aes/                 # tiny-AES-c (Unlicense / public domain) —
                               # AES-128 ECB primitive for tests + osdp-pd-mock
-rust/                         # planned: osdp-sys + osdp Rust crates
+rust/                         # Rust workspace
+├── osdp-sys/                 #   raw FFI bindings (no_std), built via cc crate
+└── osdp/                     #   safe wrapper (typed errors, Pd / Acu, examples)
 docs/                         # design docs and plan; spec/ is gitignored
 ```
 
@@ -155,6 +157,31 @@ For a tight embedded build (core only), set both options to `OFF` and
 link the `osdp::core` and `osdp::messages` (and optionally
 `osdp::dispatch`) targets only — no compiler-options or test framework
 get pulled in.
+
+### Rust crates
+
+Two Rust crates under `rust/` wrap the C library:
+
+| Crate       | Layer                                 | `no_std` | Use it when…                                                     |
+| ----------- | ------------------------------------- | -------- | ---------------------------------------------------------------- |
+| `osdp-sys`  | raw FFI (extern fn + `#[repr(C)]`)    | yes      | you want bindings only and will write your own ergonomics        |
+| `osdp`      | safe wrapper (typed errors, traits)   | yes (requires `alloc`) | you want a Rust-shaped API: `Pd`, `Acu`, `frame::decode`, … |
+
+Both crates compile the C sources at build time via the [`cc`
+crate](https://crates.io/crates/cc) — no separate CMake step, no
+`libclang`, and `cargo build --target …` cross-compiles cleanly to
+any target the C library compiles on. Build / test / run the
+loopback example with:
+
+```sh
+cargo build  --manifest-path rust/Cargo.toml
+cargo test   --manifest-path rust/Cargo.toml
+cargo run    --manifest-path rust/Cargo.toml --example loopback
+```
+
+Secure Channel is wired through `osdp-sys` already; the safe-wrapper
+SC API (an `Aes128` trait + key configuration) is on the roadmap in
+[docs/PLAN.md](docs/PLAN.md).
 
 ### Inspecting a capture
 

@@ -189,11 +189,30 @@ typed message structs. Foundation for both PD and ACU work later.
   our PD and our ACU on cryptogram inputs, key derivation, frame layout,
   or MAC chain advancement shows up here.
 
-## Iteration 4+ — Optional extensions (not yet planned)
+## Iteration 4 — Rust adapter (in progress)
+
+- ☑ **`osdp-sys` crate.** Raw FFI bindings to every public symbol in
+  `core/`, `pd/`, and `acu/`. `no_std`, hand-written, checked in. Build
+  via the `cc` crate so `cargo build --target …` cross-compiles
+  cleanly. Six smoke tests verify CRC, checksum, frame round-trip, and
+  struct layout for `osdp_pd_t` / `osdp_acu_t` (catches ABI mismatches).
+- ☑ **`osdp` safe wrapper crate** (plaintext). Typed `Error` /
+  `Result`; `frame::decode` / `frame::build` with a borrowed
+  `Frame<'a>`; `pd::Pd` and `acu::Acu` with `Transport` /
+  `CommandHandler` / `ReplyHandler` / `TimeoutHandler` traits.
+  `examples/loopback.rs` demonstrates a full Pd↔Acu round-trip
+  in-process (POLL→ACK and ID→PDID, byte-identical end to end).
+- ☐ **Secure Channel in the safe wrapper.** Add an `Aes128` trait,
+  per-PD key configuration, and the SC event handler. FFI is already
+  in `osdp-sys`; the wrapper just needs the trait-object glue.
+- ☐ **Per-message codec wrappers.** `osdp::messages::Pdid::decode`
+  etc., on top of the existing `osdp_*_decode` / `osdp_*_build` FFI.
+- ☐ **Publishing** to crates.io (post-stabilization).
+
+## Iteration 5+ — Optional extensions (not yet planned)
 
 - File transfer, biometric, keypad extensions, manufacturer-specific
   commands, multi-part messages, certifiable test harness.
-- Rust wrapper crate hardening + publishing.
 - Full-capture replay: extend `test_capture_replay` from the handshake
   alone (SCS_11..14) to all 592 frames in `sc-monitor-current.osdpcap`,
   including SCS_15..18 operational traffic.
