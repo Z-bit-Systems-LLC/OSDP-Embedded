@@ -138,9 +138,19 @@ static int hex_digit(char c)
     return -1;
 }
 
-/* Decode a hex-with-interspersed-whitespace string into raw bytes.
+/* True for any byte that legitimately separates two hex pairs. We
+ * accept whitespace (libosdp-conformance dialect: " 53 80 ...") and
+ * dashes (OSDP.Net ACUConsole dialect: "53-80-..."), since both styles
+ * appear in the wild. */
+static int is_hex_sep(char c)
+{
+    return is_ws(c) || c == '-';
+}
+
+/* Decode a hex-with-interspersed-separators string into raw bytes.
  * Each byte is exactly two hex digits adjacent to each other; arbitrary
- * whitespace is allowed between bytes (including leading/trailing). */
+ * whitespace and dashes are allowed between bytes (including leading
+ * and trailing). */
 static osdpcap_status_t decode_hex(const char *src,
                                    uint8_t *dst, size_t cap,
                                    size_t *written)
@@ -148,7 +158,7 @@ static osdpcap_status_t decode_hex(const char *src,
     *written = 0;
     const char *p = src;
     for (;;) {
-        while (*p && is_ws(*p)) {
+        while (*p && is_hex_sep(*p)) {
             p++;
         }
         if (!*p) {

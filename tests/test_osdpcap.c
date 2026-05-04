@@ -114,6 +114,43 @@ static void test_parse_tolerates_arbitrary_whitespace_in_data(void)
     TEST_ASSERT_EQUAL_HEX8(0x60, r.data[2]);
 }
 
+/* OSDP.Net's ACUConsole emits captures with dash-separated hex bytes
+ * (e.g. "53-00-08-00-04-60-EB-AA") instead of the libosdp-conformance
+ * convention of " 53 00 08 ..." with leading-space + space-separated.
+ * Both are common in the wild; the parser accepts either. */
+static void test_parse_handles_dash_separated_data(void)
+{
+    osdpcap_record_t r;
+    static const char line[] =
+        "{\"timeSec\":\"1777904629\",\"timeNano\":\"794233800\","
+        "\"io\":\"output\","
+        "\"data\":\"53-00-08-00-04-60-EB-AA\","
+        "\"osdpTraceVersion\":\"1\","
+        "\"osdpSource\":\"ACUConsole\"}\n";
+    TEST_ASSERT_EQUAL(OSDPCAP_OK, osdpcap_parse_line(line, &r));
+    TEST_ASSERT_EQUAL_size_t(8, r.data_len);
+    static const uint8_t expected[] = {
+        0x53, 0x00, 0x08, 0x00, 0x04, 0x60, 0xEB, 0xAA
+    };
+    TEST_ASSERT_EQUAL_MEMORY(expected, r.data, sizeof(expected));
+    TEST_ASSERT_EQUAL_STRING("ACUConsole", r.source);
+}
+
+/* Mixed separators (whitespace and dashes interleaved) — accept rather
+ * than reject; the wire bytes are unambiguous either way. */
+static void test_parse_handles_mixed_separators(void)
+{
+    osdpcap_record_t r;
+    TEST_ASSERT_EQUAL(OSDPCAP_OK,
+                      osdpcap_parse_line(
+                          "{\"data\":\"53-80 08-00\"}\n", &r));
+    TEST_ASSERT_EQUAL_size_t(4, r.data_len);
+    TEST_ASSERT_EQUAL_HEX8(0x53, r.data[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x80, r.data[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x08, r.data[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, r.data[3]);
+}
+
 static void test_parse_rejects_odd_hex_digits(void)
 {
     osdpcap_record_t r;
@@ -178,6 +215,8 @@ int main(void)
     RUN_TEST(test_parse_accepts_zero_byte_data);
     RUN_TEST(test_parse_handles_uppercase_and_lowercase_hex);
     RUN_TEST(test_parse_tolerates_arbitrary_whitespace_in_data);
+    RUN_TEST(test_parse_handles_dash_separated_data);
+    RUN_TEST(test_parse_handles_mixed_separators);
     RUN_TEST(test_parse_rejects_odd_hex_digits);
     RUN_TEST(test_parse_field_order_is_irrelevant);
     RUN_TEST(test_parse_accepts_bare_numeric_time_fields);
