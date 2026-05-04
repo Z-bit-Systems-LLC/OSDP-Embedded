@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+[package]
+name        = "osdp-sys"
+description = "Raw FFI bindings to the OSDP-Embedded C library"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+# `links` tells cargo about the native library so it can prevent two
+# different crates from linking the same C symbols into one binary.
+links       = "osdp_embedded"
+build       = "build.rs"
+
+# Bindings are hand-written and live in `src/lib.rs`. The build script
+# uses the `cc` crate to compile every .c file in core/src, pd/src and
+# acu/src into one static archive. No bindgen / libclang dependency,
+# which keeps embedded cross-builds friction-free.
+[lib]
+name = "osdp_sys"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"

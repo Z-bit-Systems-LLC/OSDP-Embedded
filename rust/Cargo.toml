@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# OSDP-Embedded — Rust workspace.
+#
+# Two-crate split, matching the common -sys/safe-wrapper convention used
+# by zlib-sys/flate2, openssl-sys/openssl, etc:
+#
+#   - `osdp-sys`: raw FFI bindings to the C core. no_std. No policy, no
+#     ergonomics — anything spelled the way the C header spells it.
+#   - `osdp`: safe Rust wrapper. Provides idiomatic types around the
+#     state machines and codecs. Delegates every operation to
+#     `osdp-sys`; never reimplements protocol logic in Rust.
+#
+# Both crates are no_std-by-default. Optional `alloc` and `std` features
+# in the safe wrapper enable closure-based callbacks and standard error
+# trait integration; the bare API works on bare-metal targets without
+# any allocator.
+[workspace]
+resolver = "2"
+members  = [
+    "osdp-sys",
+    # "osdp" — added in a follow-up commit. Members must compile, so
+    # we land them one at a time.
+]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2021"
+license       = "GPL-3.0-or-later"
+authors       = ["Z-bit Systems, LLC"]
+repository    = "https://github.com/Z-bit-Systems-LLC/OSDP-Embedded"
+rust-version  = "1.70"
