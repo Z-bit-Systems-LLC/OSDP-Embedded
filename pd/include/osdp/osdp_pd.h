@@ -32,23 +32,20 @@ extern "C" {
  *         // ... cooperative scheduling / sleep / wfi
  *     }
  *
- * Iteration 2 phase 1 scope:
+ * Capabilities:
  *   - Address filtering (accept own address + broadcast 0x7F).
  *   - Stream-decoder integration (auto-resync, CRC/checksum validation).
- *   - Application command handler invoked on each accepted command.
- *   - Reply built and emitted via transport.write().
+ *   - Application command handler invoked on each accepted command;
+ *     reply is built and emitted via transport.write().
  *   - Echoes inbound sequence number / address / integrity mode in
  *     the reply, per spec section 5.9.
- *   - Refuses Secure Channel frames with NAK 0x05 (SC arrives in
- *     iteration 3).
- *
- * Iteration 2 phase 2 scope:
- *   - Sequence number policing per spec 5.9 Table 2: when the ACU
- *     retransmits a command with the same non-zero SQN, the PD
- *     resends its cached reply without re-invoking the application
- *     handler. SQN zero always processes fresh (session reset).
- *
- * Iteration 2 phase 3 scope:
+ *   - Sequence number policing per spec 5.9 Table 2: a frame BYTE-
+ *     IDENTICAL to the previous accepted command is treated as a
+ *     retransmit and the cached reply is replayed without re-invoking
+ *     the application handler. SQN-only matching is insufficient
+ *     because of OSDP's 1→2→3→1 cyclic counter; comparing wire bytes
+ *     handles wraparound and the OSDP.Net-style "ACU resets state but
+ *     reuses SQN" edge case correctly.
  *   - Online / offline state tracking per spec 5.7: the PD considers
  *     itself offline after OSDP_PD_OFFLINE_TIMEOUT_MS without a
  *     successfully transmitted reply. On the offline transition the
@@ -56,33 +53,28 @@ extern "C" {
  *     Requires the transport to provide a `now_ms` callback; without
  *     one the timeout is disabled and the PD is "online" after first
  *     successful reply.
- *
- * Iteration 3 phase 3a scope:
- *   - Optional Secure Channel handshake (SCS_11 → SCS_12, SCS_13 →
- *     SCS_14). When the application has supplied a crypto vtable, an
- *     SCBK and/or SCBK-D, and a cUID, the PD accepts inbound CHLNG /
- *     SCRYPT commands, generates RND.B, derives session keys, and
- *     computes the Client Cryptogram and Initial R-MAC. After SCS_14
- *     the session struct's `established` flag flips true and both
- *     MAC chain entries are seeded with the Initial R-MAC. Without
- *     SC configuration the PD continues to NAK SCB-bearing frames
- *     with code 0x05 as before.
- *
- * Iteration 3 phase 3b scope (this commit):
- *   - SCS_15..18 operational traffic. With an established session,
- *     SCS_15 and SCS_17 commands are unwrapped (MAC verified, payload
- *     decrypted for SCS_17) and dispatched through the existing
- *     osdp_pd_command_cb. Replies are wrapped to the matching reply
- *     SCB type (SCS_15 → SCS_16, SCS_17 → SCS_18). The application
- *     handler is unchanged from the non-SC case — it sees plaintext
- *     command codes and payload bytes either way.
+ *   - Optional Secure Channel: when the application supplies a crypto
+ *     vtable, an SCBK and/or SCBK-D, and a cUID via osdp_pd_set_sc_*,
+ *     the PD accepts inbound CHLNG / SCRYPT and drives the SCS_11..14
+ *     handshake. After SCS_14 the session struct's `established` flag
+ *     flips true and both MAC chain entries are seeded with the
+ *     Initial R-MAC. SCS_15 and SCS_17 commands are then unwrapped
+ *     (MAC verified, payload decrypted for SCS_17) and dispatched
+ *     through the same osdp_pd_command_cb the non-SC path uses — the
+ *     application sees plaintext command codes and payload bytes
+ *     either way. Replies are wrapped under SCS_16 by default,
+ *     SCS_18 when the reply has a non-empty payload (the encryption
+ *     decision is keyed off payload length per spec D.1.4 and is
+ *     enforced inside osdp_sc_wrap_frame). Without SC configuration
+ *     the PD continues to NAK SCB-bearing frames with code 0x05.
  *
  * Deferred for subsequent commits:
- *   - Session loss / reset handling per spec D.1.4.
  *   - Inter-character timeout policing.
  *   - Multi-record reply convenience helpers (currently the app
  *     flat-buffers).
- */
+ *   - PD-side session-loss tracking (the ACU side handles spec D.1.4
+ *     conditions today; the PD currently relies on the offline
+ *     timeout to notice when something went wrong). */
 
 /* ---- Transport HAL ------------------------------------------------------*/
 

@@ -19,61 +19,93 @@ extern "C" {
  * Counterpart of osdp::pd. The ACU initiates commands toward one or
  * more PDs sharing a half-duplex bus, manages per-PD sequence numbers,
  * times out unanswered commands, and routes accepted replies to the
- * application via a callback.
+ * application via callbacks.
  *
  * Like osdp::pd, this layer remains freestanding: no malloc, no
  * globals, no I/O of its own. The consumer supplies a transport (RS-485
  * UART, TCP, in-process loopback for tests) via a callback vtable plus
- * a reply handler.
+ * reply / timeout / SC-event handlers.
  *
- * Iteration 2 phase 4 scope (this commit):
+ * Capabilities:
+ *
  *   - Caller-allocated PD slot array (no allocation, multi-PD supported).
  *   - Explicit send_command API; the application drives polling.
  *   - One outstanding command per PD at a time. Issuing a second
- *     command while a reply is pending returns OSDP_ERR_BUSY-like
- *     INVALID_ARG; future iterations may queue.
+ *     command while a reply is pending returns OSDP_ERR_NOT_SUPPORTED
+ *     (the current "busy" sentinel; future iterations may queue).
  *   - Sequence number management per spec 5.9 Table 2: starts at 0
- *     for the first command on a fresh PD slot, then 1->2->3->1->...
+ *     for the first command on a fresh PD slot, then 1→2→3→1→…
  *     Successful reply advances; timeout retains the SQN so a retry
  *     re-uses it.
- *   - Reply timeout = REPLY_DELAY_MS (default 200, per spec 5.7).
- *     On timeout the application's timeout handler is invoked and the
- *     PD's pending state is cleared so a retry can be issued.
- *   - Per-PD online tracking: PD is online while it has produced a
- *     reply within OSDP_ACU_OFFLINE_TIMEOUT_MS.
+ *   - Reply timeout = OSDP_ACU_REPLY_TIMEOUT_MS (200 ms, spec 5.7).
+ *   - Per-PD online tracking: a PD is online while it has produced a
+ *     reply within OSDP_ACU_OFFLINE_TIMEOUT_MS (8 s, spec 5.7).
+ *   - Optional Secure Channel: per-PD opt-in via osdp_acu_set_pd_scbk*
+ *     plus a shared AES + RNG vtable bound on the ACU. See "Secure
+ *     Channel lifecycle" below.
  *
- * Iteration 3 phase 5a scope:
- *   - Optional Secure Channel handshake initiation. With one shared
- *     crypto vtable bound on the ACU and per-PD key material (SCBK or
- *     SCBK-D), the application can call osdp_acu_start_sc_handshake()
- *     to drive the SCS_11..14 sequence. The ACU sends CHLNG, consumes
- *     the CCRYPT reply (validates Client Cryptogram, captures cUID +
- *     RND.B), sends SCRYPT, consumes the RMAC_I reply (validates the
- *     Initial R-MAC), and fires the application's sc_event callback
- *     with OSDP_ACU_SC_EVENT_ESTABLISHED on success or
- *     OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED on any cryptographic
- *     mismatch. CCRYPT and RMAC_I never reach the reply_cb — they're
- *     consumed by the handshake state machine internally.
+ * ---- Secure Channel lifecycle ------------------------------------------
  *
- * Iteration 3 phase 5b scope (this commit):
- *   - Operational SCS_15..18 traffic. Once a slot's handshake has
- *     completed, every osdp_acu_send_command toward that PD is
- *     automatically wrapped: under SCS_17 when the command carries a
- *     payload, under SCS_15 when it's empty (the SCB selection is
- *     enforced by osdp_sc_wrap_frame). The application sends and
- *     receives plaintext; the SCB type, MAC, and payload encryption
- *     are transparent. Inbound SCS_16 / SCS_18 replies are unwrapped
- *     before being delivered via reply_cb.
- *   - Session-loss detection. Per spec D.1.4, an established session
- *     terminates if a reply arrives with a valid CRC but a MAC
- *     mismatch, or if a non-BUSY plaintext reply arrives. The slot
- *     transitions back to IDLE and OSDP_ACU_SC_EVENT_SESSION_LOST
- *     fires; the application may re-handshake at will.
+ * Each PD slot has an `sc_phase` field tracking the handshake state:
  *
- * Deferred for subsequent commits:
+ *     IDLE → AWAITING_CCRYPT → AWAITING_RMAC_I → ESTABLISHED
+ *      ↑__________________________________________|
+ *                   (on session loss)
+ *
+ * The application drives the transition IDLE → AWAITING_CCRYPT by
+ * calling osdp_acu_start_sc_handshake(pd_addr, use_default_key). The
+ * ACU sends osdp_CHLNG immediately and tick() drives the rest:
+ *
+ *   start_sc_handshake → emits SCS_11 CHLNG with RND.A
+ *   tick consumes SCS_12 CCRYPT
+ *     ⊕ validates Client Cryptogram
+ *     ⊕ on match, emits SCS_13 SCRYPT with Server Cryptogram
+ *     ⊕ on mismatch, fires HANDSHAKE_FAILED, returns to IDLE
+ *   tick consumes SCS_14 RMAC_I
+ *     ⊕ checks sec_blk_data[0] (0x01 ok / 0xFF PD-rejected SCRYPT)
+ *     ⊕ validates Initial R-MAC against locally-derived expected
+ *     ⊕ on success: seeds session.last_outbound_mac =
+ *                   session.last_inbound_mac = Initial R-MAC,
+ *                   transitions to ESTABLISHED, fires ESTABLISHED
+ *     ⊕ on any failure: fires HANDSHAKE_FAILED, returns to IDLE
+ *
+ * CCRYPT and RMAC_I are consumed silently by the handshake state
+ * machine — they never appear in the application's reply_cb. The
+ * application only learns the outcome through sc_event_cb.
+ *
+ * Once ESTABLISHED, every osdp_acu_send_command on that slot is
+ * automatically wrapped — there is no per-command opt-out. Inbound
+ * SCS_16 / SCS_18 replies are unwrapped before being delivered via
+ * reply_cb (always plaintext to the application).
+ *
+ * ---- Session-loss conditions -------------------------------------------
+ *
+ * An established session terminates (slot returns to IDLE; the next
+ * command on that slot goes plaintext until the application
+ * re-handshakes) on any of these events:
+ *
+ *   • A SCS_16 / SCS_18 reply has a valid CRC but its MAC fails to
+ *     verify (spec D.1.4: "encryption synchronization has been lost").
+ *   • A non-BUSY plaintext reply arrives during ESTABLISHED (D.1.4:
+ *     "any message sent without a SCB other than osdp_BUSY terminates
+ *     the session").
+ *   • A reply arrives with sequence number 0 during ESTABLISHED (5.9:
+ *     "a PD may respond with SQN zero to indicate the ACU shall reset
+ *     the sequence including clearing any secure channel session").
+ *   • The PD goes silent for OSDP_ACU_OFFLINE_TIMEOUT_MS (5.7).
+ *     Encryption synchronization can't be assumed across multi-second
+ *     silence.
+ *
+ * Each fires OSDP_ACU_SC_EVENT_SESSION_LOST. If the same offline
+ * timeout fires while the slot is mid-handshake (AWAITING_CCRYPT or
+ * AWAITING_RMAC_I) the event is OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED
+ * instead — there was nothing established to lose.
+ *
+ * ---- Deferred ----------------------------------------------------------
+ *
  *   - Auto-poll scheduling (ACU sending POLL on a per-PD interval).
- *   - In-process PD<->ACU integration tests (phase 6).
- *   - Multi-command queueing per PD. */
+ *   - Multi-command queueing per PD.
+ *   - In-process PD↔ACU loopback integration test (phase 6). */
 
 /* ---- Tuning constants ---------------------------------------------------*/
 

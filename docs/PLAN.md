@@ -91,7 +91,7 @@ typed message structs. Foundation for both PD and ACU work later.
 - ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic
   capture playback for testing PD/ACU state machines.
 
-## Iteration 3 — Secure Channel (in progress)
+## Iteration 3 — Secure Channel (in progress, only loopback test left)
 
 - ☑ **Phase 1: Crypto HAL** (`osdp_sc_crypto.h`). Single-block AES-128
   ECB encrypt + optional decrypt + optional `rand_bytes`, supplied by
@@ -137,11 +137,22 @@ typed message structs. Foundation for both PD and ACU work later.
   port, configurable via CLI flags or `OSDP_INTEROP_PD_PORT`.
   Pluggable Win32 (`serial_win.c`) and POSIX (`serial_posix.c`)
   serial adapters selected by CMake; the `pd/` library itself stays
-  freestanding. Intended pairing: Z-bit Systems' OSDP.Net `ACUConsole`
-  over a null-modem cable or a com0com pair. Secure-channel mode over
-  the serial path is pending an AES-vendoring decision (likely
-  promoting tiny-AES-c to a top-level vendor dir so both tests and
-  tools share one copy).
+  freestanding. SC mode (`--sc=scbkd` / `--sc=scbk:HEX32`) is wired
+  through a tiny tools-side AES adapter that links the shared
+  `vendor/tiny-aes/` static library. **Validated live against
+  Z-bit Systems' OSDP.Net `ACUConsole`** over a com0com pair: full
+  POLL/ID/CAP exchange, SC handshake, operational SCS_15..18
+  traffic. Two real-world bugs surfaced and fixed during that
+  testing:
+  - The PD's SQN cache was matching on SQN alone, replaying a stale
+    reply when the ACU sent two consecutive commands with the same
+    SQN (an OSDP.Net error-recovery quirk). Fixed by comparing wire
+    bytes per spec 5.9 ("byte-identical" retransmits).
+  - The PD was wrapping empty replies as SCS_18 (all-padding
+    ciphertext); OSDP.Net's depad logic rejected this. Fixed by
+    centralizing the "empty payload uses SCS_15/16" rule in
+    `osdp_sc_wrap_frame`. Live captures saved as regression
+    fixtures in `tests/captures/acuconsole-*.osdpcap`.
 - ☑ **Phase 5a: ACU handshake.** `osdp::acu` initiates SCS_11..14 via
   `osdp_acu_start_sc_handshake(pd_addr, use_default_key)` — fire-and-
   forget. The ACU sends CHLNG, consumes CCRYPT (validates the Client
@@ -156,10 +167,15 @@ typed message structs. Foundation for both PD and ACU work later.
   — SCS_17 by default, coerced to SCS_15 for empty payloads. Inbound
   SCS_16 / SCS_18 replies are unwrapped before being delivered via
   `reply_cb` (plaintext). The application sees plaintext throughout;
-  encryption/MAC are transparent. Per spec D.1.4, an established
-  session terminates on either MAC verification failure or a non-BUSY
-  plaintext reply, firing `OSDP_ACU_SC_EVENT_SESSION_LOST`; the slot
-  returns to IDLE and the application may re-handshake at will.
+  encryption / MAC are transparent. Session-loss detection covers all
+  spec-mandated termination conditions:
+    - MAC verification fails on an inbound SCS_16/18 (D.1.4).
+    - Non-BUSY plaintext reply during ESTABLISHED (D.1.4).
+    - PD reply with SQN=0 during ESTABLISHED (5.9 reset signal).
+    - PD goes silent for 8 s during ESTABLISHED or mid-handshake (5.7).
+  Each fires either `OSDP_ACU_SC_EVENT_SESSION_LOST` or
+  `OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED` (depending on prior phase) and
+  the slot returns to IDLE; the application may re-handshake at will.
 - ☐ **Phase 6: PD↔ACU SC loopback integration test.** Both real state
   machines wired together, full handshake plus operational traffic
   in-process.

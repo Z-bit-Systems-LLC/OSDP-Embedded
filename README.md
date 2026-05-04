@@ -10,16 +10,43 @@ actually need** — no malloc, no globals, no OS dependencies in the core.
 
 ## Project status
 
-**Iteration 1 — Decoder.** Take raw OSDP bytes (e.g. captured from a bus
-sniffer or logic analyzer) and decode them into typed message structs. No
-transmit path, no state machine, no Secure Channel yet. See [docs/PLAN.md](docs/PLAN.md)
-for the phased roadmap.
+**Iterations 1–3 done.** The library now covers:
+
+- **Layer 1 framing** — encode and decode every OSDP frame variant
+  (plain, with-SCB, MAC-bearing, encrypted-payload). Round-trips a
+  592-frame `libosdp-conformance` Secure Channel capture byte-for-byte.
+- **Per-message codecs** for the v2.2 baseline command/reply set
+  (POLL, ID, CAP, LED, BUZ, OUT, TEXT, COMSET on the ACU side; ACK,
+  NAK, PDID, PDCAP, RAW, KEYPAD, COM on the PD side), plus the SC
+  handshake messages (CHLNG, SCRYPT, CCRYPT, RMAC_I).
+- **PD-side state machine** (`osdp::pd`): address filtering,
+  sequence-number policing with byte-identical retransmit detection,
+  online/offline tracking, optional Secure Channel handshake +
+  operational SCS_15..18.
+- **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
+  per-PD SQN, reply/timeout callbacks, optional Secure Channel
+  handshake (fire-and-forget) and operational SCS_15..18 with
+  automatic session-loss detection per spec D.1.4 / 5.7 / 5.9.
+- **Live interop verified** against both
+  [libosdp-conformance](https://github.com/Security-Industry-Association/libosdp-conformance)
+  (via byte-level capture replay in tests) and Z-bit Systems'
+  [OSDP.Net](https://github.com/Z-bit-Systems-LLC/OSDP.Net) `ACUConsole`
+  (over a com0com null-modem pair, exercising POLL/ID/CAP plus SC).
+
+See [docs/PLAN.md](docs/PLAN.md) for the phased roadmap and what's still
+in progress.
 
 The included `osdp-parser` CLI consumes
 [OSDPCAP-format](https://github.com/Security-Industry-Association/libosdp-conformance/blob/master/doc/doc-src/osdpcap-format.md)
-captures (JSON-Lines, as produced by `libosdp-conformance` and similar
-tools) and prints a one-line summary per frame. Drop captures into
-`tests/captures/` to register them as integration tests automatically.
+captures (JSON-Lines) — both the libosdp-conformance space-separated
+dialect and OSDP.Net's dash-separated dialect — and prints a one-line
+summary per frame. Drop captures into `tests/captures/` to register
+them as integration tests automatically.
+
+The included `osdp-pd-mock` CLI runs an `osdp::pd` instance on a real
+or virtual serial port (Win32 or POSIX), with optional Secure Channel
+(`--sc=scbkd` or `--sc=scbk:HEX32`). Useful for live interop validation
+against a hardware ACU, OSDP.Net's `ACUConsole`, etc.
 
 ## Architecture at a glance
 
@@ -27,21 +54,26 @@ The core library is split by **message direction**, not by role:
 
 | Target           | Contents                                                           | Linked by         |
 | ---------------- | ------------------------------------------------------------------ | ----------------- |
-| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API           | everything        |
+| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API, Secure Channel primitives (key derivation, cryptograms, custom CBC-MAC, AES-CBC payload encrypt/decrypt, frame wrap/unwrap) | everything |
 | `osdp::messages` | One TU per command and per reply, each containing model + decoder + builder | PD, ACU, Monitor |
 | `osdp::dispatch` | Optional switch-router from frame → typed message; pulls all codecs | Monitor only      |
-| `osdp::pd`       | PD-side state machine: address filtering, command handler dispatch, sequence-number policing, online/offline tracking | PD applications |
-| `osdp::acu`      | ACU-side state machine: multi-PD registration, command issuance, reply/timeout callbacks, sequence-number progression | ACU applications |
+| `osdp::pd`       | PD-side state machine: address filtering, command handler dispatch, sequence-number policing (byte-identical retransmit detection), online/offline tracking, optional Secure Channel handshake + operational SCS_15..18 | PD applications |
+| `osdp::acu`      | ACU-side state machine: multi-PD registration, command issuance, reply/timeout callbacks, sequence-number progression, optional Secure Channel handshake (fire-and-forget) + operational SCS_15..18 with session-loss detection | ACU applications |
 
 A PD or ACU application calls per-message codec functions directly
 (`osdp_led_decode`, `osdp_pdid_build`, etc.) and lets the linker garbage-collect
 everything it doesn't reference. A Monitor links `osdp::dispatch` to decode
 arbitrary traffic without writing its own switch.
 
-Role-specific concerns — RS-485 transport, polling schedules, sequence numbers,
-PD-side responder state — live **above** the core in iteration 2+
-(`pd/`, `acu/`, `monitor/` peers of `core/`), not in this initial decoder
-release.
+Secure Channel is opt-in: a PD or ACU application that doesn't bind a
+crypto vtable + key material via the `osdp_*_set_sc_*` API behaves
+exactly like the iteration-2 (insecure) build, and the AES + RNG code
+isn't pulled into the link. When SC is enabled, the consumer supplies
+the AES-128 ECB primitive and the RNG via callbacks (`osdp_sc_crypto_t`)
+— the core never vendors a crypto implementation. Tests use a vendored
+copy of [tiny-AES-c](https://github.com/kokke/tiny-AES-c) (Unlicense /
+public domain) at `vendor/tiny-aes/`; production builds typically bind
+mbedTLS, hardware AES, or `BCryptGenRandom` / `/dev/urandom`.
 
 See [CLAUDE.md](CLAUDE.md) for the full set of architectural constraints and
 coding rules.
@@ -69,6 +101,9 @@ tests/
 ├── vendor/unity/             # vendored Unity test framework
 ├── captures/                 # drop *.osdpcap files here for integration tests
 └── test_*.c                  # Unity-based unit tests, run on host
+vendor/                       # 3rd-party code shared between tools and tests
+└── tiny-aes/                 # tiny-AES-c (Unlicense / public domain) —
+                              # AES-128 ECB primitive for tests + osdp-pd-mock
 rust/                         # planned: osdp-sys + osdp Rust crates
 docs/                         # design docs and plan; spec/ is gitignored
 ```

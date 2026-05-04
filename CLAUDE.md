@@ -36,42 +36,59 @@ seems to need a change, raise it explicitly with the user first.
    `src/dispatch/` and are linked only when the consumer wants bulk
    routing (e.g. a Monitor).
 7. **Build system: CMake.** Test framework: **Unity** (vendored).
-8. **Scope: OSDP v2.2 baseline command/reply set.** Secure Channel, file
-   transfer, biometric, and similar extensions are deferred to later
-   iterations.
-9. **Iteration 1 is decoder-only.** No transmit path, no state machine, no
-   Secure Channel. See [docs/PLAN.md](docs/PLAN.md).
+8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel.**
+   Currently implemented: Layer 1 framing, the baseline command/reply
+   set, PD-side state machine (with SC), ACU-side state machine (with
+   SC). Still deferred: file transfer, biometric, manufacturer-specific
+   commands, multi-part messages. See [docs/PLAN.md](docs/PLAN.md) for
+   what's done and what's next.
 
 ## Module layout
 
 ```
 core/include/osdp/
   osdp_types.h        # shared types, error codes, enums
-  osdp_frame.h        # Layer 1 framing
+  osdp_frame.h        # Layer 1 framing (incl. SCB types SCS_11..18)
   osdp_stream.h       # streaming push decoder
   osdp_commands.h     # all command models + per-message prototypes
   osdp_replies.h      # all reply models + per-message prototypes
   osdp_dispatch.h     # optional bulk dispatch helpers
+  osdp_sc_crypto.h    # AES-128 ECB + RNG HAL (consumer-supplied)
+  osdp_sc.h           # Secure Channel primitives: keys, cryptograms,
+                      # MAC, CBC, payload, frame wrap/unwrap
 
 core/src/
   shared/             # crc16.c, checksum.c, frame.c, stream.c — always linked
   commands/           # cmd_<name>.c — model + decode + build per command
   replies/            # reply_<name>.c — model + decode + build per reply
   dispatch/           # opt-in bulk routing; references every codec
+  sc/                 # keys.c, mac.c, cbc.c, payload.c, session.c,
+                      # wrap.c — Secure Channel primitives
 
 pd/                   # role-specific state machine for the PD side
   include/osdp/osdp_pd.h
-  src/pd.c
+  src/pd.c            # baseline state machine (address, SQN, online)
+  src/pd_sc.c         # SC handshake (SCS_11..14) + operational SCS_15..18
+  src/pd_internal.h
   CMakeLists.txt      # exports osdp::pd
 
 acu/                  # role-specific state machine for the ACU side
   include/osdp/osdp_acu.h
-  src/acu.c
+  src/acu.c           # baseline state machine (slots, SQN, timeouts)
+  src/acu_sc.c        # SC handshake + operational SC + session-loss
+  src/acu_internal.h
   CMakeLists.txt      # exports osdp::acu
 
 tools/
-  osdp-parser/        # host-side CLI: OSDPCAP reader + Monitor pipeline
-                      # (osdpcap.{c,h} + main.c). Built when
+  osdp-parser/        # host CLI: OSDPCAP reader + Monitor pipeline.
+                      # Built when OSDP_BUILD_TOOLS=ON.
+  osdp-pd-mock/       # host CLI: live PD on a serial port (Win32 +
+                      # POSIX adapters). Used for interop validation
+                      # against external ACUs (OSDP.Net, hardware).
+
+vendor/               # 3rd-party code shared between tools and tests.
+  tiny-aes/           # tiny-AES-c (Unlicense / public domain).
+                      # Only built when OSDP_BUILD_TESTS=ON or
                       # OSDP_BUILD_TOOLS=ON.
 
 tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
@@ -173,16 +190,57 @@ references only one of them, the other gets GC'd.
   add at least one round-trip test (decode → re-build → byte-compare) and
   at least one negative test (truncated, bad CRC, bad command code).
 
+## Secure Channel conventions
+
+Secure Channel (osdp_CHLNG / osdp_SCRYPT / osdp_CCRYPT / osdp_RMAC_I,
+SCS_11..18, AES-128 session keys, custom CBC-MAC) is fully implemented
+in `core/src/sc/`, `pd/src/pd_sc.c`, and `acu/src/acu_sc.c`. The core
+exposes the cryptographic primitives behind `osdp_sc_crypto_t` — the
+consumer supplies AES-128 ECB encrypt + decrypt + RNG callbacks; the
+library never vendors a crypto implementation. A few project-wide rules
+that aren't explicit in the spec:
+
+- **SCS_15/16 for empty messages, SCS_17/18 for data-bearing** (spec
+  D.1.4 interpretation: "SCS_17 and SCS_18 also include encrypted
+  message DATA"). Empty replies / commands always use the plaintext-
+  with-MAC variant. `osdp_sc_wrap_frame` enforces this by coercing
+  SCS_17→SCS_15 and SCS_18→SCS_16 when `payload_len == 0`, so callers
+  can pick the encrypted variant generically and it Does The Right
+  Thing.
+- **SQN cache must compare wire bytes, not just SQN.** The OSDP SQN
+  cycles 1→2→3→1→…, so a mere SQN match is not sufficient evidence
+  of a retransmit. Byte-identical bytes = retransmit (per spec 5.9);
+  same SQN with different bytes = a new command and must process
+  fresh. Implemented in `pd/src/pd.c::is_retransmit`.
+- **ACU session-loss conditions** (any one terminates the SC session,
+  fires `OSDP_ACU_SC_EVENT_SESSION_LOST` or `_HANDSHAKE_FAILED`, and
+  resets the slot to IDLE; the application can re-handshake at will):
+  - MAC verification fails on an inbound SCS_16/18 (D.1.4).
+  - A non-BUSY plaintext reply arrives during ESTABLISHED (D.1.4).
+  - The PD replies with SQN=0 during ESTABLISHED (5.9 reset signal).
+  - The PD goes silent for `OSDP_ACU_OFFLINE_TIMEOUT_MS` (5.7).
+  - During the handshake itself: bad Client Cryptogram in CCRYPT, or
+    `sec_blk_data[0] == 0xFF` in RMAC_I, or the offline timeout fires
+    while still in `AWAITING_*`.
+
 ## Out of scope (do not introduce without explicit user approval)
 
-- Dynamic memory allocation anywhere in `core/`.
-- OS / RTOS calls (threading, mutexes, sleeps, file I/O) in `core/`.
-- Secure Channel (osdp_SCRYPT, osdp_KEYSET, AES-128 session, MAC).
-- File transfer, biometric, manufacturer-specific commands.
-- State machines or transport layers — those belong in `pd/`, `acu/`,
-  `monitor/` peer trees added in later iterations.
-- A vendored crypto library — when SC arrives, it goes behind a HAL the
-  consumer fulfills (e.g. mbedTLS on host, hardware AES on MCU).
+- Dynamic memory allocation anywhere in `core/`, `pd/`, or `acu/`.
+- OS / RTOS calls (threading, mutexes, sleeps, file I/O) in `core/`,
+  `pd/`, or `acu/`. Tools (`tools/osdp-pd-mock`, ...) are exempt by
+  design — they're host-only.
+- A vendored crypto library inside `core/`. The consumer supplies the
+  AES + RNG primitives via the `osdp_sc_crypto_t` HAL. Tests and
+  `tools/osdp-pd-mock` use tiny-AES-c (vendor/tiny-aes/, Unlicense)
+  but production binaries are expected to bind their own (mbedTLS,
+  hardware AES, BCryptGenRandom / /dev/urandom, etc.).
+- File transfer, biometric, manufacturer-specific commands, multi-
+  part / multi-record messages, PIV data exchange.
+- KEYSET command end-to-end handling beyond a basic ACK (changing the
+  SCBK at runtime, re-handshake after KEYSET — these are valid future
+  work but haven't been implemented).
+- Auto-poll scheduling on the ACU (the application currently drives
+  every command).
 
 ## When in doubt
 
