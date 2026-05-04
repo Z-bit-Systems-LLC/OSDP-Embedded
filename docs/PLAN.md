@@ -91,7 +91,7 @@ typed message structs. Foundation for both PD and ACU work later.
 - ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic
   capture playback for testing PD/ACU state machines.
 
-## Iteration 3 — Secure Channel (in progress, only loopback test left)
+## Iteration 3 — Secure Channel (done)
 
 - ☑ **Phase 1: Crypto HAL** (`osdp_sc_crypto.h`). Single-block AES-128
   ECB encrypt + optional decrypt + optional `rand_bytes`, supplied by
@@ -176,9 +176,18 @@ typed message structs. Foundation for both PD and ACU work later.
   Each fires either `OSDP_ACU_SC_EVENT_SESSION_LOST` or
   `OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED` (depending on prior phase) and
   the slot returns to IDLE; the application may re-handshake at will.
-- ☐ **Phase 6: PD↔ACU SC loopback integration test.** Both real state
-  machines wired together, full handshake plus operational traffic
-  in-process.
+- ☑ **Phase 6: PD↔ACU SC loopback integration test.** Both real state
+  machines wired together via a shared in-memory wire (`tests/test_loopback_sc.c`).
+  Verifies the four-frame handshake (CHLNG / CCRYPT / SCRYPT / RMAC_I)
+  completes with both peers reporting "established"; POLL→ACK round-trips
+  under SCS_15/16; ID→PDID and CAP→PDCAP round-trip under SCS_17/18 with
+  encrypted payloads; an 8-command POLL/CAP mix advances the rolling MAC
+  chain without drift; tampering one MAC byte in flight tears the ACU's
+  session down and fires SESSION_LOST; offline-during-established and
+  post-loss plaintext fallback both behave per spec. This is the
+  strongest correctness check we have for SC: any disagreement between
+  our PD and our ACU on cryptogram inputs, key derivation, frame layout,
+  or MAC chain advancement shows up here.
 
 ## Iteration 4+ — Optional extensions (not yet planned)
 

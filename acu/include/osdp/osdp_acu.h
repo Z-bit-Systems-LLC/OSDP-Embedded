@@ -104,8 +104,7 @@ extern "C" {
  * ---- Deferred ----------------------------------------------------------
  *
  *   - Auto-poll scheduling (ACU sending POLL on a per-PD interval).
- *   - Multi-command queueing per PD.
- *   - In-process PD↔ACU loopback integration test (phase 6). */
+ *   - Multi-command queueing per PD. */
 
 /* ---- Tuning constants ---------------------------------------------------*/
 

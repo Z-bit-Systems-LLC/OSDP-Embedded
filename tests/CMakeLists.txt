@@ -91,6 +91,16 @@ target_link_libraries(test_acu_sc PRIVATE
     osdp_core osdp_messages osdp_acu sc_test_aes unity)
 add_test(NAME test_acu_sc COMMAND test_acu_sc)
 
+# PD↔ACU SC loopback (phase 6). Both real state machines wired through
+# a shared in-memory wire, full handshake plus operational SCS_15..18
+# traffic in-process. Strongest correctness check we have for SC: any
+# disagreement on cryptogram inputs, key derivation, frame layout or
+# MAC chain advancement shows up here.
+add_executable(test_loopback_sc test_loopback_sc.c)
+target_link_libraries(test_loopback_sc PRIVATE
+    osdp_core osdp_messages osdp_pd osdp_acu sc_test_aes unity)
+add_test(NAME test_loopback_sc COMMAND test_loopback_sc)
+
 # Capture-replay regression: drive our PD with frames extracted from a
 # real RS-485 SC capture (libosdp-conformance 1.38-4) and require
 # byte-identical responses. Independent-implementation cross-check.
