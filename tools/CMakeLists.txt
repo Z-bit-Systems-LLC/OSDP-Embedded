@@ -5,3 +5,4 @@
 # its own subdirectory and is built only when OSDP_BUILD_TOOLS is ON.
 add_subdirectory(osdp-parser)
 add_subdirectory(osdp-pd-mock)
+add_subdirectory(osdp-acu-mock)

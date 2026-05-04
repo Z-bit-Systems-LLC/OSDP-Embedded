@@ -48,6 +48,12 @@ or virtual serial port (Win32 or POSIX), with optional Secure Channel
 (`--sc=scbkd` or `--sc=scbk:HEX32`). Useful for live interop validation
 against a hardware ACU, OSDP.Net's `ACUConsole`, etc.
 
+The companion `osdp-acu-mock` CLI runs an `osdp::acu` instance on a
+serial port, driving an external PD (OSDP.Net's `PDConsole`, a
+hardware PD, or another `osdp-pd-mock` over a com0com pair). Closes
+the symmetric interop loop: pd-mock validates our PD against
+third-party ACUs, acu-mock validates our ACU against third-party PDs.
+
 ## Architecture at a glance
 
 The core library is split by **message direction**, not by role:
@@ -95,7 +101,9 @@ acu/                          # ACU-side state machine + transport HAL
 └── ...                       # exports osdp::acu
 tools/
 ├── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
-└── osdp-pd-mock/             # live PD on a serial port; pair with any ACU
+├── osdp-pd-mock/             # live PD on a serial port; pair with any ACU
+│                             # for interop validation
+└── osdp-acu-mock/            # live ACU on a serial port; pair with any PD
                               # for interop validation
 tests/
 ├── vendor/unity/             # vendored Unity test framework
@@ -181,6 +189,24 @@ small default capability set, and ACKs LED / BUZ / OUT / TEXT /
 COMSET / KEYSET. Run with `--help` for the full flag set. Secure
 Channel mode (`--sc=scbkd`) is pending an AES-vendoring decision in
 this build of the tool.
+
+`osdp-acu-mock` is the companion tool that runs an `osdp::acu` on a
+serial port and drives an external PD. It auto-sends ID once, CAP
+once, then POLL on a configurable interval (default 500 ms) and
+prints decoded replies / SC events / timeouts to stderr. SC mode is
+identical to the PD tool (`--sc=scbkd` or `--sc=scbk:HEX32`); on
+session loss it auto-restarts the handshake so a PD reboot doesn't
+require restarting the ACU process.
+
+```sh
+# Drive a PD at address 0 on COM3 with the default install key:
+$env:OSDP_INTEROP_ACU_PORT = "COM3"
+build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 --sc=scbkd -v
+
+# Plaintext mode (no SC), faster polling:
+build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 \
+    --poll-interval 200 -v
+```
 
 ## Reference material
 
