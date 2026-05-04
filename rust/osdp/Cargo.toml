@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+[package]
+name        = "osdp"
+description = "Safe Rust wrapper around the OSDP-Embedded C library"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+# The safe wrapper requires `alloc` for trait-object based callbacks
+# (Box<dyn Transport> etc); it remains no_std-compatible. The default
+# `std` feature only adds `std::error::Error` impls and `Send` markers
+# where they're sound.
+[features]
+default = ["std"]
+std     = []
+
+[dependencies]
+osdp-sys = { path = "../osdp-sys", version = "0.1.0" }
+
+[lib]
+name = "osdp"
+path = "src/lib.rs"

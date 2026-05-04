@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Z-bit Systems, LLC
+
+//! PD-side state machine.
+//!
+//! Wraps `osdp::pd` (the C library's `osdp_pd_*` API) behind two
+//! traits:
+//!
+//!   - [`Transport`] — read / write / now_ms callbacks for the wire.
+//!   - [`CommandHandler`] — application logic that turns inbound
+//!     commands into outbound replies.
+//!
+//! The wrapper boxes both trait objects on the heap and threads thin
+//! `*mut c_void` pointers into the C side; the boxes are kept alive
+//! for the lifetime of the [`Pd`] and dropped automatically when it
+//! is.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use osdp::pd::{Pd, Transport, CommandHandler, Reply};
+//! use osdp_sys::{OSDP_CMD_POLL, OSDP_REPLY_ACK};
+//!
+//! struct MyTransport;
+//! impl Transport for MyTransport {
+//!     fn read(&mut self, buf: &mut [u8]) -> usize { 0 }
+//!     fn write(&mut self, _buf: &[u8]) -> usize { 0 }
+//!     fn now_ms(&mut self) -> Option<u32> { None }
+//! }
+//!
+//! struct MyHandler;
+//! impl CommandHandler for MyHandler {
+//!     fn handle(&mut self, code: u8, _payload: &[u8]) -> osdp::Result<Reply<'_>> {
+//!         match code {
+//!             OSDP_CMD_POLL => Ok(Reply { code: OSDP_REPLY_ACK, payload: &[] }),
+//!             _             => Err(osdp::Error::NotSupported),
+//!         }
+//!     }
+//! }
+//!
+//! let mut pd = Pd::new(0x10);
+//! pd.set_transport(MyTransport);
+//! pd.set_command_handler(MyHandler);
+//! pd.tick();
+//! ```
+
+use alloc::boxed::Box;
+use core::ffi::c_int;
+use core::ffi::c_void;
+use core::mem::MaybeUninit;
+use core::ptr;
+use core::slice;
+
+use osdp_sys as sys;
+
+use crate::error::{Error, Result};
+
+/// Wire-side I/O. The PD calls these from inside [`Pd::tick`].
+///
+/// `read` returns 0 on idle (no bytes available). Negative returns are
+/// reserved for future error reporting; for now, return 0 on any
+/// transient error. Bytes returned should belong to the slice the
+/// caller provided.
+///
+/// `write` returns the byte count successfully written; a short write
+/// is treated as a transmission error by the PD.
+///
+/// `now_ms` is optional. If `None`, online/offline tracking is
+/// disabled and the PD is "online" forever once it has sent a reply.
+pub trait Transport: 'static {
+    fn read (&mut self, buf: &mut [u8]) -> usize;
+    fn write(&mut self, buf: &[u8])     -> usize;
+    fn now_ms(&mut self) -> Option<u32>;
+}
+
+/// What the application wants to send back for an inbound command.
+/// Borrowed payload — the bytes are copied into the PD's TX scratch
+/// before [`CommandHandler::handle`] returns, so the buffer can be
+/// short-lived.
+pub struct Reply<'a> {
+    pub code:    u8,
+    pub payload: &'a [u8],
+}
+
+/// Application-level command handler. Called by [`Pd::tick`] for each
+/// accepted inbound command.
+///
+/// Return:
+///   - `Ok(reply)` — the PD will frame and transmit `reply`.
+///   - `Err(Error::NotSupported)` — the PD will send NAK 0x03 (Unknown
+///     Command Code).
+///   - any other `Err(...)` — the PD treats it as an internal error
+///     and drops the command silently.
+pub trait CommandHandler: 'static {
+    fn handle<'a>(
+        &'a mut self,
+        cmd_code: u8,
+        payload:  &[u8],
+    ) -> Result<Reply<'a>>;
+}
+
+// ---- Internal storage ---------------------------------------------------
+//
+// Each trait object is wrapped in a `Box<dyn Trait>`. We need the
+// stored value to be a thin pointer so it survives the round-trip
+// through `*mut c_void`, hence the outer `Box<…>`.
+
+type TransportBox       = Box<dyn Transport>;
+type CommandHandlerBox  = Box<dyn CommandHandler>;
+
+/// PD context. Owns the C state plus any user-supplied trait objects.
+///
+/// Drop-safe: when [`Pd`] is dropped, the contained boxes are freed.
+pub struct Pd {
+    /// The C-side context. Heap-allocated because it's ~2.5 KB and we
+    /// want a stable address (the C side stores `*mut osdp_pd_t`
+    /// internally during set_transport / set_command_handler).
+    inner: Box<sys::osdp_pd_t>,
+    /// Held alive for the lifetime of `self`. The C side keeps a raw
+    /// `*mut c_void` derived from this box's heap address.
+    transport:    Option<Box<TransportBox>>,
+    cmd_handler:  Option<Box<CommandHandlerBox>>,
+}
+
+impl Pd {
+    /// Create a fresh PD listening on `address` (7-bit, 0x00..0x7E).
+    /// Address 0x7F (broadcast) is implicitly accepted.
+    pub fn new(address: u8) -> Self {
+        let mut inner = Box::<sys::osdp_pd_t>::new(unsafe { MaybeUninit::zeroed().assume_init() });
+        unsafe { sys::osdp_pd_init(&mut *inner, address) };
+        Self {
+            inner,
+            transport: None,
+            cmd_handler: None,
+        }
+    }
+
+    /// Bind a transport. Replaces any previously-set transport (the
+    /// old one is dropped).
+    pub fn set_transport<T: Transport>(&mut self, transport: T) {
+        // Move into a Box<dyn Transport> first, then box THAT to get a
+        // thin pointer suitable for round-tripping through *mut c_void.
+        let boxed: Box<TransportBox> = Box::new(Box::new(transport));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        let c_transport = sys::osdp_pd_transport_t {
+            read:   Some(transport_read_thunk),
+            write:  Some(transport_write_thunk),
+            now_ms: Some(transport_now_ms_thunk),
+            user:   user_ptr,
+        };
+        unsafe { sys::osdp_pd_set_transport(&mut *self.inner, &c_transport) };
+
+        // Reclaim ownership of the box. Its heap location doesn't
+        // change; user_ptr remains valid for as long as we hold the
+        // box, which is exactly the lifetime of `self`.
+        self.transport = Some(unsafe { Box::from_raw(user_ptr as *mut TransportBox) });
+    }
+
+    /// Bind the application command handler. Replaces any previously-
+    /// set handler (the old one is dropped).
+    pub fn set_command_handler<H: CommandHandler>(&mut self, handler: H) {
+        let boxed: Box<CommandHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            sys::osdp_pd_set_command_handler(
+                &mut *self.inner,
+                Some(command_handler_thunk),
+                user_ptr,
+            );
+        }
+
+        self.cmd_handler = Some(unsafe { Box::from_raw(user_ptr as *mut CommandHandlerBox) });
+    }
+
+    /// Pump the state machine: drain inbound bytes, dispatch any
+    /// complete commands to the handler, send replies. Idempotent and
+    /// non-blocking; call from the main loop.
+    pub fn tick(&mut self) {
+        unsafe { sys::osdp_pd_tick(&mut *self.inner) };
+    }
+
+    /// True iff the PD has sent at least one reply within the last
+    /// 8 seconds. Always false for a fresh `Pd` until a reply lands.
+    pub fn is_online(&self) -> bool {
+        unsafe { sys::osdp_pd_is_online(&*self.inner) }
+    }
+}
+
+// `osdp::pd` is single-threaded by design (no internal locks). Don't
+// expose Send/Sync; the user can wrap a Pd in a Mutex if they need to
+// share ownership across threads.
+
+// ---- Thunks ------------------------------------------------------------
+//
+// Translate a C-ABI callback into a Rust trait method invocation.
+
+unsafe extern "C" fn transport_read_thunk(
+    user: *mut c_void,
+    buf:  *mut u8,
+    cap:  usize,
+) -> c_int {
+    let storage = &mut *(user as *mut TransportBox);
+    let slice = slice::from_raw_parts_mut(buf, cap);
+    storage.read(slice) as c_int
+}
+
+unsafe extern "C" fn transport_write_thunk(
+    user: *mut c_void,
+    buf:  *const u8,
+    len:  usize,
+) -> c_int {
+    let storage = &mut *(user as *mut TransportBox);
+    let slice = slice::from_raw_parts(buf, len);
+    storage.write(slice) as c_int
+}
+
+unsafe extern "C" fn transport_now_ms_thunk(user: *mut c_void) -> u32 {
+    let storage = &mut *(user as *mut TransportBox);
+    storage.now_ms().unwrap_or(0)
+}
+
+unsafe extern "C" fn command_handler_thunk(
+    user:        *mut c_void,
+    cmd_code:    u8,
+    payload:     *const u8,
+    payload_len: usize,
+    reply:       *mut sys::osdp_pd_reply_t,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut CommandHandlerBox);
+    let payload_slice = if payload_len == 0 || payload.is_null() {
+        &[][..]
+    } else {
+        slice::from_raw_parts(payload, payload_len)
+    };
+
+    match storage.handle(cmd_code, payload_slice) {
+        Ok(reply_value) => {
+            let r = &mut *reply;
+            r.code        = reply_value.code;
+            r.payload_len = reply_value.payload.len();
+            r.payload     = if reply_value.payload.is_empty() {
+                ptr::null()
+            } else {
+                reply_value.payload.as_ptr()
+            };
+            sys::osdp_status_t::OSDP_OK
+        }
+        Err(e) => e.to_status(),
+    }
+}
+
+// ---- Drop impl ---------------------------------------------------------
+
+impl Drop for Pd {
+    fn drop(&mut self) {
+        // The C side stores raw *mut c_void user pointers into our
+        // boxes. Clear the C-side callbacks first so a stray tick
+        // can't fire after we drop the boxes — defensive, since
+        // `Pd` shouldn't be tick'd from another thread.
+        unsafe {
+            // Detach the command handler with NULL.
+            sys::osdp_pd_set_command_handler(&mut *self.inner, None, ptr::null_mut());
+            // Replace the transport with one whose callbacks are NULL
+            // so future tick()s can't dereference our (about to be
+            // dropped) trait objects. We still own the C struct; the
+            // memcpy inside set_transport just overwrites the C-side
+            // copy.
+            let dead = sys::osdp_pd_transport_t {
+                read:   None,
+                write:  None,
+                now_ms: None,
+                user:   ptr::null_mut(),
+            };
+            sys::osdp_pd_set_transport(&mut *self.inner, &dead);
+        }
+        // self.transport / self.cmd_handler drop here, freeing the
+        // boxes. self.inner drops too.
+    }
+}
+
+// Suppress "unused" warning on Error in some configs.
+const _: fn() = || { let _: fn(Error) -> sys::osdp_status_t = Error::to_status; };
