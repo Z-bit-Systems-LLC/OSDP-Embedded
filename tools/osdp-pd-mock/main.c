@@ -81,6 +81,7 @@ typedef struct app_state {
     osdp_pdid_t          pdid;
     osdp_pdcap_record_t  pdcap[16];
     size_t               pdcap_count;
+    uint8_t              address;
     int                  verbose;
 
     /* Scratch for build_* outputs returned to the PD via reply.payload. */
@@ -105,6 +106,34 @@ static const char *cmd_name(uint8_t code)
     }
 }
 
+static const char *reply_name(uint8_t code)
+{
+    switch (code) {
+    case OSDP_REPLY_ACK:    return "ACK";
+    case OSDP_REPLY_NAK:    return "NAK";
+    case OSDP_REPLY_PDID:   return "PDID";
+    case OSDP_REPLY_PDCAP:  return "PDCAP";
+    case OSDP_REPLY_LSTATR: return "LSTATR";
+    case OSDP_REPLY_ISTATR: return "ISTATR";
+    case OSDP_REPLY_OSTATR: return "OSTATR";
+    case OSDP_REPLY_RSTATR: return "RSTATR";
+    case OSDP_REPLY_RAW:    return "RAW";
+    case OSDP_REPLY_KEYPAD: return "KEYPAD";
+    case OSDP_REPLY_COM:    return "COM";
+    case OSDP_REPLY_BUSY:   return "BUSY";
+    case OSDP_REPLY_CCRYPT: return "CCRYPT";
+    case OSDP_REPLY_RMAC_I: return "RMAC_I";
+    default:                return "?";
+    }
+}
+
+static void hex_dump(FILE *f, const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        fprintf(f, "%s%02X", i ? " " : "", buf[i]);
+    }
+}
+
 static osdp_status_t app_handler(void           *user,
                                  uint8_t         cmd_code,
                                  const uint8_t  *payload,
@@ -112,41 +141,45 @@ static osdp_status_t app_handler(void           *user,
                                  osdp_pd_reply_t *reply)
 {
     app_state_t *s = (app_state_t *)user;
-    (void)payload; (void)payload_len;
 
     if (s->verbose >= 1) {
-        fprintf(stderr, "  [cmd 0x%02x %-7s payload_len=%zu]\n",
-                cmd_code, cmd_name(cmd_code), payload_len);
+        fprintf(stderr, "<-- recv   PD 0x%02X  cmd %s",
+                s->address, cmd_name(cmd_code));
+        if (payload_len > 0) {
+            fprintf(stderr, "  payload[%zu]=", payload_len);
+            hex_dump(stderr, payload, payload_len);
+        }
+        fputc('\n', stderr);
     }
 
+    osdp_status_t r = OSDP_OK;
     switch (cmd_code) {
     case OSDP_CMD_POLL:
         reply->code        = OSDP_REPLY_ACK;
         reply->payload     = NULL;
         reply->payload_len = 0;
-        return OSDP_OK;
+        break;
 
     case OSDP_CMD_ID: {
         size_t built = 0;
-        const osdp_status_t r = osdp_pdid_build(&s->pdid, s->scratch,
-                                                sizeof(s->scratch), &built);
-        if (r != OSDP_OK) return OSDP_ERR_BAD_PAYLOAD;
+        r = osdp_pdid_build(&s->pdid, s->scratch,
+                            sizeof(s->scratch), &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
         reply->code        = OSDP_REPLY_PDID;
         reply->payload     = s->scratch;
         reply->payload_len = built;
-        return OSDP_OK;
+        break;
     }
 
     case OSDP_CMD_CAP: {
         size_t built = 0;
-        const osdp_status_t r = osdp_pdcap_build(s->pdcap, s->pdcap_count,
-                                                 s->scratch, sizeof(s->scratch),
-                                                 &built);
-        if (r != OSDP_OK) return OSDP_ERR_BAD_PAYLOAD;
+        r = osdp_pdcap_build(s->pdcap, s->pdcap_count,
+                             s->scratch, sizeof(s->scratch), &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
         reply->code        = OSDP_REPLY_PDCAP;
         reply->payload     = s->scratch;
         reply->payload_len = built;
-        return OSDP_OK;
+        break;
     }
 
     case OSDP_CMD_LED:
@@ -158,11 +191,32 @@ static osdp_status_t app_handler(void           *user,
         reply->code        = OSDP_REPLY_ACK;
         reply->payload     = NULL;
         reply->payload_len = 0;
-        return OSDP_OK;
+        break;
 
     default:
-        return OSDP_ERR_NOT_SUPPORTED;
+        r = OSDP_ERR_NOT_SUPPORTED;
+        break;
     }
+
+    /* Mirror the outbound reply (or framework-synthesized NAK for an
+     * unsupported command) so the user can see both halves of the
+     * exchange. SC handshake / SCS_15..18 wrap-unwrap happen below this
+     * layer and don't surface here. */
+    if (r == OSDP_OK) {
+        fprintf(stderr, "--> reply  PD 0x%02X  cmd %s -> %s",
+                s->address, cmd_name(cmd_code), reply_name(reply->code));
+        if (reply->payload_len > 0) {
+            fprintf(stderr, "  payload[%zu]=", reply->payload_len);
+            hex_dump(stderr, reply->payload, reply->payload_len);
+        }
+        fputc('\n', stderr);
+    } else if (r == OSDP_ERR_NOT_SUPPORTED) {
+        fprintf(stderr,
+                "--> reply  PD 0x%02X  cmd %s -> NAK  nak_code=0x03\n",
+                s->address, cmd_name(cmd_code));
+    }
+
+    return r;
 }
 
 /* ---- CLI -------------------------------------------------------------- */
@@ -298,6 +352,7 @@ int main(int argc, char **argv)
     app.pdid        = kDefaultPdid;
     app.pdcap_count = DEFAULT_PDCAP_COUNT;
     (void)memcpy(app.pdcap, kDefaultPdcap, sizeof(kDefaultPdcap));
+    app.address     = cli.address;
     app.verbose     = cli.verbose;
 
     /* Open the serial port. */
