@@ -35,7 +35,7 @@ pub const SC_CUID_LEN: usize = sys::OSDP_SC_CUID_LEN;
 /// AES-128 block size, also the key size for the symmetric primitives
 /// the C side calls into.
 pub const AES_BLOCK_LEN: usize = sys::OSDP_AES_BLOCK_LEN;
-pub const AES_KEY_LEN:   usize = sys::OSDP_AES_KEY_LEN;
+pub const AES_KEY_LEN: usize = sys::OSDP_AES_KEY_LEN;
 
 /// Default install-time SCBK ("SCBK-D") from spec D.4 — re-export of
 /// `osdp_sys::OSDP_SCBK_DEFAULT`. Known to anyone with the public spec;
@@ -108,7 +108,7 @@ pub(crate) fn build_vtable(crypto: ScCryptoBox) -> (sys::osdp_sc_crypto_t, *mut 
     let v = sys::osdp_sc_crypto_t {
         aes128_ecb_encrypt: Some(aes_encrypt_thunk),
         aes128_ecb_decrypt: Some(aes_decrypt_thunk),
-        rand_bytes:         Some(rand_thunk),
+        rand_bytes: Some(rand_thunk),
         user,
     };
     (v, user)
@@ -119,10 +119,10 @@ pub(crate) fn build_vtable(crypto: ScCryptoBox) -> (sys::osdp_sc_crypto_t, *mut 
 /// with `out`), then dispatch into the trait method.
 unsafe fn run_block_op(
     user: *mut c_void,
-    key:  *const u8,
-    in_:  *const u8,
-    out:  *mut u8,
-    op:   impl FnOnce(
+    key: *const u8,
+    in_: *const u8,
+    out: *mut u8,
+    op: impl FnOnce(
         &mut dyn ScCrypto,
         &[u8; AES_KEY_LEN],
         &[u8; AES_BLOCK_LEN],
@@ -133,8 +133,8 @@ unsafe fn run_block_op(
 
     // Copy key + input out into owned arrays so we can hand &T / &mut T
     // to the trait method without aliasing concerns.
-    let mut key_arr  = [0u8; AES_KEY_LEN];
-    let mut in_arr   = [0u8; AES_BLOCK_LEN];
+    let mut key_arr = [0u8; AES_KEY_LEN];
+    let mut in_arr = [0u8; AES_BLOCK_LEN];
     ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), AES_KEY_LEN);
     ptr::copy_nonoverlapping(in_, in_arr.as_mut_ptr(), AES_BLOCK_LEN);
 
@@ -148,39 +148,35 @@ unsafe fn run_block_op(
         ptr::copy_nonoverlapping(out_arr.as_ptr(), out, AES_BLOCK_LEN);
     }
     match r {
-        Ok(())  => sys::osdp_status_t::OSDP_OK,
-        Err(e)  => e.to_status(),
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
     }
 }
 
 unsafe extern "C" fn aes_encrypt_thunk(
     user: *mut c_void,
-    key:  *const u8,
-    in_:  *const u8,
-    out:  *mut u8,
+    key: *const u8,
+    in_: *const u8,
+    out: *mut u8,
 ) -> sys::osdp_status_t {
     run_block_op(user, key, in_, out, |c, k, i, o| c.aes_encrypt(k, i, o))
 }
 
 unsafe extern "C" fn aes_decrypt_thunk(
     user: *mut c_void,
-    key:  *const u8,
-    in_:  *const u8,
-    out:  *mut u8,
+    key: *const u8,
+    in_: *const u8,
+    out: *mut u8,
 ) -> sys::osdp_status_t {
     run_block_op(user, key, in_, out, |c, k, i, o| c.aes_decrypt(k, i, o))
 }
 
-unsafe extern "C" fn rand_thunk(
-    user: *mut c_void,
-    out:  *mut u8,
-    len:  usize,
-) -> sys::osdp_status_t {
+unsafe extern "C" fn rand_thunk(user: *mut c_void, out: *mut u8, len: usize) -> sys::osdp_status_t {
     let storage = &mut *(user as *mut ScCryptoBox);
     let slice = core::slice::from_raw_parts_mut(out, len);
     match storage.rand_bytes(slice) {
-        Ok(())  => sys::osdp_status_t::OSDP_OK,
-        Err(e)  => e.to_status(),
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
     }
 }
 
@@ -205,12 +201,12 @@ pub enum ScEventKind {
 impl ScEventKind {
     fn from_sys(k: sys::osdp_acu_sc_event_kind_t) -> Self {
         match k {
-            sys::osdp_acu_sc_event_kind_t::ESTABLISHED      => Self::Established,
+            sys::osdp_acu_sc_event_kind_t::ESTABLISHED => Self::Established,
             sys::osdp_acu_sc_event_kind_t::HANDSHAKE_FAILED => Self::HandshakeFailed,
-            sys::osdp_acu_sc_event_kind_t::SESSION_LOST     => Self::SessionLost,
+            sys::osdp_acu_sc_event_kind_t::SESSION_LOST => Self::SessionLost,
             // Forward-compatible: any unknown event maps to SessionLost
             // since the slot has already returned to IDLE on the C side.
-            _                                                => Self::SessionLost,
+            _ => Self::SessionLost,
         }
     }
 }
@@ -218,7 +214,7 @@ impl ScEventKind {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct ScEvent {
     pub pd_address: u8,
-    pub kind:       ScEventKind,
+    pub kind: ScEventKind,
 }
 
 pub trait ScEventHandler: 'static {
@@ -228,13 +224,13 @@ pub trait ScEventHandler: 'static {
 pub(crate) type ScEventBox = Box<dyn ScEventHandler>;
 
 pub(crate) unsafe extern "C" fn sc_event_thunk(
-    user:  *mut c_void,
+    user: *mut c_void,
     event: *const sys::osdp_acu_sc_event_t,
 ) {
     let storage = &mut *(user as *mut ScEventBox);
     let e = &*event;
     storage.on_sc_event(&ScEvent {
         pd_address: e.pd_address,
-        kind:       ScEventKind::from_sys(e.kind),
+        kind: ScEventKind::from_sys(e.kind),
     });
 }

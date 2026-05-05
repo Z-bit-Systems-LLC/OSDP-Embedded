@@ -16,24 +16,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use osdp::acu::{
-    Acu,
-    ReplyEvent,
-    ReplyHandler,
-    Transport as AcuTransport,
-};
-use osdp::pd::{
-    CommandHandler,
-    Pd,
-    Reply,
-    Transport as PdTransport,
-};
-use osdp_sys::{
-    OSDP_CMD_ID,
-    OSDP_CMD_POLL,
-    OSDP_REPLY_ACK,
-    OSDP_REPLY_PDID,
-};
+use osdp::acu::{Acu, ReplyEvent, ReplyHandler, Transport as AcuTransport};
+use osdp::pd::{CommandHandler, Pd, Reply, Transport as PdTransport};
+use osdp_sys::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
 
 /// Two append-only byte buffers, one per direction.
 #[derive(Default)]
@@ -74,15 +59,27 @@ impl<const PD: bool> WireAdapter<PD> {
 }
 
 impl PdTransport for WireAdapter<true> {
-    fn read(&mut self, buf: &mut [u8]) -> usize { self.drain_incoming(buf) }
-    fn write(&mut self, buf: &[u8])     -> usize { self.append_outgoing(buf) }
-    fn now_ms(&mut self) -> Option<u32> { None }  // Online tracking off.
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        self.drain_incoming(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> usize {
+        self.append_outgoing(buf)
+    }
+    fn now_ms(&mut self) -> Option<u32> {
+        None
+    } // Online tracking off.
 }
 
 impl AcuTransport for WireAdapter<false> {
-    fn read(&mut self, buf: &mut [u8]) -> usize { self.drain_incoming(buf) }
-    fn write(&mut self, buf: &[u8])     -> usize { self.append_outgoing(buf) }
-    fn now_ms(&mut self) -> Option<u32> { None }
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        self.drain_incoming(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> usize {
+        self.append_outgoing(buf)
+    }
+    fn now_ms(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 // ---- PD application logic --------------------------------------------
@@ -92,25 +89,27 @@ impl AcuTransport for WireAdapter<false> {
 /// `&mut self`. Vendor + model + version + serial (LE) +
 /// firmware major/minor/build, exactly as the spec describes.
 const SAMPLE_PDID: [u8; 12] = [
-    0xCA, 0xFE, 0x00,         // vendor
-    0x10,                     // model
-    0x01,                     // version
-    0xEF, 0xBE, 0xAD, 0xDE,   // serial = 0xDEAD_BEEF (little-endian on the wire)
-    0x01, 0x02, 0x03,         // fw major / minor / build
+    0xCA, 0xFE, 0x00, // vendor
+    0x10, // model
+    0x01, // version
+    0xEF, 0xBE, 0xAD, 0xDE, // serial = 0xDEAD_BEEF (little-endian on the wire)
+    0x01, 0x02, 0x03, // fw major / minor / build
 ];
 
 struct DemoHandler;
 
 impl CommandHandler for DemoHandler {
-    fn handle<'a>(
-        &'a mut self,
-        cmd_code: u8,
-        _payload: &[u8],
-    ) -> osdp::Result<Reply<'a>> {
+    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp::Result<Reply<'a>> {
         match cmd_code {
-            OSDP_CMD_POLL => Ok(Reply { code: OSDP_REPLY_ACK,  payload: &[] }),
-            OSDP_CMD_ID   => Ok(Reply { code: OSDP_REPLY_PDID, payload: &SAMPLE_PDID }),
-            _             => Err(osdp::Error::NotSupported),
+            OSDP_CMD_POLL => Ok(Reply {
+                code: OSDP_REPLY_ACK,
+                payload: &[],
+            }),
+            OSDP_CMD_ID => Ok(Reply {
+                code: OSDP_REPLY_PDID,
+                payload: &SAMPLE_PDID,
+            }),
+            _ => Err(osdp::Error::NotSupported),
         }
     }
 }
@@ -119,7 +118,7 @@ impl CommandHandler for DemoHandler {
 
 #[derive(Default)]
 struct CapturedReplies {
-    log: Vec<(u8, u8, u8, Vec<u8>)>,  // (pd_addr, cmd, reply, payload)
+    log: Vec<(u8, u8, u8, Vec<u8>)>, // (pd_addr, cmd, reply, payload)
 }
 
 struct ReplyCapture {
@@ -129,7 +128,10 @@ struct ReplyCapture {
 impl ReplyHandler for ReplyCapture {
     fn on_reply(&mut self, e: &ReplyEvent<'_>) {
         self.inner.borrow_mut().log.push((
-            e.pd_address, e.cmd_code, e.reply_code, e.payload.to_vec(),
+            e.pd_address,
+            e.cmd_code,
+            e.reply_code,
+            e.payload.to_vec(),
         ));
     }
 }
@@ -148,23 +150,31 @@ fn main() {
 
     // ---- PD side ----
     let mut pd = Pd::new(0x10);
-    pd.set_transport(WireAdapter::<true> { wire: Rc::clone(&wire) });
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
     pd.set_command_handler(DemoHandler);
 
     // ---- ACU side ----
     let captured = Rc::new(RefCell::new(CapturedReplies::default()));
     let mut acu = Acu::new(1);
-    acu.set_transport(WireAdapter::<false> { wire: Rc::clone(&wire) });
-    acu.set_reply_handler(ReplyCapture { inner: Rc::clone(&captured) });
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
     acu.register_pd(0, 0x10).expect("register_pd");
 
     // ---- Round trip 1: POLL → ACK ----
-    acu.send_command(0x10, OSDP_CMD_POLL, &[]).expect("send POLL");
+    acu.send_command(0x10, OSDP_CMD_POLL, &[])
+        .expect("send POLL");
     cycle(&mut pd, &mut acu, 4);
 
     // ---- Round trip 2: ID → PDID ----
-    let id_request: [u8; 1] = [0x00];  // standard PDID selector
-    acu.send_command(0x10, OSDP_CMD_ID, &id_request).expect("send ID");
+    let id_request: [u8; 1] = [0x00]; // standard PDID selector
+    acu.send_command(0x10, OSDP_CMD_ID, &id_request)
+        .expect("send ID");
     cycle(&mut pd, &mut acu, 4);
 
     // ---- Verify ----

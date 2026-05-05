@@ -48,18 +48,18 @@ impl Error {
     /// Convert a raw status code into either `Ok(())` or `Err(...)`.
     pub(crate) fn from_status(s: osdp_status_t) -> Result<()> {
         match s {
-            osdp_status_t::OSDP_OK                   => Ok(()),
-            osdp_status_t::OSDP_ERR_INVALID_ARG      => Err(Error::InvalidArg),
+            osdp_status_t::OSDP_OK => Ok(()),
+            osdp_status_t::OSDP_ERR_INVALID_ARG => Err(Error::InvalidArg),
             osdp_status_t::OSDP_ERR_BUFFER_TOO_SMALL => Err(Error::BufferTooSmall),
-            osdp_status_t::OSDP_ERR_TRUNCATED        => Err(Error::Truncated),
-            osdp_status_t::OSDP_ERR_BAD_SOM          => Err(Error::BadSom),
-            osdp_status_t::OSDP_ERR_BAD_LENGTH       => Err(Error::BadLength),
-            osdp_status_t::OSDP_ERR_BAD_CTRL         => Err(Error::BadCtrl),
-            osdp_status_t::OSDP_ERR_BAD_CRC          => Err(Error::BadCrc),
-            osdp_status_t::OSDP_ERR_BAD_CHECKSUM     => Err(Error::BadChecksum),
-            osdp_status_t::OSDP_ERR_BAD_PAYLOAD      => Err(Error::BadPayload),
-            osdp_status_t::OSDP_ERR_NOT_SUPPORTED    => Err(Error::NotSupported),
-            osdp_status_t(other)                     => Err(Error::Other(other)),
+            osdp_status_t::OSDP_ERR_TRUNCATED => Err(Error::Truncated),
+            osdp_status_t::OSDP_ERR_BAD_SOM => Err(Error::BadSom),
+            osdp_status_t::OSDP_ERR_BAD_LENGTH => Err(Error::BadLength),
+            osdp_status_t::OSDP_ERR_BAD_CTRL => Err(Error::BadCtrl),
+            osdp_status_t::OSDP_ERR_BAD_CRC => Err(Error::BadCrc),
+            osdp_status_t::OSDP_ERR_BAD_CHECKSUM => Err(Error::BadChecksum),
+            osdp_status_t::OSDP_ERR_BAD_PAYLOAD => Err(Error::BadPayload),
+            osdp_status_t::OSDP_ERR_NOT_SUPPORTED => Err(Error::NotSupported),
+            osdp_status_t(other) => Err(Error::Other(other)),
         }
     }
 
@@ -68,17 +68,17 @@ impl Error {
     /// returns `Err(...)`.
     pub(crate) fn to_status(self) -> osdp_status_t {
         match self {
-            Error::InvalidArg     => osdp_status_t::OSDP_ERR_INVALID_ARG,
+            Error::InvalidArg => osdp_status_t::OSDP_ERR_INVALID_ARG,
             Error::BufferTooSmall => osdp_status_t::OSDP_ERR_BUFFER_TOO_SMALL,
-            Error::Truncated      => osdp_status_t::OSDP_ERR_TRUNCATED,
-            Error::BadSom         => osdp_status_t::OSDP_ERR_BAD_SOM,
-            Error::BadLength      => osdp_status_t::OSDP_ERR_BAD_LENGTH,
-            Error::BadCtrl        => osdp_status_t::OSDP_ERR_BAD_CTRL,
-            Error::BadCrc         => osdp_status_t::OSDP_ERR_BAD_CRC,
-            Error::BadChecksum    => osdp_status_t::OSDP_ERR_BAD_CHECKSUM,
-            Error::BadPayload     => osdp_status_t::OSDP_ERR_BAD_PAYLOAD,
-            Error::NotSupported   => osdp_status_t::OSDP_ERR_NOT_SUPPORTED,
-            Error::Other(n)       => osdp_status_t(n),
+            Error::Truncated => osdp_status_t::OSDP_ERR_TRUNCATED,
+            Error::BadSom => osdp_status_t::OSDP_ERR_BAD_SOM,
+            Error::BadLength => osdp_status_t::OSDP_ERR_BAD_LENGTH,
+            Error::BadCtrl => osdp_status_t::OSDP_ERR_BAD_CTRL,
+            Error::BadCrc => osdp_status_t::OSDP_ERR_BAD_CRC,
+            Error::BadChecksum => osdp_status_t::OSDP_ERR_BAD_CHECKSUM,
+            Error::BadPayload => osdp_status_t::OSDP_ERR_BAD_PAYLOAD,
+            Error::NotSupported => osdp_status_t::OSDP_ERR_NOT_SUPPORTED,
+            Error::Other(n) => osdp_status_t(n),
         }
     }
 }
@@ -86,17 +86,17 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidArg     => f.write_str("invalid argument"),
+            Error::InvalidArg => f.write_str("invalid argument"),
             Error::BufferTooSmall => f.write_str("output buffer too small"),
-            Error::Truncated      => f.write_str("not enough bytes to decode"),
-            Error::BadSom         => f.write_str("bad SOM marker"),
-            Error::BadLength      => f.write_str("bad LEN field"),
-            Error::BadCtrl        => f.write_str("bad CTRL byte"),
-            Error::BadCrc         => f.write_str("bad CRC"),
-            Error::BadChecksum    => f.write_str("bad checksum"),
-            Error::BadPayload     => f.write_str("bad payload"),
-            Error::NotSupported   => f.write_str("not supported"),
-            Error::Other(n)       => write!(f, "osdp_status_t({})", n),
+            Error::Truncated => f.write_str("not enough bytes to decode"),
+            Error::BadSom => f.write_str("bad SOM marker"),
+            Error::BadLength => f.write_str("bad LEN field"),
+            Error::BadCtrl => f.write_str("bad CTRL byte"),
+            Error::BadCrc => f.write_str("bad CRC"),
+            Error::BadChecksum => f.write_str("bad checksum"),
+            Error::BadPayload => f.write_str("bad payload"),
+            Error::NotSupported => f.write_str("not supported"),
+            Error::Other(n) => write!(f, "osdp_status_t({})", n),
         }
     }
 }

@@ -45,9 +45,7 @@ fn crc16_init_constant_round_trip() {
     // must agree.
     let data = b"hello osdp";
     let one_shot = unsafe { osdp_crc16(data.as_ptr(), data.len()) };
-    let streamed = unsafe {
-        osdp_crc16_update(OSDP_CRC16_INIT, data.as_ptr(), data.len())
-    };
+    let streamed = unsafe { osdp_crc16_update(OSDP_CRC16_INIT, data.as_ptr(), data.len()) };
     assert_eq!(one_shot, streamed);
 }
 
@@ -66,22 +64,22 @@ fn poll_frame_round_trips() {
     // address 0x10, sequence 1). Decode it back. Header fields must
     // round-trip.
     let mut frame_in = osdp_frame_t {
-        address:      0x10,
-        reply:        false,
-        sequence:     1,
-        integrity:    osdp_integrity_t::OSDP_INTEGRITY_CRC,
-        has_scb:      false,
-        scb_length:   0,
-        scb_type:     0,
-        scb_data:     ptr::null(),
+        address: 0x10,
+        reply: false,
+        sequence: 1,
+        integrity: osdp_integrity_t::OSDP_INTEGRITY_CRC,
+        has_scb: false,
+        scb_length: 0,
+        scb_type: 0,
+        scb_data: ptr::null(),
         scb_data_len: 0,
-        code:         OSDP_CMD_POLL,
-        payload:      ptr::null(),
-        payload_len:  0,
-        mac:          ptr::null(),
-        mac_len:      0,
-        raw:          ptr::null(),
-        raw_len:      0,
+        code: OSDP_CMD_POLL,
+        payload: ptr::null(),
+        payload_len: 0,
+        mac: ptr::null(),
+        mac_len: 0,
+        raw: ptr::null(),
+        raw_len: 0,
     };
 
     let mut buf = [0u8; OSDP_FRAME_MAX_LEN];
@@ -101,17 +99,15 @@ fn poll_frame_round_trips() {
 
     // Decode back.
     let mut frame_out = MaybeUninit::<osdp_frame_t>::zeroed();
-    let r = unsafe {
-        osdp_frame_decode(buf.as_ptr(), written, frame_out.as_mut_ptr())
-    };
+    let r = unsafe { osdp_frame_decode(buf.as_ptr(), written, frame_out.as_mut_ptr()) };
     assert_eq!(r, osdp_status_t::OSDP_OK);
     let frame_out = unsafe { frame_out.assume_init() };
-    assert_eq!(frame_out.address,    0x10);
-    assert_eq!(frame_out.reply,      false);
-    assert_eq!(frame_out.sequence,   1);
-    assert_eq!(frame_out.integrity,  osdp_integrity_t::OSDP_INTEGRITY_CRC);
-    assert_eq!(frame_out.has_scb,    false);
-    assert_eq!(frame_out.code,       OSDP_CMD_POLL);
+    assert_eq!(frame_out.address, 0x10);
+    assert!(!frame_out.reply);
+    assert_eq!(frame_out.sequence, 1);
+    assert_eq!(frame_out.integrity, osdp_integrity_t::OSDP_INTEGRITY_CRC);
+    assert!(!frame_out.has_scb);
+    assert_eq!(frame_out.code, OSDP_CMD_POLL);
     assert_eq!(frame_out.payload_len, 0);
 
     // Suppress unused-mut warnings on the input frame.
@@ -128,7 +124,7 @@ fn pd_init_produces_addressable_struct() {
     let mut pd = Box::<osdp_pd_t>::new(unsafe { core::mem::zeroed() });
     unsafe { osdp_pd_init(&mut *pd, 0x10) };
     assert_eq!(pd.address, 0x10);
-    assert_eq!(pd.have_last, false);
+    assert!(!pd.have_last);
     // is_online is false right after init (no reply sent yet).
     assert!(unsafe { !osdp_pd_is_online(&*pd) });
 }
@@ -138,7 +134,7 @@ fn acu_init_with_one_slot() {
     // ACU + one PD slot, both heap-allocated. Same purpose as the PD
     // test: catches struct-layout mistakes via memset-zero in init.
     let mut slot = Box::<osdp_acu_pd_slot_t>::new(unsafe { core::mem::zeroed() });
-    let mut acu  = Box::<osdp_acu_t>::new(unsafe { core::mem::zeroed() });
+    let mut acu = Box::<osdp_acu_t>::new(unsafe { core::mem::zeroed() });
     unsafe { osdp_acu_init(&mut *acu, &mut *slot, 1) };
 
     let r = unsafe { osdp_acu_register_pd(&mut *acu, 0, 0x10) };

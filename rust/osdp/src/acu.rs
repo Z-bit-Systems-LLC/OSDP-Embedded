@@ -54,8 +54,8 @@ use crate::sc::{self, ScCrypto, ScEventHandler, SC_KEY_LEN};
 
 /// Wire-side I/O. Same shape as `pd::Transport`.
 pub trait Transport: 'static {
-    fn read (&mut self, buf: &mut [u8]) -> usize;
-    fn write(&mut self, buf: &[u8])     -> usize;
+    fn read(&mut self, buf: &mut [u8]) -> usize;
+    fn write(&mut self, buf: &[u8]) -> usize;
     fn now_ms(&mut self) -> Option<u32>;
 }
 
@@ -64,9 +64,9 @@ pub trait Transport: 'static {
 /// if you need to keep them past the callback.
 pub struct ReplyEvent<'a> {
     pub pd_address: u8,
-    pub cmd_code:   u8,
+    pub cmd_code: u8,
     pub reply_code: u8,
-    pub payload:    &'a [u8],
+    pub payload: &'a [u8],
 }
 
 pub trait ReplyHandler: 'static {
@@ -76,8 +76,8 @@ pub trait ReplyHandler: 'static {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct TimeoutEvent {
     pub pd_address: u8,
-    pub cmd_code:   u8,
-    pub cmd_seq:    u8,
+    pub cmd_code: u8,
+    pub cmd_seq: u8,
 }
 
 pub trait TimeoutHandler: 'static {
@@ -87,8 +87,8 @@ pub trait TimeoutHandler: 'static {
 // ---- Storage types -----------------------------------------------------
 
 type TransportBox = Box<dyn Transport>;
-type ReplyBox     = Box<dyn ReplyHandler>;
-type TimeoutBox   = Box<dyn TimeoutHandler>;
+type ReplyBox = Box<dyn ReplyHandler>;
+type TimeoutBox = Box<dyn TimeoutHandler>;
 
 /// ACU context. Owns the C state plus user-supplied trait objects.
 pub struct Acu {
@@ -98,11 +98,11 @@ pub struct Acu {
     /// `self`.
     slots: Vec<sys::osdp_acu_pd_slot_t>,
 
-    transport:    Option<Box<TransportBox>>,
-    reply_h:      Option<Box<ReplyBox>>,
-    timeout_h:    Option<Box<TimeoutBox>>,
-    sc_crypto:    Option<Box<sc::ScCryptoBox>>,
-    sc_event_h:   Option<Box<sc::ScEventBox>>,
+    transport: Option<Box<TransportBox>>,
+    reply_h: Option<Box<ReplyBox>>,
+    timeout_h: Option<Box<TimeoutBox>>,
+    sc_crypto: Option<Box<sc::ScCryptoBox>>,
+    sc_event_h: Option<Box<sc::ScEventBox>>,
 }
 
 impl Acu {
@@ -135,10 +135,10 @@ impl Acu {
         let user_ptr = Box::into_raw(boxed) as *mut c_void;
 
         let c = sys::osdp_acu_transport_t {
-            read:   Some(transport_read_thunk),
-            write:  Some(transport_write_thunk),
+            read: Some(transport_read_thunk),
+            write: Some(transport_write_thunk),
             now_ms: Some(transport_now_ms_thunk),
-            user:   user_ptr,
+            user: user_ptr,
         };
         unsafe { sys::osdp_acu_set_transport(&mut *self.inner, &c) };
 
@@ -150,11 +150,7 @@ impl Acu {
         let user_ptr = Box::into_raw(boxed) as *mut c_void;
 
         unsafe {
-            sys::osdp_acu_set_reply_handler(
-                &mut *self.inner,
-                Some(reply_thunk),
-                user_ptr,
-            );
+            sys::osdp_acu_set_reply_handler(&mut *self.inner, Some(reply_thunk), user_ptr);
         }
         self.reply_h = Some(unsafe { Box::from_raw(user_ptr as *mut ReplyBox) });
     }
@@ -164,11 +160,7 @@ impl Acu {
         let user_ptr = Box::into_raw(boxed) as *mut c_void;
 
         unsafe {
-            sys::osdp_acu_set_timeout_handler(
-                &mut *self.inner,
-                Some(timeout_thunk),
-                user_ptr,
-            );
+            sys::osdp_acu_set_timeout_handler(&mut *self.inner, Some(timeout_thunk), user_ptr);
         }
         self.timeout_h = Some(unsafe { Box::from_raw(user_ptr as *mut TimeoutBox) });
     }
@@ -177,9 +169,7 @@ impl Acu {
     /// is reset to 0 (per spec the first command on a new connection
     /// uses SQN zero).
     pub fn register_pd(&mut self, slot_index: usize, pd_address: u8) -> Result<()> {
-        let s = unsafe {
-            sys::osdp_acu_register_pd(&mut *self.inner, slot_index, pd_address)
-        };
+        let s = unsafe { sys::osdp_acu_register_pd(&mut *self.inner, slot_index, pd_address) };
         Error::from_status(s)
     }
 
@@ -189,13 +179,12 @@ impl Acu {
     ///   - `Err(InvalidArg)` — `pd_address` is not registered.
     ///   - `Err(NotSupported)` — the slot has an outstanding command
     ///     awaiting reply (one outstanding command per PD at a time).
-    pub fn send_command(
-        &mut self,
-        pd_address: u8,
-        cmd_code:   u8,
-        payload:    &[u8],
-    ) -> Result<()> {
-        let payload_ptr = if payload.is_empty() { ptr::null() } else { payload.as_ptr() };
+    pub fn send_command(&mut self, pd_address: u8, cmd_code: u8, payload: &[u8]) -> Result<()> {
+        let payload_ptr = if payload.is_empty() {
+            ptr::null()
+        } else {
+            payload.as_ptr()
+        };
         let s = unsafe {
             sys::osdp_acu_send_command(
                 &mut *self.inner,
@@ -254,7 +243,8 @@ impl Acu {
     /// when `start_sc_handshake` is invoked with `use_default_key =
     /// true`.
     pub fn set_pd_scbk_d(&mut self, pd_address: u8, scbk_d: &[u8; SC_KEY_LEN]) -> Result<()> {
-        let s = unsafe { sys::osdp_acu_set_pd_scbk_d(&mut *self.inner, pd_address, scbk_d.as_ptr()) };
+        let s =
+            unsafe { sys::osdp_acu_set_pd_scbk_d(&mut *self.inner, pd_address, scbk_d.as_ptr()) };
         Error::from_status(s)
     }
 
@@ -266,11 +256,7 @@ impl Acu {
         let outer: Box<sc::ScEventBox> = Box::new(boxed);
         let user = Box::into_raw(outer) as *mut c_void;
         unsafe {
-            sys::osdp_acu_set_sc_event_handler(
-                &mut *self.inner,
-                Some(sc::sc_event_thunk),
-                user,
-            );
+            sys::osdp_acu_set_sc_event_handler(&mut *self.inner, Some(sc::sc_event_thunk), user);
         }
         self.sc_event_h = Some(unsafe { Box::from_raw(user as *mut sc::ScEventBox) });
     }
@@ -301,17 +287,13 @@ impl Acu {
 
 // ---- Thunks ------------------------------------------------------------
 
-unsafe extern "C" fn transport_read_thunk(
-    user: *mut c_void, buf: *mut u8, cap: usize,
-) -> c_int {
+unsafe extern "C" fn transport_read_thunk(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int {
     let storage = &mut *(user as *mut TransportBox);
     let slice = slice::from_raw_parts_mut(buf, cap);
     storage.read(slice) as c_int
 }
 
-unsafe extern "C" fn transport_write_thunk(
-    user: *mut c_void, buf: *const u8, len: usize,
-) -> c_int {
+unsafe extern "C" fn transport_write_thunk(user: *mut c_void, buf: *const u8, len: usize) -> c_int {
     let storage = &mut *(user as *mut TransportBox);
     let slice = slice::from_raw_parts(buf, len);
     storage.write(slice) as c_int
@@ -322,10 +304,7 @@ unsafe extern "C" fn transport_now_ms_thunk(user: *mut c_void) -> u32 {
     storage.now_ms().unwrap_or(0)
 }
 
-unsafe extern "C" fn reply_thunk(
-    user:  *mut c_void,
-    event: *const sys::osdp_acu_reply_event_t,
-) {
+unsafe extern "C" fn reply_thunk(user: *mut c_void, event: *const sys::osdp_acu_reply_event_t) {
     let storage = &mut *(user as *mut ReplyBox);
     let e = &*event;
     let payload = if e.payload_len == 0 || e.payload.is_null() {
@@ -335,22 +314,19 @@ unsafe extern "C" fn reply_thunk(
     };
     storage.on_reply(&ReplyEvent {
         pd_address: e.pd_address,
-        cmd_code:   e.cmd_code,
+        cmd_code: e.cmd_code,
         reply_code: e.reply_code,
         payload,
     });
 }
 
-unsafe extern "C" fn timeout_thunk(
-    user:  *mut c_void,
-    event: *const sys::osdp_acu_timeout_event_t,
-) {
+unsafe extern "C" fn timeout_thunk(user: *mut c_void, event: *const sys::osdp_acu_timeout_event_t) {
     let storage = &mut *(user as *mut TimeoutBox);
     let e = &*event;
     storage.on_timeout(TimeoutEvent {
         pd_address: e.pd_address,
-        cmd_code:   e.cmd_code,
-        cmd_seq:    e.cmd_seq,
+        cmd_code: e.cmd_code,
+        cmd_seq: e.cmd_seq,
     });
 }
 
@@ -359,11 +335,14 @@ unsafe extern "C" fn timeout_thunk(
 impl Drop for Acu {
     fn drop(&mut self) {
         unsafe {
-            sys::osdp_acu_set_reply_handler   (&mut *self.inner, None, ptr::null_mut());
-            sys::osdp_acu_set_timeout_handler (&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_acu_set_reply_handler(&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_acu_set_timeout_handler(&mut *self.inner, None, ptr::null_mut());
             sys::osdp_acu_set_sc_event_handler(&mut *self.inner, None, ptr::null_mut());
             let dead = sys::osdp_acu_transport_t {
-                read: None, write: None, now_ms: None, user: ptr::null_mut(),
+                read: None,
+                write: None,
+                now_ms: None,
+                user: ptr::null_mut(),
             };
             sys::osdp_acu_set_transport(&mut *self.inner, &dead);
         }
@@ -372,4 +351,6 @@ impl Drop for Acu {
 }
 
 // Quiet a couple of "unused import" warnings in some configurations.
-const _: fn() = || { let _: Vec<u8> = vec![]; };
+const _: fn() = || {
+    let _: Vec<u8> = vec![];
+};

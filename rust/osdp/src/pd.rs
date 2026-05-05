@@ -69,8 +69,8 @@ use crate::sc::{self, ScCrypto, SC_CUID_LEN, SC_KEY_LEN};
 /// `now_ms` is optional. If `None`, online/offline tracking is
 /// disabled and the PD is "online" forever once it has sent a reply.
 pub trait Transport: 'static {
-    fn read (&mut self, buf: &mut [u8]) -> usize;
-    fn write(&mut self, buf: &[u8])     -> usize;
+    fn read(&mut self, buf: &mut [u8]) -> usize;
+    fn write(&mut self, buf: &[u8]) -> usize;
     fn now_ms(&mut self) -> Option<u32>;
 }
 
@@ -79,7 +79,7 @@ pub trait Transport: 'static {
 /// before [`CommandHandler::handle`] returns, so the buffer can be
 /// short-lived.
 pub struct Reply<'a> {
-    pub code:    u8,
+    pub code: u8,
     pub payload: &'a [u8],
 }
 
@@ -93,11 +93,7 @@ pub struct Reply<'a> {
 ///   - any other `Err(...)` — the PD treats it as an internal error
 ///     and drops the command silently.
 pub trait CommandHandler: 'static {
-    fn handle<'a>(
-        &'a mut self,
-        cmd_code: u8,
-        payload:  &[u8],
-    ) -> Result<Reply<'a>>;
+    fn handle<'a>(&'a mut self, cmd_code: u8, payload: &[u8]) -> Result<Reply<'a>>;
 }
 
 // ---- Internal storage ---------------------------------------------------
@@ -106,8 +102,8 @@ pub trait CommandHandler: 'static {
 // stored value to be a thin pointer so it survives the round-trip
 // through `*mut c_void`, hence the outer `Box<…>`.
 
-type TransportBox       = Box<dyn Transport>;
-type CommandHandlerBox  = Box<dyn CommandHandler>;
+type TransportBox = Box<dyn Transport>;
+type CommandHandlerBox = Box<dyn CommandHandler>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -119,13 +115,13 @@ pub struct Pd {
     inner: Box<sys::osdp_pd_t>,
     /// Held alive for the lifetime of `self`. The C side keeps a raw
     /// `*mut c_void` derived from this box's heap address.
-    transport:    Option<Box<TransportBox>>,
-    cmd_handler:  Option<Box<CommandHandlerBox>>,
+    transport: Option<Box<TransportBox>>,
+    cmd_handler: Option<Box<CommandHandlerBox>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
     /// copy stays valid.
-    sc_crypto:    Option<Box<sc::ScCryptoBox>>,
+    sc_crypto: Option<Box<sc::ScCryptoBox>>,
 }
 
 impl Pd {
@@ -151,10 +147,10 @@ impl Pd {
         let user_ptr = Box::into_raw(boxed) as *mut c_void;
 
         let c_transport = sys::osdp_pd_transport_t {
-            read:   Some(transport_read_thunk),
-            write:  Some(transport_write_thunk),
+            read: Some(transport_read_thunk),
+            write: Some(transport_write_thunk),
             now_ms: Some(transport_now_ms_thunk),
-            user:   user_ptr,
+            user: user_ptr,
         };
         unsafe { sys::osdp_pd_set_transport(&mut *self.inner, &c_transport) };
 
@@ -251,21 +247,13 @@ impl Pd {
 //
 // Translate a C-ABI callback into a Rust trait method invocation.
 
-unsafe extern "C" fn transport_read_thunk(
-    user: *mut c_void,
-    buf:  *mut u8,
-    cap:  usize,
-) -> c_int {
+unsafe extern "C" fn transport_read_thunk(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int {
     let storage = &mut *(user as *mut TransportBox);
     let slice = slice::from_raw_parts_mut(buf, cap);
     storage.read(slice) as c_int
 }
 
-unsafe extern "C" fn transport_write_thunk(
-    user: *mut c_void,
-    buf:  *const u8,
-    len:  usize,
-) -> c_int {
+unsafe extern "C" fn transport_write_thunk(user: *mut c_void, buf: *const u8, len: usize) -> c_int {
     let storage = &mut *(user as *mut TransportBox);
     let slice = slice::from_raw_parts(buf, len);
     storage.write(slice) as c_int
@@ -277,11 +265,11 @@ unsafe extern "C" fn transport_now_ms_thunk(user: *mut c_void) -> u32 {
 }
 
 unsafe extern "C" fn command_handler_thunk(
-    user:        *mut c_void,
-    cmd_code:    u8,
-    payload:     *const u8,
+    user: *mut c_void,
+    cmd_code: u8,
+    payload: *const u8,
     payload_len: usize,
-    reply:       *mut sys::osdp_pd_reply_t,
+    reply: *mut sys::osdp_pd_reply_t,
 ) -> sys::osdp_status_t {
     let storage = &mut *(user as *mut CommandHandlerBox);
     let payload_slice = if payload_len == 0 || payload.is_null() {
@@ -293,9 +281,9 @@ unsafe extern "C" fn command_handler_thunk(
     match storage.handle(cmd_code, payload_slice) {
         Ok(reply_value) => {
             let r = &mut *reply;
-            r.code        = reply_value.code;
+            r.code = reply_value.code;
             r.payload_len = reply_value.payload.len();
-            r.payload     = if reply_value.payload.is_empty() {
+            r.payload = if reply_value.payload.is_empty() {
                 ptr::null()
             } else {
                 reply_value.payload.as_ptr()
@@ -323,10 +311,10 @@ impl Drop for Pd {
             // memcpy inside set_transport just overwrites the C-side
             // copy.
             let dead = sys::osdp_pd_transport_t {
-                read:   None,
-                write:  None,
+                read: None,
+                write: None,
                 now_ms: None,
-                user:   ptr::null_mut(),
+                user: ptr::null_mut(),
             };
             sys::osdp_pd_set_transport(&mut *self.inner, &dead);
         }
@@ -336,4 +324,6 @@ impl Drop for Pd {
 }
 
 // Suppress "unused" warning on Error in some configs.
-const _: fn() = || { let _: fn(Error) -> sys::osdp_status_t = Error::to_status; };
+const _: fn() = || {
+    let _: fn(Error) -> sys::osdp_status_t = Error::to_status;
+};
