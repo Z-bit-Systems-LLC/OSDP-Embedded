@@ -20,7 +20,11 @@ default = ["std"]
 std     = []
 
 [dependencies]
-osdp-sys = { path = "../osdp-sys", version = "0.1.0" }
+# Path + version: cargo uses `path` while building inside the workspace
+# but uses `version` when published to a registry. The two must match
+# the value of `workspace.package.version` in the workspace Cargo.toml
+# above. Bump both together.
+osdp-sys = { path = "../osdp-sys", version = "=0.1.0-alpha.1" }
 
 # Examples and integration tests use a real AES backend so the loopback
 # Secure-Channel example exercises the full handshake. The `aes` crate
