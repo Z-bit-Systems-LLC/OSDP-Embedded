@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# OSDP-Embedded — Azure DevOps pipeline.
+#
+# Layout matches Z-bit Systems' Azure DevOps CI guide
+# (https://github.com/Z-bit-Systems-LLC/Guidelines/blob/main/docs/azure-devops-ci-guide.md):
+# this file is the entry point that defines triggers and orchestrates
+# the two jobs; the steps themselves live in build.yml and package.yml
+# templates next to this file.
+#
+# Trunk-based: every push to `main` runs `build`. Tagging a commit
+# `v*` (e.g. `v0.1.0` or `v0.1.0-alpha.2`) additionally runs
+# `package` to produce release artifacts.
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+# Default Pull-Request trigger so PRs run the build template too.
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  buildConfiguration: 'Release'
+
+jobs:
+  # Build + test, runs on every push and PR.
+  - job: build
+    displayName: 'Build & Test'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+      - checkout: self
+        # The repo currently has no submodules. Keeping
+        # `submodules: true` here for forward compat — it's a no-op
+        # while .gitmodules doesn't exist, but if we ever vendor a
+        # shared library this way we won't have to remember to flip
+        # it on.
+        submodules: true
+      - template: build.yml
+
+  # Package + publish artifacts. Only runs on tagged commits — push
+  # a tag like `v0.1.0-alpha.2` to trigger a release build.
+  - job: package
+    displayName: 'Package & Publish'
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    pool:
+      vmImage: 'windows-latest'
+    dependsOn:
+      - build
+    steps:
+      - checkout: self
+        submodules: true
+        persistCredentials: true
+        clean: true
+      - template: package.yml

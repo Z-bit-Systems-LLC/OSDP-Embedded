@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# Build + test template — invoked from azure-pipelines.yml's `build` job.
+#
+# Two stacks to verify:
+#
+#   1. C library + tools via CMake / ctest. The Microsoft-hosted
+#      windows-latest agent ships with VS Build Tools and CMake
+#      pre-installed, so no setup task is needed.
+#   2. Rust workspace via cargo. The agent has rustup pre-installed
+#      and `cargo` on PATH; we still run `rustup update` so we get
+#      the latest stable each build.
+#
+# Quality gates after the basic build/test:
+#   - `cargo fmt --check` enforces consistent Rust formatting.
+#   - `cargo clippy -D warnings` treats lint warnings as errors,
+#     mirroring the ReSharper code-inspection gate used in OSDP.Net.
+
+steps:
+  # ---- C library + tools -----------------------------------------------
+
+  - task: CmdLine@2
+    displayName: 'CMake configure (Release)'
+    inputs:
+      script: |
+        cmake -S . -B build ^
+          -DCMAKE_BUILD_TYPE=$(buildConfiguration) ^
+          -DOSDP_BUILD_TESTS=ON ^
+          -DOSDP_BUILD_TOOLS=ON
+
+  - task: CmdLine@2
+    displayName: 'CMake build (Release)'
+    inputs:
+      script: 'cmake --build build --config $(buildConfiguration)'
+
+  - task: CmdLine@2
+    displayName: 'ctest (Release)'
+    inputs:
+      script: 'ctest --test-dir build -C $(buildConfiguration) --output-on-failure'
+
+  # ---- Rust workspace --------------------------------------------------
+  #
+  # rustup is pre-installed on Microsoft-hosted agents. Forcing an
+  # update gives us the latest stable each run; pinning a specific
+  # toolchain would go in rust-toolchain.toml instead.
+
+  - task: CmdLine@2
+    displayName: 'rustup update stable'
+    inputs:
+      script: |
+        rustup update stable
+        rustup default stable
+        rustc --version
+        cargo --version
+
+  - task: CmdLine@2
+    displayName: 'cargo fmt --check'
+    inputs:
+      script: 'cargo fmt --manifest-path rust/Cargo.toml --all -- --check'
+
+  - task: CmdLine@2
+    displayName: 'cargo clippy (warnings = errors)'
+    inputs:
+      script: 'cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings'
+
+  - task: CmdLine@2
+    displayName: 'cargo build --workspace'
+    inputs:
+      script: 'cargo build --manifest-path rust/Cargo.toml --workspace --release'
+
+  - task: CmdLine@2
+    displayName: 'cargo test --workspace'
+    inputs:
+      script: 'cargo test --manifest-path rust/Cargo.toml --workspace --release'
+
+  # Smoke-run the loopback examples — they assert their own results
+  # with `assert!()`, so a non-zero exit means the API regressed.
+  - task: CmdLine@2
+    displayName: 'cargo run --example loopback'
+    inputs:
+      script: 'cargo run --manifest-path rust/Cargo.toml --release --example loopback'
+
+  - task: CmdLine@2
+    displayName: 'cargo run --example loopback_sc'
+    inputs:
+      script: 'cargo run --manifest-path rust/Cargo.toml --release --example loopback_sc'

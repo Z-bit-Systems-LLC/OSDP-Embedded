@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# Package template — invoked only when the trigger ref is a `v*` tag
+# (see azure-pipelines.yml). Produces a downloadable artifact bundle
+# with everything a release consumer might want:
+#
+#   - Win32 binaries:  osdp-parser.exe, osdp-pd-mock.exe, osdp-acu-mock.exe
+#   - Rust crate packages: osdp-sys-X.Y.Z.crate, osdp-X.Y.Z.crate
+#
+# Multi-OS native binaries (Linux x64/ARM64, macOS) aren't built here
+# yet; for those we'd matrix the package job across `ubuntu-latest`
+# and `macos-latest`. Easy to add later when there's demand.
+
+steps:
+  # ---- Native Windows binaries via CMake -------------------------------
+
+  - task: CmdLine@2
+    displayName: 'CMake configure (Release)'
+    inputs:
+      script: |
+        cmake -S . -B build-release ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DOSDP_BUILD_TESTS=OFF ^
+          -DOSDP_BUILD_TOOLS=ON
+
+  - task: CmdLine@2
+    displayName: 'CMake build (Release)'
+    inputs:
+      script: 'cmake --build build-release --config Release'
+
+  # Stage the .exe files into the artifact directory.
+  - task: CopyFiles@2
+    displayName: 'Stage Windows tool binaries'
+    inputs:
+      sourceFolder: 'build-release'
+      contents: |
+        tools/osdp-parser/Release/osdp-parser.exe
+        tools/osdp-pd-mock/Release/osdp-pd-mock.exe
+        tools/osdp-acu-mock/Release/osdp-acu-mock.exe
+      targetFolder: '$(Build.ArtifactStagingDirectory)/tools/win-x64'
+      flattenFolders: true
+
+  # ---- Rust crate packages --------------------------------------------
+  #
+  # `cargo package` produces a `.crate` (gzipped tarball) that crates.io
+  # would consume. We don't auto-publish here — that requires a CRATES_IO
+  # token and is best done as a manual step with `cargo publish` after
+  # reviewing the staged artifact.
+
+  - task: CmdLine@2
+    displayName: 'rustup update stable'
+    inputs:
+      script: |
+        rustup update stable
+        rustup default stable
+
+  - task: CmdLine@2
+    displayName: 'cargo package osdp-sys'
+    inputs:
+      script: |
+        cargo package --manifest-path rust/osdp-sys/Cargo.toml ^
+          --target-dir rust/target/package-osdp-sys ^
+          --no-verify
+
+  - task: CmdLine@2
+    displayName: 'cargo package osdp'
+    inputs:
+      script: |
+        cargo package --manifest-path rust/osdp/Cargo.toml ^
+          --target-dir rust/target/package-osdp ^
+          --no-verify
+
+  - task: CopyFiles@2
+    displayName: 'Stage Rust crate packages'
+    inputs:
+      sourceFolder: 'rust/target'
+      contents: |
+        package-osdp-sys/package/*.crate
+        package-osdp/package/*.crate
+      targetFolder: '$(Build.ArtifactStagingDirectory)/crates'
+      flattenFolders: true
+
+  # ---- Publish ---------------------------------------------------------
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish release artifacts'
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifactName: 'osdp-embedded-release'
