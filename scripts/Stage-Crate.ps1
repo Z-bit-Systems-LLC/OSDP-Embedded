@@ -93,6 +93,11 @@ Write-Host "Staged $total C source/header files into:" -ForegroundColor Green
 Write-Host "  $vendorDir"
 Write-Host ''
 Write-Host 'Next:' -ForegroundColor Yellow
-Write-Host '  cargo publish --manifest-path rust/osdp/Cargo.toml --dry-run'
-Write-Host '  cargo publish --manifest-path rust/osdp/Cargo.toml'
+Write-Host '  cargo publish --manifest-path rust/osdp/Cargo.toml --dry-run --allow-dirty'
+Write-Host '  cargo publish --manifest-path rust/osdp/Cargo.toml --allow-dirty'
 Write-Host '  ./scripts/Stage-Crate.ps1 -Clean'
+Write-Host ''
+Write-Host '`--allow-dirty` is required: vendor-c/ is gitignored, so cargo sees it' -ForegroundColor DarkGray
+Write-Host 'as untracked. The staged files are byte-for-byte copies of the' -ForegroundColor DarkGray
+Write-Host 'committed core/, pd/, acu/ tree at HEAD; the published .crate still' -ForegroundColor DarkGray
+Write-Host 'represents the same git state.' -ForegroundColor DarkGray

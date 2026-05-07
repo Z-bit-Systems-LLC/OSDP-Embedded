@@ -89,7 +89,7 @@ standalone, exercising the same path crates.io users will hit:
 
 ```pwsh
 cargo package --manifest-path rust/osdp/Cargo.toml `
-    --target-dir rust/target/package
+    --target-dir rust/target/package --allow-dirty
 ```
 
 The output ends with `Verifying osdp-embedded v…` followed by a clean
@@ -100,8 +100,16 @@ Then a registry dry-run, which checks crates.io for name collisions,
 license metadata, etc., without actually uploading:
 
 ```pwsh
-cargo publish --manifest-path rust/osdp/Cargo.toml --dry-run
+cargo publish --manifest-path rust/osdp/Cargo.toml --dry-run --allow-dirty
 ```
+
+**Why `--allow-dirty`?** The staged `rust/osdp/vendor-c/` directory
+is gitignored (it's a transient mirror, not source-of-truth), so
+cargo sees those files as uncommitted changes and refuses to publish
+without an explicit override. They're byte-for-byte copies of the
+committed `core/`, `pd/`, `acu/` tree at the current HEAD, so the
+published `.crate` still represents a deterministic snapshot of the
+git state — the override is correct here.
 
 ### 5. Tag, publish, push
 
@@ -114,7 +122,7 @@ git push origin v0.1.0-alpha.2          # triggers ci/package.yml
 
 # Actual publish (irreversible — the version number is burned forever
 # on crates.io even if you `cargo yank` it):
-cargo publish --manifest-path rust/osdp/Cargo.toml
+cargo publish --manifest-path rust/osdp/Cargo.toml --allow-dirty
 ```
 
 ### 6. Clean up
