@@ -8,6 +8,12 @@
 # so users write `use osdp_embedded::pd::Pd`.
 name        = "osdp-embedded"
 description = "OSDP v2.2.2 implementation in C with a safe Rust wrapper. PD and ACU state machines (incl. Secure Channel) over a freestanding C core."
+# README is staged into rust/osdp/README.md by scripts/Stage-Crate.ps1
+# (a copy of the repo-root README, which covers the whole project
+# including the Rust API). The file is gitignored at the crate path
+# and only exists during `cargo publish`; the include list below
+# whitelists it so it lands in the published .crate.
+readme      = "README.md"
 version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
@@ -35,6 +41,7 @@ include = [
     "examples/**/*.rs",
     "build.rs",
     "Cargo.toml",
+    "README.md",
     "vendor-c/**/*.c",
     "vendor-c/**/*.h",
 ]

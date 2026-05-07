@@ -70,17 +70,24 @@ foreach ($combo in @("", "--features pd", "--features acu", "--features pd,acu")
 }
 ```
 
-### 3. Stage the C source tree into `vendor-c/`
+### 3. Stage the C source tree + README into the crate dir
 
 The `osdp-embedded` crate's `build.rs` references `<repo>/{core,pd,acu}/`
 during in-workspace dev builds, but `cargo publish` only packages files
-inside the crate directory. The stage script copies the C tree into
-`rust/osdp/vendor-c/` (gitignored) so the published `.crate` carries
-its own copy:
+inside the crate directory. The stage script handles both the C
+source mirror and the README that crates.io renders on the package
+page:
 
 ```pwsh
 ./scripts/Stage-Crate.ps1
 ```
+
+This copies:
+- `<repo>/{core,pd,acu}/**/*.{c,h}` → `rust/osdp/vendor-c/...`
+- `<repo>/README.md` → `rust/osdp/README.md`
+
+Both destinations are gitignored — they only exist during the publish
+window. `Stage-Crate.ps1 -Clean` removes them.
 
 ### 4. Run `cargo package` + dry-run publish
 

@@ -28,8 +28,11 @@ Cargo.lock
 # Staging dir populated by scripts/Stage-Crate.ps1 immediately before
 # `cargo publish`; never checked in. The C source tree is the canonical
 # copy at `<repo>/{core,pd,acu}/`; vendor-c/ is just a transient mirror
-# so the published .crate ships them.
+# so the published .crate ships them. The README is the same story:
+# canonical at the repo root, copied into rust/osdp/ at publish time
+# so cargo resolves the `readme = "README.md"` field.
 rust/osdp/vendor-c/
+rust/osdp/README.md
 
 .claude/
 
