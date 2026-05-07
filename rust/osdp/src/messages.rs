@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::ptr;
 
-use osdp_sys as sys;
+use crate::sys;
 
 use crate::error::{Error, Result};
 
@@ -762,6 +762,7 @@ unsafe fn slice_from_raw_or_empty<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn round_trip<F: FnOnce(&mut [u8]) -> Result<usize>>(build: F) -> Vec<u8> {
         let mut buf = [0u8; 256];

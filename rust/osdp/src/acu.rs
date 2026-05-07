@@ -14,8 +14,8 @@
 //! does not auto-poll.
 //!
 //! ```no_run
-//! use osdp::acu::{Acu, Transport, ReplyHandler, ReplyEvent};
-//! use osdp_sys::OSDP_CMD_POLL;
+//! use osdp_embedded::acu::{Acu, Transport, ReplyHandler, ReplyEvent};
+//! use osdp_embedded::messages::OSDP_CMD_POLL;
 //!
 //! struct MyTransport;
 //! impl Transport for MyTransport {
@@ -38,26 +38,24 @@
 //! ```
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
 
-use osdp_sys as sys;
+use crate::sys;
 
 use crate::error::{Error, Result};
 use crate::sc::{self, ScCrypto, ScEventHandler, SC_KEY_LEN};
 
 // ---- Public traits ------------------------------------------------------
 
-/// Wire-side I/O. Same shape as `pd::Transport`.
-pub trait Transport: 'static {
-    fn read(&mut self, buf: &mut [u8]) -> usize;
-    fn write(&mut self, buf: &[u8]) -> usize;
-    fn now_ms(&mut self) -> Option<u32>;
-}
+// Hoisted at the crate root - same trait shape worked for both Pd and
+// Acu, no reason to keep duplicates. Re-exported here so consumers can
+// still write `osdp_embedded::acu::Transport` if they prefer the
+// role-qualified path.
+pub use crate::transport::Transport;
 
 /// What the ACU passes to the application's `ReplyHandler::on_reply`.
 /// Slices borrow from the ACU's RX buffer — copy out before returning
@@ -349,8 +347,3 @@ impl Drop for Acu {
         // Boxes dropped here. self.slots dropped here. self.inner dropped here.
     }
 }
-
-// Quiet a couple of "unused import" warnings in some configurations.
-const _: fn() = || {
-    let _: Vec<u8> = vec![];
-};

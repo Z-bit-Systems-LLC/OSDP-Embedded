@@ -24,10 +24,13 @@ use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 
-use osdp::acu::{Acu, ReplyEvent, ReplyHandler, Transport as AcuTransport};
-use osdp::pd::{CommandHandler, Pd, Reply, Transport as PdTransport};
-use osdp::sc::{ScCrypto, ScEvent, ScEventHandler, ScEventKind, AES_BLOCK_LEN, AES_KEY_LEN};
-use osdp_sys::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
+use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
+use osdp_embedded::messages::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
+use osdp_embedded::pd::{CommandHandler, Pd, Reply};
+use osdp_embedded::sc::{
+    ScCrypto, ScEvent, ScEventHandler, ScEventKind, AES_BLOCK_LEN, AES_KEY_LEN,
+};
+use osdp_embedded::Transport;
 
 // ---- Wire (same shape as plaintext loopback) -------------------------
 
@@ -60,18 +63,8 @@ impl<const PD: bool> WireAdapter<PD> {
     }
 }
 
-impl PdTransport for WireAdapter<true> {
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        self.drain_incoming(buf)
-    }
-    fn write(&mut self, buf: &[u8]) -> usize {
-        self.append_outgoing(buf)
-    }
-    fn now_ms(&mut self) -> Option<u32> {
-        None
-    }
-}
-impl AcuTransport for WireAdapter<false> {
+// One Transport impl, generic over which side of the wire we are.
+impl<const PD: bool> Transport for WireAdapter<PD> {
     fn read(&mut self, buf: &mut [u8]) -> usize {
         self.drain_incoming(buf)
     }
@@ -106,7 +99,7 @@ impl ScCrypto for DemoCrypto {
         key: &[u8; AES_KEY_LEN],
         in_: &[u8; AES_BLOCK_LEN],
         out: &mut [u8; AES_BLOCK_LEN],
-    ) -> osdp::Result<()> {
+    ) -> osdp_embedded::Result<()> {
         let cipher = Aes128::new(GenericArray::from_slice(key));
         let mut block = GenericArray::clone_from_slice(in_);
         cipher.encrypt_block(&mut block);
@@ -119,7 +112,7 @@ impl ScCrypto for DemoCrypto {
         key: &[u8; AES_KEY_LEN],
         in_: &[u8; AES_BLOCK_LEN],
         out: &mut [u8; AES_BLOCK_LEN],
-    ) -> osdp::Result<()> {
+    ) -> osdp_embedded::Result<()> {
         let cipher = Aes128::new(GenericArray::from_slice(key));
         let mut block = GenericArray::clone_from_slice(in_);
         cipher.decrypt_block(&mut block);
@@ -127,7 +120,7 @@ impl ScCrypto for DemoCrypto {
         Ok(())
     }
 
-    fn rand_bytes(&mut self, out: &mut [u8]) -> osdp::Result<()> {
+    fn rand_bytes(&mut self, out: &mut [u8]) -> osdp_embedded::Result<()> {
         // LCG (Numerical Recipes constants). Reproducible across runs.
         for byte in out.iter_mut() {
             self.rng_state = self
@@ -155,7 +148,7 @@ const SCBK: [u8; 16] = [
 struct DemoHandler;
 
 impl CommandHandler for DemoHandler {
-    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp::Result<Reply<'a>> {
+    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp_embedded::Result<Reply<'a>> {
         match cmd_code {
             OSDP_CMD_POLL => Ok(Reply {
                 code: OSDP_REPLY_ACK,
@@ -165,7 +158,7 @@ impl CommandHandler for DemoHandler {
                 code: OSDP_REPLY_PDID,
                 payload: &SAMPLE_PDID,
             }),
-            _ => Err(osdp::Error::NotSupported),
+            _ => Err(osdp_embedded::Error::NotSupported),
         }
     }
 }

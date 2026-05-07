@@ -7,11 +7,11 @@
 .SYNOPSIS
     Bump the OSDP-Embedded version, syncing both Rust and C sources.
 .DESCRIPTION
-    Updates four places that reference the project version:
-      * rust/Cargo.toml - [workspace.package].version
-      * rust/osdp/Cargo.toml - the `=X.Y.Z` pin on its osdp-sys dep
-      * CMakeLists.txt - project(... VERSION x.y.z) (numeric portion only;
-        CMake doesn't accept pre-release suffixes)
+    Updates two places that reference the project version:
+      * rust/Cargo.toml - [workspace.package].version (the
+        osdp-embedded crate inherits via `version.workspace = true`)
+      * CMakeLists.txt - project(... VERSION x.y.z) (numeric portion
+        only; CMake doesn't accept pre-release suffixes)
     The Rust version is the source of truth for publishing; the C side
     mirrors only the numeric prefix.
 .PARAMETER Version
@@ -118,21 +118,7 @@ Update-Lines `
     } `
     -Description '[workspace.package].version'
 
-# 2. rust/osdp/Cargo.toml - exact-version pin on the osdp-sys dep
-Update-Lines `
-    -Path 'rust/osdp/Cargo.toml' `
-    -LineMatches {
-        param($line)
-        $code = ($line -split '#', 2)[0]
-        return ($code -match '^\s*osdp-sys\s*=' -and $code -match 'version\s*=\s*"=')
-    } `
-    -Replacement {
-        param($line)
-        [regex]::Replace($line, '(version\s*=\s*"=)[^"]+(")', ('${1}' + $Version + '${2}'))
-    } `
-    -Description 'osdp-sys exact-version pin'
-
-# 3. CMakeLists.txt - project(... VERSION x.y.z) - numeric only
+# 2. CMakeLists.txt - project(... VERSION x.y.z) - numeric only
 Update-Lines `
     -Path 'CMakeLists.txt' `
     -LineMatches {

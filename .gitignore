@@ -25,6 +25,12 @@ compile_commands.json
 target/
 Cargo.lock
 
+# Staging dir populated by scripts/Stage-Crate.ps1 immediately before
+# `cargo publish`; never checked in. The C source tree is the canonical
+# copy at `<repo>/{core,pd,acu}/`; vendor-c/ is just a transient mirror
+# so the published .crate ships them.
+rust/osdp/vendor-c/
+
 .claude/
 
 *~

@@ -16,9 +16,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use osdp::acu::{Acu, ReplyEvent, ReplyHandler, Transport as AcuTransport};
-use osdp::pd::{CommandHandler, Pd, Reply, Transport as PdTransport};
-use osdp_sys::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
+use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
+use osdp_embedded::messages::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
+use osdp_embedded::pd::{CommandHandler, Pd, Reply};
+use osdp_embedded::Transport;
 
 /// Two append-only byte buffers, one per direction.
 #[derive(Default)]
@@ -58,7 +59,9 @@ impl<const PD: bool> WireAdapter<PD> {
     }
 }
 
-impl PdTransport for WireAdapter<true> {
+// One Transport impl, generic over which side of the wire we are.
+// The hoisted Transport trait works for both Pd and Acu now.
+impl<const PD: bool> Transport for WireAdapter<PD> {
     fn read(&mut self, buf: &mut [u8]) -> usize {
         self.drain_incoming(buf)
     }
@@ -66,19 +69,7 @@ impl PdTransport for WireAdapter<true> {
         self.append_outgoing(buf)
     }
     fn now_ms(&mut self) -> Option<u32> {
-        None
-    } // Online tracking off.
-}
-
-impl AcuTransport for WireAdapter<false> {
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        self.drain_incoming(buf)
-    }
-    fn write(&mut self, buf: &[u8]) -> usize {
-        self.append_outgoing(buf)
-    }
-    fn now_ms(&mut self) -> Option<u32> {
-        None
+        None // Online tracking off.
     }
 }
 
@@ -99,7 +90,7 @@ const SAMPLE_PDID: [u8; 12] = [
 struct DemoHandler;
 
 impl CommandHandler for DemoHandler {
-    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp::Result<Reply<'a>> {
+    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp_embedded::Result<Reply<'a>> {
         match cmd_code {
             OSDP_CMD_POLL => Ok(Reply {
                 code: OSDP_REPLY_ACK,
@@ -109,7 +100,7 @@ impl CommandHandler for DemoHandler {
                 code: OSDP_REPLY_PDID,
                 payload: &SAMPLE_PDID,
             }),
-            _ => Err(osdp::Error::NotSupported),
+            _ => Err(osdp_embedded::Error::NotSupported),
         }
     }
 }

@@ -191,28 +191,40 @@ typed message structs. Foundation for both PD and ACU work later.
 
 ## Iteration 4 — Rust adapter (in progress)
 
-- ☑ **`osdp-sys` crate.** Raw FFI bindings to every public symbol in
-  `core/`, `pd/`, and `acu/`. `no_std`, hand-written, checked in. Build
-  via the `cc` crate so `cargo build --target …` cross-compiles
-  cleanly. Six smoke tests verify CRC, checksum, frame round-trip, and
-  struct layout for `osdp_pd_t` / `osdp_acu_t` (catches ABI mismatches).
-- ☑ **`osdp` safe wrapper crate** (plaintext). Typed `Error` /
-  `Result`; `frame::decode` / `frame::build` with a borrowed
-  `Frame<'a>`; `pd::Pd` and `acu::Acu` with `Transport` /
-  `CommandHandler` / `ReplyHandler` / `TimeoutHandler` traits.
-  `examples/loopback.rs` demonstrates a full Pd↔Acu round-trip
-  in-process (POLL→ACK and ID→PDID, byte-identical end to end).
-- ☑ **Secure Channel in the safe wrapper.** `osdp::sc::ScCrypto`
-  trait (AES-128 encrypt + decrypt + RNG) plus PD-side
-  `set_sc_crypto`/`set_sc_scbk`/`set_sc_scbk_d`/`set_sc_cuid`/
-  `sc_established`, ACU-side `set_sc_crypto`/`set_pd_scbk*`/
-  `start_sc_handshake`/`set_sc_event_handler`/`is_pd_sc_established`
-  with an `ScEventKind` enum (`Established` / `HandshakeFailed` /
-  `SessionLost`). Validated via `examples/loopback_sc.rs` which
-  runs the full SCS_11..14 handshake and POLL→ACK + ID→PDID under
-  SCS_15..18 in process, with the `aes` crate as the AES backend.
-- ☑ **Per-message codec wrappers.** `osdp::messages` provides typed
-  `decode` / `build` for every command (`Poll`, `IdRequest`,
+- ☑ **Single-crate Rust wrapper, `osdp-embedded`.** The C library is
+  exposed through one published crate at `rust/osdp/`, no companion
+  `-sys` crate. The FFI bindings live in a private `mod sys` and
+  `build.rs` compiles the C tree via the [`cc`
+  crate](https://crates.io/crates/cc) so `cargo build --target …`
+  cross-compiles to any target the C library compiles on. Earlier
+  iterations split into `osdp-sys` + safe wrapper; collapsed for
+  simpler publishing (single `cargo publish`, single Cargo.toml to
+  bump per release).
+- ☑ **Cargo features for role selection.** `pd` and `acu` features
+  gate both the Rust modules and the corresponding `.c` file
+  compilation in `build.rs`. A PD-only firmware build
+  (`--no-default-features --features pd`) genuinely doesn't compile
+  any ACU code. Default features: `["std", "pd", "acu"]`. All four
+  feature combos are clippy-clean and tested.
+- ☑ **Plaintext API.** Typed `Error` / `Result`; `frame::decode` /
+  `frame::build` with a borrowed `Frame<'a>`; one shared
+  `osdp_embedded::Transport` trait used by both `pd::Pd` and
+  `acu::Acu`; role-specific `CommandHandler` / `ReplyHandler` /
+  `TimeoutHandler` traits. `examples/loopback.rs` demonstrates a full
+  Pd↔Acu round-trip in-process (POLL→ACK and ID→PDID, byte-identical
+  end to end).
+- ☑ **Secure Channel API.** `osdp_embedded::sc::ScCrypto` trait
+  (AES-128 encrypt + decrypt + RNG) plus PD-side `set_sc_crypto` /
+  `set_sc_scbk` / `set_sc_scbk_d` / `set_sc_cuid` / `sc_established`;
+  ACU-side `set_sc_crypto` / `set_pd_scbk*` / `start_sc_handshake` /
+  `set_sc_event_handler` / `is_pd_sc_established` with an
+  `ScEventKind` enum (`Established` / `HandshakeFailed` /
+  `SessionLost`). The ACU-only event types are gated behind the `acu`
+  feature. Validated via `examples/loopback_sc.rs` which runs the full
+  SCS_11..14 handshake and POLL→ACK + ID→PDID under SCS_15..18
+  in-process, with the `aes` crate as the AES backend.
+- ☑ **Per-message codec wrappers.** `osdp_embedded::messages` provides
+  typed `decode` / `build` for every command (`Poll`, `IdRequest`,
   `CapRequest`, `Out`, `Led`, `BuzCmd`, `Text<'a>`, `ComsetCmd`) and
   every reply (`Ack`, `Nak<'a>`, `Pdid`, `Pdcap`, `Raw<'a>`,
   `Keypad<'a>`, `Com`) in the v2.2.2 baseline set, on top of the
@@ -221,7 +233,13 @@ typed message structs. Foundation for both PD and ACU work later.
   borrowed-slice payloads (`Nak`, `Text`, `Raw`, `Keypad`) carry a
   lifetime back to the input. Eight unit tests cover round-trip plus
   a representative truncated-decode negative.
-- ☐ **Publishing** to crates.io (post-stabilization).
+- ☑ **Publish-ready packaging.** `scripts/Stage-Crate.ps1` mirrors the
+  C tree into `rust/osdp/vendor-c/` (gitignored) so `cargo package`
+  produces a tarball that compiles standalone from inside the
+  archive. CI verifies this via `cargo package` (with verify) on
+  every tagged build. See [PUBLISHING.md](PUBLISHING.md) for the
+  manual `cargo publish` recipe.
+- ☐ **Publishing** to crates.io. Pending the first release tag.
 
 ## Iteration 5+ — Optional extensions (not yet planned)
 

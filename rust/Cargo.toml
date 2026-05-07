@@ -1,25 +1,20 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Z-bit Systems, LLC
 
-# OSDP-Embedded — Rust workspace.
+# OSDP-Embedded - Rust workspace.
 #
-# Two-crate split, matching the common -sys/safe-wrapper convention used
-# by zlib-sys/flate2, openssl-sys/openssl, etc:
+# A single crate (`osdp-embedded`) wraps the C library directly. The
+# FFI seam is in-crate (`mod sys`); cargo features `pd` and `acu` gate
+# both the Rust modules and the corresponding .c file compilation, so
+# a PD-only firmware build (`--no-default-features --features pd`)
+# never compiles ACU code.
 #
-#   - `osdp-sys`: raw FFI bindings to the C core. no_std. No policy, no
-#     ergonomics — anything spelled the way the C header spells it.
-#   - `osdp`: safe Rust wrapper. Provides idiomatic types around the
-#     state machines and codecs. Delegates every operation to
-#     `osdp-sys`; never reimplements protocol logic in Rust.
-#
-# Both crates are no_std-by-default. Optional `alloc` and `std` features
-# in the safe wrapper enable closure-based callbacks and standard error
-# trait integration; the bare API works on bare-metal targets without
-# any allocator.
+# Earlier iterations had a separate `osdp-sys` crate following the
+# common -sys/safe-wrapper convention; we collapsed it for simpler
+# publishing. See git history if revisiting that decision.
 [workspace]
 resolver = "2"
 members  = [
-    "osdp-sys",
     "osdp",
 ]
 

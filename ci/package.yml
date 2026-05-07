@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Z-bit Systems, LLC
 
-# Package template — invoked only when the trigger ref is a `v*` tag
+# Package template - invoked only when the trigger ref is a `v*` tag
 # (see azure-pipelines.yml). Produces a downloadable artifact bundle
 # with everything a release consumer might want:
 #
-#   - Win32 binaries:  osdp-parser.exe, osdp-pd-mock.exe, osdp-acu-mock.exe
-#   - Rust crate packages: osdp-sys-X.Y.Z.crate, osdp-X.Y.Z.crate
+#   - Win32 binaries:    osdp-parser.exe, osdp-pd-mock.exe,
+#                        osdp-acu-mock.exe
+#   - Rust crate package: osdp-embedded-X.Y.Z.crate
 #
 # Multi-OS native binaries (Linux x64/ARM64, macOS) aren't built here
 # yet; for those we'd matrix the package job across `ubuntu-latest`
@@ -41,12 +42,13 @@ steps:
       targetFolder: '$(Build.ArtifactStagingDirectory)/tools/win-x64'
       flattenFolders: true
 
-  # ---- Rust crate packages --------------------------------------------
+  # ---- Rust crate package ---------------------------------------------
   #
   # `cargo package` produces a `.crate` (gzipped tarball) that crates.io
-  # would consume. We don't auto-publish here — that requires a CRATES_IO
-  # token and is best done as a manual step with `cargo publish` after
-  # reviewing the staged artifact.
+  # would consume. We don't auto-publish here - that requires a
+  # CRATES_IO token and is best done as a manual step with
+  # `cargo publish` after reviewing the staged artifact. See
+  # docs/PUBLISHING.md.
 
   - task: CmdLine@2
     displayName: 'rustup update stable'
@@ -55,29 +57,30 @@ steps:
         rustup update stable
         rustup default stable
 
-  - task: CmdLine@2
-    displayName: 'cargo package osdp-sys'
+  - task: PowerShell@2
+    displayName: 'Stage vendor-c (for cargo package verify)'
+    # cargo package needs the C sources to be inside the crate dir
+    # in order to compile the staged tarball during verify. The
+    # script copies <repo>/{core,pd,acu}/ into rust/osdp/vendor-c/;
+    # build.rs detects the staged layout at compile time. Must run
+    # before `cargo package` below.
     inputs:
-      script: |
-        cargo package --manifest-path rust/osdp-sys/Cargo.toml ^
-          --target-dir rust/target/package-osdp-sys ^
-          --no-verify
+      filePath: 'scripts/Stage-Crate.ps1'
+      pwsh: true
 
   - task: CmdLine@2
-    displayName: 'cargo package osdp'
+    displayName: 'cargo package osdp-embedded (with verify)'
     inputs:
       script: |
         cargo package --manifest-path rust/osdp/Cargo.toml ^
-          --target-dir rust/target/package-osdp ^
-          --no-verify
+          --target-dir rust/target/package
 
   - task: CopyFiles@2
-    displayName: 'Stage Rust crate packages'
+    displayName: 'Stage Rust crate package'
     inputs:
       sourceFolder: 'rust/target'
       contents: |
-        package-osdp-sys/package/*.crate
-        package-osdp/package/*.crate
+        package/package/*.crate
       targetFolder: '$(Build.ArtifactStagingDirectory)/crates'
       flattenFolders: true
 

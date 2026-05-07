@@ -5,7 +5,7 @@
 
 use core::fmt;
 
-use osdp_sys::osdp_status_t;
+use crate::sys::osdp_status_t;
 
 /// Every error the C library can report. The `Other` variant is a
 /// catch-all for forward compatibility — a future C release that adds
@@ -65,7 +65,11 @@ impl Error {
 
     /// Inverse: the canonical `osdp_status_t` we'd return back to C.
     /// Used by the trait-object thunks when an application handler
-    /// returns `Err(...)`.
+    /// returns `Err(...)`. Only called when at least one of the
+    /// `pd` / `acu` features is enabled (the thunks live there); no
+    /// callers in a core-only build, so silence the dead-code lint
+    /// for that combo.
+    #[allow(dead_code)]
     pub(crate) fn to_status(self) -> osdp_status_t {
         match self {
             Error::InvalidArg => osdp_status_t::OSDP_ERR_INVALID_ARG,

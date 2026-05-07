@@ -18,8 +18,8 @@
 //! # Example
 //!
 //! ```no_run
-//! use osdp::pd::{Pd, Transport, CommandHandler, Reply};
-//! use osdp_sys::{OSDP_CMD_POLL, OSDP_REPLY_ACK};
+//! use osdp_embedded::pd::{Pd, Transport, CommandHandler, Reply};
+//! use osdp_embedded::messages::{OSDP_CMD_POLL, OSDP_REPLY_ACK};
 //!
 //! struct MyTransport;
 //! impl Transport for MyTransport {
@@ -30,10 +30,10 @@
 //!
 //! struct MyHandler;
 //! impl CommandHandler for MyHandler {
-//!     fn handle(&mut self, code: u8, _payload: &[u8]) -> osdp::Result<Reply<'_>> {
+//!     fn handle(&mut self, code: u8, _payload: &[u8]) -> osdp_embedded::Result<Reply<'_>> {
 //!         match code {
 //!             OSDP_CMD_POLL => Ok(Reply { code: OSDP_REPLY_ACK, payload: &[] }),
-//!             _             => Err(osdp::Error::NotSupported),
+//!             _             => Err(osdp_embedded::Error::NotSupported),
 //!         }
 //!     }
 //! }
@@ -51,28 +51,15 @@ use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
 
-use osdp_sys as sys;
+use crate::sys;
 
 use crate::error::{Error, Result};
 use crate::sc::{self, ScCrypto, SC_CUID_LEN, SC_KEY_LEN};
-
-/// Wire-side I/O. The PD calls these from inside [`Pd::tick`].
-///
-/// `read` returns 0 on idle (no bytes available). Negative returns are
-/// reserved for future error reporting; for now, return 0 on any
-/// transient error. Bytes returned should belong to the slice the
-/// caller provided.
-///
-/// `write` returns the byte count successfully written; a short write
-/// is treated as a transmission error by the PD.
-///
-/// `now_ms` is optional. If `None`, online/offline tracking is
-/// disabled and the PD is "online" forever once it has sent a reply.
-pub trait Transport: 'static {
-    fn read(&mut self, buf: &mut [u8]) -> usize;
-    fn write(&mut self, buf: &[u8]) -> usize;
-    fn now_ms(&mut self) -> Option<u32>;
-}
+// Hoisted at the crate root - same trait shape worked for both Pd and
+// Acu, no reason to keep duplicates. Re-exported here so consumers can
+// still write `osdp_embedded::pd::Transport` if they prefer the
+// role-qualified path.
+pub use crate::transport::Transport;
 
 /// What the application wants to send back for an inbound command.
 /// Borrowed payload — the bytes are copied into the PD's TX scratch

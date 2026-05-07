@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
-//! Raw FFI bindings to the OSDP-Embedded C library.
+//! Raw FFI bindings to the OSDP-Embedded C library (private module).
 //!
 //! Every name here mirrors a name in one of the C public headers under
 //! `core/include/osdp/`, `pd/include/osdp/`, or `acu/include/osdp/`. No
@@ -9,12 +9,18 @@
 //! pointers, raw `extern "C" fn` callbacks, structs as the C side
 //! defines them.
 //!
-//! The crate is `no_std`. It does not depend on `alloc`. It compiles on
-//! every target the C library compiles on.
+//! Consumers don't access this module directly - they go through the
+//! safe wrappers in `osdp_embedded::pd`, `::acu`, `::frame`, etc. This
+//! module exists as the in-crate FFI seam.
 //!
-//! Consumers who want a typesafe Rust API should reach for the sibling
-//! `osdp` crate, which builds on top of these bindings without
-//! reimplementing protocol logic in Rust.
+//! ## Feature gating
+//!
+//! - The shared FFI (framing, codecs, dispatch, SC primitives, crc16,
+//!   checksum) is always compiled.
+//! - PD bindings (`osdp_pd_t` and friends) live in [`pd_ffi`] and are
+//!   re-exported under the `pd` feature; the matching .c files in
+//!   `pd/src/` only compile when the feature is on.
+//! - ACU bindings live in [`acu_ffi`] under the `acu` feature.
 //!
 //! ## ABI assumptions
 //!
@@ -25,10 +31,15 @@
 //!   ARMv7-M, ARMv7-A, ARMv8-M).
 //! - `size_t` matches `usize` and `int` matches `core::ffi::c_int`.
 
-#![no_std]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
+// FFI bindings exist for the entire C public surface; not every item
+// is referenced by the safe wrappers above. Silencing dead-code is
+// preferable to dropping bindings that consumers might reach via
+// `crate::sys::*` in custom unsafe code or that we'll wrap in a
+// future module.
+#![allow(dead_code)]
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -715,265 +726,291 @@ extern "C" {
 }
 
 // ====================================================================
-// osdp_pd.h
+// osdp_pd.h - feature-gated to `pd`
 // ====================================================================
 
-pub const OSDP_PD_TX_BUF_LEN: usize = 256;
-pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
+#[cfg(feature = "pd")]
+pub use pd_ffi::*;
 
-pub type osdp_pd_read_cb =
-    Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
-pub type osdp_pd_write_cb =
-    Option<unsafe extern "C" fn(user: *mut c_void, buf: *const u8, len: usize) -> c_int>;
-pub type osdp_pd_now_ms_cb = Option<unsafe extern "C" fn(user: *mut c_void) -> u32>;
+#[cfg(feature = "pd")]
+mod pd_ffi {
+    use super::*;
 
-#[repr(C)]
-pub struct osdp_pd_transport_t {
-    pub read: osdp_pd_read_cb,
-    pub write: osdp_pd_write_cb,
-    pub now_ms: osdp_pd_now_ms_cb,
-    pub user: *mut c_void,
-}
+    pub const OSDP_PD_TX_BUF_LEN: usize = 256;
+    pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
 
-#[repr(C)]
-pub struct osdp_pd_reply_t {
-    pub code: u8,
-    pub payload: *const u8,
-    pub payload_len: usize,
-}
+    pub type osdp_pd_read_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
+    pub type osdp_pd_write_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, buf: *const u8, len: usize) -> c_int>;
+    pub type osdp_pd_now_ms_cb = Option<unsafe extern "C" fn(user: *mut c_void) -> u32>;
 
-pub type osdp_pd_command_cb = Option<
-    unsafe extern "C" fn(
-        user: *mut c_void,
-        cmd_code: u8,
-        payload: *const u8,
-        payload_len: usize,
-        reply: *mut osdp_pd_reply_t,
-    ) -> osdp_status_t,
->;
+    #[repr(C)]
+    pub struct osdp_pd_transport_t {
+        pub read: osdp_pd_read_cb,
+        pub write: osdp_pd_write_cb,
+        pub now_ms: osdp_pd_now_ms_cb,
+        pub user: *mut c_void,
+    }
 
-#[repr(C)]
-pub struct osdp_pd_sc_t {
-    pub crypto: osdp_sc_crypto_t,
-    pub crypto_set: bool,
-    pub scbk: [u8; OSDP_SC_KEY_LEN],
-    pub scbk_set: bool,
-    pub scbk_d: [u8; OSDP_SC_KEY_LEN],
-    pub scbk_d_set: bool,
-    pub cuid: [u8; OSDP_SC_CUID_LEN],
-    pub cuid_set: bool,
-    pub session: osdp_sc_session_t,
-    pub got_chlng: bool,
-    pub rnd_a: [u8; OSDP_SC_RND_LEN],
-    pub rnd_b: [u8; OSDP_SC_RND_LEN],
-    pub key_selector: u8,
-}
+    #[repr(C)]
+    pub struct osdp_pd_reply_t {
+        pub code: u8,
+        pub payload: *const u8,
+        pub payload_len: usize,
+    }
 
-#[repr(C)]
-pub struct osdp_pd_t {
-    pub address: u8,
-    pub rx: osdp_stream_t,
-    pub transport: osdp_pd_transport_t,
-    pub cmd_cb: osdp_pd_command_cb,
-    pub cmd_user: *mut c_void,
-    pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
+    pub type osdp_pd_command_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            cmd_code: u8,
+            payload: *const u8,
+            payload_len: usize,
+            reply: *mut osdp_pd_reply_t,
+        ) -> osdp_status_t,
+    >;
 
-    pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
-    pub last_reply_len: usize,
-    pub last_cmd: [u8; OSDP_PD_TX_BUF_LEN],
-    pub last_cmd_len: usize,
-    pub last_seq: u8,
-    pub have_last: bool,
+    #[repr(C)]
+    pub struct osdp_pd_sc_t {
+        pub crypto: osdp_sc_crypto_t,
+        pub crypto_set: bool,
+        pub scbk: [u8; OSDP_SC_KEY_LEN],
+        pub scbk_set: bool,
+        pub scbk_d: [u8; OSDP_SC_KEY_LEN],
+        pub scbk_d_set: bool,
+        pub cuid: [u8; OSDP_SC_CUID_LEN],
+        pub cuid_set: bool,
+        pub session: osdp_sc_session_t,
+        pub got_chlng: bool,
+        pub rnd_a: [u8; OSDP_SC_RND_LEN],
+        pub rnd_b: [u8; OSDP_SC_RND_LEN],
+        pub key_selector: u8,
+    }
 
-    pub online: bool,
-    pub last_comm_ms: u32,
+    #[repr(C)]
+    pub struct osdp_pd_t {
+        pub address: u8,
+        pub rx: osdp_stream_t,
+        pub transport: osdp_pd_transport_t,
+        pub cmd_cb: osdp_pd_command_cb,
+        pub cmd_user: *mut c_void,
+        pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
 
-    pub sc: osdp_pd_sc_t,
-}
+        pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_reply_len: usize,
+        pub last_cmd: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_cmd_len: usize,
+        pub last_seq: u8,
+        pub have_last: bool,
 
-extern "C" {
-    pub fn osdp_pd_init(pd: *mut osdp_pd_t, address: u8);
-    pub fn osdp_pd_set_transport(pd: *mut osdp_pd_t, transport: *const osdp_pd_transport_t);
-    pub fn osdp_pd_set_command_handler(
-        pd: *mut osdp_pd_t,
-        cb: osdp_pd_command_cb,
-        user: *mut c_void,
-    );
-    pub fn osdp_pd_tick(pd: *mut osdp_pd_t);
-    pub fn osdp_pd_is_online(pd: *const osdp_pd_t) -> bool;
+        pub online: bool,
+        pub last_comm_ms: u32,
 
-    pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
-    pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
-    pub fn osdp_pd_set_sc_scbk_d(pd: *mut osdp_pd_t, scbk_d: *const u8);
-    pub fn osdp_pd_set_sc_cuid(pd: *mut osdp_pd_t, cuid: *const u8);
-    pub fn osdp_pd_sc_established(pd: *const osdp_pd_t) -> bool;
-}
+        pub sc: osdp_pd_sc_t,
+    }
+
+    extern "C" {
+        pub fn osdp_pd_init(pd: *mut osdp_pd_t, address: u8);
+        pub fn osdp_pd_set_transport(pd: *mut osdp_pd_t, transport: *const osdp_pd_transport_t);
+        pub fn osdp_pd_set_command_handler(
+            pd: *mut osdp_pd_t,
+            cb: osdp_pd_command_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_pd_tick(pd: *mut osdp_pd_t);
+        pub fn osdp_pd_is_online(pd: *const osdp_pd_t) -> bool;
+
+        pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
+        pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
+        pub fn osdp_pd_set_sc_scbk_d(pd: *mut osdp_pd_t, scbk_d: *const u8);
+        pub fn osdp_pd_set_sc_cuid(pd: *mut osdp_pd_t, cuid: *const u8);
+        pub fn osdp_pd_sc_established(pd: *const osdp_pd_t) -> bool;
+    }
+} // mod pd_ffi
 
 // ====================================================================
-// osdp_acu.h
+// osdp_acu.h - feature-gated to `acu`
 // ====================================================================
 
-pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
-pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
-pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
+#[cfg(feature = "acu")]
+pub use acu_ffi::*;
 
-pub type osdp_acu_read_cb = osdp_pd_read_cb;
-pub type osdp_acu_write_cb = osdp_pd_write_cb;
-pub type osdp_acu_now_ms_cb = osdp_pd_now_ms_cb;
+#[cfg(feature = "acu")]
+mod acu_ffi {
+    use super::*;
 
-#[repr(C)]
-pub struct osdp_acu_transport_t {
-    pub read: osdp_acu_read_cb,
-    pub write: osdp_acu_write_cb,
-    pub now_ms: osdp_acu_now_ms_cb,
-    pub user: *mut c_void,
-}
+    pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
+    pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
+    pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
 
-#[repr(transparent)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub struct osdp_acu_sc_phase_t(pub c_int);
+    // The transport callback shape is identical between PD and ACU; rather
+    // than aliasing `osdp_pd_read_cb` (which would create a hard cross-
+    // feature dependency), we redeclare them here. They're ABI-identical
+    // to the PD versions.
+    pub type osdp_acu_read_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
+    pub type osdp_acu_write_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, buf: *const u8, len: usize) -> c_int>;
+    pub type osdp_acu_now_ms_cb = Option<unsafe extern "C" fn(user: *mut c_void) -> u32>;
 
-impl osdp_acu_sc_phase_t {
-    pub const IDLE: Self = Self(0);
-    pub const AWAITING_CCRYPT: Self = Self(1);
-    pub const AWAITING_RMAC_I: Self = Self(2);
-    pub const ESTABLISHED: Self = Self(3);
-}
+    #[repr(C)]
+    pub struct osdp_acu_transport_t {
+        pub read: osdp_acu_read_cb,
+        pub write: osdp_acu_write_cb,
+        pub now_ms: osdp_acu_now_ms_cb,
+        pub user: *mut c_void,
+    }
 
-#[repr(C)]
-pub struct osdp_acu_pd_slot_t {
-    pub in_use: bool,
-    pub address: u8,
-    pub next_seq: u8,
-    pub waiting: bool,
-    pub pending_seq: u8,
-    pub pending_code: u8,
-    pub pending_sent_ms: u32,
-    pub online: bool,
-    pub last_reply_ms: u32,
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    pub struct osdp_acu_sc_phase_t(pub c_int);
 
-    pub scbk_set: bool,
-    pub scbk: [u8; OSDP_SC_KEY_LEN],
-    pub scbk_d_set: bool,
-    pub scbk_d: [u8; OSDP_SC_KEY_LEN],
+    impl osdp_acu_sc_phase_t {
+        pub const IDLE: Self = Self(0);
+        pub const AWAITING_CCRYPT: Self = Self(1);
+        pub const AWAITING_RMAC_I: Self = Self(2);
+        pub const ESTABLISHED: Self = Self(3);
+    }
 
-    pub sc_phase: osdp_acu_sc_phase_t,
-    pub sc_key_selector: u8,
-    pub sc_rnd_a: [u8; OSDP_SC_RND_LEN],
-    pub sc_rnd_b: [u8; OSDP_SC_RND_LEN],
-    pub sc_cuid: [u8; OSDP_SC_CUID_LEN],
+    #[repr(C)]
+    pub struct osdp_acu_pd_slot_t {
+        pub in_use: bool,
+        pub address: u8,
+        pub next_seq: u8,
+        pub waiting: bool,
+        pub pending_seq: u8,
+        pub pending_code: u8,
+        pub pending_sent_ms: u32,
+        pub online: bool,
+        pub last_reply_ms: u32,
 
-    pub sc_session: osdp_sc_session_t,
-}
+        pub scbk_set: bool,
+        pub scbk: [u8; OSDP_SC_KEY_LEN],
+        pub scbk_d_set: bool,
+        pub scbk_d: [u8; OSDP_SC_KEY_LEN],
 
-#[repr(C)]
-pub struct osdp_acu_reply_event_t {
-    pub pd_address: u8,
-    pub cmd_code: u8,
-    pub reply_code: u8,
-    pub payload: *const u8,
-    pub payload_len: usize,
-}
+        pub sc_phase: osdp_acu_sc_phase_t,
+        pub sc_key_selector: u8,
+        pub sc_rnd_a: [u8; OSDP_SC_RND_LEN],
+        pub sc_rnd_b: [u8; OSDP_SC_RND_LEN],
+        pub sc_cuid: [u8; OSDP_SC_CUID_LEN],
 
-#[repr(C)]
-pub struct osdp_acu_timeout_event_t {
-    pub pd_address: u8,
-    pub cmd_code: u8,
-    pub cmd_seq: u8,
-}
+        pub sc_session: osdp_sc_session_t,
+    }
 
-pub type osdp_acu_reply_cb =
-    Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_reply_event_t)>;
-pub type osdp_acu_timeout_cb =
-    Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_timeout_event_t)>;
+    #[repr(C)]
+    pub struct osdp_acu_reply_event_t {
+        pub pd_address: u8,
+        pub cmd_code: u8,
+        pub reply_code: u8,
+        pub payload: *const u8,
+        pub payload_len: usize,
+    }
 
-#[repr(transparent)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub struct osdp_acu_sc_event_kind_t(pub c_int);
+    #[repr(C)]
+    pub struct osdp_acu_timeout_event_t {
+        pub pd_address: u8,
+        pub cmd_code: u8,
+        pub cmd_seq: u8,
+    }
 
-impl osdp_acu_sc_event_kind_t {
-    pub const ESTABLISHED: Self = Self(0);
-    pub const HANDSHAKE_FAILED: Self = Self(1);
-    pub const SESSION_LOST: Self = Self(2);
-}
+    pub type osdp_acu_reply_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_reply_event_t)>;
+    pub type osdp_acu_timeout_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_timeout_event_t)>;
 
-#[repr(C)]
-pub struct osdp_acu_sc_event_t {
-    pub pd_address: u8,
-    pub kind: osdp_acu_sc_event_kind_t,
-}
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    pub struct osdp_acu_sc_event_kind_t(pub c_int);
 
-pub type osdp_acu_sc_event_cb =
-    Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_sc_event_t)>;
+    impl osdp_acu_sc_event_kind_t {
+        pub const ESTABLISHED: Self = Self(0);
+        pub const HANDSHAKE_FAILED: Self = Self(1);
+        pub const SESSION_LOST: Self = Self(2);
+    }
 
-#[repr(C)]
-pub struct osdp_acu_t {
-    pub transport: osdp_acu_transport_t,
-    pub pds: *mut osdp_acu_pd_slot_t,
-    pub pd_count: usize,
-    pub reply_cb: osdp_acu_reply_cb,
-    pub reply_user: *mut c_void,
-    pub timeout_cb: osdp_acu_timeout_cb,
-    pub timeout_user: *mut c_void,
-    pub rx: osdp_stream_t,
-    pub tx_buf: [u8; OSDP_ACU_TX_BUF_LEN],
-    pub integrity: osdp_integrity_t,
-    pub sc_crypto: osdp_sc_crypto_t,
-    pub sc_crypto_set: bool,
-    pub sc_event_cb: osdp_acu_sc_event_cb,
-    pub sc_event_user: *mut c_void,
-}
+    #[repr(C)]
+    pub struct osdp_acu_sc_event_t {
+        pub pd_address: u8,
+        pub kind: osdp_acu_sc_event_kind_t,
+    }
 
-extern "C" {
-    pub fn osdp_acu_init(acu: *mut osdp_acu_t, pd_slots: *mut osdp_acu_pd_slot_t, pd_count: usize);
-    pub fn osdp_acu_set_transport(acu: *mut osdp_acu_t, transport: *const osdp_acu_transport_t);
-    pub fn osdp_acu_set_reply_handler(
-        acu: *mut osdp_acu_t,
-        cb: osdp_acu_reply_cb,
-        user: *mut c_void,
-    );
-    pub fn osdp_acu_set_timeout_handler(
-        acu: *mut osdp_acu_t,
-        cb: osdp_acu_timeout_cb,
-        user: *mut c_void,
-    );
-    pub fn osdp_acu_set_integrity(acu: *mut osdp_acu_t, integrity: osdp_integrity_t);
-    pub fn osdp_acu_register_pd(
-        acu: *mut osdp_acu_t,
-        slot_index: usize,
-        pd_address: u8,
-    ) -> osdp_status_t;
-    pub fn osdp_acu_send_command(
-        acu: *mut osdp_acu_t,
-        pd_address: u8,
-        cmd_code: u8,
-        payload: *const u8,
-        payload_len: usize,
-    ) -> osdp_status_t;
-    pub fn osdp_acu_tick(acu: *mut osdp_acu_t);
-    pub fn osdp_acu_is_pd_online(acu: *const osdp_acu_t, pd_address: u8) -> bool;
-    pub fn osdp_acu_is_pd_busy(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+    pub type osdp_acu_sc_event_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_sc_event_t)>;
 
-    pub fn osdp_acu_set_sc_crypto(acu: *mut osdp_acu_t, crypto: *const osdp_sc_crypto_t);
-    pub fn osdp_acu_set_pd_scbk(
-        acu: *mut osdp_acu_t,
-        pd_address: u8,
-        scbk: *const u8,
-    ) -> osdp_status_t;
-    pub fn osdp_acu_set_pd_scbk_d(
-        acu: *mut osdp_acu_t,
-        pd_address: u8,
-        scbk_d: *const u8,
-    ) -> osdp_status_t;
-    pub fn osdp_acu_set_sc_event_handler(
-        acu: *mut osdp_acu_t,
-        cb: osdp_acu_sc_event_cb,
-        user: *mut c_void,
-    );
-    pub fn osdp_acu_start_sc_handshake(
-        acu: *mut osdp_acu_t,
-        pd_address: u8,
-        use_default_key: bool,
-    ) -> osdp_status_t;
-    pub fn osdp_acu_is_pd_sc_established(acu: *const osdp_acu_t, pd_address: u8) -> bool;
-}
+    #[repr(C)]
+    pub struct osdp_acu_t {
+        pub transport: osdp_acu_transport_t,
+        pub pds: *mut osdp_acu_pd_slot_t,
+        pub pd_count: usize,
+        pub reply_cb: osdp_acu_reply_cb,
+        pub reply_user: *mut c_void,
+        pub timeout_cb: osdp_acu_timeout_cb,
+        pub timeout_user: *mut c_void,
+        pub rx: osdp_stream_t,
+        pub tx_buf: [u8; OSDP_ACU_TX_BUF_LEN],
+        pub integrity: osdp_integrity_t,
+        pub sc_crypto: osdp_sc_crypto_t,
+        pub sc_crypto_set: bool,
+        pub sc_event_cb: osdp_acu_sc_event_cb,
+        pub sc_event_user: *mut c_void,
+    }
+
+    extern "C" {
+        pub fn osdp_acu_init(
+            acu: *mut osdp_acu_t,
+            pd_slots: *mut osdp_acu_pd_slot_t,
+            pd_count: usize,
+        );
+        pub fn osdp_acu_set_transport(acu: *mut osdp_acu_t, transport: *const osdp_acu_transport_t);
+        pub fn osdp_acu_set_reply_handler(
+            acu: *mut osdp_acu_t,
+            cb: osdp_acu_reply_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_acu_set_timeout_handler(
+            acu: *mut osdp_acu_t,
+            cb: osdp_acu_timeout_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_acu_set_integrity(acu: *mut osdp_acu_t, integrity: osdp_integrity_t);
+        pub fn osdp_acu_register_pd(
+            acu: *mut osdp_acu_t,
+            slot_index: usize,
+            pd_address: u8,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_send_command(
+            acu: *mut osdp_acu_t,
+            pd_address: u8,
+            cmd_code: u8,
+            payload: *const u8,
+            payload_len: usize,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_tick(acu: *mut osdp_acu_t);
+        pub fn osdp_acu_is_pd_online(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+        pub fn osdp_acu_is_pd_busy(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+
+        pub fn osdp_acu_set_sc_crypto(acu: *mut osdp_acu_t, crypto: *const osdp_sc_crypto_t);
+        pub fn osdp_acu_set_pd_scbk(
+            acu: *mut osdp_acu_t,
+            pd_address: u8,
+            scbk: *const u8,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_set_pd_scbk_d(
+            acu: *mut osdp_acu_t,
+            pd_address: u8,
+            scbk_d: *const u8,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_set_sc_event_handler(
+            acu: *mut osdp_acu_t,
+            cb: osdp_acu_sc_event_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_acu_start_sc_handshake(
+            acu: *mut osdp_acu_t,
+            pd_address: u8,
+            use_default_key: bool,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_is_pd_sc_established(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+    }
+} // mod acu_ffi

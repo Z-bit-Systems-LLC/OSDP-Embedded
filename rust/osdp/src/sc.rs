@@ -19,11 +19,19 @@
 //!     `set_sc_event_handler`. Trigger the handshake with
 //!     `acu.start_sc_handshake(pd_address, use_default_key)`.
 
+// `Box`, `c_void`, and `ptr` are used by the C-side vtable thunks
+// below, which only compile when at least one role feature is active
+// (the thunks have no callers without `pd` or `acu`). Gating the
+// imports too keeps the core-only build (`--no-default-features`)
+// warning-free.
+#[cfg(any(feature = "pd", feature = "acu"))]
 use alloc::boxed::Box;
+#[cfg(any(feature = "pd", feature = "acu"))]
 use core::ffi::c_void;
+#[cfg(any(feature = "pd", feature = "acu"))]
 use core::ptr;
 
-use osdp_sys as sys;
+use crate::sys;
 
 use crate::error::{Error, Result};
 
@@ -96,9 +104,19 @@ pub trait ScCrypto: 'static {
 }
 
 // ---- C-side vtable plumbing --------------------------------------------
+//
+// The thunks below adapt a `Box<dyn ScCrypto>` into the C
+// `osdp_sc_crypto_t` vtable. They're called from inside the C-side
+// state machines, so they're only meaningful when at least one role
+// (PD or ACU) is feature-enabled. With neither, this section compiles
+// cleanly but is dead code; gating avoids the dead-code warnings
+// without forfeiting the ScCrypto trait itself (consumers building
+// their own monitor-style wrapper might still want it).
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 pub(crate) type ScCryptoBox = Box<dyn ScCrypto>;
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 /// Build a C `osdp_sc_crypto_t` whose function pointers route into the
 /// supplied trait object. Returns the raw user pointer the caller must
 /// reclaim (via `Box::from_raw`) and stash inside the owning struct.
@@ -114,6 +132,7 @@ pub(crate) fn build_vtable(crypto: ScCryptoBox) -> (sys::osdp_sc_crypto_t, *mut 
     (v, user)
 }
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 /// Shared implementation for both the encrypt and decrypt thunks: copy
 /// the 16-byte input to a stack buffer (handles potential aliasing
 /// with `out`), then dispatch into the trait method.
@@ -153,6 +172,7 @@ unsafe fn run_block_op(
     }
 }
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 unsafe extern "C" fn aes_encrypt_thunk(
     user: *mut c_void,
     key: *const u8,
@@ -162,6 +182,7 @@ unsafe extern "C" fn aes_encrypt_thunk(
     run_block_op(user, key, in_, out, |c, k, i, o| c.aes_encrypt(k, i, o))
 }
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 unsafe extern "C" fn aes_decrypt_thunk(
     user: *mut c_void,
     key: *const u8,
@@ -171,6 +192,7 @@ unsafe extern "C" fn aes_decrypt_thunk(
     run_block_op(user, key, in_, out, |c, k, i, o| c.aes_decrypt(k, i, o))
 }
 
+#[cfg(any(feature = "pd", feature = "acu"))]
 unsafe extern "C" fn rand_thunk(user: *mut c_void, out: *mut u8, len: usize) -> sys::osdp_status_t {
     let storage = &mut *(user as *mut ScCryptoBox);
     let slice = core::slice::from_raw_parts_mut(out, len);
@@ -181,7 +203,13 @@ unsafe extern "C" fn rand_thunk(user: *mut c_void, out: *mut u8, len: usize) -> 
 }
 
 // ---- ACU-side SC events ------------------------------------------------
+//
+// SC handshake outcomes are reported by the ACU only - the PD's
+// handshake state is queryable directly via `Pd::sc_established`. These
+// types and the dispatch thunk are gated on the `acu` feature so a
+// PD-only build doesn't carry them.
 
+#[cfg(feature = "acu")]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ScEventKind {
     /// Handshake completed; SCS_15..18 traffic is now permitted on
@@ -198,6 +226,7 @@ pub enum ScEventKind {
     SessionLost,
 }
 
+#[cfg(feature = "acu")]
 impl ScEventKind {
     fn from_sys(k: sys::osdp_acu_sc_event_kind_t) -> Self {
         match k {
@@ -211,18 +240,22 @@ impl ScEventKind {
     }
 }
 
+#[cfg(feature = "acu")]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct ScEvent {
     pub pd_address: u8,
     pub kind: ScEventKind,
 }
 
+#[cfg(feature = "acu")]
 pub trait ScEventHandler: 'static {
     fn on_sc_event(&mut self, event: &ScEvent);
 }
 
+#[cfg(feature = "acu")]
 pub(crate) type ScEventBox = Box<dyn ScEventHandler>;
 
+#[cfg(feature = "acu")]
 pub(crate) unsafe extern "C" fn sc_event_thunk(
     user: *mut c_void,
     event: *const sys::osdp_acu_sc_event_t,

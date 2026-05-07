@@ -13,7 +13,7 @@ use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
 
-use osdp_sys as sys;
+use crate::sys;
 
 use crate::error::{Error, Result};
 

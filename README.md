@@ -113,8 +113,9 @@ vendor/                       # 3rd-party code shared between tools and tests
 └── tiny-aes/                 # tiny-AES-c (Unlicense / public domain) —
                               # AES-128 ECB primitive for tests + osdp-pd-mock
 rust/                         # Rust workspace
-├── osdp-sys/                 #   raw FFI bindings (no_std), built via cc crate
-└── osdp/                     #   safe wrapper (typed errors, Pd / Acu, examples)
+└── osdp/                     #   `osdp-embedded` crate: typed Pd / Acu /
+                              #   frame / messages / sc + private FFI seam
+                              #   (mod sys, no_std, built via cc crate)
 docs/                         # design docs and plan; spec/ is gitignored
 ```
 
@@ -158,30 +159,49 @@ link the `osdp::core` and `osdp::messages` (and optionally
 `osdp::dispatch`) targets only — no compiler-options or test framework
 get pulled in.
 
-### Rust crates
+### Rust crate
 
-Two Rust crates under `rust/` wrap the C library:
+The `osdp-embedded` crate under `rust/osdp/` wraps the C library
+behind an idiomatic Rust API. `no_std`-compatible (requires `alloc`
+for the trait-object based callbacks); compiles the C sources via
+the [`cc` crate](https://crates.io/crates/cc) at build time, so no
+separate CMake step or `libclang` is needed and `cargo build --target …`
+cross-compiles cleanly to any target the C library compiles on.
 
-| Crate       | Layer                                 | `no_std` | Use it when…                                                     |
-| ----------- | ------------------------------------- | -------- | ---------------------------------------------------------------- |
-| `osdp-sys`  | raw FFI (extern fn + `#[repr(C)]`)    | yes      | you want bindings only and will write your own ergonomics        |
-| `osdp`      | safe wrapper (typed errors, traits)   | yes (requires `alloc`) | you want a Rust-shaped API: `Pd`, `Acu`, `frame::decode`, … |
+The crate offers Cargo features for selecting which roles get
+compiled in. A PD-only firmware build doesn't carry any ACU code —
+not at the Rust level, not at the C level:
 
-Both crates compile the C sources at build time via the [`cc`
-crate](https://crates.io/crates/cc) — no separate CMake step, no
-`libclang`, and `cargo build --target …` cross-compiles cleanly to
-any target the C library compiles on. Build / test / run the
-loopback example with:
+```toml
+# Pure PD firmware:
+osdp-embedded = { version = "0.1", default-features = false, features = ["pd"] }
+
+# ACU controller:
+osdp-embedded = { version = "0.1", features = ["acu"] }
+
+# Both (typical for tools, monitors, integration tests — also the default):
+osdp-embedded = "0.1"
+```
+
+Default features: `["std", "pd", "acu"]`.
+
+Public API: `osdp_embedded::{Error, Result, Transport, frame, messages, sc}`,
+`osdp_embedded::pd::{Pd, CommandHandler, Reply}` (under `pd`),
+`osdp_embedded::acu::{Acu, ReplyHandler, TimeoutHandler, …}` (under
+`acu`), and the `osdp_embedded::sc::ScCrypto` trait for application-
+supplied AES + RNG.
+
+Build / test / run the loopback examples:
 
 ```sh
 cargo build  --manifest-path rust/Cargo.toml
 cargo test   --manifest-path rust/Cargo.toml
 cargo run    --manifest-path rust/Cargo.toml --example loopback
+cargo run    --manifest-path rust/Cargo.toml --example loopback_sc
 ```
 
-Secure Channel is wired through `osdp-sys` already; the safe-wrapper
-SC API (an `Aes128` trait + key configuration) is on the roadmap in
-[docs/PLAN.md](docs/PLAN.md).
+See [docs/PUBLISHING.md](docs/PUBLISHING.md) for the release recipe
+(version bump, vendoring the C tree, `cargo publish`).
 
 ### Inspecting a capture
 
