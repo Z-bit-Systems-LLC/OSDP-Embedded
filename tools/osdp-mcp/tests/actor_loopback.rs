@@ -22,9 +22,10 @@ use osdp_embedded::messages::{
 use osdp_embedded::pd::Pd;
 use osdp_embedded::Transport;
 
-// Pull the handler + log from osdp-mcp's library half (src/lib.rs).
+// Pull the handler + log + overrides from osdp-mcp's library half.
 use osdp_mcp::handler;
 use osdp_mcp::log::{Direction, LogInner};
+use osdp_mcp::overrides;
 use std::sync::Arc as StdArc;
 
 #[derive(Default)]
@@ -89,6 +90,7 @@ fn default_handler_handles_baseline() {
 
     let stats = Arc::new(Mutex::new(handler::PdStats::default()));
     let log = StdArc::new(LogInner::new(64));
+    let ovmap = overrides::new_map();
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
@@ -96,6 +98,7 @@ fn default_handler_handles_baseline() {
     pd.set_command_handler(handler::DefaultHandler::new(
         Arc::clone(&stats),
         StdArc::clone(&log),
+        StdArc::clone(&ovmap),
         0x10,
     ));
 
@@ -163,4 +166,27 @@ fn default_handler_handles_baseline() {
             (Direction::Reply, OSDP_REPLY_PDCAP),
         ]
     );
+    drop(page);
+
+    // ---- nak_next override: next POLL → NAK 0x03, then default ----
+    // Reset reply capture so the assertions below are about new
+    // events only.
+    captured.borrow_mut().log.clear();
+    overrides::nak_next(&ovmap, OSDP_CMD_POLL, 0x03);
+
+    acu.send_command(0x10, OSDP_CMD_POLL, &[]).unwrap();
+    cycle(&mut pd, &mut acu, 4);
+    acu.send_command(0x10, OSDP_CMD_POLL, &[]).unwrap();
+    cycle(&mut pd, &mut acu, 4);
+
+    let cap = captured.borrow();
+    assert_eq!(cap.log.len(), 2);
+    use osdp_embedded::messages::OSDP_REPLY_NAK;
+    let (_, cmd, reply, payload) = &cap.log[0];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_NAK));
+    assert_eq!(payload, &vec![0x03], "NAK code in payload");
+    // Second POLL falls back to the default ACK behavior.
+    let (_, cmd, reply, payload) = &cap.log[1];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_ACK));
+    assert!(payload.is_empty());
 }

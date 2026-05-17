@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use osdp_mcp::log::{LogEntry, LogPage, DEFAULT_CAPACITY};
+use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
@@ -79,6 +80,89 @@ struct WaitForCommandArgs {
 
 fn default_wait_timeout_ms() -> u32 {
     5_000
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReplyStep {
+    /// OSDP reply code (e.g. 0x40 for ACK, 0x41 for NAK, 0x45 PDID).
+    code: u8,
+    /// Optional payload, hex-encoded ("00FF1A"). Empty / omitted for
+    /// ACK and other payload-less replies.
+    #[serde(default)]
+    payload_hex: String,
+}
+
+impl ReplyStep {
+    fn into_override(self) -> Result<OverrideReply, String> {
+        Ok(OverrideReply {
+            code: self.code,
+            payload: hex_decode(&self.payload_hex)?,
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetReplyForArgs {
+    /// Command code (e.g. 0x60 for POLL) to override.
+    cmd_code: u8,
+    /// Reply to send for every matching command until cleared.
+    #[serde(flatten)]
+    reply: ReplyStep,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetReplyScriptArgs {
+    cmd_code: u8,
+    /// Sequence of replies. The first matching command gets `steps[0]`,
+    /// the next `steps[1]`, and so on.
+    steps: Vec<ReplyStep>,
+    /// When false (default), the override is removed once `steps` is
+    /// exhausted and subsequent commands fall back to the default
+    /// handler. When true, popped steps go to the back so the queue
+    /// loops forever.
+    #[serde(default)]
+    cycle: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct NakNextArgs {
+    cmd_code: u8,
+    /// NAK error code per spec table 32. 0x03 (Unknown Command) is
+    /// the common default; use 0x04 for "Unexpected Sequence", 0x05
+    /// "Unsupported Security Block", 0x06 "Encryption Required", etc.
+    #[serde(default = "default_nak_code")]
+    nak_code: u8,
+}
+
+fn default_nak_code() -> u8 {
+    0x03
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    if s.len() % 2 != 0 {
+        return Err(format!("hex string must have even length, got {}", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("invalid hex char {:?}", b as char)),
+    }
 }
 
 // ---- Service ---------------------------------------------------------
@@ -186,6 +270,73 @@ impl OsdpMcp {
             .wait_for_command(args.cmd_code, args.timeout_ms, args.since_seq)
             .await
             .map(Json)
+    }
+
+    /// Pin a fixed reply for `cmd_code`. The handler will return this
+    /// for every matching command until you call `clear_overrides`
+    /// or replace it with another set_reply_*.
+    #[tool(
+        description = "Install a static reply override for a command code. Replies are repeated for every matching command until cleared."
+    )]
+    fn set_reply_for(
+        &self,
+        Parameters(args): Parameters<SetReplyForArgs>,
+    ) -> Result<String, String> {
+        let reply = args.reply.into_override()?;
+        let code = args.cmd_code;
+        let reply_code = reply.code;
+        self.pd.set_reply_for(code, reply);
+        Ok(format!(
+            "static override installed: cmd 0x{:02X} -> reply 0x{:02X}",
+            code, reply_code
+        ))
+    }
+
+    /// Install a sequenced override. The first matching command gets
+    /// `steps[0]`, the second `steps[1]`, etc. When the queue
+    /// empties, behavior depends on `cycle`: false (default) falls
+    /// back to the default handler; true wraps around forever.
+    #[tool(
+        description = "Install a scripted reply sequence for a command code. cycle=false (default) consumes; cycle=true loops forever."
+    )]
+    fn set_reply_script(
+        &self,
+        Parameters(args): Parameters<SetReplyScriptArgs>,
+    ) -> Result<String, String> {
+        let n = args.steps.len();
+        let steps: Result<Vec<_>, _> = args
+            .steps
+            .into_iter()
+            .map(ReplyStep::into_override)
+            .collect();
+        let steps = steps?;
+        self.pd.set_reply_script(args.cmd_code, steps, args.cycle);
+        Ok(format!(
+            "script override installed: cmd 0x{:02X}, {} step(s), cycle={}",
+            args.cmd_code, n, args.cycle
+        ))
+    }
+
+    /// One-shot: make the next command with `cmd_code` reply with
+    /// NAK `nak_code`, then resume default behavior. Convenient for
+    /// "make the ACU see a single NAK and verify it recovers".
+    #[tool(
+        description = "Make the next inbound command with `cmd_code` reply with NAK `nak_code`, then resume default behavior."
+    )]
+    fn nak_next(&self, Parameters(args): Parameters<NakNextArgs>) -> String {
+        self.pd.nak_next(args.cmd_code, args.nak_code);
+        format!(
+            "next cmd 0x{:02X} will reply NAK 0x{:02X}",
+            args.cmd_code, args.nak_code
+        )
+    }
+
+    /// Drop every installed override. Subsequent commands fall
+    /// through to the default handler. Idempotent.
+    #[tool(description = "Drop every installed reply override. Idempotent.")]
+    fn clear_overrides(&self) -> String {
+        self.pd.clear_overrides();
+        "overrides cleared".to_string()
     }
 }
 

@@ -110,6 +110,66 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         first_text(&res)
     );
 
+    // ---- override tools accept input without a running PD ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("set_reply_for").with_arguments(object!({
+                "cmd_code": 0x60,
+                "code": 0x40,
+                "payload_hex": ""
+            })),
+        )
+        .await?;
+    assert!(
+        first_text(&res).contains("static override installed"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("set_reply_script").with_arguments(object!({
+                "cmd_code": 0x60,
+                "cycle": true,
+                "steps": [
+                    { "code": 0x40, "payload_hex": "" },
+                    { "code": 0x41, "payload_hex": "03" }
+                ]
+            })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("2 step(s)"));
+
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("nak_next")
+                .with_arguments(object!({ "cmd_code": 0x60, "nak_code": 0x04 })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("NAK 0x04"));
+
+    let res = service
+        .call_tool(CallToolRequestParams::new("clear_overrides"))
+        .await?;
+    assert_eq!(first_text(&res), "overrides cleared");
+
+    // Bad hex should surface a clear error.
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("set_reply_for").with_arguments(object!({
+                "cmd_code": 0x60,
+                "code": 0x40,
+                "payload_hex": "ZZ"
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("invalid hex"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
     service.cancel().await?;
     Ok(())
 }

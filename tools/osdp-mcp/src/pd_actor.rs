@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::handler::{DefaultHandler, PdStats};
 use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
+use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
 
 /// Snapshot of the PD's current state, returned by `pd_status`.
@@ -95,6 +96,10 @@ pub struct PdHandle {
     /// Shared with the handler so reads (`get_log`, `wait_for_command`,
     /// `clear_log`) can bypass the actor channel for minimal latency.
     log: Arc<LogInner>,
+    /// Shared with the handler. Writers (the override-related tools)
+    /// modify it directly; the handler reads + consumes script steps
+    /// inside `take_for`.
+    overrides: OverrideMap,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -105,14 +110,17 @@ impl PdHandle {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
+        let overrides = overrides::new_map();
         let log_for_thread = Arc::clone(&log);
+        let overrides_for_thread = Arc::clone(&overrides);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
-            .spawn(move || actor_loop(rx, log_for_thread))
+            .spawn(move || actor_loop(rx, log_for_thread, overrides_for_thread))
             .expect("spawn PD actor thread");
         Self {
             tx,
             log,
+            overrides,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -160,6 +168,31 @@ impl PdHandle {
     /// preserved so any outstanding cursor stays meaningful.
     pub fn clear_log(&self) {
         self.log.clear();
+    }
+
+    /// Install a static reply override for `cmd_code` — every
+    /// matching command gets the same canned reply until cleared or
+    /// replaced.
+    pub fn set_reply_for(&self, cmd_code: u8, reply: OverrideReply) {
+        overrides::set_static(&self.overrides, cmd_code, reply);
+    }
+
+    /// Install a scripted sequence of replies for `cmd_code`.
+    /// `cycle=true` loops forever; `cycle=false` falls back to the
+    /// default handler once exhausted.
+    pub fn set_reply_script(&self, cmd_code: u8, steps: Vec<OverrideReply>, cycle: bool) {
+        overrides::set_script(&self.overrides, cmd_code, steps, cycle);
+    }
+
+    /// One-shot: make the next command with `cmd_code` reply with
+    /// NAK `nak_code`, then resume default behavior.
+    pub fn nak_next(&self, cmd_code: u8, nak_code: u8) {
+        overrides::nak_next(&self.overrides, cmd_code, nak_code);
+    }
+
+    /// Drop every installed override.
+    pub fn clear_overrides(&self) {
+        overrides::clear(&self.overrides);
     }
 
     /// Wait up to `timeout_ms` for a command with `cmd_code` to
@@ -211,7 +244,7 @@ struct Slot {
     stats: Arc<Mutex<PdStats>>,
 }
 
-fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>) {
+fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>, overrides: OverrideMap) {
     let mut slot: Option<Slot> = None;
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
@@ -222,7 +255,7 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>) {
         // channel works from a non-async context.
         loop {
             match rx.try_recv() {
-                Ok(cmd) => handle_cmd(cmd, &mut slot, &log),
+                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Service shut down — exit cleanly.
@@ -239,7 +272,7 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>) {
     }
 }
 
-fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>) {
+fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>, overrides: &OverrideMap) {
     match cmd {
         Cmd::Configure {
             port,
@@ -249,9 +282,10 @@ fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>) {
         } => {
             // Tear down any existing PD first; one slot per actor.
             *slot = None;
-            let result = open_pd(&port, baud, address, Arc::clone(log)).map(|s| {
-                *slot = Some(s);
-            });
+            let result =
+                open_pd(&port, baud, address, Arc::clone(log), Arc::clone(overrides)).map(|s| {
+                    *slot = Some(s);
+                });
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
@@ -282,13 +316,24 @@ fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>) {
     }
 }
 
-fn open_pd(port: &str, baud: u32, address: u8, log: Arc<LogInner>) -> anyhow::Result<Slot> {
+fn open_pd(
+    port: &str,
+    baud: u32,
+    address: u8,
+    log: Arc<LogInner>,
+    overrides: OverrideMap,
+) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::new(Arc::clone(&stats), log, address));
+    pd.set_command_handler(DefaultHandler::new(
+        Arc::clone(&stats),
+        log,
+        overrides,
+        address,
+    ));
 
     tracing::info!(
         port,
