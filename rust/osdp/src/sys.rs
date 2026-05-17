@@ -375,6 +375,28 @@ extern "C" {
         buf_cap: usize,
         written: *mut usize,
     ) -> osdp_status_t;
+
+    pub fn osdp_keyset_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_keyset_cmd_t,
+    ) -> osdp_status_t;
+    pub fn osdp_keyset_build(
+        in_: *const osdp_keyset_cmd_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+}
+
+pub const OSDP_KEYSET_HEADER_BYTES: usize = 2;
+
+#[repr(C)]
+pub struct osdp_keyset_cmd_t {
+    pub key_type: u8,
+    pub key_length: u8,
+    pub key_data: *const u8,
+    pub key_data_len: usize,
 }
 
 // ====================================================================

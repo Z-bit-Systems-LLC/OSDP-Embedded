@@ -208,6 +208,45 @@ osdp_status_t osdp_comset_decode(const uint8_t *payload, size_t len,
 osdp_status_t osdp_comset_build(const osdp_comset_cmd_t *in,
                                 uint8_t *buf, size_t buf_cap, size_t *written);
 
+/* ========================================================================
+ * osdp_KEYSET (0x75) — rotate the PD's Secure Channel Base Key.
+ *
+ * Wire layout (spec 6.x / Annex B):
+ *   byte 0    : key_type   — 0x01 = SCBK; other values reserved.
+ *   byte 1    : key_length — must match the payload bytes that follow.
+ *   bytes 2.. : key_data   — `key_length` bytes of new key material.
+ *
+ * For v2.2 baseline the only meaningful key_type is SCBK and key_length
+ * is always 16 (matches OSDP_SC_KEY_LEN). The decoder accepts the
+ * envelope generically; consumers MUST validate key_type / key_length
+ * against what they're prepared to apply.
+ *
+ * The PD-side state machine in `osdp::pd` applies a well-formed
+ * SCBK KEYSET inline (writes pd->sc.scbk, keeps the existing SC
+ * session running) — the next handshake will use the rotated key.
+ * ====================================================================== */
+
+#define OSDP_KEYSET_HEADER_BYTES 2U
+
+/* Key-type values per spec Annex A.1. SCBK is the only meaningful
+ * value in the v2.2 baseline; the enum is here so callers can write
+ * `OSDP_KEYSET_KEY_TYPE_SCBK` rather than a magic 0x01. */
+typedef enum osdp_keyset_key_type {
+    OSDP_KEYSET_KEY_TYPE_SCBK = 0x01U
+} osdp_keyset_key_type_t;
+
+typedef struct osdp_keyset_cmd {
+    uint8_t        key_type;       /* OSDP_KEYSET_KEY_TYPE_SCBK = 0x01 */
+    uint8_t        key_length;     /* must equal key_data_len           */
+    const uint8_t *key_data;       /* may be NULL when key_data_len==0  */
+    size_t         key_data_len;
+} osdp_keyset_cmd_t;
+
+osdp_status_t osdp_keyset_decode(const uint8_t *payload, size_t len,
+                                 osdp_keyset_cmd_t *out);
+osdp_status_t osdp_keyset_build(const osdp_keyset_cmd_t *in,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
 #ifdef __cplusplus
 }
 #endif

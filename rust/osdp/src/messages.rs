@@ -41,7 +41,8 @@ pub use sys::{
 };
 pub use sys::{
     OSDP_NAK_BAD_CHECK, OSDP_NAK_CMD_LENGTH, OSDP_NAK_ENCRYPTION_REQUIRED, OSDP_NAK_NO_ERROR,
-    OSDP_NAK_UNEXPECTED_SEQUENCE, OSDP_NAK_UNKNOWN_CMD, OSDP_NAK_UNSUPPORTED_SCB,
+    OSDP_NAK_RECORD_INVALID, OSDP_NAK_UNEXPECTED_SEQUENCE, OSDP_NAK_UNKNOWN_CMD,
+    OSDP_NAK_UNSUPPORTED_SCB,
 };
 pub use sys::{
     OSDP_REPLY_ACK, OSDP_REPLY_BUSY, OSDP_REPLY_CCRYPT, OSDP_REPLY_COM, OSDP_REPLY_FMT,
@@ -438,6 +439,61 @@ impl ComsetCmd {
         };
         let mut written: usize = 0;
         let s = unsafe { sys::osdp_comset_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// Key-type values for [`Keyset`]. Spec v2.2 baseline only defines
+/// SCBK; other values are reserved.
+pub const OSDP_KEYSET_KEY_TYPE_SCBK: u8 = 0x01;
+
+/// `osdp_KEYSET` (0x75) — rotate the PD's Secure Channel Base Key.
+///
+/// Wire layout per spec Annex B: 2-byte header (`key_type`,
+/// `key_length`) followed by `key_length` bytes of new key material.
+/// For SCBK rotation, `key_type = 0x01` and `key_length = 16`.
+///
+/// The PD-side state machine in [`crate::pd::Pd`] applies a
+/// well-formed SCBK KEYSET inline (writes the new key into the PD's
+/// SCBK slot, keeps the existing SC session running). The next
+/// handshake will use the rotated key — the current one is left
+/// untouched so the ACU can either keep using the live session or
+/// initiate a new handshake at its discretion.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Keyset<'a> {
+    pub key_type: u8,
+    pub key_length: u8,
+    pub key_data: &'a [u8],
+}
+
+impl<'a> Keyset<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_keyset_cmd_t>::zeroed();
+        let s =
+            unsafe { sys::osdp_keyset_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            key_type: r.key_type,
+            key_length: r.key_length,
+            key_data: unsafe { slice_from_raw_or_empty(r.key_data, r.key_data_len) },
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_keyset_cmd_t {
+            key_type: self.key_type,
+            key_length: self.key_length,
+            key_data: if self.key_data.is_empty() {
+                ptr::null()
+            } else {
+                self.key_data.as_ptr()
+            },
+            key_data_len: self.key_data.len(),
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_keyset_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
         Error::from_status(s)?;
         Ok(written)
     }

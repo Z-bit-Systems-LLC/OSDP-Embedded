@@ -3,8 +3,10 @@
 
 #include "osdp/osdp_pd.h"
 
+#include "osdp/osdp_commands.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
+#include "osdp/osdp_sc.h"
 
 #include "pd_internal.h"
 
@@ -45,6 +47,42 @@ static osdp_status_t build_nak(osdp_pd_t          *pd,
         .payload_len = 1,
     };
     return build_reply(pd, cmd, &reply, out_len);
+}
+
+/* Apply an incoming KEYSET payload to the PD's SCBK. Called from
+ * both the plaintext (pd.c) and SC (pd_sc.c) dispatch paths after
+ * the application handler has ACK'd the command.
+ *
+ * Spec semantic: the new SCBK takes effect on the *next* handshake.
+ * The existing SC session (session keys, SQN, etc.) keeps running —
+ * the ACU initiates a fresh handshake when it wants to switch to
+ * the rotated key. This matches how real PDs behave: KEYSET is an
+ * out-of-band write to persistent storage; SC continues until
+ * either side decides to re-handshake. */
+osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
+                                            const uint8_t *payload,
+                                            size_t         payload_len)
+{
+    osdp_keyset_cmd_t parsed;
+    const osdp_status_t s = osdp_keyset_decode(payload, payload_len, &parsed);
+    if (s != OSDP_OK) {
+        return s;  /* malformed envelope → caller NAK's */
+    }
+    if (parsed.key_type != OSDP_KEYSET_KEY_TYPE_SCBK) {
+        /* v2.2 baseline defines only SCBK; reserved key types are
+         * NACK'd so the ACU sees an explicit "I won't apply this". */
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+    if (parsed.key_length != OSDP_SC_KEY_LEN || parsed.key_data == NULL) {
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+
+    /* Overwrite the stored SCBK and mark it set. The crypto vtable,
+     * cuid, scbk_d, and the live session keys (s_enc / s_mac1 /
+     * s_mac2 / counters in pd->sc.session) are all left alone. */
+    (void)memcpy(pd->sc.scbk, parsed.key_data, OSDP_SC_KEY_LEN);
+    pd->sc.scbk_set = true;
+    return OSDP_OK;
 }
 
 /* Exposed under a stable name so the SC handlers (in pd_sc.c) can
@@ -134,6 +172,22 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
     size_t built = 0;
     osdp_status_t br;
     if (app_status == OSDP_OK) {
+        /* KEYSET hook: if the app ACK'd a KEYSET, apply the new SCBK
+         * before transmitting the ACK. A malformed payload demotes the
+         * ACK to NAK so the ACU sees the failure. The application
+         * doesn't have to know about KEYSET — its existing "ACK
+         * everything I recognise" default works. */
+        if (cmd->code == OSDP_CMD_KEYSET) {
+            const osdp_status_t ks = osdp_pd_internal_apply_keyset(
+                pd, cmd->payload, cmd->payload_len);
+            if (ks != OSDP_OK) {
+                const uint8_t nak_code =
+                    (ks == OSDP_ERR_NOT_SUPPORTED) ? OSDP_NAK_UNKNOWN_CMD
+                                                   : OSDP_NAK_RECORD_INVALID;
+                br = build_nak(pd, cmd, nak_code, &built);
+                return (br == OSDP_OK) ? built : 0;
+            }
+        }
         br = build_reply(pd, cmd, &reply, &built);
     } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
         br = build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &built);

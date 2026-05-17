@@ -338,6 +338,91 @@ static void test_comset_build_rejects_address_above_7e(void)
 }
 
 /* ========================================================================
+ * osdp_KEYSET
+ * ====================================================================== */
+
+static void test_keyset_round_trip_scbk(void)
+{
+    /* A spec-shaped KEYSET: 2-byte header (key_type=SCBK, len=16) +
+     * 16 bytes of key material. */
+    static const uint8_t key[OSDP_KEYSET_HEADER_BYTES + 16] = {
+        0x01, 0x10, /* SCBK, 16 bytes */
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+    };
+
+    osdp_keyset_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_keyset_decode(key, sizeof(key), &got));
+    TEST_ASSERT_EQUAL_UINT8(OSDP_KEYSET_KEY_TYPE_SCBK, got.key_type);
+    TEST_ASSERT_EQUAL_UINT8(16, got.key_length);
+    TEST_ASSERT_EQUAL_size_t(16, got.key_data_len);
+    TEST_ASSERT_EQUAL_MEMORY(&key[2], got.key_data, 16);
+
+    /* Round-trip through the builder yields byte-identical output. */
+    uint8_t out[OSDP_KEYSET_HEADER_BYTES + 16] = { 0 };
+    size_t  written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_keyset_build(&got, out, sizeof(out), &written));
+    TEST_ASSERT_EQUAL_size_t(sizeof(key), written);
+    TEST_ASSERT_EQUAL_MEMORY(key, out, sizeof(key));
+}
+
+static void test_keyset_decode_rejects_length_mismatch(void)
+{
+    /* Header claims 16-byte key but payload only carries 4 bytes — a
+     * malicious or buggy ACU should not silently corrupt the SCBK. */
+    static const uint8_t lying[6] = { 0x01, 0x10, 1, 2, 3, 4 };
+    osdp_keyset_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_keyset_decode(lying, sizeof(lying), &got));
+}
+
+static void test_keyset_decode_rejects_short_payload(void)
+{
+    /* Anything < 2 bytes can't even hold the header. */
+    static const uint8_t one[1] = { 0x01 };
+    osdp_keyset_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_keyset_decode(one, sizeof(one), &got));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_keyset_decode(NULL, 0, &got));
+}
+
+static void test_keyset_build_rejects_inconsistent_length(void)
+{
+    /* `key_length` field disagrees with `key_data_len` — we won't
+     * happily put a lying frame on the wire. */
+    static const uint8_t k[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+    osdp_keyset_cmd_t in = {
+        .key_type     = OSDP_KEYSET_KEY_TYPE_SCBK,
+        .key_length   = 16,             /* lies */
+        .key_data     = k,
+        .key_data_len = 4,              /* truth */
+    };
+    uint8_t out[32];
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_keyset_build(&in, out, sizeof(out), &written));
+}
+
+static void test_keyset_build_rejects_buffer_too_small(void)
+{
+    static const uint8_t k[16] = { 0 };
+    osdp_keyset_cmd_t in = {
+        .key_type     = OSDP_KEYSET_KEY_TYPE_SCBK,
+        .key_length   = 16,
+        .key_data     = k,
+        .key_data_len = 16,
+    };
+    uint8_t out[10]; /* needs 18 */
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_keyset_build(&in, out, sizeof(out), &written));
+    TEST_ASSERT_EQUAL_size_t(0, written);
+}
+
+/* ========================================================================
  * Registration
  * ====================================================================== */
 
@@ -374,5 +459,11 @@ int main(void)
     /* COMSET */
     RUN_TEST(test_comset_round_trip);
     RUN_TEST(test_comset_build_rejects_address_above_7e);
+    /* KEYSET */
+    RUN_TEST(test_keyset_round_trip_scbk);
+    RUN_TEST(test_keyset_decode_rejects_length_mismatch);
+    RUN_TEST(test_keyset_decode_rejects_short_payload);
+    RUN_TEST(test_keyset_build_rejects_inconsistent_length);
+    RUN_TEST(test_keyset_build_rejects_buffer_too_small);
     return UNITY_END();
 }

@@ -212,6 +212,17 @@ that aren't explicit in the spec:
   of a retransmit. Byte-identical bytes = retransmit (per spec 5.9);
   same SQN with different bytes = a new command and must process
   fresh. Implemented in `pd/src/pd.c::is_retransmit`.
+- **KEYSET rotates the SCBK in place; the current SC session keeps
+  running.** When a well-formed `osdp_KEYSET` (key_type=SCBK,
+  key_length=16) is accepted by the application handler, the PD-side
+  dispatch path applies the new key into `pd->sc.scbk` and ACKs.
+  Session keys (`s_enc`, `s_mac1`, `s_mac2`, SQN counters) are
+  intentionally left alone — the rotated key only matters for the
+  *next* handshake, which the ACU initiates whenever it chooses.
+  Malformed KEYSET payloads (header length mismatch, unsupported
+  key_type) downgrade the wire reply from ACK to NAK 0x09
+  (`OSDP_NAK_RECORD_INVALID`) so the ACU sees the failure; the
+  stored SCBK is never overwritten on a bad write.
 - **ACU session-loss conditions** (any one terminates the SC session,
   fires `OSDP_ACU_SC_EVENT_SESSION_LOST` or `_HANDSHAKE_FAILED`, and
   resets the slot to IDLE; the application can re-handshake at will):
@@ -236,9 +247,6 @@ that aren't explicit in the spec:
   hardware AES, BCryptGenRandom / /dev/urandom, etc.).
 - File transfer, biometric, manufacturer-specific commands, multi-
   part / multi-record messages, PIV data exchange.
-- KEYSET command end-to-end handling beyond a basic ACK (changing the
-  SCBK at runtime, re-handshake after KEYSET — these are valid future
-  work but haven't been implemented).
 - Auto-poll scheduling on the ACU (the application currently drives
   every command).
 

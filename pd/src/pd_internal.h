@@ -22,4 +22,30 @@ bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd);
 size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
                                           const osdp_frame_t *cmd);
 
+/* Decode a KEYSET payload and, if it carries a valid 16-byte SCBK,
+ * copy the new key into pd->sc.scbk (and set the `scbk_set` flag).
+ * Called by both the plaintext and SC dispatch paths after the
+ * application handler has indicated it would ACK — so the agreed-
+ * upon semantic is "the PD ACKs the KEYSET, then the next handshake
+ * uses the rotated key".
+ *
+ * Crucially, the existing SC session (s_enc / s_mac1 / s_mac2,
+ * SQN counters, etc.) is left intact. The ACU is responsible for
+ * initiating a fresh handshake when it wants the new key to take
+ * effect on the wire.
+ *
+ * Returns:
+ *   OSDP_OK                    — key applied successfully.
+ *   OSDP_ERR_BAD_PAYLOAD       — wire layout malformed (caller
+ *                                should override the ACK with NAK
+ *                                0x09 so the ACU sees the failure).
+ *   OSDP_ERR_NOT_SUPPORTED     — key_type other than SCBK (0x01)
+ *                                or key_length other than 16
+ *                                (caller should override with NAK
+ *                                0x03).
+ */
+osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t      *pd,
+                                            const uint8_t  *payload,
+                                            size_t          payload_len);
+
 #endif /* OSDP_PD_INTERNAL_H */

@@ -959,6 +959,171 @@ static void test_scs_15_nak_then_valid_poll_chains_correctly(void)
     TEST_ASSERT_EQUAL_size_t(0, ack_plain_len);
 }
 
+/* ---- KEYSET runtime rotation -----------------------------------------*/
+
+/* App handler that ACKs everything the spec baseline supports — including
+ * KEYSET. The library applies the new SCBK after this returns OSDP_OK. */
+static osdp_status_t keyset_friendly_handler(void                 *user,
+                                             uint8_t               cmd_code,
+                                             const uint8_t        *payload,
+                                             size_t                payload_len,
+                                             osdp_pd_reply_t      *reply)
+{
+    (void)user; (void)payload; (void)payload_len;
+    switch (cmd_code) {
+    case OSDP_CMD_POLL:
+    case OSDP_CMD_KEYSET:
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
+    default:
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+}
+
+/* Send a SCS_17 KEYSET carrying a valid 16-byte SCBK under an
+ * established session, expect SCS_16 ACK, and verify that:
+ *   - pd->sc.scbk now equals the new key (rotation actually applied);
+ *   - the live session keys are unchanged (no force-restart);
+ *   - pd_sc_established() still returns true.
+ *
+ * This is the behavior the user asked for: rotate the stored SCBK
+ * without forcing the ACU to re-handshake mid-session. */
+static void test_keyset_under_sc_rotates_scbk_without_restart(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, keyset_friendly_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    /* Capture session keys + counters before the KEYSET — they must
+     * survive the rotation untouched. */
+    uint8_t s_enc_before [OSDP_SC_KEY_LEN];
+    uint8_t s_mac1_before[OSDP_SC_KEY_LEN];
+    uint8_t s_mac2_before[OSDP_SC_KEY_LEN];
+    (void)memcpy(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+
+    /* The new SCBK that the ACU is rotating us to. Deliberately
+     * different from kSCBK / kSCBK_D so the assertion below is sharp. */
+    static const uint8_t kNewSCBK[OSDP_SC_KEY_LEN] = {
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+    };
+
+    uint8_t keyset_payload[OSDP_KEYSET_HEADER_BYTES + OSDP_SC_KEY_LEN];
+    keyset_payload[0] = OSDP_KEYSET_KEY_TYPE_SCBK;
+    keyset_payload[1] = OSDP_SC_KEY_LEN;
+    (void)memcpy(&keyset_payload[2], kNewSCBK, OSDP_SC_KEY_LEN);
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_KEYSET;
+    cmd_template.payload     = keyset_payload;
+    cmd_template.payload_len = sizeof(keyset_payload);
+
+    uint8_t cmd_wire[128]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    /* Reply: SCS_16 ACK (empty payload → unencrypted SCS_16 variant). */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(0, plain_len);
+
+    /* The whole point of this test: the rotated key is in pd.sc.scbk
+     * and the session state is unchanged. */
+    TEST_ASSERT_TRUE(pd.sc.scbk_set);
+    TEST_ASSERT_EQUAL_MEMORY(kNewSCBK, pd.sc.scbk, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+}
+
+/* If the ACU sends a KEYSET with a malformed payload (wrong length,
+ * unsupported key_type, etc.), the library overrides the app handler's
+ * ACK with a NAK so the ACU sees the failure. The stored SCBK must be
+ * left untouched — corrupting it on a bad write would brick the PD. */
+static void test_keyset_with_malformed_payload_naks_and_preserves_scbk(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, keyset_friendly_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    uint8_t scbk_before[OSDP_SC_KEY_LEN];
+    (void)memcpy(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
+
+    /* Header says 16-byte key but payload only carries 4 bytes — the
+     * decoder rejects this. */
+    static const uint8_t lying_payload[6] = { 0x01, 0x10, 1, 2, 3, 4 };
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_KEYSET;
+    cmd_template.payload     = lying_payload;
+    cmd_template.payload_len = sizeof(lying_payload);
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, plain_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, plain[0]);
+
+    /* Stored SCBK must NOT have changed. */
+    TEST_ASSERT_EQUAL_MEMORY(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -981,5 +1146,8 @@ int main(void)
     RUN_TEST(test_scs_17_cmd_with_empty_reply_uses_scs_16);
     /* Regression: post-NAK chain. */
     RUN_TEST(test_scs_15_nak_then_valid_poll_chains_correctly);
+    /* KEYSET runtime rotation. */
+    RUN_TEST(test_keyset_under_sc_rotates_scbk_without_restart);
+    RUN_TEST(test_keyset_with_malformed_payload_naks_and_preserves_scbk);
     return UNITY_END();
 }

@@ -82,6 +82,7 @@ fn main() {
         "core/src/commands/cmd_cap.c",
         "core/src/commands/cmd_comset.c",
         "core/src/commands/cmd_id.c",
+        "core/src/commands/cmd_keyset.c",
         "core/src/commands/cmd_led.c",
         "core/src/commands/cmd_out.c",
         "core/src/commands/cmd_poll.c",

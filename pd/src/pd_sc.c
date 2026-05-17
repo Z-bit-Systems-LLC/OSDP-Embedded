@@ -299,6 +299,25 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * is sufficient. */
     uint8_t nak_byte = OSDP_NAK_UNKNOWN_CMD;
     if (app_status == OSDP_OK) {
+        /* KEYSET hook: same shape as the plaintext path in pd.c —
+         * if the app ACK'd a KEYSET arriving under SC, apply the
+         * new SCBK before transmitting the ACK. On malformed input
+         * we downgrade the wire reply to a NAK so the ACU sees it.
+         * The live SC session is intentionally NOT torn down — the
+         * rotated key only matters for the next handshake. */
+        if (cmd->code == OSDP_CMD_KEYSET) {
+            const osdp_status_t ks = osdp_pd_internal_apply_keyset(
+                pd, plaintext, plaintext_len);
+            if (ks != OSDP_OK) {
+                nak_byte = (ks == OSDP_ERR_NOT_SUPPORTED)
+                               ? OSDP_NAK_UNKNOWN_CMD
+                               : OSDP_NAK_RECORD_INVALID;
+                reply_template.code        = OSDP_REPLY_NAK;
+                reply_template.payload     = &nak_byte;
+                reply_template.payload_len = 1;
+                goto wrap;
+            }
+        }
         reply_template.code        = reply.code;
         reply_template.payload     = reply.payload;
         reply_template.payload_len = reply.payload_len;
@@ -309,6 +328,8 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     } else {
         return 0;  /* internal handler error — drop */
     }
+
+wrap:;
 
     size_t built = 0;
     s = osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session,

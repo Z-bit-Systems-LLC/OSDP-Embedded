@@ -40,6 +40,7 @@ add_library(osdp_messages STATIC
     src/commands/cmd_buz.c
     src/commands/cmd_text.c
     src/commands/cmd_comset.c
+    src/commands/cmd_keyset.c
     # Replies (PD → ACU)
     src/replies/reply_ack.c
     src/replies/reply_nak.c
