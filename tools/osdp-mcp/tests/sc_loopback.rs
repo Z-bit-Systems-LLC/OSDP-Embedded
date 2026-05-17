@@ -152,6 +152,7 @@ fn run_sc_round_trip(sel: Selector) {
     let log = StdArc::new(LogInner::new(128));
     let ovmap = overrides::new_map();
     let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
     let mut pd = Pd::new(PD_ADDRESS);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
@@ -161,6 +162,7 @@ fn run_sc_round_trip(sel: Selector) {
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
         StdArc::clone(&evq),
+        StdArc::clone(&drops),
         PD_ADDRESS,
     ));
     pd.set_sc_crypto(BoxedSc(fresh_crypto(sel)));

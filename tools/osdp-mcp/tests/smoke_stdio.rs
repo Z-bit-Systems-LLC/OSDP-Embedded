@@ -183,6 +183,39 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         Some(0)
     );
 
+    // ---- drop_next_n_replies surfaces through pd_status ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("drop_next_n_replies").with_arguments(object!({ "n": 5 })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("5 reply"));
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_status"))
+        .await?;
+    let status = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        status.get("drop_remaining").and_then(|v| v.as_u64()),
+        Some(5)
+    );
+    // Reset it back to 0.
+    let _ = service
+        .call_tool(
+            CallToolRequestParams::new("drop_next_n_replies").with_arguments(object!({ "n": 0 })),
+        )
+        .await?;
+
+    // ---- force_session_loss errors when no PD is configured ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("force_session_loss"))
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("no PD configured"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
     // ---- get_log on a fresh server returns an empty page ----
     let res = service
         .call_tool(CallToolRequestParams::new("get_log"))

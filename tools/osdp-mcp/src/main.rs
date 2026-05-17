@@ -215,6 +215,13 @@ struct InjectLocalStatusArgs {
     power: u8,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DropNextNRepliesArgs {
+    /// How many upcoming replies the PD should silently swallow.
+    /// Passing 0 effectively cancels any pending drop.
+    n: u32,
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -528,6 +535,35 @@ impl OsdpMcp {
     fn clear_events(&self) -> String {
         self.pd.clear_events();
         "events cleared".to_string()
+    }
+
+    /// Make the PD silently swallow the next `n` replies. Each
+    /// dropped reply still logs the inbound command so the agent
+    /// can verify which got eaten. Exercises the ACU's offline-
+    /// detection path; replaces any previous pending drop count.
+    #[tool(
+        description = "Make the PD silently swallow the next `n` replies (tests the ACU's offline-detection path)."
+    )]
+    fn drop_next_n_replies(&self, Parameters(args): Parameters<DropNextNRepliesArgs>) -> String {
+        self.pd.drop_next_n_replies(args.n);
+        format!("PD will drop the next {} reply(ies)", args.n)
+    }
+
+    /// Tear down and rebuild the current PD with the same
+    /// parameters (port, baud, address, SC config). The serial
+    /// port briefly closes and reopens; the ACU sees the PD reset
+    /// its SQN (and SC state, if enabled), which trips spec
+    /// D.1.4 / 5.9 session-loss detection. Errors if no PD is
+    /// currently configured.
+    #[tool(
+        description = "Force a session-loss event by rebuilding the current PD. The ACU should re-handshake."
+    )]
+    async fn force_session_loss(&self) -> Result<String, String> {
+        self.pd
+            .force_session_loss()
+            .await
+            .map(|()| "PD reset; session loss forced on the ACU side".to_string())
+            .map_err(|e| format!("force_session_loss failed: {}", e))
     }
 }
 

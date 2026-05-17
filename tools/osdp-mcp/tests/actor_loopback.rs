@@ -94,6 +94,7 @@ fn default_handler_handles_baseline() {
     let log = StdArc::new(LogInner::new(64));
     let ovmap = overrides::new_map();
     let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
@@ -103,6 +104,7 @@ fn default_handler_handles_baseline() {
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
         StdArc::clone(&evq),
+        StdArc::clone(&drops),
         0x10,
     ));
 
@@ -280,4 +282,8 @@ fn default_handler_handles_baseline() {
     let (_, cmd, reply, payload) = &cap.log[3];
     assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_ACK));
     assert!(payload.is_empty());
+    // Drop counter wasn't touched in this test path; covered by the
+    // separate handler-level unit test (handler::tests::drop_counter…).
+    drop(cap);
+    let _ = drops;
 }

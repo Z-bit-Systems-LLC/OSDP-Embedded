@@ -13,6 +13,7 @@
 //! `set_reply_for` etc.; the override check will be wired into the
 //! match below.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -104,6 +105,11 @@ pub fn default_pdcap() -> Pdcap {
     }
 }
 
+/// Atomic counter tracking how many upcoming replies the handler
+/// should swallow silently. Shared with the actor / PdHandle so
+/// `drop_next_n_replies` can write it while the handler decrements.
+pub type DropCounter = Arc<AtomicU32>;
+
 /// Application handler. Owns the PDID/PDCAP it reports and a scratch
 /// buffer the build helpers serialize into; the `Reply.payload` slice
 /// the PD copies out borrows from this buffer.
@@ -115,6 +121,7 @@ pub struct DefaultHandler {
     log: Arc<LogInner>,
     overrides: OverrideMap,
     events: EventQueue,
+    drop_remaining: DropCounter,
     pd_address: u8,
     epoch: Instant,
 }
@@ -125,6 +132,7 @@ impl DefaultHandler {
         log: Arc<LogInner>,
         overrides: OverrideMap,
         events: EventQueue,
+        drop_remaining: DropCounter,
         pd_address: u8,
     ) -> Self {
         Self {
@@ -135,6 +143,7 @@ impl DefaultHandler {
             log,
             overrides,
             events,
+            drop_remaining,
             pd_address,
             epoch: Instant::now(),
         }
@@ -185,6 +194,29 @@ impl CommandHandler for DefaultHandler {
         // if we end up returning an error below.
         self.log
             .push(Direction::Cmd, self.pd_address, cmd_code, payload, now);
+
+        // Fault injection: drop the next N replies silently.
+        // Returning a non-NotSupported error makes the C library
+        // skip emitting a reply (see osdp_embedded::pd docs), which
+        // is exactly the "PD went deaf" scenario for testing the
+        // ACU's offline-detection path.
+        if self
+            .drop_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            if let Ok(mut s) = self.stats.lock() {
+                s.last_command_at_ms = Some(now);
+                s.last_cmd_code = Some(cmd_code);
+            }
+            return Err(osdp_embedded::Error::BadPayload);
+        }
 
         // Override table wins over events and over the default
         // behavior. take_for both pops scripted steps and clones the
@@ -260,5 +292,54 @@ impl CommandHandler for DefaultHandler {
             code: reply_code,
             payload: reply_payload,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events;
+    use crate::log::LogInner;
+    use crate::overrides;
+    use osdp_embedded::pd::CommandHandler;
+
+    fn make_handler(drops: u32) -> (DefaultHandler, DropCounter) {
+        let stats = Arc::new(Mutex::new(PdStats::default()));
+        let log = Arc::new(LogInner::new(16));
+        let ovmap = overrides::new_map();
+        let evq = events::new_queue();
+        let drop_counter: DropCounter = Arc::new(AtomicU32::new(drops));
+        let h = DefaultHandler::new(stats, log, ovmap, evq, Arc::clone(&drop_counter), 0x10);
+        (h, drop_counter)
+    }
+
+    #[test]
+    fn drop_counter_silences_n_replies_then_resumes() {
+        let (mut h, drops) = make_handler(2);
+
+        // First two POLLs return Err(BadPayload), which causes the C
+        // library to drop the reply silently.
+        let r1 = h.handle(OSDP_CMD_POLL, &[]);
+        assert!(matches!(r1, Err(osdp_embedded::Error::BadPayload)));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        let r2 = h.handle(OSDP_CMD_POLL, &[]);
+        assert!(matches!(r2, Err(osdp_embedded::Error::BadPayload)));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        // Third POLL goes through to the default ACK behavior.
+        let r3 = h.handle(OSDP_CMD_POLL, &[]).expect("third POLL ok");
+        assert_eq!(r3.code, OSDP_REPLY_ACK);
+        assert!(r3.payload.is_empty());
+        // Counter stays at 0 — no underflow.
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn drop_counter_zero_passes_through() {
+        let (mut h, drops) = make_handler(0);
+        let r = h.handle(OSDP_CMD_POLL, &[]).unwrap();
+        assert_eq!(r.code, OSDP_REPLY_ACK);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
 }

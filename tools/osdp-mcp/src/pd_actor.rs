@@ -15,6 +15,7 @@
 //! `pd_stop` tears it down. The thread loop ticks the current PD (if
 //! any) and drains pending commands once per cycle.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, PdStats};
+use crate::handler::{DefaultHandler, DropCounter, PdStats};
 use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
@@ -57,6 +58,9 @@ pub struct PdStatus {
     /// How many PD-initiated events are queued for the next POLLs
     /// (RAW / KEYPAD / LSTATR from inject_* tools).
     pub event_queue_depth: u32,
+    /// How many upcoming replies the handler will swallow silently
+    /// (set via `drop_next_n_replies`).
+    pub drop_remaining: u32,
 }
 
 impl PdStatus {
@@ -73,6 +77,7 @@ impl PdStatus {
             last_cmd_code: None,
             last_reply_code: None,
             event_queue_depth: 0,
+            drop_remaining: 0,
         }
     }
 }
@@ -108,6 +113,14 @@ enum Cmd {
     Status {
         reply: oneshot::Sender<PdStatus>,
     },
+    /// Tear down and rebuild the current PD with the same parameters
+    /// (port, baud, address, SC config). The serial port briefly
+    /// closes and reopens; the ACU sees the PD reset its SC state
+    /// and SQN, which trips the spec D.1.4 / 5.9 session-loss path.
+    /// Errors if no PD is currently configured.
+    ForceSessionLoss {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Handle the MCP service holds. Clone-able, Send + Sync — multiple
@@ -126,6 +139,10 @@ pub struct PdHandle {
     /// LSTATR). The handler drains one per POLL when the override
     /// table misses; the inject_* tools enqueue.
     events: EventQueue,
+    /// Atomic count of upcoming replies the handler should silently
+    /// swallow. `drop_next_n_replies` writes this; the handler
+    /// decrements once per dropped reply.
+    drop_remaining: DropCounter,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -141,9 +158,11 @@ impl PdHandle {
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
         let overrides = overrides::new_map();
         let events = events::new_queue();
+        let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
         let log_for_thread = Arc::clone(&log);
         let overrides_for_thread = Arc::clone(&overrides);
         let events_for_thread = Arc::clone(&events);
+        let drop_for_thread = Arc::clone(&drop_remaining);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -152,6 +171,7 @@ impl PdHandle {
                     log_for_thread,
                     overrides_for_thread,
                     events_for_thread,
+                    drop_for_thread,
                     crypto_factory,
                 )
             })
@@ -161,6 +181,7 @@ impl PdHandle {
             log,
             overrides,
             events,
+            drop_remaining,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -261,6 +282,30 @@ impl PdHandle {
         events::clear(&self.events);
     }
 
+    /// Make the handler silently drop the next `n` replies. Each
+    /// dropped reply still logs the inbound command (so the agent
+    /// can see what was eaten); the PD just doesn't transmit
+    /// anything in response. Tests the ACU's offline-detection
+    /// path. Cumulative — calling twice with n=2 each sets the
+    /// counter to 4 only if the first hasn't been consumed yet;
+    /// otherwise the new value replaces the residual.
+    pub fn drop_next_n_replies(&self, n: u32) {
+        self.drop_remaining.store(n, Ordering::Relaxed);
+    }
+
+    /// Tear down and rebuild the current PD with the same parameters.
+    /// Forces the ACU into session-loss detection — the rebuilt PD
+    /// starts with a fresh SQN and (if SC was configured) loses its
+    /// SC session state.
+    pub async fn force_session_loss(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ForceSessionLoss { reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?
+    }
+
     /// Wait up to `timeout_ms` for a command with `cmd_code` to
     /// arrive (entries with `seq > since_seq`). Returns the matching
     /// entry on success, an error string on timeout.
@@ -307,6 +352,10 @@ struct Slot {
     port: String,
     baud: u32,
     address: u8,
+    /// Last SC config we were asked for. Replayed by
+    /// `ForceSessionLoss` so the rebuilt PD comes up with the same
+    /// SC posture as the original.
+    sc: Option<ScConfig>,
     stats: Arc<Mutex<PdStats>>,
 }
 
@@ -315,6 +364,7 @@ fn actor_loop(
     log: Arc<LogInner>,
     overrides: OverrideMap,
     events: EventQueue,
+    drop_remaining: DropCounter,
     crypto_factory: CryptoFactory,
 ) {
     let mut slot: Option<Slot> = None;
@@ -327,7 +377,15 @@ fn actor_loop(
         // channel works from a non-async context.
         loop {
             match rx.try_recv() {
-                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides, &events, &crypto_factory),
+                Ok(cmd) => handle_cmd(
+                    cmd,
+                    &mut slot,
+                    &log,
+                    &overrides,
+                    &events,
+                    &drop_remaining,
+                    &crypto_factory,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Service shut down — exit cleanly.
@@ -344,12 +402,14 @@ fn actor_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
     log: &Arc<LogInner>,
     overrides: &OverrideMap,
     events: &EventQueue,
+    drop_remaining: &DropCounter,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -369,6 +429,7 @@ fn handle_cmd(
                 Arc::clone(log),
                 Arc::clone(overrides),
                 Arc::clone(events),
+                Arc::clone(drop_remaining),
                 sc,
                 crypto_factory,
             )
@@ -381,14 +442,51 @@ fn handle_cmd(
             *slot = None;
             let _ = reply.send(());
         }
+        Cmd::ForceSessionLoss { reply } => {
+            let result = match slot.take() {
+                None => Err(anyhow::anyhow!("no PD configured; nothing to force-reset")),
+                Some(old) => {
+                    // Replay the original configure with the same
+                    // port/baud/address/sc. The serial port briefly
+                    // closes and reopens; the ACU's next exchange
+                    // sees a fresh-boot PD.
+                    tracing::info!(
+                        port = %old.port,
+                        address = format!("0x{:02X}", old.address),
+                        "force_session_loss: rebuilding PD"
+                    );
+                    let r = open_pd(
+                        &old.port,
+                        old.baud,
+                        old.address,
+                        Arc::clone(log),
+                        Arc::clone(overrides),
+                        Arc::clone(events),
+                        Arc::clone(drop_remaining),
+                        old.sc.clone(),
+                        crypto_factory,
+                    );
+                    match r {
+                        Ok(s) => {
+                            *slot = Some(s);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            let _ = reply.send(result);
+        }
         Cmd::Status { reply } => {
-            // Event queue depth is independent of whether a PD is
-            // running — inject_* calls enqueue regardless, and the
-            // queue persists across pd_stop / pd_configure cycles.
+            // Event queue depth + drop counter are independent of
+            // whether a PD is running — agent-side state that the
+            // handler reads when a PD is later configured.
             let queue_depth = events::len(events) as u32;
+            let drops = drop_remaining.load(Ordering::Relaxed);
             let status = match slot.as_ref() {
                 None => PdStatus {
                     event_queue_depth: queue_depth,
+                    drop_remaining: drops,
                     ..PdStatus::idle()
                 },
                 Some(s) => {
@@ -405,6 +503,7 @@ fn handle_cmd(
                         last_cmd_code: stats.last_cmd_code,
                         last_reply_code: stats.last_reply_code,
                         event_queue_depth: queue_depth,
+                        drop_remaining: drops,
                     }
                 }
             };
@@ -425,6 +524,7 @@ fn open_pd(
     log: Arc<LogInner>,
     overrides: OverrideMap,
     events: EventQueue,
+    drop_remaining: DropCounter,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -438,6 +538,7 @@ fn open_pd(
         log,
         overrides,
         events,
+        drop_remaining,
         address,
     ));
 
@@ -447,7 +548,7 @@ fn open_pd(
     // default PDID we report (spec D.4.3 — first 8 bytes of the PDID
     // byte stream: vendor[3] + model + version + serial[0..2]).
     let mut sc_mode_label = "none";
-    if let Some(cfg) = sc {
+    if let Some(cfg) = sc.as_ref() {
         let crypto = crypto_factory();
         pd.set_sc_crypto(BoxedSc(crypto));
         let cuid = derive_cuid_from_default_pdid();
@@ -458,7 +559,7 @@ fn open_pd(
                 sc_mode_label = "scbkd";
             }
             ScConfig::Scbk(key) => {
-                pd.set_sc_scbk(&key);
+                pd.set_sc_scbk(key);
                 sc_mode_label = "scbk";
             }
         }
@@ -476,6 +577,7 @@ fn open_pd(
         port: port.to_string(),
         baud,
         address,
+        sc,
         stats,
     })
 }

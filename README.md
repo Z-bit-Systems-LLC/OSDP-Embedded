@@ -341,6 +341,8 @@ Tools exposed today:
 |             | `inject_keypad`        | Queue a keypad press; reports KEYPAD on the next POLL.           |
 |             | `inject_local_status`  | Queue a tamper/power change; reports LSTATR on the next POLL.    |
 |             | `clear_events`         | Drop every queued event.                                         |
+| Faults      | `drop_next_n_replies`  | Silently swallow the next N replies — exercises ACU offline detection. |
+|             | `force_session_loss`   | Rebuild the PD with the same params; ACU should re-handshake.    |
 | Liveness    | `ping`                 | Banner string — confirms the server is reachable.                |
 
 Defaults (PDID vendor "ZBC", a small PDCAP set, baseline
@@ -362,11 +364,10 @@ Either mode also derives the cUID from the configured PDID per
 spec D.4.3 and binds the chosen AES backend (`--crypto`) as the
 PD's `ScCrypto` provider.
 
-Event injection (RAW / KEYPAD / LSTATR) is wired up — `inject_*`
-tools enqueue PD-initiated reports, drained one per POLL in FIFO
-order, and `pd_status.event_queue_depth` surfaces the queue size.
-Fault injection (`force_session_loss`, `drop_next_n_replies`) is
-still pending.
+Event injection (RAW / KEYPAD / LSTATR) and fault injection
+(`drop_next_n_replies`, `force_session_loss`) are wired up.
+`pd_status` surfaces both `event_queue_depth` and `drop_remaining`
+so an agent can confirm its setup before driving the ACU.
 
 ## Reference material
 
