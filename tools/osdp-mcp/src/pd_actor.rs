@@ -23,6 +23,7 @@ use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::handler::{DefaultHandler, PdStats};
+use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
 use crate::serial_transport::SerialTransport;
 
 /// Snapshot of the PD's current state, returned by `pd_status`.
@@ -91,6 +92,9 @@ enum Cmd {
 #[derive(Clone)]
 pub struct PdHandle {
     tx: mpsc::UnboundedSender<Cmd>,
+    /// Shared with the handler so reads (`get_log`, `wait_for_command`,
+    /// `clear_log`) can bypass the actor channel for minimal latency.
+    log: Arc<LogInner>,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -100,12 +104,15 @@ impl PdHandle {
     /// Spawn the actor thread. Call once at startup.
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
+        let log_for_thread = Arc::clone(&log);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
-            .spawn(move || actor_loop(rx))
+            .spawn(move || actor_loop(rx, log_for_thread))
             .expect("spawn PD actor thread");
         Self {
             tx,
+            log,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -142,6 +149,57 @@ impl PdHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))
     }
+
+    /// Read up to `limit` log entries with `seq > since_seq`. Goes
+    /// straight to the shared log — no actor round-trip.
+    pub fn get_log(&self, since_seq: u64, limit: usize) -> LogPage {
+        self.log.snapshot(since_seq, limit)
+    }
+
+    /// Drop every entry currently in the log. `next_seq` is
+    /// preserved so any outstanding cursor stays meaningful.
+    pub fn clear_log(&self) {
+        self.log.clear();
+    }
+
+    /// Wait up to `timeout_ms` for a command with `cmd_code` to
+    /// arrive (entries with `seq > since_seq`). Returns the matching
+    /// entry on success, an error string on timeout.
+    pub async fn wait_for_command(
+        &self,
+        cmd_code: u8,
+        timeout_ms: u32,
+        since_seq: u64,
+    ) -> Result<crate::log::LogEntry, String> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+        loop {
+            // Register interest BEFORE checking — closes the window
+            // where a notify could fire between the check and the
+            // await and get missed.
+            let notified = self.log.notify.notified();
+            if let Some(entry) = self.log.find_command_at_or_after(since_seq, cmd_code) {
+                return Ok(entry);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timeout: no cmd 0x{:02X} arrived within {} ms",
+                    cmd_code, timeout_ms
+                ));
+            }
+            // notify_waiters may have already fired — that's OK,
+            // `notified` was registered before the check above, so
+            // the next iteration will see the new entry.
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(format!(
+                    "timeout: no cmd 0x{:02X} arrived within {} ms",
+                    cmd_code, timeout_ms
+                ));
+            }
+        }
+    }
 }
 
 /// Runtime state held by the actor thread itself.
@@ -153,7 +211,7 @@ struct Slot {
     stats: Arc<Mutex<PdStats>>,
 }
 
-fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>) {
+fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>) {
     let mut slot: Option<Slot> = None;
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
@@ -164,7 +222,7 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>) {
         // channel works from a non-async context.
         loop {
             match rx.try_recv() {
-                Ok(cmd) => handle_cmd(cmd, &mut slot),
+                Ok(cmd) => handle_cmd(cmd, &mut slot, &log),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Service shut down — exit cleanly.
@@ -181,7 +239,7 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>) {
     }
 }
 
-fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>) {
+fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>) {
     match cmd {
         Cmd::Configure {
             port,
@@ -191,7 +249,7 @@ fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>) {
         } => {
             // Tear down any existing PD first; one slot per actor.
             *slot = None;
-            let result = open_pd(&port, baud, address).map(|s| {
+            let result = open_pd(&port, baud, address, Arc::clone(log)).map(|s| {
                 *slot = Some(s);
             });
             let _ = reply.send(result);
@@ -224,13 +282,13 @@ fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>) {
     }
 }
 
-fn open_pd(port: &str, baud: u32, address: u8) -> anyhow::Result<Slot> {
+fn open_pd(port: &str, baud: u32, address: u8, log: Arc<LogInner>) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::new(Arc::clone(&stats)));
+    pd.set_command_handler(DefaultHandler::new(Arc::clone(&stats), log, address));
 
     tracing::info!(
         port,

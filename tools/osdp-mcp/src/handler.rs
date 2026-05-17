@@ -18,10 +18,12 @@ use std::time::Instant;
 
 use osdp_embedded::messages::{
     Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_COMSET, OSDP_CMD_ID,
-    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT, OSDP_REPLY_ACK,
-    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
+    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{CommandHandler, Reply};
+
+use crate::log::{Direction, LogInner};
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -108,24 +110,33 @@ pub struct DefaultHandler {
     pub pdcap: Pdcap,
     scratch: [u8; SCRATCH_LEN],
     stats: Arc<Mutex<PdStats>>,
+    log: Arc<LogInner>,
+    pd_address: u8,
     epoch: Instant,
 }
 
 impl DefaultHandler {
-    pub fn new(stats: Arc<Mutex<PdStats>>) -> Self {
+    pub fn new(stats: Arc<Mutex<PdStats>>, log: Arc<LogInner>, pd_address: u8) -> Self {
         Self {
             pdid: default_pdid(),
             pdcap: default_pdcap(),
             scratch: [0; SCRATCH_LEN],
             stats,
+            log,
+            pd_address,
             epoch: Instant::now(),
         }
     }
 }
 
 impl CommandHandler for DefaultHandler {
-    fn handle<'a>(&'a mut self, cmd_code: u8, _payload: &[u8]) -> osdp_embedded::Result<Reply<'a>> {
+    fn handle<'a>(&'a mut self, cmd_code: u8, payload: &[u8]) -> osdp_embedded::Result<Reply<'a>> {
         let now = self.epoch.elapsed().as_millis() as u32;
+
+        // Log the inbound command first, so the agent sees it even
+        // if we end up returning an error below.
+        self.log
+            .push(Direction::Cmd, self.pd_address, cmd_code, payload, now);
 
         // Decide the reply (and serialise payload into scratch)
         // before touching stats — keeps the &mut self.scratch borrow
@@ -142,7 +153,22 @@ impl CommandHandler for DefaultHandler {
             }
             OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET
             | OSDP_CMD_COMSET => (OSDP_REPLY_ACK, 0),
-            _ => return Err(osdp_embedded::Error::NotSupported),
+            _ => {
+                // Library will synthesise NAK 0x03; record it now
+                // since we won't get a hook on the outbound path.
+                self.log.push(
+                    Direction::Nak,
+                    self.pd_address,
+                    OSDP_NAK_UNKNOWN_CMD,
+                    &[],
+                    now,
+                );
+                if let Ok(mut s) = self.stats.lock() {
+                    s.last_command_at_ms = Some(now);
+                    s.last_cmd_code = Some(cmd_code);
+                }
+                return Err(osdp_embedded::Error::NotSupported);
+            }
         };
 
         // Stats stamp covers both the command arrival and our reply,
@@ -154,9 +180,18 @@ impl CommandHandler for DefaultHandler {
             s.last_reply_code = Some(reply_code);
         }
 
+        let reply_payload = &self.scratch[..payload_len];
+        self.log.push(
+            Direction::Reply,
+            self.pd_address,
+            reply_code,
+            reply_payload,
+            now,
+        );
+
         Ok(Reply {
             code: reply_code,
-            payload: &self.scratch[..payload_len],
+            payload: reply_payload,
         })
     }
 }

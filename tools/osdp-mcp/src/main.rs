@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use osdp_mcp::log::{LogEntry, LogPage, DEFAULT_CAPACITY};
 use osdp_mcp::pd_actor::{PdHandle, PdStatus};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
@@ -43,6 +44,41 @@ struct PdConfigureArgs {
 
 fn default_baud() -> u32 {
     9600
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetLogArgs {
+    /// Skip entries with `seq <= since_seq`. Use the `next_seq` from
+    /// a previous response to continue paging. Defaults to 0 (all).
+    #[serde(default)]
+    since_seq: u64,
+    /// Cap the number of entries returned. Defaults to the ring
+    /// capacity so a single call drains everything.
+    #[serde(default = "default_log_limit")]
+    limit: u32,
+}
+
+fn default_log_limit() -> u32 {
+    DEFAULT_CAPACITY as u32
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WaitForCommandArgs {
+    /// OSDP command code (e.g. 0x60 for POLL, 0x61 for ID).
+    cmd_code: u8,
+    /// Hard timeout. Defaults to 5s — long enough to catch slow ACUs,
+    /// short enough that an MCP client doesn't hang forever.
+    #[serde(default = "default_wait_timeout_ms")]
+    timeout_ms: u32,
+    /// Only consider entries with `seq > since_seq`. Defaults to 0
+    /// — the agent typically snapshots the log first, drives the
+    /// ACU, then waits using the snapshot's `next_seq` as cursor.
+    #[serde(default)]
+    since_seq: u64,
+}
+
+fn default_wait_timeout_ms() -> u32 {
+    5_000
 }
 
 // ---- Service ---------------------------------------------------------
@@ -118,6 +154,38 @@ impl OsdpMcp {
             .await
             .map(Json)
             .map_err(|e| format!("pd_status failed: {}", e))
+    }
+
+    /// Read recent on-wire events (commands accepted, replies sent,
+    /// library-synthesised NAKs). Cursor-paged via `since_seq`.
+    #[tool(
+        description = "Return up to `limit` log entries with seq > since_seq. Includes the cursor for the next call."
+    )]
+    fn get_log(&self, Parameters(args): Parameters<GetLogArgs>) -> Json<LogPage> {
+        Json(self.pd.get_log(args.since_seq, args.limit as usize))
+    }
+
+    /// Drop every entry currently in the log. `next_seq` keeps
+    /// climbing so cursors from before the clear stay meaningful.
+    #[tool(description = "Drop every entry currently in the log. Idempotent.")]
+    fn clear_log(&self) -> String {
+        self.pd.clear_log();
+        "log cleared".to_string()
+    }
+
+    /// Block until a command with the given code arrives, or the
+    /// timeout fires. Returns the matching log entry on success.
+    #[tool(
+        description = "Wait up to `timeout_ms` for an inbound command with `cmd_code`. Returns the matching log entry, or errors on timeout."
+    )]
+    async fn wait_for_command(
+        &self,
+        Parameters(args): Parameters<WaitForCommandArgs>,
+    ) -> Result<Json<LogEntry>, String> {
+        self.pd
+            .wait_for_command(args.cmd_code, args.timeout_ms, args.since_seq)
+            .await
+            .map(Json)
     }
 }
 

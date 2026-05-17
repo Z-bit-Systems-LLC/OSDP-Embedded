@@ -7,5 +7,6 @@
 //! serial port.
 
 pub mod handler;
+pub mod log;
 pub mod pd_actor;
 pub mod serial_transport;

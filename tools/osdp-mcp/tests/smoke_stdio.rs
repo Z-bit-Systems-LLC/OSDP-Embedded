@@ -77,6 +77,39 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         "unexpected error text: {text:?}"
     );
 
+    // ---- get_log on a fresh server returns an empty page ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("get_log"))
+        .await?;
+    let page = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        page.get("entries")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(0)
+    );
+    assert_eq!(page.get("total").and_then(|v| v.as_u64()), Some(0));
+
+    // ---- clear_log is idempotent on an empty log ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("clear_log"))
+        .await?;
+    assert_eq!(first_text(&res), "log cleared");
+
+    // ---- wait_for_command times out cleanly when no PD is running ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("wait_for_command")
+                .with_arguments(object!({ "cmd_code": 0x60, "timeout_ms": 50 })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("timeout"),
+        "expected timeout message, got {:?}",
+        first_text(&res)
+    );
+
     service.cancel().await?;
     Ok(())
 }

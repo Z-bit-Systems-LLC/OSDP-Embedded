@@ -22,8 +22,10 @@ use osdp_embedded::messages::{
 use osdp_embedded::pd::Pd;
 use osdp_embedded::Transport;
 
-// Pull the handler from osdp-mcp's library half (src/lib.rs).
+// Pull the handler + log from osdp-mcp's library half (src/lib.rs).
 use osdp_mcp::handler;
+use osdp_mcp::log::{Direction, LogInner};
+use std::sync::Arc as StdArc;
 
 #[derive(Default)]
 struct Wire {
@@ -86,11 +88,16 @@ fn default_handler_handles_baseline() {
     let wire = Rc::new(RefCell::new(Wire::default()));
 
     let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(64));
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
     });
-    pd.set_command_handler(handler::DefaultHandler::new(Arc::clone(&stats)));
+    pd.set_command_handler(handler::DefaultHandler::new(
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        0x10,
+    ));
 
     let captured = Rc::new(RefCell::new(Captured::default()));
     let mut acu = Acu::new(1);
@@ -114,28 +121,46 @@ fn default_handler_handles_baseline() {
     acu.send_command(0x10, OSDP_CMD_CAP, &[0x00]).unwrap();
     cycle(&mut pd, &mut acu, 4);
 
-    let log = captured.borrow();
-    assert_eq!(log.log.len(), 3, "expected 3 replies, got {:?}", log.log);
+    let cap = captured.borrow();
+    assert_eq!(cap.log.len(), 3, "expected 3 replies, got {:?}", cap.log);
 
     // POLL → ACK
-    let (addr, cmd, reply, payload) = &log.log[0];
+    let (addr, cmd, reply, payload) = &cap.log[0];
     assert_eq!((*addr, *cmd, *reply), (0x10, OSDP_CMD_POLL, OSDP_REPLY_ACK));
     assert!(payload.is_empty());
 
     // ID → PDID — decode and confirm it matches default_pdid().
-    let (_, cmd, reply, payload) = &log.log[1];
+    let (_, cmd, reply, payload) = &cap.log[1];
     assert_eq!((*cmd, *reply), (OSDP_CMD_ID, OSDP_REPLY_PDID));
     let pdid = Pdid::decode(payload).expect("decode default PDID");
     assert_eq!(pdid, handler::default_pdid());
 
     // CAP → PDCAP — decode and confirm it matches default_pdcap().
-    let (_, cmd, reply, payload) = &log.log[2];
+    let (_, cmd, reply, payload) = &cap.log[2];
     assert_eq!((*cmd, *reply), (OSDP_CMD_CAP, OSDP_REPLY_PDCAP));
     let pdcap = Pdcap::decode(payload).expect("decode default PDCAP");
     assert_eq!(pdcap, handler::default_pdcap());
+    drop(cap);
 
     // Stats picked up the last cmd/reply.
     let s = stats.lock().unwrap();
     assert_eq!(s.last_cmd_code, Some(OSDP_CMD_CAP));
     assert_eq!(s.last_reply_code, Some(OSDP_REPLY_PDCAP));
+    drop(s);
+
+    // ---- Log captured all three round trips (cmd + reply each) ----
+    let page = log.snapshot(0, 100);
+    assert_eq!(page.entries.len(), 6, "expected 3 cmd + 3 reply entries");
+    let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
+    assert_eq!(
+        codes,
+        vec![
+            (Direction::Cmd, OSDP_CMD_POLL),
+            (Direction::Reply, OSDP_REPLY_ACK),
+            (Direction::Cmd, OSDP_CMD_ID),
+            (Direction::Reply, OSDP_REPLY_PDID),
+            (Direction::Cmd, OSDP_CMD_CAP),
+            (Direction::Reply, OSDP_REPLY_PDCAP),
+        ]
+    );
 }
