@@ -16,6 +16,10 @@
 resolver = "2"
 members  = [
     "osdp",
+    # The MCP server lives under tools/ alongside the C-based host
+    # tools (osdp-pd-mock, osdp-acu-mock, osdp-parser); listing it
+    # here lets cargo build/test it as part of the workspace.
+    "../tools/osdp-mcp",
 ]
 
 [workspace.package]

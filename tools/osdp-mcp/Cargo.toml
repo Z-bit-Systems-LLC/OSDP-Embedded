@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# osdp-mcp — Model Context Protocol server that drives an osdp-embedded
+# PD against an ACU under test. Lets an AI agent (or any MCP client)
+# spin up a virtual PD on a real serial port or an in-process loopback,
+# script its replies, inject events, and observe what the ACU sends.
+#
+# Listed as a member of the rust/Cargo.toml workspace; sits under
+# tools/ to mirror the existing host-tool layout (osdp-pd-mock,
+# osdp-acu-mock, osdp-parser).
+
+[package]
+name        = "osdp-mcp"
+description = "MCP server exposing the osdp-embedded PD state machine for testing OSDP ACUs."
+# The workspace root lives in ../../rust/, not in any ancestor of this
+# Cargo.toml. Without this hint cargo can't find the [workspace.package]
+# block to inherit `version` / `edition` / etc. from.
+workspace   = "../../rust"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+publish     = false
+
+[dependencies]
+osdp-embedded = { path = "../../rust/osdp", default-features = false, features = ["std", "pd"] }
+
+# rmcp is the official Rust MCP SDK. Default features (base64, macros,
+# server) plus transport-io for stdio. Past 1.0, so API churn is
+# bounded — bump the patch as needed.
+rmcp = { version = "1.7", features = ["transport-io"] }
+
+# rmcp's macros expand to async fns and Tokio I/O; we need a multi-
+# thread runtime for the stdio server loop. The PD itself is !Send
+# and runs on a dedicated std::thread (set up in later milestones).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+
+# Type-safe tool parameter schemas. rmcp re-exports schemars but
+# requires the consumer to depend on it directly for derive support.
+schemars = "0.8"
+serde    = { version = "1", features = ["derive"] }
+
+# Pulled in by rmcp; declare explicitly so we can use ? in main().
+anyhow = "1"
+
+# Stderr logging — never write to stdout when MCP is on stdio.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Integration tests spawn the built binary and drive it over stdio
+# using rmcp's own client. `client` enables the client side of the
+# service; `transport-child-process` provides TokioChildProcess.
+rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
+# rmcp::object! macro expands to serde_json::json!(...) so the caller
+# needs serde_json in scope.
+serde_json = "1"
