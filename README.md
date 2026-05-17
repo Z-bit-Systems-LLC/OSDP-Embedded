@@ -54,6 +54,15 @@ hardware PD, or another `osdp-pd-mock` over a com0com pair). Closes
 the symmetric interop loop: pd-mock validates our PD against
 third-party ACUs, acu-mock validates our ACU against third-party PDs.
 
+The `osdp-mcp` server (Rust, stdio
+[Model Context Protocol](https://modelcontextprotocol.io/)) exposes
+the same PD-on-a-serial-port behavior as `osdp-pd-mock` but driven
+through an AI agent. The agent can bring a PD up, script its
+replies for any command code, inject NAKs, wait for specific
+inbound commands, and read the decoded wire history — useful for
+interactive ACU interop investigation and for letting an agent
+author its own regression tests against a controller.
+
 ## Architecture at a glance
 
 The core library is split by **message direction**, not by role:
@@ -103,8 +112,11 @@ tools/
 ├── osdp-parser/              # OSDPCAP-aware CLI Monitor (osdpcap reader + main)
 ├── osdp-pd-mock/             # live PD on a serial port; pair with any ACU
 │                             # for interop validation
-└── osdp-acu-mock/            # live ACU on a serial port; pair with any PD
-                              # for interop validation
+├── osdp-acu-mock/            # live ACU on a serial port; pair with any PD
+│                             # for interop validation
+└── osdp-mcp/                 # MCP server exposing an `osdp::pd` for
+                              # agent-driven ACU testing (Rust;
+                              # member of the rust/ workspace)
 tests/
 ├── vendor/unity/             # vendored Unity test framework
 ├── captures/                 # drop *.osdpcap files here for integration tests
@@ -254,6 +266,65 @@ build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 --sc=scbkd -v
 build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 \
     --poll-interval 200 -v
 ```
+
+### Agent-driven testing (MCP server)
+
+`tools/osdp-mcp/` is a stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) server
+that wraps the Rust `osdp_embedded::pd::Pd` so an AI agent
+(Claude Code, an IDE assistant, an autonomous test runner) can
+drive a virtual PD against an ACU under test. The agent gets a
+small set of tools for lifecycle, observation, and reply
+scripting; the PD itself lives on a dedicated thread inside the
+server so the `!Send` C state machine stays single-threaded
+while the MCP layer remains async.
+
+Built as part of the Rust workspace — no CMake step:
+
+```sh
+cargo build  --manifest-path rust/Cargo.toml -p osdp-mcp
+cargo test   --manifest-path rust/Cargo.toml -p osdp-mcp
+```
+
+The binary lands at `rust/target/debug/osdp-mcp` (or `…/release/`
+with `--release`). Wire it into an MCP-capable client by pointing
+at that path. Example for Claude Code (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "osdp-mcp": {
+      "command": "C:\\path\\to\\OSDP-Embedded\\rust\\target\\release\\osdp-mcp.exe"
+    }
+  }
+}
+```
+
+Tools exposed today:
+
+| Category    | Tool                  | Purpose                                                          |
+| ----------- | --------------------- | ---------------------------------------------------------------- |
+| Lifecycle   | `pd_configure`        | Open a serial port and start the PD on it.                       |
+|             | `pd_stop`             | Tear the PD down (idempotent).                                   |
+|             | `pd_status`           | Structured snapshot: running / online / SC / last cmd / last reply. |
+| Observation | `get_log`             | Cursor-paged decoded wire history (commands, replies, NAKs).     |
+|             | `clear_log`           | Drop log entries; cursor stays monotonic.                        |
+|             | `wait_for_command`    | Block until an inbound command with a given code arrives.        |
+| Scripting   | `set_reply_for`       | Pin a static reply for a command code.                           |
+|             | `set_reply_script`    | Queue a sequence of replies (one-shot or cycling).               |
+|             | `nak_next`            | One-shot: make the next command of a given code reply NAK.       |
+|             | `clear_overrides`     | Drop every installed override.                                   |
+| Liveness    | `ping`                | Banner string — confirms the server is reachable.                |
+
+Defaults (PDID vendor "ZBC", a small PDCAP set, baseline
+POLL/ID/CAP/LED/BUZ/OUT/TEXT/KEYSET/COMSET behavior) match
+`osdp-pd-mock` so a freshly-configured MCP-driven PD behaves
+identically to the CLI tool. The agent overrides specific cmd
+codes from there.
+
+Secure Channel support, event injection (RAW/KEYPAD/LSTATR), and
+fault injection (force_session_loss, drop_next_n_replies) are
+planned but not yet shipped.
 
 ## Reference material
 
