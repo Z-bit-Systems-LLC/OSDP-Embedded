@@ -43,14 +43,20 @@ struct PdConfigureArgs {
     /// (0x7F) is always accepted in addition to this one.
     #[serde(default)]
     address: u8,
-    /// Secure Channel mode. "none" (default) disables SC entirely —
-    /// the PD will NAK any SCB frame. "scbkd" binds the well-known
-    /// install key from the spec (anyone with the spec PDF knows it).
-    /// "scbk" binds a per-installation key — pair with `scbk_hex`.
+    /// Secure Channel mode. Accepted values:
+    ///   - "none" (default): SC disabled; the PD NAKs any SCB frame.
+    ///   - "install" (alias: "scbkd", "default"): PD is in install
+    ///     mode and accepts handshakes with the well-known SCBK-D
+    ///     key from the spec (D.4). Use this for first-time keying
+    ///     and for development against ACUs that handshake with the
+    ///     default key.
+    ///   - "scbk" (alias: "operational"): PD uses a per-installation
+    ///     16-byte SCBK — pair with `scbk_hex`. This is the steady-
+    ///     state mode after a KEYSET has rotated the install key.
     #[serde(default)]
     sc_mode: Option<String>,
-    /// 32-hex-char SCBK (16 bytes) — required when `sc_mode` is "scbk",
-    /// ignored otherwise.
+    /// 32-hex-char SCBK (16 bytes) — required when `sc_mode` is
+    /// "scbk" / "operational", ignored otherwise.
     #[serde(default)]
     scbk_hex: Option<String>,
 }
@@ -60,10 +66,20 @@ fn default_baud() -> u32 {
 }
 
 fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
-    match args.sc_mode.as_deref() {
-        None | Some("") | Some("none") => Ok(None),
-        Some("scbkd") => Ok(Some(ScConfig::Scbkd)),
-        Some("scbk") => {
+    // Normalise to lowercase so "Install" / "SCBKD" etc. all work.
+    let mode = args
+        .sc_mode
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase());
+    match mode.as_deref() {
+        None | Some("") | Some("none") | Some("off") => Ok(None),
+        // Install mode = SCBK-D (spec D.4 well-known default key).
+        // Accept the colloquial term plus the spec-internal name and
+        // a few common synonyms an agent might reach for.
+        Some("install") | Some("scbkd") | Some("scbk-d") | Some("default") => {
+            Ok(Some(ScConfig::Scbkd))
+        }
+        Some("scbk") | Some("operational") | Some("custom") => {
             let hex = args.scbk_hex.as_deref().unwrap_or("");
             let bytes = hex_decode(hex)?;
             if bytes.len() != 16 {
@@ -77,7 +93,8 @@ fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
             Ok(Some(ScConfig::Scbk(key)))
         }
         Some(other) => Err(format!(
-            "unknown sc_mode {other:?}; expected one of: none, scbkd, scbk"
+            "unknown sc_mode {other:?}; expected one of: \
+             none, install (= scbkd / default), scbk (= operational, with scbk_hex)"
         )),
     }
 }
@@ -292,8 +309,8 @@ impl OsdpMcp {
         let sc = parse_sc_config(&args)?;
         let sc_label = match &sc {
             None => "off".to_string(),
-            Some(ScConfig::Scbkd) => "scbkd".to_string(),
-            Some(ScConfig::Scbk(_)) => "scbk".to_string(),
+            Some(ScConfig::Scbkd) => "install (SCBK-D)".to_string(),
+            Some(ScConfig::Scbk(_)) => "operational (SCBK)".to_string(),
         };
         self.pd
             .configure(args.port.clone(), args.baud, args.address, sc)

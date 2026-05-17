@@ -105,6 +105,36 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         .await?;
     assert_eq!(res.is_error, Some(true));
     assert!(first_text(&res).contains("unknown sc_mode"));
+    // Error message must mention the friendly aliases so an agent
+    // that asked for the wrong thing can self-correct.
+    assert!(
+        first_text(&res).contains("install"),
+        "error should hint at 'install' as an accepted value, got: {:?}",
+        first_text(&res)
+    );
+
+    // ---- sc_mode synonyms all parse: "install", "Install",
+    //      "scbkd", "default" all reach SCBK-D. Bad port still
+    //      fails configure (which is fine — we're testing the
+    //      sc_mode validation path, not the serial open).
+    for alias in ["install", "Install", "SCBKD", "default", "scbk-d"] {
+        let res = service
+            .call_tool(
+                CallToolRequestParams::new("pd_configure").with_arguments(object!({
+                    "port": "bogus-COM999",
+                    "sc_mode": alias,
+                })),
+            )
+            .await?;
+        // Configure fails on the serial open, NOT on sc_mode parse —
+        // the error text should reflect that.
+        assert_eq!(res.is_error, Some(true), "alias {alias} should pass parse");
+        assert!(
+            first_text(&res).contains("pd_configure failed"),
+            "alias {alias} produced wrong error: {:?}",
+            first_text(&res)
+        );
+    }
 
     // ---- inject_raw queues a card-read event ----
     let res = service
