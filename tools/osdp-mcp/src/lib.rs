@@ -6,6 +6,7 @@
 //! and default handler directly, without going through MCP or a
 //! serial port.
 
+pub mod crypto;
 pub mod handler;
 pub mod log;
 pub mod overrides;

@@ -282,9 +282,26 @@ while the MCP layer remains async.
 Built as part of the Rust workspace — no CMake step:
 
 ```sh
+# Default build (RustCrypto AES backend for Secure Channel):
 cargo build  --manifest-path rust/Cargo.toml -p osdp-mcp
 cargo test   --manifest-path rust/Cargo.toml -p osdp-mcp
+
+# Add the tiny-AES-c backend on top:
+cargo build  --manifest-path rust/Cargo.toml -p osdp-mcp --features crypto-tiny-aes
 ```
+
+Cargo features select which AES backends get compiled into the
+binary. At runtime, `--crypto <name>` picks among them.
+
+| Feature             | Default | AES source                       |
+| ------------------- | ------- | -------------------------------- |
+| `crypto-rustcrypto` | yes     | pure-Rust [`aes`](https://crates.io/crates/aes) crate (constant-time) |
+| `crypto-tiny-aes`   | no      | vendored tiny-AES-c, compiled via `build.rs` from `vendor/tiny-aes/` |
+
+Both backends source random bytes from `getrandom` (the OS CSPRNG —
+`BCryptGenRandom` / `/dev/urandom` / `getentropy`). Adding a third
+backend (wolfCrypt, mbedTLS, hardware AES) is a single file behind
+a new `crypto-*` feature.
 
 The binary lands at `rust/target/debug/osdp-mcp` (or `…/release/`
 with `--release`). Wire it into an MCP-capable client by pointing
@@ -294,11 +311,17 @@ at that path. Example for Claude Code (`~/.claude.json`):
 {
   "mcpServers": {
     "osdp-mcp": {
-      "command": "C:\\path\\to\\OSDP-Embedded\\rust\\target\\release\\osdp-mcp.exe"
+      "command": "C:\\path\\to\\OSDP-Embedded\\rust\\target\\release\\osdp-mcp.exe",
+      "args": ["--crypto", "rustcrypto"]
     }
   }
 }
 ```
+
+`--crypto` may be omitted; the binary defaults to the first
+compiled-in backend (RustCrypto when built with default features).
+Run `osdp-mcp --help` for the full list of recognised backend
+names in the current build.
 
 Tools exposed today:
 
@@ -322,9 +345,22 @@ POLL/ID/CAP/LED/BUZ/OUT/TEXT/KEYSET/COMSET behavior) match
 identically to the CLI tool. The agent overrides specific cmd
 codes from there.
 
-Secure Channel support, event injection (RAW/KEYPAD/LSTATR), and
-fault injection (force_session_loss, drop_next_n_replies) are
-planned but not yet shipped.
+Secure Channel is enabled per-PD by passing `sc_mode` to
+`pd_configure`. Two modes:
+
+  - `"scbkd"` — bind the well-known install-time SCBK-D from the
+    spec. Convenient for development against an ACU that supports
+    handshake with the default key.
+  - `"scbk"` + `scbk_hex` — bind a per-installation SCBK (32 hex
+    chars = 16 bytes). The ACU side must hold the matching key.
+
+Either mode also derives the cUID from the configured PDID per
+spec D.4.3 and binds the chosen AES backend (`--crypto`) as the
+PD's `ScCrypto` provider.
+
+Event injection (RAW/KEYPAD/LSTATR) and fault injection
+(force_session_loss, drop_next_n_replies) are planned but not yet
+shipped.
 
 ## Reference material
 

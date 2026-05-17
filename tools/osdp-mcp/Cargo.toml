@@ -25,8 +25,27 @@ repository.workspace   = true
 rust-version.workspace = true
 publish     = false
 
+# ---- Features --------------------------------------------------------
+#
+# Crypto backend selection. The library never vendors AES; the binary
+# picks one or more backends at compile time and the runtime --crypto
+# flag chooses between them. Default is RustCrypto's `aes` — pure
+# Rust, constant-time, no external setup. tiny-AES-c (compiled from
+# vendor/tiny-aes/ at build time) is gated separately so binaries
+# that don't want the FFI overhead stay lean. Both backends source
+# their RNG bytes from `getrandom`.
+[features]
+default           = ["crypto-rustcrypto"]
+crypto-rustcrypto = ["dep:aes", "dep:getrandom"]
+crypto-tiny-aes   = ["dep:getrandom"]
+
 [dependencies]
 osdp-embedded = { path = "../../rust/osdp", default-features = false, features = ["std", "pd"] }
+
+# Optional crypto backend deps — compiled in only when the matching
+# feature is active.
+aes       = { version = "0.8", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 # rmcp is the official Rust MCP SDK. Default features (base64, macros,
 # server) plus transport-io for stdio. Past 1.0, so API churn is
@@ -55,6 +74,12 @@ serialport = "4"
 # Stderr logging — never write to stdout when MCP is on stdio.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+# Only invoked when `crypto-tiny-aes` is active, in which case we
+# compile vendor/tiny-aes/aes.c and link AES_ECB_encrypt /
+# AES_ECB_decrypt for the FFI in src/crypto/tiny_aes.rs.
+cc = "1.0"
 
 [dev-dependencies]
 # Integration tests spawn the built binary and drive it over stdio

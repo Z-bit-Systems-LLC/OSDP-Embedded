@@ -22,6 +22,7 @@ use std::time::Duration;
 use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::handler::{DefaultHandler, PdStats};
 use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
@@ -71,6 +72,21 @@ impl PdStatus {
     }
 }
 
+/// Secure Channel configuration for a freshly-configured PD.
+///
+/// `None` means "no SC" — the PD will NAK any SCB-bearing frame
+/// with code 0x05 (matches the C library's behavior when the
+/// crypto vtable + keys are absent).
+#[derive(Debug, Clone)]
+pub enum ScConfig {
+    /// Use the well-known install-time SCBK-D from the spec. The
+    /// PD will accept handshakes initiated with the SCBK-D selector.
+    Scbkd,
+    /// Use a per-installation SCBK (custom 16-byte key). PD will
+    /// accept handshakes with the SCBK selector.
+    Scbk([u8; 16]),
+}
+
 /// Messages the MCP side sends to the actor. Every variant carries a
 /// `oneshot::Sender` so the caller can await the result.
 enum Cmd {
@@ -78,6 +94,7 @@ enum Cmd {
         port: String,
         baud: u32,
         address: u8,
+        sc: Option<ScConfig>,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     Stop {
@@ -106,8 +123,11 @@ pub struct PdHandle {
 }
 
 impl PdHandle {
-    /// Spawn the actor thread. Call once at startup.
-    pub fn spawn() -> Self {
+    /// Spawn the actor thread with the given crypto factory. The
+    /// factory is invoked once per `pd_configure` that enables SC,
+    /// so each PD has its own fresh `ScCrypto` instance (and RNG
+    /// state, if the backend keeps any).
+    pub fn spawn(crypto_factory: CryptoFactory) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
         let overrides = overrides::new_map();
@@ -115,7 +135,7 @@ impl PdHandle {
         let overrides_for_thread = Arc::clone(&overrides);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
-            .spawn(move || actor_loop(rx, log_for_thread, overrides_for_thread))
+            .spawn(move || actor_loop(rx, log_for_thread, overrides_for_thread, crypto_factory))
             .expect("spawn PD actor thread");
         Self {
             tx,
@@ -125,13 +145,20 @@ impl PdHandle {
         }
     }
 
-    pub async fn configure(&self, port: String, baud: u32, address: u8) -> anyhow::Result<()> {
+    pub async fn configure(
+        &self,
+        port: String,
+        baud: u32,
+        address: u8,
+        sc: Option<ScConfig>,
+    ) -> anyhow::Result<()> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Configure {
                 port,
                 baud,
                 address,
+                sc,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
@@ -244,7 +271,12 @@ struct Slot {
     stats: Arc<Mutex<PdStats>>,
 }
 
-fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>, overrides: OverrideMap) {
+fn actor_loop(
+    mut rx: mpsc::UnboundedReceiver<Cmd>,
+    log: Arc<LogInner>,
+    overrides: OverrideMap,
+    crypto_factory: CryptoFactory,
+) {
     let mut slot: Option<Slot> = None;
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
@@ -255,7 +287,7 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>, override
         // channel works from a non-async context.
         loop {
             match rx.try_recv() {
-                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides),
+                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides, &crypto_factory),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Service shut down — exit cleanly.
@@ -272,20 +304,35 @@ fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>, log: Arc<LogInner>, override
     }
 }
 
-fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>, log: &Arc<LogInner>, overrides: &OverrideMap) {
+fn handle_cmd(
+    cmd: Cmd,
+    slot: &mut Option<Slot>,
+    log: &Arc<LogInner>,
+    overrides: &OverrideMap,
+    crypto_factory: &CryptoFactory,
+) {
     match cmd {
         Cmd::Configure {
             port,
             baud,
             address,
+            sc,
             reply,
         } => {
             // Tear down any existing PD first; one slot per actor.
             *slot = None;
-            let result =
-                open_pd(&port, baud, address, Arc::clone(log), Arc::clone(overrides)).map(|s| {
-                    *slot = Some(s);
-                });
+            let result = open_pd(
+                &port,
+                baud,
+                address,
+                Arc::clone(log),
+                Arc::clone(overrides),
+                sc,
+                crypto_factory,
+            )
+            .map(|s| {
+                *slot = Some(s);
+            });
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
@@ -322,6 +369,8 @@ fn open_pd(
     address: u8,
     log: Arc<LogInner>,
     overrides: OverrideMap,
+    sc: Option<ScConfig>,
+    crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
@@ -335,10 +384,34 @@ fn open_pd(
         address,
     ));
 
+    // Bind Secure Channel material if requested. The crypto factory
+    // mints a fresh provider per PD so the AES + RNG state is
+    // independent across configures. The cUID is derived from the
+    // default PDID we report (spec D.4.3 — first 8 bytes of the PDID
+    // byte stream: vendor[3] + model + version + serial[0..2]).
+    let mut sc_mode_label = "none";
+    if let Some(cfg) = sc {
+        let crypto = crypto_factory();
+        pd.set_sc_crypto(BoxedSc(crypto));
+        let cuid = derive_cuid_from_default_pdid();
+        pd.set_sc_cuid(&cuid);
+        match cfg {
+            ScConfig::Scbkd => {
+                pd.set_sc_scbk_d(osdp_embedded::sc::scbk_default());
+                sc_mode_label = "scbkd";
+            }
+            ScConfig::Scbk(key) => {
+                pd.set_sc_scbk(&key);
+                sc_mode_label = "scbk";
+            }
+        }
+    }
+
     tracing::info!(
         port,
         baud,
         address = format!("0x{:02X}", address),
+        sc = sc_mode_label,
         "PD configured"
     );
     Ok(Slot {
@@ -348,4 +421,26 @@ fn open_pd(
         address,
         stats,
     })
+}
+
+/// Build the 8-byte cUID from the default PDID. Spec D.4.3:
+/// `vendor[0..3] + model + version + serial[0..2]` (the first two
+/// bytes of serial in transmission order — little-endian on the wire).
+fn derive_cuid_from_default_pdid() -> [u8; 8] {
+    let p = crate::handler::default_pdid();
+    let serial_le = p.serial.to_le_bytes();
+    [
+        p.vendor_code[0],
+        p.vendor_code[1],
+        p.vendor_code[2],
+        p.model,
+        p.version,
+        serial_le[0],
+        serial_le[1],
+        // Spec D.4.3 takes the first 8 bytes of the PDID byte stream.
+        // After vendor[3] + model + version we have 2 bytes of serial
+        // left to fill 8. Pad the 8th byte with serial[2] for
+        // continuity with the wire layout.
+        serial_le[2],
+    ]
 }

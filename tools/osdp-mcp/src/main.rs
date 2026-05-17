@@ -12,9 +12,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogPage, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
-use osdp_mcp::pd_actor::{PdHandle, PdStatus};
+use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_router, Json, ServiceExt};
@@ -41,10 +42,43 @@ struct PdConfigureArgs {
     /// (0x7F) is always accepted in addition to this one.
     #[serde(default)]
     address: u8,
+    /// Secure Channel mode. "none" (default) disables SC entirely —
+    /// the PD will NAK any SCB frame. "scbkd" binds the well-known
+    /// install key from the spec (anyone with the spec PDF knows it).
+    /// "scbk" binds a per-installation key — pair with `scbk_hex`.
+    #[serde(default)]
+    sc_mode: Option<String>,
+    /// 32-hex-char SCBK (16 bytes) — required when `sc_mode` is "scbk",
+    /// ignored otherwise.
+    #[serde(default)]
+    scbk_hex: Option<String>,
 }
 
 fn default_baud() -> u32 {
     9600
+}
+
+fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
+    match args.sc_mode.as_deref() {
+        None | Some("") | Some("none") => Ok(None),
+        Some("scbkd") => Ok(Some(ScConfig::Scbkd)),
+        Some("scbk") => {
+            let hex = args.scbk_hex.as_deref().unwrap_or("");
+            let bytes = hex_decode(hex)?;
+            if bytes.len() != 16 {
+                return Err(format!(
+                    "sc_mode='scbk' requires a 32-hex-char key (16 bytes); got {} byte(s)",
+                    bytes.len()
+                ));
+            }
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&bytes);
+            Ok(Some(ScConfig::Scbk(key)))
+        }
+        Some(other) => Err(format!(
+            "unknown sc_mode {other:?}; expected one of: none, scbkd, scbk"
+        )),
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -173,10 +207,11 @@ struct OsdpMcp {
 }
 
 impl OsdpMcp {
-    fn new() -> Self {
-        Self {
-            pd: Arc::new(PdHandle::spawn()),
-        }
+    fn new(crypto: Selector) -> anyhow::Result<Self> {
+        let factory = crypto.factory().map_err(|e| anyhow::anyhow!(e))?;
+        Ok(Self {
+            pd: Arc::new(PdHandle::spawn(factory)),
+        })
     }
 }
 
@@ -204,13 +239,19 @@ impl OsdpMcp {
         &self,
         Parameters(args): Parameters<PdConfigureArgs>,
     ) -> Result<String, String> {
+        let sc = parse_sc_config(&args)?;
+        let sc_label = match &sc {
+            None => "off".to_string(),
+            Some(ScConfig::Scbkd) => "scbkd".to_string(),
+            Some(ScConfig::Scbk(_)) => "scbk".to_string(),
+        };
         self.pd
-            .configure(args.port.clone(), args.baud, args.address)
+            .configure(args.port.clone(), args.baud, args.address, sc)
             .await
             .map(|()| {
                 format!(
-                    "PD configured on {} @ {}bps addr=0x{:02X}",
-                    args.port, args.baud, args.address
+                    "PD configured on {} @ {}bps addr=0x{:02X} sc={}",
+                    args.port, args.baud, args.address, sc_label
                 )
             })
             .map_err(|e| format!("pd_configure failed: {}", e))
@@ -342,6 +383,53 @@ impl OsdpMcp {
 
 // ---- Main ------------------------------------------------------------
 
+/// Parsed CLI args. Tiny enough that hand-rolling beats pulling in clap.
+struct Cli {
+    crypto: Selector,
+}
+
+fn parse_cli() -> Result<Cli, String> {
+    let mut args = std::env::args().skip(1);
+    let mut crypto: Option<Selector> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--crypto" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "--crypto requires a value".to_string())?;
+                crypto = Some(v.parse()?);
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "osdp-mcp — MCP server exposing an osdp-embedded PD\n\n\
+                     Usage: osdp-mcp [--crypto <backend>]\n\n\
+                     Options:\n  \
+                       --crypto <name>   AES backend to use for Secure Channel.\n                       \
+                                       Available in this build: {available}\n                       \
+                                       Default: {default}\n  \
+                       --help, -h        Show this message and exit.\n",
+                    available = Selector::available()
+                        .into_iter()
+                        .map(|s| s.name())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    default = Selector::default_for_build()
+                        .map(|s| s.name())
+                        .unwrap_or("<none>"),
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    let crypto = crypto.or_else(Selector::default_for_build).ok_or_else(|| {
+        "no crypto backend compiled in; rebuild with `--features crypto-rustcrypto` \
+         and/or `--features crypto-tiny-aes`"
+            .to_string()
+    })?;
+    Ok(Cli { crypto })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // CRITICAL: MCP uses stdout for JSON-RPC framing; logs MUST go to
@@ -354,13 +442,24 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!("osdp-mcp starting (stdio transport)");
+    let cli = parse_cli().map_err(|e| {
+        eprintln!("osdp-mcp: {e}\n(run with --help for usage)");
+        anyhow::anyhow!(e)
+    })?;
+
+    tracing::info!(
+        crypto = cli.crypto.name(),
+        "osdp-mcp starting (stdio transport)"
+    );
 
     // .inspect_err is Rust 1.76+; workspace MSRV is 1.70 so use map_err.
-    let service = OsdpMcp::new().serve(stdio()).await.map_err(|e| {
-        tracing::error!(?e, "failed to start MCP service");
-        e
-    })?;
+    let service = OsdpMcp::new(cli.crypto)?
+        .serve(stdio())
+        .await
+        .map_err(|e| {
+            tracing::error!(?e, "failed to start MCP service");
+            e
+        })?;
 
     service.waiting().await?;
     Ok(())

@@ -77,6 +77,35 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         "unexpected error text: {text:?}"
     );
 
+    // ---- pd_configure with sc_mode="scbk" but bad key length errors ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_configure").with_arguments(object!({
+                "port": "ignored-bad-key-comes-first",
+                "sc_mode": "scbk",
+                "scbk_hex": "ABCD"   // only 2 bytes, not 16
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("32-hex-char"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
+    // ---- pd_configure with unknown sc_mode errors ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_configure").with_arguments(object!({
+                "port": "irrelevant",
+                "sc_mode": "tls"
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(first_text(&res).contains("unknown sc_mode"));
+
     // ---- get_log on a fresh server returns an empty page ----
     let res = service
         .call_tool(CallToolRequestParams::new("get_log"))
