@@ -106,6 +106,83 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
     assert_eq!(res.is_error, Some(true));
     assert!(first_text(&res).contains("unknown sc_mode"));
 
+    // ---- inject_raw queues a card-read event ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("inject_raw").with_arguments(object!({
+                "bit_count": 26,
+                "data_hex": "DEADBEEF"
+            })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("RAW queued"));
+
+    // Bit count must match data length.
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("inject_raw").with_arguments(object!({
+                "bit_count": 26,
+                "data_hex": "DE" // only 1 byte for a 4-byte payload
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(first_text(&res).contains("needs 4 bytes"));
+
+    // ---- inject_keypad with ASCII digits ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("inject_keypad")
+                .with_arguments(object!({ "digits": "1234#" })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("KEYPAD queued"));
+
+    // ---- inject_local_status with tamper flag ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("inject_local_status")
+                .with_arguments(object!({ "tamper": 1 })),
+        )
+        .await?;
+    assert!(first_text(&res).contains("LSTATR queued"));
+
+    // tamper must be 0 or 1.
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("inject_local_status")
+                .with_arguments(object!({ "tamper": 7 })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(first_text(&res).contains("must be 0 or 1"));
+
+    // ---- pd_status surfaces the queue depth (3 queued, 2 failed) ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_status"))
+        .await?;
+    let status = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        status.get("event_queue_depth").and_then(|v| v.as_u64()),
+        Some(3),
+        "expected 3 queued events (RAW + KEYPAD + LSTATR), got {:?}",
+        status.get("event_queue_depth")
+    );
+
+    // ---- clear_events drops the queue ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("clear_events"))
+        .await?;
+    assert_eq!(first_text(&res), "events cleared");
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_status"))
+        .await?;
+    let status = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        status.get("event_queue_depth").and_then(|v| v.as_u64()),
+        Some(0)
+    );
+
     // ---- get_log on a fresh server returns an empty page ----
     let res = service
         .call_tool(CallToolRequestParams::new("get_log"))

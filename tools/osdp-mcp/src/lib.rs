@@ -7,6 +7,7 @@
 //! serial port.
 
 pub mod crypto;
+pub mod events;
 pub mod handler;
 pub mod log;
 pub mod overrides;

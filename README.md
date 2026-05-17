@@ -325,19 +325,23 @@ names in the current build.
 
 Tools exposed today:
 
-| Category    | Tool                  | Purpose                                                          |
-| ----------- | --------------------- | ---------------------------------------------------------------- |
-| Lifecycle   | `pd_configure`        | Open a serial port and start the PD on it.                       |
-|             | `pd_stop`             | Tear the PD down (idempotent).                                   |
-|             | `pd_status`           | Structured snapshot: running / online / SC / last cmd / last reply. |
-| Observation | `get_log`             | Cursor-paged decoded wire history (commands, replies, NAKs).     |
-|             | `clear_log`           | Drop log entries; cursor stays monotonic.                        |
-|             | `wait_for_command`    | Block until an inbound command with a given code arrives.        |
-| Scripting   | `set_reply_for`       | Pin a static reply for a command code.                           |
-|             | `set_reply_script`    | Queue a sequence of replies (one-shot or cycling).               |
-|             | `nak_next`            | One-shot: make the next command of a given code reply NAK.       |
-|             | `clear_overrides`     | Drop every installed override.                                   |
-| Liveness    | `ping`                | Banner string — confirms the server is reachable.                |
+| Category    | Tool                   | Purpose                                                          |
+| ----------- | ---------------------- | ---------------------------------------------------------------- |
+| Lifecycle   | `pd_configure`         | Open a serial port and start the PD on it (with optional SC).    |
+|             | `pd_stop`              | Tear the PD down (idempotent).                                   |
+|             | `pd_status`            | Structured snapshot: running / online / SC / last cmd+reply / event queue depth. |
+| Observation | `get_log`              | Cursor-paged decoded wire history (commands, replies, NAKs).     |
+|             | `clear_log`            | Drop log entries; cursor stays monotonic.                        |
+|             | `wait_for_command`     | Block until an inbound command with a given code arrives.        |
+| Scripting   | `set_reply_for`        | Pin a static reply for a command code.                           |
+|             | `set_reply_script`     | Queue a sequence of replies (one-shot or cycling).               |
+|             | `nak_next`             | One-shot: make the next command of a given code reply NAK.       |
+|             | `clear_overrides`      | Drop every installed override.                                   |
+| Events      | `inject_raw`           | Queue a card-read; the PD reports RAW on its next POLL.          |
+|             | `inject_keypad`        | Queue a keypad press; reports KEYPAD on the next POLL.           |
+|             | `inject_local_status`  | Queue a tamper/power change; reports LSTATR on the next POLL.    |
+|             | `clear_events`         | Drop every queued event.                                         |
+| Liveness    | `ping`                 | Banner string — confirms the server is reachable.                |
 
 Defaults (PDID vendor "ZBC", a small PDCAP set, baseline
 POLL/ID/CAP/LED/BUZ/OUT/TEXT/KEYSET/COMSET behavior) match
@@ -358,9 +362,11 @@ Either mode also derives the cUID from the configured PDID per
 spec D.4.3 and binds the chosen AES backend (`--crypto`) as the
 PD's `ScCrypto` provider.
 
-Event injection (RAW/KEYPAD/LSTATR) and fault injection
-(force_session_loss, drop_next_n_replies) are planned but not yet
-shipped.
+Event injection (RAW / KEYPAD / LSTATR) is wired up — `inject_*`
+tools enqueue PD-initiated reports, drained one per POLL in FIFO
+order, and `pd_status.event_queue_depth` surfaces the queue size.
+Fault injection (`force_session_loss`, `drop_next_n_replies`) is
+still pending.
 
 ## Reference material
 

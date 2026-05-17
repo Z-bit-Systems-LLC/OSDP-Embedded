@@ -30,6 +30,7 @@ use osdp_embedded::sc::{
 use osdp_embedded::Transport;
 
 use osdp_mcp::crypto::{BoxedSc, Selector};
+use osdp_mcp::events;
 use osdp_mcp::handler;
 use osdp_mcp::log::{Direction, LogInner};
 use osdp_mcp::overrides;
@@ -150,6 +151,7 @@ fn run_sc_round_trip(sel: Selector) {
     let stats = Arc::new(Mutex::new(handler::PdStats::default()));
     let log = StdArc::new(LogInner::new(128));
     let ovmap = overrides::new_map();
+    let evq = events::new_queue();
     let mut pd = Pd::new(PD_ADDRESS);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
@@ -158,6 +160,7 @@ fn run_sc_round_trip(sel: Selector) {
         Arc::clone(&stats),
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
         PD_ADDRESS,
     ));
     pd.set_sc_crypto(BoxedSc(fresh_crypto(sel)));

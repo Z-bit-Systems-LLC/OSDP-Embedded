@@ -23,6 +23,7 @@ use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
+use crate::events::{self, EventQueue};
 use crate::handler::{DefaultHandler, PdStats};
 use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
@@ -53,6 +54,9 @@ pub struct PdStatus {
     /// without pulling the full log).
     pub last_cmd_code: Option<u8>,
     pub last_reply_code: Option<u8>,
+    /// How many PD-initiated events are queued for the next POLLs
+    /// (RAW / KEYPAD / LSTATR from inject_* tools).
+    pub event_queue_depth: u32,
 }
 
 impl PdStatus {
@@ -68,6 +72,7 @@ impl PdStatus {
             last_reply_at_ms: None,
             last_cmd_code: None,
             last_reply_code: None,
+            event_queue_depth: 0,
         }
     }
 }
@@ -117,6 +122,10 @@ pub struct PdHandle {
     /// modify it directly; the handler reads + consumes script steps
     /// inside `take_for`.
     overrides: OverrideMap,
+    /// PD-initiated events queued for the next POLL (RAW / KEYPAD /
+    /// LSTATR). The handler drains one per POLL when the override
+    /// table misses; the inject_* tools enqueue.
+    events: EventQueue,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -131,16 +140,27 @@ impl PdHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
         let overrides = overrides::new_map();
+        let events = events::new_queue();
         let log_for_thread = Arc::clone(&log);
         let overrides_for_thread = Arc::clone(&overrides);
+        let events_for_thread = Arc::clone(&events);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
-            .spawn(move || actor_loop(rx, log_for_thread, overrides_for_thread, crypto_factory))
+            .spawn(move || {
+                actor_loop(
+                    rx,
+                    log_for_thread,
+                    overrides_for_thread,
+                    events_for_thread,
+                    crypto_factory,
+                )
+            })
             .expect("spawn PD actor thread");
         Self {
             tx,
             log,
             overrides,
+            events,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -222,6 +242,25 @@ impl PdHandle {
         overrides::clear(&self.overrides);
     }
 
+    /// Queue a pre-baked reply to be emitted on the next POLL
+    /// (after the override table misses). FIFO ordering — multiple
+    /// inject_* calls drain across consecutive POLLs.
+    pub fn enqueue_event(&self, ev: OverrideReply) {
+        events::enqueue(&self.events, ev);
+    }
+
+    /// Current event-queue depth (how many POLLs it would take to
+    /// drain). Exposed in `pd_status`.
+    pub fn event_queue_depth(&self) -> usize {
+        events::len(&self.events)
+    }
+
+    /// Drop every queued event. Subsequent POLLs go straight to
+    /// override-or-ACK.
+    pub fn clear_events(&self) {
+        events::clear(&self.events);
+    }
+
     /// Wait up to `timeout_ms` for a command with `cmd_code` to
     /// arrive (entries with `seq > since_seq`). Returns the matching
     /// entry on success, an error string on timeout.
@@ -275,6 +314,7 @@ fn actor_loop(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     log: Arc<LogInner>,
     overrides: OverrideMap,
+    events: EventQueue,
     crypto_factory: CryptoFactory,
 ) {
     let mut slot: Option<Slot> = None;
@@ -287,7 +327,7 @@ fn actor_loop(
         // channel works from a non-async context.
         loop {
             match rx.try_recv() {
-                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides, &crypto_factory),
+                Ok(cmd) => handle_cmd(cmd, &mut slot, &log, &overrides, &events, &crypto_factory),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Service shut down — exit cleanly.
@@ -309,6 +349,7 @@ fn handle_cmd(
     slot: &mut Option<Slot>,
     log: &Arc<LogInner>,
     overrides: &OverrideMap,
+    events: &EventQueue,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -327,6 +368,7 @@ fn handle_cmd(
                 address,
                 Arc::clone(log),
                 Arc::clone(overrides),
+                Arc::clone(events),
                 sc,
                 crypto_factory,
             )
@@ -340,8 +382,15 @@ fn handle_cmd(
             let _ = reply.send(());
         }
         Cmd::Status { reply } => {
+            // Event queue depth is independent of whether a PD is
+            // running — inject_* calls enqueue regardless, and the
+            // queue persists across pd_stop / pd_configure cycles.
+            let queue_depth = events::len(events) as u32;
             let status = match slot.as_ref() {
-                None => PdStatus::idle(),
+                None => PdStatus {
+                    event_queue_depth: queue_depth,
+                    ..PdStatus::idle()
+                },
                 Some(s) => {
                     let stats = s.stats.lock().map(|g| g.clone()).unwrap_or_default();
                     PdStatus {
@@ -355,6 +404,7 @@ fn handle_cmd(
                         last_reply_at_ms: stats.last_reply_at_ms,
                         last_cmd_code: stats.last_cmd_code,
                         last_reply_code: stats.last_reply_code,
+                        event_queue_depth: queue_depth,
                     }
                 }
             };
@@ -363,12 +413,18 @@ fn handle_cmd(
     }
 }
 
+// Internal fan-in helper; takes one arg per shared resource it
+// needs to wire into the freshly-minted Pd. Could be folded into a
+// builder struct but every arg is distinct, so a plain function is
+// clearer despite the count.
+#[allow(clippy::too_many_arguments)]
 fn open_pd(
     port: &str,
     baud: u32,
     address: u8,
     log: Arc<LogInner>,
     overrides: OverrideMap,
+    events: EventQueue,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -381,6 +437,7 @@ fn open_pd(
         Arc::clone(&stats),
         log,
         overrides,
+        events,
         address,
     ));
 

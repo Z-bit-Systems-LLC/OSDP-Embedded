@@ -16,13 +16,15 @@ use std::sync::{Arc, Mutex};
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
 use osdp_embedded::messages::{
-    Pdcap, Pdid, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDCAP,
-    OSDP_REPLY_PDID,
+    Keypad, Pdcap, Pdid, Raw, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK,
+    OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW,
 };
 use osdp_embedded::pd::Pd;
 use osdp_embedded::Transport;
+use osdp_mcp::overrides::OverrideReply;
 
-// Pull the handler + log + overrides from osdp-mcp's library half.
+// Pull the handler + log + overrides + events from osdp-mcp's lib.
+use osdp_mcp::events;
 use osdp_mcp::handler;
 use osdp_mcp::log::{Direction, LogInner};
 use osdp_mcp::overrides;
@@ -91,6 +93,7 @@ fn default_handler_handles_baseline() {
     let stats = Arc::new(Mutex::new(handler::PdStats::default()));
     let log = StdArc::new(LogInner::new(64));
     let ovmap = overrides::new_map();
+    let evq = events::new_queue();
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
@@ -99,6 +102,7 @@ fn default_handler_handles_baseline() {
         Arc::clone(&stats),
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
         0x10,
     ));
 
@@ -187,6 +191,93 @@ fn default_handler_handles_baseline() {
     assert_eq!(payload, &vec![0x03], "NAK code in payload");
     // Second POLL falls back to the default ACK behavior.
     let (_, cmd, reply, payload) = &cap.log[1];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_ACK));
+    assert!(payload.is_empty());
+    drop(cap);
+
+    // ---- Event injection: RAW / KEYPAD / LSTATR drain in FIFO ----
+    captured.borrow_mut().log.clear();
+
+    // 26-bit Wiegand card (the textbook example): 4 bytes carrying
+    // the bit-packed data, format_code = 1.
+    let raw_payload = {
+        let raw = Raw {
+            reader_no: 0,
+            format_code: 1,
+            bit_count: 26,
+            bit_data: &[0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut buf = vec![0u8; 16];
+        let n = raw.build(&mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    };
+    let kp_payload = {
+        let kp = Keypad {
+            reader_no: 0,
+            digits: b"1234#",
+        };
+        let mut buf = vec![0u8; 16];
+        let n = kp.build(&mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    };
+    events::enqueue(
+        &evq,
+        OverrideReply {
+            code: OSDP_REPLY_RAW,
+            payload: raw_payload.clone(),
+        },
+    );
+    events::enqueue(
+        &evq,
+        OverrideReply {
+            code: OSDP_REPLY_KEYPAD,
+            payload: kp_payload.clone(),
+        },
+    );
+    events::enqueue(
+        &evq,
+        OverrideReply {
+            code: OSDP_REPLY_LSTATR,
+            payload: vec![1, 0], // tamper=1, power=0
+        },
+    );
+
+    // Three POLLs should drain the three events; a fourth gets ACK.
+    for _ in 0..4 {
+        acu.send_command(0x10, OSDP_CMD_POLL, &[]).unwrap();
+        cycle(&mut pd, &mut acu, 4);
+    }
+
+    let cap = captured.borrow();
+    assert_eq!(
+        cap.log.len(),
+        4,
+        "expected 4 POLL replies, got {:?}",
+        cap.log
+    );
+    // POLL #1 → RAW
+    let (_, cmd, reply, payload) = &cap.log[0];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_RAW));
+    let raw_decoded = Raw::decode(payload).expect("decode RAW");
+    assert_eq!(raw_decoded.bit_count, 26);
+    assert_eq!(raw_decoded.format_code, 1);
+    assert_eq!(raw_decoded.bit_data, &[0xDE, 0xAD, 0xBE, 0xEF][..]);
+
+    // POLL #2 → KEYPAD
+    let (_, cmd, reply, payload) = &cap.log[1];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_KEYPAD));
+    let kp_decoded = Keypad::decode(payload).expect("decode KEYPAD");
+    assert_eq!(kp_decoded.digits, b"1234#");
+
+    // POLL #3 → LSTATR (tamper=1, power=0)
+    let (_, cmd, reply, payload) = &cap.log[2];
+    assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_LSTATR));
+    assert_eq!(payload, &vec![1, 0]);
+
+    // POLL #4 → ACK (queue empty)
+    let (_, cmd, reply, payload) = &cap.log[3];
     assert_eq!((*cmd, *reply), (OSDP_CMD_POLL, OSDP_REPLY_ACK));
     assert!(payload.is_empty());
 }

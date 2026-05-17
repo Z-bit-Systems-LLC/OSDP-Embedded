@@ -23,8 +23,9 @@ use osdp_embedded::messages::{
 };
 use osdp_embedded::pd::{CommandHandler, Reply};
 
+use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
-use crate::overrides::{self, OverrideMap};
+use crate::overrides::{self, OverrideMap, OverrideReply};
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -113,6 +114,7 @@ pub struct DefaultHandler {
     stats: Arc<Mutex<PdStats>>,
     log: Arc<LogInner>,
     overrides: OverrideMap,
+    events: EventQueue,
     pd_address: u8,
     epoch: Instant,
 }
@@ -122,6 +124,7 @@ impl DefaultHandler {
         stats: Arc<Mutex<PdStats>>,
         log: Arc<LogInner>,
         overrides: OverrideMap,
+        events: EventQueue,
         pd_address: u8,
     ) -> Self {
         Self {
@@ -131,9 +134,46 @@ impl DefaultHandler {
             stats,
             log,
             overrides,
+            events,
             pd_address,
             epoch: Instant::now(),
         }
+    }
+
+    /// Emit a pre-baked reply borrowed from `self.scratch`. Shared
+    /// between the override-table path and the events path so the
+    /// scratch-copy + stats-stamp + log-push logic stays in one place.
+    fn emit_canned(
+        &mut self,
+        ov: OverrideReply,
+        cmd_code: u8,
+        now: u32,
+    ) -> osdp_embedded::Result<Reply<'_>> {
+        if ov.payload.len() > self.scratch.len() {
+            // Programmer error — replies shouldn't exceed
+            // OSDP_PD_TX_BUF_LEN. Drop silently rather than panic;
+            // the agent will see the absence of a reply.
+            return Err(osdp_embedded::Error::BadPayload);
+        }
+        self.scratch[..ov.payload.len()].copy_from_slice(&ov.payload);
+        if let Ok(mut s) = self.stats.lock() {
+            s.last_command_at_ms = Some(now);
+            s.last_cmd_code = Some(cmd_code);
+            s.last_reply_at_ms = Some(now);
+            s.last_reply_code = Some(ov.code);
+        }
+        let reply_payload = &self.scratch[..ov.payload.len()];
+        self.log.push(
+            Direction::Reply,
+            self.pd_address,
+            ov.code,
+            reply_payload,
+            now,
+        );
+        Ok(Reply {
+            code: ov.code,
+            payload: reply_payload,
+        })
     }
 }
 
@@ -146,35 +186,23 @@ impl CommandHandler for DefaultHandler {
         self.log
             .push(Direction::Cmd, self.pd_address, cmd_code, payload, now);
 
-        // Override table wins over the default match. take_for both
-        // pops scripted steps and clones the resulting reply, so we
-        // don't hold the override mutex while copying into scratch.
+        // Override table wins over events and over the default
+        // behavior. take_for both pops scripted steps and clones the
+        // resulting reply, so we don't hold the override mutex while
+        // copying into scratch.
         if let Some(ov) = overrides::take_for(&self.overrides, cmd_code) {
-            if ov.payload.len() > self.scratch.len() {
-                // Programmer error — overrides shouldn't exceed
-                // OSDP_PD_TX_BUF_LEN. Drop silently rather than
-                // panic; the agent will see the absence of a reply.
-                return Err(osdp_embedded::Error::BadPayload);
+            return self.emit_canned(ov, cmd_code, now);
+        }
+
+        // Events are PD-initiated reports waiting for a POLL to
+        // surface them — RAW for card reads, KEYPAD for key
+        // presses, LSTATR for tamper/power changes. One per POLL,
+        // in FIFO order. When the queue's empty the POLL gets a
+        // plain ACK below.
+        if cmd_code == OSDP_CMD_POLL {
+            if let Some(ev) = events::pop(&self.events) {
+                return self.emit_canned(ev, cmd_code, now);
             }
-            self.scratch[..ov.payload.len()].copy_from_slice(&ov.payload);
-            if let Ok(mut s) = self.stats.lock() {
-                s.last_command_at_ms = Some(now);
-                s.last_cmd_code = Some(cmd_code);
-                s.last_reply_at_ms = Some(now);
-                s.last_reply_code = Some(ov.code);
-            }
-            let reply_payload = &self.scratch[..ov.payload.len()];
-            self.log.push(
-                Direction::Reply,
-                self.pd_address,
-                ov.code,
-                reply_payload,
-                now,
-            );
-            return Ok(Reply {
-                code: ov.code,
-                payload: reply_payload,
-            });
         }
 
         // Decide the reply (and serialise payload into scratch)

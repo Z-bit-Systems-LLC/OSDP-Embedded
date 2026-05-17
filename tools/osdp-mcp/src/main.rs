@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogPage, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
@@ -170,6 +171,48 @@ struct NakNextArgs {
 
 fn default_nak_code() -> u8 {
     0x03
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct InjectRawArgs {
+    /// Reader number on the PD (most PDs only have one — reader 0).
+    #[serde(default)]
+    reader_no: u8,
+    /// Spec Table 33: 0 = raw, 1 = Wiegand (default), 2 = UID,
+    /// 3 = OSS-SID.
+    #[serde(default = "default_format_code")]
+    format_code: u8,
+    /// Bit count of the card data — Wiegand 26 / Wiegand 34 are
+    /// typical. `data_hex` must hold `(bit_count + 7) / 8` bytes.
+    bit_count: u16,
+    /// Hex-encoded card bit data (e.g. "DEADBEEF" for 32 bits).
+    /// MSB-aligned per spec Table 33.
+    data_hex: String,
+}
+
+fn default_format_code() -> u8 {
+    1 // Wiegand — the realistic default for most access-control PDs.
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct InjectKeypadArgs {
+    /// Reader number on the PD (most PDs only have one — reader 0).
+    #[serde(default)]
+    reader_no: u8,
+    /// ASCII digits typed at the keypad (e.g. "1234#" for code 1234
+    /// followed by enter). Each char becomes one byte per spec
+    /// Table 35.
+    digits: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct InjectLocalStatusArgs {
+    /// 0 = not tampered (default), 1 = tampered.
+    #[serde(default)]
+    tamper: u8,
+    /// 0 = power OK (default), 1 = power lost.
+    #[serde(default)]
+    power: u8,
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -378,6 +421,113 @@ impl OsdpMcp {
     fn clear_overrides(&self) -> String {
         self.pd.clear_overrides();
         "overrides cleared".to_string()
+    }
+
+    /// Queue a card-read event. Surfaces as RAW on the next POLL
+    /// (in FIFO order with other queued events).
+    #[tool(
+        description = "Inject a card-read event. The PD will reply RAW on its next POLL with the supplied card data."
+    )]
+    fn inject_raw(&self, Parameters(args): Parameters<InjectRawArgs>) -> Result<String, String> {
+        let bit_data = hex_decode(&args.data_hex)?;
+        let expected = (args.bit_count as usize + 7) / 8;
+        if bit_data.len() != expected {
+            return Err(format!(
+                "bit_count={} needs {} bytes of data_hex, got {}",
+                args.bit_count,
+                expected,
+                bit_data.len()
+            ));
+        }
+        let raw = Raw {
+            reader_no: args.reader_no,
+            format_code: args.format_code,
+            bit_count: args.bit_count,
+            bit_data: &bit_data,
+        };
+        let mut buf = vec![0u8; 4 + bit_data.len()];
+        let n = raw
+            .build(&mut buf)
+            .map_err(|e| format!("RAW build failed: {e:?}"))?;
+        buf.truncate(n);
+        self.pd.enqueue_event(OverrideReply {
+            code: OSDP_REPLY_RAW,
+            payload: buf,
+        });
+        Ok(format!(
+            "RAW queued: reader={}, format={}, bit_count={}, data_len={}",
+            args.reader_no, args.format_code, args.bit_count, expected
+        ))
+    }
+
+    /// Queue a keypad event. Surfaces as KEYPAD on the next POLL.
+    #[tool(
+        description = "Inject a keypad event. The PD will reply KEYPAD on its next POLL with the supplied ASCII digits."
+    )]
+    fn inject_keypad(
+        &self,
+        Parameters(args): Parameters<InjectKeypadArgs>,
+    ) -> Result<String, String> {
+        let digits = args.digits.as_bytes();
+        if digits.len() > u8::MAX as usize {
+            return Err(format!(
+                "keypad digits limited to 255 bytes, got {}",
+                digits.len()
+            ));
+        }
+        let kp = Keypad {
+            reader_no: args.reader_no,
+            digits,
+        };
+        let mut buf = vec![0u8; 2 + digits.len()];
+        let n = kp
+            .build(&mut buf)
+            .map_err(|e| format!("KEYPAD build failed: {e:?}"))?;
+        buf.truncate(n);
+        self.pd.enqueue_event(OverrideReply {
+            code: OSDP_REPLY_KEYPAD,
+            payload: buf,
+        });
+        Ok(format!(
+            "KEYPAD queued: reader={}, digits={:?}",
+            args.reader_no, args.digits
+        ))
+    }
+
+    /// Queue a local-status event (tamper / power). Surfaces as
+    /// LSTATR on the next POLL. Spec D.2.1 — the payload is two
+    /// bytes: tamper_status (0/1), power_status (0/1).
+    #[tool(
+        description = "Inject a tamper/power state change. The PD will reply LSTATR on its next POLL with the supplied flags."
+    )]
+    fn inject_local_status(
+        &self,
+        Parameters(args): Parameters<InjectLocalStatusArgs>,
+    ) -> Result<String, String> {
+        // No typed builder in osdp-embedded for LSTATR; the payload
+        // is simply [tamper, power], each 0 or 1 per spec D.2.1.
+        if args.tamper > 1 || args.power > 1 {
+            return Err(format!(
+                "tamper and power must be 0 or 1, got tamper={}, power={}",
+                args.tamper, args.power
+            ));
+        }
+        self.pd.enqueue_event(OverrideReply {
+            code: OSDP_REPLY_LSTATR,
+            payload: vec![args.tamper, args.power],
+        });
+        Ok(format!(
+            "LSTATR queued: tamper={}, power={}",
+            args.tamper, args.power
+        ))
+    }
+
+    /// Drop every queued event. The next POLL goes straight to
+    /// override-or-ACK. Idempotent.
+    #[tool(description = "Drop every queued PD-initiated event. Idempotent.")]
+    fn clear_events(&self) -> String {
+        self.pd.clear_events();
+        "events cleared".to_string()
     }
 }
 
