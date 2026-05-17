@@ -38,13 +38,19 @@ rmcp = { version = "1.7", features = ["transport-io"] }
 # and runs on a dedicated std::thread (set up in later milestones).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
-# Type-safe tool parameter schemas. rmcp re-exports schemars but
-# requires the consumer to depend on it directly for derive support.
-schemars = "0.8"
+# Type-safe tool parameter schemas. rmcp 1.7 internally uses
+# schemars 1.x; matching that version here is required for the
+# Json<T> structured-output wrapper to accept our types (otherwise
+# we'd be implementing JsonSchema from the wrong crate version).
+schemars = "1"
 serde    = { version = "1", features = ["derive"] }
 
 # Pulled in by rmcp; declare explicitly so we can use ? in main().
 anyhow = "1"
+
+# Cross-platform serial port access for the PD-side wire.
+# Same shape osdp-pd-mock would use if it were Rust.
+serialport = "4"
 
 # Stderr logging — never write to stdout when MCP is on stdio.
 tracing            = "0.1"
@@ -58,3 +64,8 @@ rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 # rmcp::object! macro expands to serde_json::json!(...) so the caller
 # needs serde_json in scope.
 serde_json = "1"
+# The actor-loopback test pairs our PD with an in-process Acu to
+# verify the default handler responds to POLL / ID / CAP correctly.
+# Adding `acu` here unifies with the [dependencies] feature set only
+# during `cargo test`; release builds stay PD-only.
+osdp-embedded = { path = "../../rust/osdp", default-features = false, features = ["std", "pd", "acu"] }

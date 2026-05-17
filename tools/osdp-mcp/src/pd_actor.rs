@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Z-bit Systems, LLC
+
+//! Single-threaded actor that owns the [`osdp_embedded::pd::Pd`] and
+//! its serial port.
+//!
+//! `Pd` is `!Send` by design (see `rust/osdp/src/lib.rs`). The MCP
+//! tool handlers run on a Tokio reactor and are `Send + Sync` —
+//! incompatible. We bridge that gap by pinning the PD to a dedicated
+//! `std::thread`, exchanging commands with the async side via an
+//! unbounded mpsc channel and one-shot reply channels.
+//!
+//! The actor thread runs forever (until the process exits). Inside
+//! it, a PD is *optionally* configured — `pd_configure` starts one,
+//! `pd_stop` tears it down. The thread loop ticks the current PD (if
+//! any) and drains pending commands once per cycle.
+
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use osdp_embedded::pd::Pd;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::handler::{DefaultHandler, PdStats};
+use crate::serial_transport::SerialTransport;
+
+/// Snapshot of the PD's current state, returned by `pd_status`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct PdStatus {
+    /// True when a PD is configured and ticking.
+    pub running: bool,
+    /// Serial port name the PD is bound to, e.g. "COM5".
+    pub port: Option<String>,
+    pub baud: Option<u32>,
+    /// 7-bit PD address (0x00..0x7E). 0x7F (broadcast) is always
+    /// accepted in addition to this one.
+    pub address: Option<u8>,
+    /// True iff the PD has sent at least one reply within the last
+    /// 8 seconds (`osdp_pd_is_online`).
+    pub is_online: bool,
+    /// True iff the SCS_11..14 handshake completed (always false in
+    /// milestone 2 — SC is wired up in milestone 5).
+    pub sc_established: bool,
+    /// Most recent command code accepted from the ACU, ms since the
+    /// PD epoch (32-bit wrap is fine).
+    pub last_command_at_ms: Option<u32>,
+    pub last_reply_at_ms: Option<u32>,
+    /// Most recent command and reply codes (for quick debugging
+    /// without pulling the full log).
+    pub last_cmd_code: Option<u8>,
+    pub last_reply_code: Option<u8>,
+}
+
+impl PdStatus {
+    fn idle() -> Self {
+        Self {
+            running: false,
+            port: None,
+            baud: None,
+            address: None,
+            is_online: false,
+            sc_established: false,
+            last_command_at_ms: None,
+            last_reply_at_ms: None,
+            last_cmd_code: None,
+            last_reply_code: None,
+        }
+    }
+}
+
+/// Messages the MCP side sends to the actor. Every variant carries a
+/// `oneshot::Sender` so the caller can await the result.
+enum Cmd {
+    Configure {
+        port: String,
+        baud: u32,
+        address: u8,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    Stop {
+        reply: oneshot::Sender<()>,
+    },
+    Status {
+        reply: oneshot::Sender<PdStatus>,
+    },
+}
+
+/// Handle the MCP service holds. Clone-able, Send + Sync — multiple
+/// concurrent tool calls all funnel into one actor.
+#[derive(Clone)]
+pub struct PdHandle {
+    tx: mpsc::UnboundedSender<Cmd>,
+    /// Kept alive so we can `join` on shutdown (currently unused;
+    /// reserved for graceful stop in later milestones).
+    _join: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl PdHandle {
+    /// Spawn the actor thread. Call once at startup.
+    pub fn spawn() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let join = thread::Builder::new()
+            .name("osdp-mcp-pd".into())
+            .spawn(move || actor_loop(rx))
+            .expect("spawn PD actor thread");
+        Self {
+            tx,
+            _join: Arc::new(Mutex::new(Some(join))),
+        }
+    }
+
+    pub async fn configure(&self, port: String, baud: u32, address: u8) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Configure {
+                port,
+                baud,
+                address,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?
+    }
+
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Stop { reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?;
+        Ok(())
+    }
+
+    pub async fn status(&self) -> anyhow::Result<PdStatus> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Status { reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))
+    }
+}
+
+/// Runtime state held by the actor thread itself.
+struct Slot {
+    pd: Pd,
+    port: String,
+    baud: u32,
+    address: u8,
+    stats: Arc<Mutex<PdStats>>,
+}
+
+fn actor_loop(mut rx: mpsc::UnboundedReceiver<Cmd>) {
+    let mut slot: Option<Slot> = None;
+    // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
+    // (ms-scale) so this is plenty; sleeping yields the CPU.
+    let tick_period = Duration::from_millis(1);
+
+    loop {
+        // Drain everything queued before ticking. try_recv on a tokio
+        // channel works from a non-async context.
+        loop {
+            match rx.try_recv() {
+                Ok(cmd) => handle_cmd(cmd, &mut slot),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Service shut down — exit cleanly.
+                    return;
+                }
+            }
+        }
+
+        if let Some(s) = slot.as_mut() {
+            s.pd.tick();
+        }
+
+        thread::sleep(tick_period);
+    }
+}
+
+fn handle_cmd(cmd: Cmd, slot: &mut Option<Slot>) {
+    match cmd {
+        Cmd::Configure {
+            port,
+            baud,
+            address,
+            reply,
+        } => {
+            // Tear down any existing PD first; one slot per actor.
+            *slot = None;
+            let result = open_pd(&port, baud, address).map(|s| {
+                *slot = Some(s);
+            });
+            let _ = reply.send(result);
+        }
+        Cmd::Stop { reply } => {
+            *slot = None;
+            let _ = reply.send(());
+        }
+        Cmd::Status { reply } => {
+            let status = match slot.as_ref() {
+                None => PdStatus::idle(),
+                Some(s) => {
+                    let stats = s.stats.lock().map(|g| g.clone()).unwrap_or_default();
+                    PdStatus {
+                        running: true,
+                        port: Some(s.port.clone()),
+                        baud: Some(s.baud),
+                        address: Some(s.address),
+                        is_online: s.pd.is_online(),
+                        sc_established: s.pd.sc_established(),
+                        last_command_at_ms: stats.last_command_at_ms,
+                        last_reply_at_ms: stats.last_reply_at_ms,
+                        last_cmd_code: stats.last_cmd_code,
+                        last_reply_code: stats.last_reply_code,
+                    }
+                }
+            };
+            let _ = reply.send(status);
+        }
+    }
+}
+
+fn open_pd(port: &str, baud: u32, address: u8) -> anyhow::Result<Slot> {
+    let transport = SerialTransport::open(port, baud)?;
+    let stats = Arc::new(Mutex::new(PdStats::default()));
+
+    let mut pd = Pd::new(address);
+    pd.set_transport(transport);
+    pd.set_command_handler(DefaultHandler::new(Arc::clone(&stats)));
+
+    tracing::info!(
+        port,
+        baud,
+        address = format!("0x{:02X}", address),
+        "PD configured"
+    );
+    Ok(Slot {
+        pd,
+        port: port.to_string(),
+        baud,
+        address,
+        stats,
+    })
+}
