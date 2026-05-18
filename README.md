@@ -54,14 +54,15 @@ hardware PD, or another `osdp-pd-mock` over a com0com pair). Closes
 the symmetric interop loop: pd-mock validates our PD against
 third-party ACUs, acu-mock validates our ACU against third-party PDs.
 
-The `osdp-mcp` server (Rust, stdio
-[Model Context Protocol](https://modelcontextprotocol.io/)) exposes
-the same PD-on-a-serial-port behavior as `osdp-pd-mock` but driven
-through an AI agent. The agent can bring a PD up, script its
-replies for any command code, inject NAKs, wait for specific
-inbound commands, and read the decoded wire history — useful for
-interactive ACU interop investigation and for letting an agent
-author its own regression tests against a controller.
+The `osdp-mcp` server (Rust,
+[Model Context Protocol](https://modelcontextprotocol.io/) over
+stdio or streamable HTTP) exposes the same PD-on-a-serial-port
+behavior as `osdp-pd-mock` but driven through an AI agent. The
+agent can bring a PD up, script its replies for any command code,
+inject NAKs, wait for specific inbound commands, and read the
+decoded wire history — useful for interactive ACU interop
+investigation and for letting an agent author its own regression
+tests against a controller.
 
 ## Architecture at a glance
 
@@ -304,8 +305,23 @@ backend (wolfCrypt, mbedTLS, hardware AES) is a single file behind
 a new `crypto-*` feature.
 
 The binary lands at `rust/target/debug/osdp-mcp` (or `…/release/`
-with `--release`). Wire it into an MCP-capable client by pointing
-at that path. Example for Claude Code (`~/.claude.json`):
+with `--release`). Two transports are supported, selected at
+runtime by `--transport`:
+
+| Transport          | Flag                  | Use                                                                  |
+| ------------------ | --------------------- | -------------------------------------------------------------------- |
+| stdio (default)    | `--transport stdio`   | One MCP client per process over stdin/stdout. What desktop clients (Claude Desktop, Claude Code) launch directly. |
+| Streamable HTTP    | `--transport http`    | Long-running HTTP server mounted at `/mcp`. Multiple concurrent clients share one PD. Useful for remote agents, CI runners, or sharing a PD across IDE sessions. |
+
+For HTTP mode the bind address is `--bind <addr>`, defaulting to
+`127.0.0.1:8080`. Loopback is the default by design — the
+PD-control surface (script replies, inject events, force session
+loss) is unauthenticated, so binding to a non-loopback address is
+something the operator opts into deliberately. Put a reverse
+proxy with auth in front if you need that.
+
+Example for Claude Code (`~/.claude.json`), launching osdp-mcp on
+stdio (the typical local-agent setup):
 
 ```json
 {
@@ -316,6 +332,17 @@ at that path. Example for Claude Code (`~/.claude.json`):
     }
   }
 }
+```
+
+Example for running as a remote/shared HTTP server and pointing a
+client at it by URL:
+
+```sh
+# Start the server (loopback by default):
+osdp-mcp --transport http --bind 127.0.0.1:8080
+
+# In the client config, reference the endpoint instead of a command:
+#   "osdp-mcp": { "url": "http://127.0.0.1:8080/mcp" }
 ```
 
 `--crypto` may be omitted; the binary defaults to the first

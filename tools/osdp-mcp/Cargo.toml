@@ -48,9 +48,17 @@ aes       = { version = "0.8", optional = true }
 getrandom = { version = "0.2", optional = true }
 
 # rmcp is the official Rust MCP SDK. Default features (base64, macros,
-# server) plus transport-io for stdio. Past 1.0, so API churn is
+# server) plus transport-io for stdio and transport-streamable-http-
+# server for the remote (HTTP) listener. Past 1.0, so API churn is
 # bounded — bump the patch as needed.
-rmcp = { version = "1.7", features = ["transport-io"] }
+rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http-server"] }
+
+# Streamable-HTTP transport plumbing. `axum` provides the HTTP server
+# we mount rmcp's `StreamableHttpService` onto (it's a tower::Service,
+# not self-hosting). `tokio-util` is for the CancellationToken used to
+# stop in-flight SSE streams cleanly on Ctrl-C.
+axum       = "0.8"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # rmcp's macros expand to async fns and Tokio I/O; we need a multi-
 # thread runtime for the stdio server loop. The PD itself is !Send

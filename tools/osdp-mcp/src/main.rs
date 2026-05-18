@@ -4,11 +4,17 @@
 //! osdp-mcp — MCP server that drives an osdp-embedded PD against an
 //! ACU under test.
 //!
-//! Milestone 2: PD actor + serial transport + lifecycle tools
-//! (`pd_configure`, `pd_stop`, `pd_status`) plus the milestone-1
-//! `ping` keep-alive. PDID / PDCAP defaults match `osdp-pd-mock` so
-//! a freshly-configured PD behaves identically to the existing tool.
+//! Two transports, chosen at startup via `--transport`:
+//!   - `stdio` (default) — one MCP client per process over
+//!     stdin/stdout. What local desktop clients launch directly.
+//!   - `http` — streamable-HTTP server mounted at `/mcp` on
+//!     `--bind <addr>` (default `127.0.0.1:8080`). Multiple clients
+//!     share one PD (one `PdHandle` per process).
+//!
+//! PDID / PDCAP defaults match `osdp-pd-mock` so a freshly-configured
+//! PD behaves identically to the existing CLI tool.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -19,6 +25,8 @@ use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{schemars, tool, tool_router, Json, ServiceExt};
 use tracing_subscriber::EnvFilter;
 
@@ -586,14 +594,38 @@ impl OsdpMcp {
 
 // ---- Main ------------------------------------------------------------
 
+/// Which transport the server should listen on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    /// MCP over stdio — the default. One client per process, exits
+    /// when the client closes stdin. What every local MCP client
+    /// (Claude Desktop, Claude Code, etc.) expects.
+    Stdio,
+    /// MCP over streamable HTTP — the modern remote transport. The
+    /// server mounts at `/mcp` on the address given by `--bind` and
+    /// stays up until Ctrl-C; any number of concurrent clients all
+    /// share the one PD instance.
+    Http,
+}
+
 /// Parsed CLI args. Tiny enough that hand-rolling beats pulling in clap.
 struct Cli {
     crypto: Selector,
+    transport: TransportKind,
+    bind: SocketAddr,
 }
+
+/// Default bind address for `--transport http`. Loopback by design —
+/// the user has to opt into a non-localhost address explicitly,
+/// since this exposes the PD-control surface (script replies, inject
+/// events, force session loss) to whoever can reach the port.
+const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8080";
 
 fn parse_cli() -> Result<Cli, String> {
     let mut args = std::env::args().skip(1);
     let mut crypto: Option<Selector> = None;
+    let mut transport: Option<TransportKind> = None;
+    let mut bind: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--crypto" => {
@@ -602,15 +634,41 @@ fn parse_cli() -> Result<Cli, String> {
                     .ok_or_else(|| "--crypto requires a value".to_string())?;
                 crypto = Some(v.parse()?);
             }
+            "--transport" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "--transport requires a value".to_string())?;
+                transport = Some(match v.trim().to_ascii_lowercase().as_str() {
+                    "stdio" => TransportKind::Stdio,
+                    "http" | "streamable-http" => TransportKind::Http,
+                    other => {
+                        return Err(format!(
+                            "unknown --transport {other:?}; expected stdio or http"
+                        ))
+                    }
+                });
+            }
+            "--bind" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "--bind requires a value".to_string())?;
+                bind = Some(v);
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "osdp-mcp — MCP server exposing an osdp-embedded PD\n\n\
-                     Usage: osdp-mcp [--crypto <backend>]\n\n\
+                     Usage: osdp-mcp [--transport <stdio|http>] [--bind <addr>] [--crypto <backend>]\n\n\
                      Options:\n  \
+                       --transport <kind>  MCP transport.\n                       \
+                                         stdio (default): one client over stdin/stdout.\n                       \
+                                         http: streamable-HTTP server mounted at /mcp.\n  \
+                       --bind <addr>     Bind address for --transport http.\n                       \
+                                         Default: {bind} (loopback).\n  \
                        --crypto <name>   AES backend to use for Secure Channel.\n                       \
-                                       Available in this build: {available}\n                       \
-                                       Default: {default}\n  \
+                                         Available in this build: {available}\n                       \
+                                         Default: {default}\n  \
                        --help, -h        Show this message and exit.\n",
+                    bind = DEFAULT_HTTP_BIND,
                     available = Selector::available()
                         .into_iter()
                         .map(|s| s.name())
@@ -630,13 +688,24 @@ fn parse_cli() -> Result<Cli, String> {
          and/or `--features crypto-tiny-aes`"
             .to_string()
     })?;
-    Ok(Cli { crypto })
+    let transport = transport.unwrap_or(TransportKind::Stdio);
+    let bind_str = bind.as_deref().unwrap_or(DEFAULT_HTTP_BIND);
+    let bind: SocketAddr = bind_str
+        .parse()
+        .map_err(|e| format!("invalid --bind {bind_str:?}: {e}"))?;
+    Ok(Cli {
+        crypto,
+        transport,
+        bind,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // CRITICAL: MCP uses stdout for JSON-RPC framing; logs MUST go to
-    // stderr or the client will choke on interleaved bytes.
+    // On stdio the JSON-RPC framing owns stdout; we must keep stderr
+    // for logs. On HTTP it's fine either way, but keeping the same
+    // writer means the log output looks identical whichever transport
+    // is in use.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -650,20 +719,70 @@ async fn main() -> Result<()> {
         anyhow::anyhow!(e)
     })?;
 
-    tracing::info!(
-        crypto = cli.crypto.name(),
-        "osdp-mcp starting (stdio transport)"
-    );
+    let handler = OsdpMcp::new(cli.crypto)?;
+
+    match cli.transport {
+        TransportKind::Stdio => run_stdio(handler, cli.crypto).await,
+        TransportKind::Http => run_http(handler, cli.crypto, cli.bind).await,
+    }
+}
+
+async fn run_stdio(handler: OsdpMcp, crypto: Selector) -> Result<()> {
+    tracing::info!(crypto = crypto.name(), "osdp-mcp starting (stdio transport)");
 
     // .inspect_err is Rust 1.76+; workspace MSRV is 1.70 so use map_err.
-    let service = OsdpMcp::new(cli.crypto)?
-        .serve(stdio())
-        .await
-        .map_err(|e| {
-            tracing::error!(?e, "failed to start MCP service");
-            e
-        })?;
+    let service = handler.serve(stdio()).await.map_err(|e| {
+        tracing::error!(?e, "failed to start MCP service");
+        e
+    })?;
 
     service.waiting().await?;
+    Ok(())
+}
+
+async fn run_http(handler: OsdpMcp, crypto: Selector, bind: SocketAddr) -> Result<()> {
+    tracing::info!(
+        crypto = crypto.name(),
+        %bind,
+        "osdp-mcp starting (streamable-HTTP transport at /mcp)"
+    );
+
+    // Cancellation token lets us cut in-flight SSE streams when the
+    // process is asked to shut down (Ctrl-C). Without it, axum's
+    // graceful shutdown would still wait for long-lived response
+    // bodies (the MCP SSE side-channel) to drain on their own.
+    let ct = tokio_util::sync::CancellationToken::new();
+    let svc_ct = ct.child_token();
+
+    // StreamableHttpService is a tower::Service. Per-session
+    // semantics: the factory closure is called once per new MCP
+    // client; we hand out a clone of the shared handler so every
+    // session sees the same `Arc<PdHandle>` (one PD per process —
+    // matches stdio).
+    //
+    // `StreamableHttpServerConfig` is `#[non_exhaustive]` so the
+    // struct-expression form is blocked; assign the one field we
+    // care about after default-construction instead.
+    let mut svc_cfg = StreamableHttpServerConfig::default();
+    svc_cfg.cancellation_token = svc_ct;
+    let svc = StreamableHttpService::new(
+        move || Ok(handler.clone()),
+        Arc::new(LocalSessionManager::default()),
+        svc_cfg,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", svc);
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind {bind} failed: {e}"))?;
+    tracing::info!(%bind, "osdp-mcp listening");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Ctrl-C received, shutting down");
+            ct.cancel();
+        })
+        .await?;
     Ok(())
 }
