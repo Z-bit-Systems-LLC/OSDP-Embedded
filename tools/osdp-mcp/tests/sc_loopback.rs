@@ -32,7 +32,7 @@ use osdp_embedded::Transport;
 use osdp_mcp::crypto::{BoxedSc, Selector};
 use osdp_mcp::events;
 use osdp_mcp::handler;
-use osdp_mcp::log::{Direction, LogInner};
+use osdp_mcp::log::{Direction, EffectiveFilter, LogInner};
 use osdp_mcp::overrides;
 
 #[derive(Default)]
@@ -227,7 +227,7 @@ fn run_sc_round_trip(sel: Selector) {
     drop(cap);
 
     // ---- Log captured plaintext on both sides ----
-    let page = log.snapshot(0, 100);
+    let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
     let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
     assert_eq!(
         codes,

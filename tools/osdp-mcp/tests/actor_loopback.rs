@@ -26,7 +26,7 @@ use osdp_mcp::overrides::OverrideReply;
 // Pull the handler + log + overrides + events from osdp-mcp's lib.
 use osdp_mcp::events;
 use osdp_mcp::handler;
-use osdp_mcp::log::{Direction, LogInner};
+use osdp_mcp::log::{Direction, EffectiveFilter, LogInner};
 use osdp_mcp::overrides;
 use std::sync::Arc as StdArc;
 
@@ -158,7 +158,7 @@ fn default_handler_handles_baseline() {
     drop(s);
 
     // ---- Log captured all three round trips (cmd + reply each) ----
-    let page = log.snapshot(0, 100);
+    let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
     assert_eq!(page.entries.len(), 6, "expected 3 cmd + 3 reply entries");
     let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
     assert_eq!(

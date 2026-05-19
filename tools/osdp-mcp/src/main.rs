@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
 use osdp_mcp::crypto::Selector;
-use osdp_mcp::log::{LogEntry, LogPage, DEFAULT_CAPACITY};
+use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
 use rmcp::handler::server::wrapper::Parameters;
@@ -109,7 +109,7 @@ fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetLogArgs {
-    /// Skip entries with `seq <= since_seq`. Use the `next_seq` from
+    /// Skip entries with `seq < since_seq`. Use the `next_seq` from
     /// a previous response to continue paging. Defaults to 0 (all).
     #[serde(default)]
     since_seq: u64,
@@ -117,6 +117,30 @@ struct GetLogArgs {
     /// capacity so a single call drains everything.
     #[serde(default = "default_log_limit")]
     limit: u32,
+    /// Codes to omit. **Default is `[0x60, 0x40]`** (POLL/ACK
+    /// heartbeat) — without this filter a polling ACU will fill the
+    /// log with thousands of repetitive entries. The response's
+    /// `suppressed` block reports per-code counts of what was hidden,
+    /// so you can see the heartbeat is alive without paging through
+    /// it. Pass `exclude_codes: []` (empty array) to see every entry
+    /// including heartbeat. Ignored if `include_codes` is set.
+    #[serde(default)]
+    exclude_codes: Option<Vec<u8>>,
+    /// Only include entries whose code is in this list. Everything
+    /// else is treated as suppressed. Pair with a focused list when
+    /// hunting for a specific exchange (e.g. `[0x61, 0x45]` for ID
+    /// + PDID).
+    #[serde(default)]
+    include_codes: Option<Vec<u8>>,
+}
+
+impl GetLogArgs {
+    fn filter(&self) -> LogFilter {
+        LogFilter {
+            exclude_codes: self.exclude_codes.clone(),
+            include_codes: self.include_codes.clone(),
+        }
+    }
 }
 
 fn default_log_limit() -> u32 {
@@ -358,11 +382,38 @@ impl OsdpMcp {
 
     /// Read recent on-wire events (commands accepted, replies sent,
     /// library-synthesised NAKs). Cursor-paged via `since_seq`.
+    ///
+    /// **By default POLL (0x60) and ACK (0x40) heartbeat are
+    /// hidden** — a polling ACU produces ~2 entries/second of them
+    /// and they drown out everything else. The response's
+    /// `suppressed` block tells you how many were hidden per code,
+    /// so the heartbeat is verifiably alive without paging through
+    /// it. To see every byte, pass `exclude_codes: []`. To focus on
+    /// a specific exchange, pass `include_codes: [...]`.
     #[tool(
-        description = "Return up to `limit` log entries with seq > since_seq. Includes the cursor for the next call."
+        description = "Return up to `limit` log entries with seq >= since_seq. \
+                       By default POLL/ACK heartbeat is filtered out and reported in `suppressed`; \
+                       pass `exclude_codes: []` to see every entry. \
+                       Pair with `get_log_summary` to scan for noise without reading payloads."
     )]
     fn get_log(&self, Parameters(args): Parameters<GetLogArgs>) -> Json<LogPage> {
-        Json(self.pd.get_log(args.since_seq, args.limit as usize))
+        let filter = args.filter().resolve();
+        Json(self.pd.get_log(args.since_seq, args.limit as usize, filter))
+    }
+
+    /// Per-(direction, code) summary of the whole current ring.
+    /// Returns counts only — no payloads — so the response stays
+    /// small even when the log is full of heartbeat. Sorted by
+    /// count desc so noisy codes surface first. Use this as a
+    /// cheap "what's interesting in the log?" probe before
+    /// committing to a full `get_log` page.
+    #[tool(
+        description = "Return per-(direction, code) counts across the entire log ring. \
+                       Cheap; payload-free. Useful for spotting noise (POLL/ACK at the top) \
+                       and deciding which codes to focus on with get_log."
+    )]
+    fn get_log_summary(&self) -> Json<LogSummary> {
+        Json(self.pd.get_log_summary())
     }
 
     /// Drop every entry currently in the log. `next_seq` keeps

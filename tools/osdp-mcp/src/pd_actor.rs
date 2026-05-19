@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
 use crate::handler::{DefaultHandler, DropCounter, PdStats};
-use crate::log::{LogInner, LogPage, DEFAULT_CAPACITY};
+use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
 
@@ -226,10 +226,18 @@ impl PdHandle {
             .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))
     }
 
-    /// Read up to `limit` log entries with `seq > since_seq`. Goes
-    /// straight to the shared log — no actor round-trip.
-    pub fn get_log(&self, since_seq: u64, limit: usize) -> LogPage {
-        self.log.snapshot(since_seq, limit)
+    /// Read up to `limit` log entries with `seq >= since_seq`,
+    /// filtered through `filter`. Goes straight to the shared log
+    /// — no actor round-trip.
+    pub fn get_log(&self, since_seq: u64, limit: usize, filter: EffectiveFilter) -> LogPage {
+        self.log.snapshot(since_seq, limit, filter)
+    }
+
+    /// Per-(direction, code) summary of the whole current ring.
+    /// Cheap probe: returns counts only, never payloads. Useful for
+    /// "what's in the log?" without paging through it.
+    pub fn get_log_summary(&self) -> LogSummary {
+        self.log.summary()
     }
 
     /// Drop every entry currently in the log. `next_seq` is

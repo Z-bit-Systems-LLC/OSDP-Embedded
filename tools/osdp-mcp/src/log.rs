@@ -16,13 +16,18 @@
 //! only entries added since). `clear_log` drops entries but does NOT
 //! rewind `next_seq` — clients holding a cursor stay consistent.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 use tokio::sync::Notify;
 
+/// Default codes hidden from `get_log` when neither `include_codes`
+/// nor `exclude_codes` is supplied — the heartbeat POLL → ACK pair.
+/// Agents that want to see every byte pass `exclude_codes: []`.
+pub const DEFAULT_NOISE_CODES: &[u8] = &[0x60, 0x40];
+
 /// Where a logged frame came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// ACU → PD command accepted by the handler.
@@ -121,29 +126,84 @@ impl LogInner {
         let _ = entry_seq;
     }
 
-    /// Return entries with `seq >= since_seq`, capped at `limit`.
-    /// `next_seq` in the returned page is `highest returned seq + 1`
-    /// (or `since_seq` if nothing matched) — pass it back as the
-    /// next call's `since_seq` to read only new entries.
-    pub fn snapshot(&self, since_seq: u64, limit: usize) -> LogPage {
+    /// Return entries with `seq >= since_seq`, capped at `limit`,
+    /// filtered through `filter`. Suppressed entries (those that
+    /// matched in range but were filtered out) are reported back in
+    /// `LogPage::suppressed` so the agent can see they exist without
+    /// scrolling them. `next_seq` in the returned page is
+    /// `highest seq seen + 1` (across BOTH kept and suppressed
+    /// entries) — pass it back as the next call's `since_seq` to
+    /// read only newer entries.
+    pub fn snapshot(&self, since_seq: u64, limit: usize, filter: EffectiveFilter) -> LogPage {
         let s = self.state.lock().expect("log mutex");
         let mut out = Vec::new();
-        let mut highest: Option<u64> = None;
+        let mut highest_seen: Option<u64> = None;
+        let mut suppressed_counts: BTreeMap<u8, u32> = BTreeMap::new();
+        let mut suppressed_total: u32 = 0;
         for e in &s.entries {
-            if e.seq >= since_seq {
-                if out.len() >= limit {
-                    break;
-                }
-                highest = Some(e.seq);
+            if e.seq < since_seq {
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            // Advance the cursor across kept + suppressed entries
+            // alike — otherwise a page full of nothing-but-suppressed
+            // would re-page the same entries forever.
+            highest_seen = Some(e.seq);
+            if filter.passes(e.code) {
                 out.push(e.clone());
+            } else {
+                *suppressed_counts.entry(e.code).or_insert(0) += 1;
+                suppressed_total += 1;
             }
         }
+        let by_code = suppressed_counts
+            .into_iter()
+            .map(|(code, count)| SuppressedCount { code, count })
+            .collect();
         LogPage {
             entries: out,
-            next_seq: highest.map(|h| h + 1).unwrap_or(since_seq),
-            // Total length of the ring at snapshot time — handy for
-            // agents that just want to know "is there anything?".
+            next_seq: highest_seen.map(|h| h + 1).unwrap_or(since_seq),
             total: s.entries.len() as u32,
+            suppressed: Suppressed {
+                total: suppressed_total,
+                by_code,
+            },
+        }
+    }
+
+    /// Per-(direction, code) count across the entire current ring.
+    /// Bypasses `get_log`'s filter — the point of the summary is to
+    /// reveal what's noisy. Sorted by count desc so the loudest codes
+    /// surface first.
+    pub fn summary(&self) -> LogSummary {
+        let s = self.state.lock().expect("log mutex");
+        let mut stats: BTreeMap<(Direction, u8), LogCodeStat> = BTreeMap::new();
+        for e in &s.entries {
+            let key = (e.direction, e.code);
+            stats
+                .entry(key)
+                .and_modify(|st| {
+                    st.count += 1;
+                    st.last_seq = e.seq;
+                    st.last_timestamp_ms = e.timestamp_ms;
+                })
+                .or_insert(LogCodeStat {
+                    direction: e.direction,
+                    code: e.code,
+                    count: 1,
+                    first_seq: e.seq,
+                    last_seq: e.seq,
+                    last_timestamp_ms: e.timestamp_ms,
+                });
+        }
+        let mut by_code: Vec<LogCodeStat> = stats.into_values().collect();
+        by_code.sort_by_key(|row| std::cmp::Reverse(row.count));
+        LogSummary {
+            total: s.entries.len() as u32,
+            by_code,
+            next_seq: s.next_seq,
         }
     }
 
@@ -167,16 +227,113 @@ impl LogInner {
     }
 }
 
-/// Result of `LogInner::snapshot`. Carries entries + the cursor the
-/// agent should pass on its next call.
+/// Result of `LogInner::snapshot`. Carries kept entries, the cursor
+/// the agent should pass on its next call, and a per-code report of
+/// how many entries got filtered out so the agent can confirm the
+/// heartbeat is alive without scrolling through it.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct LogPage {
     pub entries: Vec<LogEntry>,
-    /// Pass back as `since_seq` to read the next page. Equals
-    /// `since_seq` from the request if nothing new arrived.
+    /// Pass back as `since_seq` to read the next page. Advances past
+    /// suppressed entries too, so a heartbeat-only window doesn't
+    /// re-page forever.
     pub next_seq: u64,
     /// Number of entries currently in the ring (after the snapshot).
     pub total: u32,
+    /// Entries that matched the cursor range but were filtered out.
+    /// Useful for "is anything happening, just hidden by my filter?".
+    pub suppressed: Suppressed,
+}
+
+/// Filter as accepted from the MCP layer. Both fields are
+/// `Option<Vec<u8>>` so the layer above can distinguish "not set"
+/// (apply the default heartbeat filter) from "explicitly empty"
+/// (no filter at all). Resolve into an [`EffectiveFilter`] before
+/// passing into [`LogInner::snapshot`].
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct LogFilter {
+    /// Codes to omit from the returned entries. Suppressed counts
+    /// still appear in `suppressed`. Ignored if `include_codes` is
+    /// also set.
+    #[serde(default)]
+    pub exclude_codes: Option<Vec<u8>>,
+    /// If set, only include entries whose code is in this list;
+    /// everything else is treated as suppressed.
+    #[serde(default)]
+    pub include_codes: Option<Vec<u8>>,
+}
+
+impl LogFilter {
+    /// Apply the "default = exclude POLL+ACK" policy when neither
+    /// list is supplied. An explicitly-empty `exclude_codes: []`
+    /// stays empty (= no exclusions).
+    pub fn resolve(self) -> EffectiveFilter {
+        match (self.include_codes, self.exclude_codes) {
+            (Some(inc), _) => EffectiveFilter::Include(inc),
+            (None, Some(exc)) => EffectiveFilter::Exclude(exc),
+            (None, None) => EffectiveFilter::Exclude(DEFAULT_NOISE_CODES.to_vec()),
+        }
+    }
+}
+
+/// Filter after policy resolution. Either an allow-list or a
+/// deny-list. An empty `Exclude([])` matches every entry.
+#[derive(Debug, Clone)]
+pub enum EffectiveFilter {
+    Include(Vec<u8>),
+    Exclude(Vec<u8>),
+}
+
+impl EffectiveFilter {
+    pub fn passes(&self, code: u8) -> bool {
+        match self {
+            EffectiveFilter::Include(allow) => allow.contains(&code),
+            EffectiveFilter::Exclude(deny) => !deny.contains(&code),
+        }
+    }
+}
+
+/// Per-code count of suppressed entries during a snapshot.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct SuppressedCount {
+    pub code: u8,
+    pub count: u32,
+}
+
+/// Report of entries the filter dropped during a snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, schemars::JsonSchema)]
+pub struct Suppressed {
+    /// Sum of all `by_code[].count`.
+    pub total: u32,
+    /// Per-code breakdown, sorted ascending by code.
+    pub by_code: Vec<SuppressedCount>,
+}
+
+/// One row in [`LogSummary`] — count + cursor metadata for a single
+/// (direction, code) pair across the entire current ring.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct LogCodeStat {
+    pub direction: Direction,
+    pub code: u8,
+    pub count: u32,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub last_timestamp_ms: u32,
+}
+
+/// Result of `LogInner::summary`. Tells the agent what's in the log
+/// without serialising every entry — cheap "is there anything
+/// interesting?" probe.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct LogSummary {
+    /// Number of entries currently in the ring.
+    pub total: u32,
+    /// One row per (direction, code) pair, sorted by count descending.
+    /// The first entries are typically the noisiest (POLL/ACK).
+    pub by_code: Vec<LogCodeStat>,
+    /// Next seq the ring will assign. Pass to `get_log(since_seq=...)`
+    /// to read only entries arriving after this summary.
+    pub next_seq: u64,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -198,7 +355,7 @@ mod tests {
         let log = LogInner::new(4);
         log.push(Direction::Cmd, 0x10, 0x60, &[], 0);
         log.push(Direction::Reply, 0x10, 0x40, &[], 1);
-        let page = log.snapshot(0, 100);
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].seq, 0);
         assert_eq!(page.entries[1].seq, 1);
@@ -214,15 +371,15 @@ mod tests {
         let log = LogInner::new(8);
         log.push(Direction::Cmd, 0, 0x60, &[], 0);
         log.push(Direction::Cmd, 0, 0x61, &[], 1);
-        let first = log.snapshot(0, 100);
+        let first = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(first.next_seq, 2);
         // Nothing added since → empty page, cursor unchanged.
-        let second = log.snapshot(first.next_seq, 100);
+        let second = log.snapshot(first.next_seq, 100, EffectiveFilter::Exclude(vec![]));
         assert!(second.entries.is_empty());
         assert_eq!(second.next_seq, 2);
         // Add an entry, page returns just it.
         log.push(Direction::Cmd, 0, 0x62, &[], 2);
-        let third = log.snapshot(first.next_seq, 100);
+        let third = log.snapshot(first.next_seq, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(third.entries.len(), 1);
         assert_eq!(third.entries[0].seq, 2);
         assert_eq!(third.next_seq, 3);
@@ -234,7 +391,7 @@ mod tests {
         for i in 0..5u32 {
             log.push(Direction::Cmd, 0, i as u8, &[], i);
         }
-        let page = log.snapshot(0, 100);
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(page.entries.len(), 2);
         // Oldest 3 should be gone; remaining are seq 3 and 4.
         assert_eq!(page.entries[0].seq, 3);
@@ -247,11 +404,108 @@ mod tests {
         log.push(Direction::Cmd, 0, 0x60, &[], 0);
         log.push(Direction::Cmd, 0, 0x61, &[], 1);
         log.clear();
-        assert!(log.snapshot(0, 100).entries.is_empty());
+        assert!(log.snapshot(0, 100, EffectiveFilter::Exclude(vec![])).entries.is_empty());
         log.push(Direction::Cmd, 0, 0x62, &[], 2);
-        let page = log.snapshot(0, 100);
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         // next_seq kept climbing across clear() — new entry is seq 2.
         assert_eq!(page.entries[0].seq, 2);
+    }
+
+    #[test]
+    fn filter_default_resolves_to_exclude_heartbeat() {
+        let f: LogFilter = Default::default();
+        match f.resolve() {
+            EffectiveFilter::Exclude(deny) => {
+                assert_eq!(deny, DEFAULT_NOISE_CODES.to_vec());
+            }
+            _ => panic!("expected Exclude default"),
+        }
+    }
+
+    #[test]
+    fn filter_explicit_empty_exclude_keeps_everything() {
+        let f = LogFilter {
+            exclude_codes: Some(vec![]),
+            include_codes: None,
+        };
+        match f.resolve() {
+            EffectiveFilter::Exclude(deny) => assert!(deny.is_empty()),
+            _ => panic!("expected Exclude with empty list"),
+        }
+    }
+
+    #[test]
+    fn snapshot_default_filter_hides_heartbeat_and_reports_suppressed() {
+        let log = LogInner::new(16);
+        // 3× POLL/ACK heartbeat + one ID/PDID pair.
+        for i in 0..3 {
+            log.push(Direction::Cmd, 0, 0x60, &[], i);
+            log.push(Direction::Reply, 0, 0x40, &[], i);
+        }
+        log.push(Direction::Cmd, 0, 0x61, &[], 100);
+        log.push(Direction::Reply, 0, 0x45, &[0xAA], 100);
+
+        let filter = LogFilter::default().resolve();
+        let page = log.snapshot(0, 100, filter);
+
+        // Only ID + PDID survive the filter.
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].code, 0x61);
+        assert_eq!(page.entries[1].code, 0x45);
+
+        // Cursor advances past suppressed entries too.
+        assert_eq!(page.next_seq, 8);
+
+        // Suppression report shows 3 POLL + 3 ACK = 6 entries.
+        assert_eq!(page.suppressed.total, 6);
+        let counts: Vec<(u8, u32)> = page
+            .suppressed
+            .by_code
+            .iter()
+            .map(|c| (c.code, c.count))
+            .collect();
+        assert!(counts.contains(&(0x60, 3)));
+        assert!(counts.contains(&(0x40, 3)));
+    }
+
+    #[test]
+    fn snapshot_include_filter_returns_only_listed_codes() {
+        let log = LogInner::new(8);
+        log.push(Direction::Cmd, 0, 0x60, &[], 0);
+        log.push(Direction::Cmd, 0, 0x61, &[], 1);
+        log.push(Direction::Reply, 0, 0x45, &[], 2);
+
+        let page = log.snapshot(0, 100, EffectiveFilter::Include(vec![0x61]));
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].code, 0x61);
+        assert_eq!(page.suppressed.total, 2);
+    }
+
+    #[test]
+    fn summary_groups_by_direction_and_code_sorted_by_count_desc() {
+        let log = LogInner::new(32);
+        for i in 0..10 {
+            log.push(Direction::Cmd, 0, 0x60, &[], i);
+            log.push(Direction::Reply, 0, 0x40, &[], i);
+        }
+        log.push(Direction::Cmd, 0, 0x61, &[], 100);
+        log.push(Direction::Reply, 0, 0x45, &[], 100);
+
+        let s = log.summary();
+        assert_eq!(s.total, 22);
+        // POLL (10) and ACK (10) must be the loudest, in some order.
+        let top_two: Vec<u8> = s.by_code.iter().take(2).map(|r| r.code).collect();
+        assert!(top_two.contains(&0x60));
+        assert!(top_two.contains(&0x40));
+        // ID + PDID rows must each have count 1.
+        assert!(s
+            .by_code
+            .iter()
+            .any(|r| r.code == 0x61 && r.direction == Direction::Cmd && r.count == 1));
+        assert!(s
+            .by_code
+            .iter()
+            .any(|r| r.code == 0x45 && r.direction == Direction::Reply && r.count == 1));
     }
 
     #[test]

@@ -357,7 +357,8 @@ Tools exposed today:
 | Lifecycle   | `pd_configure`         | Open a serial port and start the PD on it (with optional SC).    |
 |             | `pd_stop`              | Tear the PD down (idempotent).                                   |
 |             | `pd_status`            | Structured snapshot: running / online / SC / last cmd+reply / event queue depth. |
-| Observation | `get_log`              | Cursor-paged decoded wire history (commands, replies, NAKs).     |
+| Observation | `get_log`              | Cursor-paged decoded wire history (commands, replies, NAKs). **Hides POLL/ACK heartbeat by default** — pass `exclude_codes: []` to see every entry. Response's `suppressed` block reports per-code hidden counts. |
+|             | `get_log_summary`      | Per-(direction, code) counts across the whole ring. No payloads — cheap "what's interesting in the log?" probe. |
 |             | `clear_log`            | Drop log entries; cursor stays monotonic.                        |
 |             | `wait_for_command`     | Block until an inbound command with a given code arrives.        |
 | Scripting   | `set_reply_for`        | Pin a static reply for a command code.                           |
