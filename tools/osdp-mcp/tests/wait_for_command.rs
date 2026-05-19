@@ -40,12 +40,17 @@ async fn wait_for_command(
     }
 }
 
+// Non-heartbeat codes throughout — POLL (0x60) / ACK (0x40) go to
+// the push-filter counter at write time and never enter the ring,
+// so they're not waitable. We use ID (0x61) as the sentinel and
+// CAP (0x62) / KEYSET (0x75) as red herrings.
+
 #[tokio::test]
 async fn returns_immediately_when_entry_already_present() {
     let log = Arc::new(LogInner::new(8));
-    log.push(Direction::Cmd, 0, 0x60, &[], 0);
+    log.push(Direction::Cmd, 0, 0x61, &[], 0);
 
-    let seq = wait_for_command(&log, 0x60, Duration::from_millis(100), 0)
+    let seq = wait_for_command(&log, 0x61, Duration::from_millis(100), 0)
         .await
         .unwrap();
     assert_eq!(seq, 0);
@@ -59,10 +64,10 @@ async fn wakes_when_matching_entry_arrives() {
     // Spawn a tick-and-push from a separate task ~25ms in the future.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        writer.push(Direction::Cmd, 0, 0x60, &[], 25);
+        writer.push(Direction::Cmd, 0, 0x61, &[], 25);
     });
 
-    let seq = wait_for_command(&log, 0x60, Duration::from_millis(500), 0)
+    let seq = wait_for_command(&log, 0x61, Duration::from_millis(500), 0)
         .await
         .unwrap();
     assert_eq!(seq, 0);
@@ -71,7 +76,7 @@ async fn wakes_when_matching_entry_arrives() {
 #[tokio::test]
 async fn times_out_when_nothing_matches() {
     let log = Arc::new(LogInner::new(8));
-    let res = wait_for_command(&log, 0x60, Duration::from_millis(20), 0).await;
+    let res = wait_for_command(&log, 0x61, Duration::from_millis(20), 0).await;
     assert!(res.is_err());
 }
 
@@ -82,14 +87,14 @@ async fn ignores_non_matching_entries_then_wakes_for_match() {
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        writer.push(Direction::Cmd, 0, 0x61, &[], 10); // wrong code
+        writer.push(Direction::Cmd, 0, 0x62, &[], 10); // CAP — wrong code
         tokio::time::sleep(Duration::from_millis(10)).await;
-        writer.push(Direction::Reply, 0, 0x60, &[], 20); // wrong direction
+        writer.push(Direction::Reply, 0, 0x61, &[], 20); // wrong direction
         tokio::time::sleep(Duration::from_millis(10)).await;
-        writer.push(Direction::Cmd, 0, 0x60, &[], 30); // ← this one
+        writer.push(Direction::Cmd, 0, 0x61, &[], 30); // ← this one
     });
 
-    let seq = wait_for_command(&log, 0x60, Duration::from_millis(500), 0)
+    let seq = wait_for_command(&log, 0x61, Duration::from_millis(500), 0)
         .await
         .unwrap();
     // Should be seq 2 (the third pushed entry; the first two were

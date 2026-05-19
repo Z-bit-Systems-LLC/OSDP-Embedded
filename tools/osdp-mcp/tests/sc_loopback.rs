@@ -229,13 +229,13 @@ fn run_sc_round_trip(sel: Selector) {
     drop(cap);
 
     // ---- Log captured plaintext on both sides ----
+    // POLL/ACK are push-filtered to a counter; only ID/PDID show up
+    // as ring entries.
     let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
     let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
     assert_eq!(
         codes,
         vec![
-            (Direction::Cmd, OSDP_CMD_POLL),
-            (Direction::Reply, OSDP_REPLY_ACK),
             (Direction::Cmd, OSDP_CMD_ID),
             (Direction::Reply, osdp_embedded::messages::OSDP_REPLY_PDID),
         ]

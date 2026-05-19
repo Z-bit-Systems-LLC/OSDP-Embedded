@@ -159,10 +159,27 @@ pub struct LogEntry {
 /// stays under a few hundred KB. Older entries get dropped silently.
 pub const DEFAULT_CAPACITY: usize = 1024;
 
+/// Lifetime aggregate for a `(direction, code)` pair that was
+/// filtered at push time and never got a ring slot. Survives ring
+/// rollover; reset by `clear`.
+#[derive(Debug, Clone)]
+struct PushCount {
+    count: u32,
+    last_timestamp_ms: u32,
+}
+
 struct State {
     entries: VecDeque<LogEntry>,
     next_seq: u64,
     cap: usize,
+    /// Codes that bypass the ring at push time — they only update
+    /// aggregate counters. Initialised to the heartbeat
+    /// (`DEFAULT_NOISE_CODES`) so a long-running session doesn't
+    /// have its ring evicted by POLL/ACK noise. Code-byte match,
+    /// not direction-aware (mirrors `EffectiveFilter`).
+    push_filter: Vec<u8>,
+    /// Lifetime aggregates for push-filtered events.
+    push_counts: BTreeMap<(Direction, u8), PushCount>,
 }
 
 /// Shared between the writer (handler on the PD thread) and the
@@ -180,12 +197,19 @@ impl LogInner {
                 entries: VecDeque::with_capacity(capacity),
                 next_seq: 0,
                 cap: capacity,
+                push_filter: DEFAULT_NOISE_CODES.to_vec(),
+                push_counts: BTreeMap::new(),
             }),
             notify: Notify::new(),
         }
     }
 
-    /// Append an entry. Drops the oldest if the buffer is full.
+    /// Record an event. POLL/ACK heartbeat goes to a counter (no
+    /// ring slot, no notify) so the 1024-entry ring stays reserved
+    /// for interesting traffic in long-running sessions. Everything
+    /// else gets a `LogEntry` in the ring and drops the oldest if
+    /// the buffer is full.
+    ///
     /// Called from the writer side (the PD thread) — no async.
     pub fn push(
         &self,
@@ -195,13 +219,30 @@ impl LogInner {
         payload: &[u8],
         timestamp_ms: u32,
     ) {
-        let entry_seq;
         {
             let mut s = self.state.lock().expect("log mutex");
+
+            if s.push_filter.contains(&code) {
+                // Heartbeat: aggregate-only path. No ring slot, no
+                // seq advance, no notify — `wait_for_command` on a
+                // push-filtered code is intentionally unsupported
+                // (those codes are noise by definition).
+                let entry = s
+                    .push_counts
+                    .entry((direction, code))
+                    .or_insert(PushCount {
+                        count: 0,
+                        last_timestamp_ms: timestamp_ms,
+                    });
+                entry.count = entry.count.saturating_add(1);
+                entry.last_timestamp_ms = timestamp_ms;
+                return;
+            }
+
             if s.entries.len() == s.cap {
                 s.entries.pop_front();
             }
-            entry_seq = s.next_seq;
+            let entry_seq = s.next_seq;
             s.next_seq += 1;
             s.entries.push_back(LogEntry {
                 seq: entry_seq,
@@ -217,7 +258,6 @@ impl LogInner {
         // re-check the log and either return or sleep again. Cheap
         // because there are usually zero or one waiters.
         self.notify.notify_waiters();
-        let _ = entry_seq;
     }
 
     /// Return entries with `seq >= since_seq`, capped at `limit`,
@@ -234,6 +274,16 @@ impl LogInner {
         let mut highest_seen: Option<u64> = None;
         let mut suppressed_counts: BTreeMap<u8, u32> = BTreeMap::new();
         let mut suppressed_total: u32 = 0;
+
+        // Push-filtered codes never enter the ring; seed the
+        // suppression report with their lifetime counters so the
+        // agent sees the heartbeat is alive regardless of `since_seq`.
+        for ((_, code), pc) in &s.push_counts {
+            let entry = suppressed_counts.entry(*code).or_insert(0);
+            *entry = entry.saturating_add(pc.count);
+            suppressed_total = suppressed_total.saturating_add(pc.count);
+        }
+
         for e in &s.entries {
             if e.seq < since_seq {
                 continue;
@@ -241,15 +291,15 @@ impl LogInner {
             if out.len() >= limit {
                 break;
             }
-            // Advance the cursor across kept + suppressed entries
-            // alike — otherwise a page full of nothing-but-suppressed
-            // would re-page the same entries forever.
+            // Advance the cursor across kept + read-suppressed
+            // entries alike — otherwise a page full of nothing-but-
+            // suppressed would re-page the same entries forever.
             highest_seen = Some(e.seq);
             if filter.passes(e.code) {
                 out.push(e.clone());
             } else {
                 *suppressed_counts.entry(e.code).or_insert(0) += 1;
-                suppressed_total += 1;
+                suppressed_total = suppressed_total.saturating_add(1);
             }
         }
         let by_code = suppressed_counts
@@ -274,6 +324,26 @@ impl LogInner {
     pub fn summary(&self) -> LogSummary {
         let s = self.state.lock().expect("log mutex");
         let mut stats: BTreeMap<(Direction, u8), LogCodeStat> = BTreeMap::new();
+
+        // Seed with the push-filtered aggregates. They have no seq
+        // (they never entered the ring), so first_seq/last_seq are
+        // 0 placeholders — agents should rely on count +
+        // last_timestamp_ms for these rows.
+        for ((dir, code), pc) in &s.push_counts {
+            stats.insert(
+                (*dir, *code),
+                LogCodeStat {
+                    direction: *dir,
+                    code: *code,
+                    name: code_name(*dir, *code),
+                    count: pc.count,
+                    first_seq: 0,
+                    last_seq: 0,
+                    last_timestamp_ms: pc.last_timestamp_ms,
+                },
+            );
+        }
+
         for e in &s.entries {
             let key = (e.direction, e.code);
             stats
@@ -293,20 +363,24 @@ impl LogInner {
                     last_timestamp_ms: e.timestamp_ms,
                 });
         }
+        let total: u32 = stats.values().map(|r| r.count).sum();
         let mut by_code: Vec<LogCodeStat> = stats.into_values().collect();
         by_code.sort_by_key(|row| std::cmp::Reverse(row.count));
         LogSummary {
-            total: s.entries.len() as u32,
+            total,
             by_code,
             next_seq: s.next_seq,
         }
     }
 
     /// Drop every entry but leave `next_seq` alone so external
-    /// cursors remain unambiguous.
+    /// cursors remain unambiguous. Push-filtered counters reset to
+    /// zero too — the agent's intent on `clear_log` is "fresh
+    /// session", and a heartbeat counter from before is misleading.
     pub fn clear(&self) {
         let mut s = self.state.lock().expect("log mutex");
         s.entries.clear();
+        s.push_counts.clear();
     }
 
     /// Scan for the first entry with `seq >= since_seq` whose
@@ -450,14 +524,16 @@ mod tests {
 
     #[test]
     fn push_and_snapshot() {
+        // Use non-heartbeat codes (ID + PDID) so the ring fills; POLL
+        // and ACK go to the heartbeat counter and never get a slot.
         let log = LogInner::new(4);
-        log.push(Direction::Cmd, 0x10, 0x60, &[], 0);
-        log.push(Direction::Reply, 0x10, 0x40, &[], 1);
+        log.push(Direction::Cmd, 0x10, 0x61, &[], 0);
+        log.push(Direction::Reply, 0x10, 0x45, &[], 1);
         let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].seq, 0);
         assert_eq!(page.entries[1].seq, 1);
-        assert_eq!(page.entries[0].code, 0x60);
+        assert_eq!(page.entries[0].code, 0x61);
         assert!(matches!(page.entries[0].direction, Direction::Cmd));
         // next_seq = highest returned + 1 → re-paging with this
         // cursor returns nothing new yet.
@@ -466,9 +542,11 @@ mod tests {
 
     #[test]
     fn snapshot_with_cursor_returns_only_new() {
+        // Non-heartbeat codes (ID / CAP / KEYSET) so they enter the
+        // ring; POLL/ACK would be aggregated by the push filter.
         let log = LogInner::new(8);
-        log.push(Direction::Cmd, 0, 0x60, &[], 0);
-        log.push(Direction::Cmd, 0, 0x61, &[], 1);
+        log.push(Direction::Cmd, 0, 0x61, &[], 0);
+        log.push(Direction::Cmd, 0, 0x62, &[], 1);
         let first = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(first.next_seq, 2);
         // Nothing added since → empty page, cursor unchanged.
@@ -476,7 +554,7 @@ mod tests {
         assert!(second.entries.is_empty());
         assert_eq!(second.next_seq, 2);
         // Add an entry, page returns just it.
-        log.push(Direction::Cmd, 0, 0x62, &[], 2);
+        log.push(Direction::Cmd, 0, 0x75, &[], 2);
         let third = log.snapshot(first.next_seq, 100, EffectiveFilter::Exclude(vec![]));
         assert_eq!(third.entries.len(), 1);
         assert_eq!(third.entries[0].seq, 2);
@@ -499,11 +577,11 @@ mod tests {
     #[test]
     fn clear_preserves_seq() {
         let log = LogInner::new(4);
-        log.push(Direction::Cmd, 0, 0x60, &[], 0);
-        log.push(Direction::Cmd, 0, 0x61, &[], 1);
+        log.push(Direction::Cmd, 0, 0x61, &[], 0);
+        log.push(Direction::Cmd, 0, 0x62, &[], 1);
         log.clear();
         assert!(log.snapshot(0, 100, EffectiveFilter::Exclude(vec![])).entries.is_empty());
-        log.push(Direction::Cmd, 0, 0x62, &[], 2);
+        log.push(Direction::Cmd, 0, 0x75, &[], 2);
         let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         // next_seq kept climbing across clear() — new entry is seq 2.
         assert_eq!(page.entries[0].seq, 2);
@@ -570,7 +648,10 @@ mod tests {
     #[test]
     fn snapshot_default_filter_hides_heartbeat_and_reports_suppressed() {
         let log = LogInner::new(16);
-        // 3× POLL/ACK heartbeat + one ID/PDID pair.
+        // 3× POLL/ACK heartbeat + one ID/PDID pair. POLL/ACK go
+        // straight to the push counter (no ring slot), so the ring
+        // only holds the two non-heartbeat entries (ID @ seq 0,
+        // PDID @ seq 1).
         for i in 0..3 {
             log.push(Direction::Cmd, 0, 0x60, &[], i);
             log.push(Direction::Reply, 0, 0x40, &[], i);
@@ -581,15 +662,18 @@ mod tests {
         let filter = LogFilter::default().resolve();
         let page = log.snapshot(0, 100, filter);
 
-        // Only ID + PDID survive the filter.
+        // Only ID + PDID survive — POLL/ACK never entered the ring.
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].code, 0x61);
         assert_eq!(page.entries[1].code, 0x45);
 
-        // Cursor advances past suppressed entries too.
-        assert_eq!(page.next_seq, 8);
+        // Cursor advances past the ring entries (next_seq = last
+        // ring seq + 1 = 2). The heartbeat counter is decoupled
+        // from the cursor model.
+        assert_eq!(page.next_seq, 2);
 
-        // Suppression report shows 3 POLL + 3 ACK = 6 entries.
+        // Suppression report carries 3 POLL + 3 ACK from the push
+        // counter so the agent sees the heartbeat is alive.
         assert_eq!(page.suppressed.total, 6);
         let counts: Vec<(u8, u32)> = page
             .suppressed
@@ -602,8 +686,58 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_pushes_never_grow_the_ring() {
+        // A tiny 4-entry ring with 1000 POLL/ACK pushes: the ring
+        // must stay empty (everything aggregated in the counter)
+        // and `total` in the LogPage is 0.
+        let log = LogInner::new(4);
+        for i in 0..500 {
+            log.push(Direction::Cmd, 0, 0x60, &[], i);
+            log.push(Direction::Reply, 0, 0x40, &[], i);
+        }
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
+        assert_eq!(page.entries.len(), 0);
+        assert_eq!(page.total, 0);
+        // But the counter saw all 1000.
+        assert_eq!(page.suppressed.total, 1000);
+
+        // Summary surfaces the counter too — the ring has nothing
+        // but POLL+ACK rows must still show up with count 500 each.
+        let s = log.summary();
+        assert_eq!(s.total, 1000);
+        let poll = s
+            .by_code
+            .iter()
+            .find(|r| r.code == 0x60 && r.direction == Direction::Cmd)
+            .expect("POLL row");
+        assert_eq!(poll.count, 500);
+        let ack = s
+            .by_code
+            .iter()
+            .find(|r| r.code == 0x40 && r.direction == Direction::Reply)
+            .expect("ACK row");
+        assert_eq!(ack.count, 500);
+    }
+
+    #[test]
+    fn clear_resets_push_counters_too() {
+        let log = LogInner::new(4);
+        log.push(Direction::Cmd, 0, 0x60, &[], 0);
+        log.push(Direction::Reply, 0, 0x40, &[], 0);
+        log.clear();
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
+        assert_eq!(page.suppressed.total, 0);
+        let s = log.summary();
+        assert_eq!(s.total, 0);
+        assert!(s.by_code.is_empty());
+    }
+
+    #[test]
     fn snapshot_include_filter_returns_only_listed_codes() {
         let log = LogInner::new(8);
+        // POLL push goes to the heartbeat counter (= 1 in suppressed
+        // total). ID and PDID go to the ring; the Include([0x61])
+        // filter keeps just ID and read-suppresses PDID.
         log.push(Direction::Cmd, 0, 0x60, &[], 0);
         log.push(Direction::Cmd, 0, 0x61, &[], 1);
         log.push(Direction::Reply, 0, 0x45, &[], 2);
@@ -611,6 +745,7 @@ mod tests {
         let page = log.snapshot(0, 100, EffectiveFilter::Include(vec![0x61]));
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].code, 0x61);
+        // POLL (push-filtered, 1) + PDID (read-filtered, 1) = 2.
         assert_eq!(page.suppressed.total, 2);
     }
 
@@ -643,22 +778,24 @@ mod tests {
 
     #[test]
     fn find_command_at_or_after_finds_first_match() {
+        // POLL is push-filtered and never enters the ring, so the
+        // ring entries here are ID @ seq 0 and KEYSET @ seq 1.
+        // `wait_for_command` on POLL is intentionally unsupported.
         let log = LogInner::new(8);
-        log.push(Direction::Cmd, 0, 0x60, &[], 0); // POLL  @ seq 0
-        log.push(Direction::Reply, 0, 0x40, &[], 1);
-        log.push(Direction::Cmd, 0, 0x61, &[], 2); // ID    @ seq 2
-        log.push(Direction::Cmd, 0, 0x60, &[], 3); // POLL  @ seq 3
+        log.push(Direction::Cmd, 0, 0x60, &[], 0); // POLL → counter
+        log.push(Direction::Reply, 0, 0x40, &[], 1); // ACK → counter
+        log.push(Direction::Cmd, 0, 0x61, &[], 2); // ID    @ ring seq 0
+        log.push(Direction::Cmd, 0, 0x75, &[], 3); // KEYSET @ ring seq 1
 
-        // From cursor 0, first POLL is the one at seq 0.
-        let e = log.find_command_at_or_after(0, 0x60).unwrap();
-        assert_eq!(e.seq, 0);
-        // From cursor 1, the seq-0 POLL is skipped; next POLL = seq 3.
-        let e = log.find_command_at_or_after(1, 0x60).unwrap();
-        assert_eq!(e.seq, 3);
-
-        // ID is at seq 2.
+        // ID is at ring seq 0.
         let e = log.find_command_at_or_after(0, 0x61).unwrap();
-        assert_eq!(e.seq, 2);
+        assert_eq!(e.seq, 0);
+        // From cursor 1, the seq-0 ID is skipped; KEYSET is at 1.
+        let e = log.find_command_at_or_after(1, 0x75).unwrap();
+        assert_eq!(e.seq, 1);
+
+        // POLL is push-filtered → not findable in the ring.
+        assert!(log.find_command_at_or_after(0, 0x60).is_none());
 
         // Nothing matches 0x99.
         assert!(log.find_command_at_or_after(0, 0x99).is_none());

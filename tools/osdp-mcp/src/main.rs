@@ -383,13 +383,15 @@ impl OsdpMcp {
     /// Read recent on-wire events (commands accepted, replies sent,
     /// library-synthesised NAKs). Cursor-paged via `since_seq`.
     ///
-    /// **By default POLL (0x60) and ACK (0x40) heartbeat are
-    /// hidden** — a polling ACU produces ~2 entries/second of them
-    /// and they drown out everything else. The response's
-    /// `suppressed` block tells you how many were hidden per code,
-    /// so the heartbeat is verifiably alive without paging through
-    /// it. To see every byte, pass `exclude_codes: []`. To focus on
-    /// a specific exchange, pass `include_codes: [...]`.
+    /// **POLL (0x60) and ACK (0x40) heartbeat never enter the ring** —
+    /// they're aggregated into the `suppressed` block at write time so
+    /// the 1024-entry ring stays reserved for interesting traffic in
+    /// long-running sessions. `exclude_codes: []` does NOT bring them
+    /// back as individual entries (their payloads are not stored); use
+    /// `get_log_summary` for the count + last-seen timestamp.
+    ///
+    /// `exclude_codes` / `include_codes` apply on top of that to filter
+    /// other codes at read time.
     #[tool(
         description = "Return up to `limit` log entries with seq >= since_seq. \
                        By default POLL/ACK heartbeat is filtered out and reported in `suppressed`; \

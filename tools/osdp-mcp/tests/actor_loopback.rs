@@ -157,21 +157,24 @@ fn default_handler_handles_baseline() {
     assert_eq!(s.last_reply_code, Some(OSDP_REPLY_PDCAP));
     drop(s);
 
-    // ---- Log captured all three round trips (cmd + reply each) ----
+    // ---- Log captured all three round trips ----
+    // POLL/ACK go to the heartbeat counter (push-filtered, no ring
+    // slot) so the 1024-entry ring stays reserved for interesting
+    // traffic; only ID/PDID and CAP/PDCAP show up as entries.
     let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
-    assert_eq!(page.entries.len(), 6, "expected 3 cmd + 3 reply entries");
     let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
     assert_eq!(
         codes,
         vec![
-            (Direction::Cmd, OSDP_CMD_POLL),
-            (Direction::Reply, OSDP_REPLY_ACK),
             (Direction::Cmd, OSDP_CMD_ID),
             (Direction::Reply, OSDP_REPLY_PDID),
             (Direction::Cmd, OSDP_CMD_CAP),
             (Direction::Reply, OSDP_REPLY_PDCAP),
         ]
     );
+    // The heartbeat IS visible — just aggregated. The suppression
+    // report carries POLL/ACK counts from the push counter.
+    assert!(page.suppressed.total >= 2, "expected POLL/ACK in suppressed counter, got {:?}", page.suppressed);
     drop(page);
 
     // ---- nak_next override: next POLL → NAK 0x03, then default ----
