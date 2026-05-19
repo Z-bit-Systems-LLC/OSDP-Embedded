@@ -277,12 +277,13 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
                                 plaintext, plaintext_len, &reply);
     }
 
-    /* Reply SCB type mirrors the inbound: SCS_15→SCS_16, SCS_17→SCS_18.
-     * `osdp_sc_wrap_frame` enforces the project-wide convention that
-     * empty payloads must use the plain (non-encrypted) variant — so
-     * an empty reply to an SCS_17 command is automatically coerced
-     * SCS_18→SCS_16 inside the wrap step. We don't need to special-
-     * case it here. */
+    /* Reply SCB type picks the reply-direction encrypted variant
+     * (SCS_18). `osdp_sc_wrap_frame` enforces the project-wide
+     * convention that the SCB type is dictated by payload presence,
+     * not by the inbound type — so an empty reply is coerced
+     * SCS_18→SCS_16, and conversely a data-bearing event reply (RAW
+     * / KEYPAD / LSTATR triggered by an empty POLL) stays as SCS_18
+     * regardless of whether the inbound was SCS_15 or SCS_17. */
     osdp_frame_t reply_template;
     (void)memset(&reply_template, 0, sizeof(reply_template));
     reply_template.address     = pd->address;
@@ -291,8 +292,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     reply_template.integrity   = cmd->integrity;
     reply_template.has_scb     = true;
     reply_template.scb_length  = OSDP_SCB_MIN_LEN;
-    reply_template.scb_type    =
-        (cmd->scb_type == OSDP_SCS_17) ? OSDP_SCS_18 : OSDP_SCS_16;
+    reply_template.scb_type    = OSDP_SCS_18;
 
     /* Stack storage that lives across the wrap call below; the wrap
      * routine copies the bytes into the output buffer so the lifetime

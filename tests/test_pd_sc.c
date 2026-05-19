@@ -784,7 +784,11 @@ static void test_scs_15_different_cmd_same_sqn_processes_fresh(void)
     TEST_ASSERT_GREATER_THAN_size_t(0, m.outgoing_len);
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    /* NAK carries a 1-byte reason payload, so the wrap step picks
+     * the encrypted variant (SCS_18) even though the inbound LSTAT
+     * came in as SCS_15. See wrap.c — payload presence dictates the
+     * SCB type. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
     uint8_t plain[16]; size_t plain_len = 0;
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
@@ -904,10 +908,12 @@ static void test_scs_15_nak_then_valid_poll_chains_correctly(void)
     m.incoming_len = bad_wire_len;
     osdp_pd_tick(&pd);
 
-    /* Decode and unwrap the NAK on the ACU side so its chain advances. */
+    /* Decode and unwrap the NAK on the ACU side so its chain advances.
+     * NAK has a 1-byte reason payload, so wrap picks the encrypted
+     * variant (SCS_18) regardless of the inbound SCS_15. */
     osdp_frame_t nak_reply;
     decode_first_outgoing(&m, &nak_reply);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, nak_reply.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, nak_reply.scb_type);
     uint8_t nak_plain[16]; size_t nak_plain_len = 0;
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &nak_reply,

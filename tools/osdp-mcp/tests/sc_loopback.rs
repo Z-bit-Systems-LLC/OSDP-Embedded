@@ -22,7 +22,9 @@ use std::rc::Rc;
 use std::sync::{Arc as StdArc, Arc, Mutex};
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
-use osdp_embedded::messages::{OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_PDID};
+use osdp_embedded::messages::{
+    Keypad, OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_PDID,
+};
 use osdp_embedded::pd::Pd;
 use osdp_embedded::sc::{
     scbk_default, ScCrypto, ScEvent, ScEventHandler, ScEventKind, AES_BLOCK_LEN, AES_KEY_LEN,
@@ -238,6 +240,148 @@ fn run_sc_round_trip(sel: Selector) {
             (Direction::Reply, osdp_embedded::messages::OSDP_REPLY_PDID),
         ]
     );
+}
+
+/// Regression: a data-bearing event reply (RAW / KEYPAD / LSTATR
+/// queued via the events module) in response to an empty POLL must
+/// be wrapped as SCS_18 (encrypted), not SCS_16 (plaintext+MAC). The
+/// previous coercion rule was one-way (SCS_17/18 → SCS_15/16 when
+/// payload empty) and the PD's reply-SCB choice mirrored the inbound
+/// — which silently emitted SCS_16 frames with payload bytes, a
+/// spec violation that made OSDP.Net's ACU drop the reply and tear
+/// the session down.
+#[cfg(feature = "crypto-rustcrypto")]
+#[test]
+fn pd_replies_to_empty_poll_with_data_bearing_event_under_sc() {
+    let sel = Selector::RustCrypto;
+    let wire = Rc::new(RefCell::new(Wire::default()));
+
+    let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(128));
+    let ovmap = overrides::new_map();
+    let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut pd = Pd::new(PD_ADDRESS);
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    pd.set_command_handler(handler::DefaultHandler::new(
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
+        StdArc::clone(&drops),
+        PD_ADDRESS,
+    ));
+    pd.set_sc_crypto(BoxedSc(fresh_crypto(sel)));
+    pd.set_sc_scbk_d(scbk_default());
+    pd.set_sc_cuid(&cuid_from_default_pdid());
+
+    let captured = Rc::new(RefCell::new(Captured::default()));
+    let mut acu = Acu::new(1);
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.set_sc_event_handler(ScEventCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.set_sc_crypto(BoxedSc(fresh_crypto(sel)));
+    acu.register_pd(0, PD_ADDRESS).expect("register_pd");
+    acu.set_pd_scbk_d(PD_ADDRESS, scbk_default())
+        .expect("set_pd_scbk_d");
+
+    acu.start_sc_handshake(PD_ADDRESS, true)
+        .expect("start_sc_handshake");
+    cycle(&mut pd, &mut acu, 8);
+    assert!(pd.sc_established());
+    assert!(acu.is_pd_sc_established(PD_ADDRESS));
+
+    // Queue a KEYPAD event the PD will surface on the next POLL.
+    let digits = b"1234#";
+    let kp = Keypad {
+        reader_no: 0,
+        digits,
+    };
+    let mut payload = vec![0u8; 2 + digits.len()];
+    let n = kp.build(&mut payload).expect("build KEYPAD payload");
+    payload.truncate(n);
+    events::enqueue(
+        &evq,
+        osdp_mcp::overrides::OverrideReply {
+            code: OSDP_REPLY_KEYPAD,
+            payload,
+        },
+    );
+
+    // ACU sends POLL. Payload is empty, so the command goes out as
+    // SCS_15 (no data + MAC). The PD's reply has KEYPAD data — must
+    // be wrapped as SCS_18 (encrypted + MAC), not SCS_16.
+    acu.send_command(PD_ADDRESS, OSDP_CMD_POLL, &[])
+        .expect("send POLL");
+
+    // Tick only the PD so its reply lands on the wire but the ACU
+    // hasn't consumed it yet. Sniff the bytes directly and assert
+    // the SCB type is SCS_18 (the spec-correct choice for a
+    // data-bearing reply) and NOT SCS_16. Before the wrap-step
+    // upgrade landed, this assertion was the gap — both peers
+    // agreed on (the wrong) SCS_16 and silently round-tripped, only
+    // breaking against a strict third-party ACU.
+    for _ in 0..4 {
+        pd.tick();
+    }
+    {
+        let p2a_bytes: Vec<u8> = {
+            let w = wire.borrow();
+            w.p2a.clone()
+        };
+        assert!(
+            !p2a_bytes.is_empty(),
+            "PD didn't emit a reply on the wire"
+        );
+        let f = osdp_embedded::frame::decode(&p2a_bytes).expect("decode PD reply");
+        let scb = f.scb.as_ref().expect("reply lacks SCB block");
+        // SCS_18 = 0x18. Anything else (SCS_16, SCS_15, ...) is wrong
+        // for a data-bearing event reply.
+        assert_eq!(
+            scb.ty, 0x18,
+            "expected SCS_18 (encrypted+MAC) for data-bearing KEYPAD reply, got 0x{:02X}",
+            scb.ty
+        );
+    }
+    for _ in 0..4 {
+        acu.tick();
+    }
+
+    let cap = captured.borrow();
+
+    // No session-loss event — the rewrap must have stayed in sync.
+    assert!(
+        !cap.sc_events
+            .iter()
+            .any(|(_, k)| matches!(k, ScEventKind::SessionLost | ScEventKind::HandshakeFailed)),
+        "unexpected SC failure during data-bearing event reply: {:?}",
+        cap.sc_events
+    );
+    assert!(
+        pd.sc_established(),
+        "PD lost its SC session during the event reply"
+    );
+    assert!(
+        acu.is_pd_sc_established(PD_ADDRESS),
+        "ACU lost its SC session during the event reply"
+    );
+
+    // ACU received exactly one reply, a KEYPAD with the queued digits.
+    assert_eq!(cap.replies.len(), 1, "expected single POLL reply");
+    let (_, cmd, reply, payload) = &cap.replies[0];
+    assert_eq!(*cmd, OSDP_CMD_POLL);
+    assert_eq!(*reply, OSDP_REPLY_KEYPAD);
+    let decoded = Keypad::decode(payload).expect("decode KEYPAD");
+    assert_eq!(decoded.reader_no, 0);
+    assert_eq!(decoded.digits, digits);
 }
 
 // Silence the unused_imports warning for AES_KEY_LEN / AES_BLOCK_LEN

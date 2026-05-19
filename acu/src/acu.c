@@ -293,10 +293,11 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
     osdp_status_t br;
 
     /* Once Secure Channel is established for this slot, every command
-     * is automatically wrapped — no per-command opt-in. The SCB type
-     * is keyed off the inbound payload: SCS_17 by default; the wrap
-     * helper coerces SCS_17→SCS_15 for empty payloads (project
-     * convention from spec D.1.4). */
+     * is automatically wrapped — no per-command opt-in. We pick the
+     * command-direction encrypted variant (SCS_17); `osdp_sc_wrap_frame`
+     * coerces to SCS_15 for empty payloads (project convention from
+     * spec D.1.4) and would coerce the other way too if a caller
+     * passed SCS_15 with data. */
     if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
         frame.has_scb     = true;
         frame.scb_length  = OSDP_SCB_MIN_LEN;

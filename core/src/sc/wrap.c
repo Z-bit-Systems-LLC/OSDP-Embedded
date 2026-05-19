@@ -45,20 +45,34 @@ osdp_status_t osdp_sc_wrap_frame(
     built.mac     = mac_placeholder;
     built.mac_len = OSDP_FRAME_MAC_LEN;
 
-    /* Project convention (spec D.1.4 interpretation): SCS_17/18 are
-     * reserved for messages with actual encrypted DATA. An empty
-     * payload has nothing to encrypt and the all-padding ciphertext
-     * confuses some ACUs (notably OSDP.Net's ACUConsole, whose depad
-     * step rejects a "fully padded" decrypted block). Coerce
-     * SCS_17→SCS_15 and SCS_18→SCS_16 when the caller passed an empty
-     * payload, so this rule is enforced once for every consumer
-     * (osdp::pd, future osdp::acu, direct callers) instead of being
-     * re-asserted at every call site. */
+    /* Project convention (spec D.1.4 interpretation): SCS_15/16 carry
+     * a MAC over plaintext-only frames; SCS_17/18 add encrypted DATA.
+     * The right SCB type is dictated by payload presence, not by what
+     * the inbound peer happened to send — an ACU's empty SCS_15 POLL
+     * can still draw a data-bearing SCS_18 reply when the PD has a
+     * RAW/KEYPAD/LSTATR event to report, and vice versa. Coerce both
+     * ways here so callers can pick "command direction" or "reply
+     * direction" generically and let the wrap step pick plaintext-
+     * vs-encrypted based on what's actually in the payload.
+     *
+     * Downgrade (data variant → plaintext variant when payload
+     * empty) avoids the all-padding ciphertext that some ACUs
+     * (notably OSDP.Net's ACUConsole) reject. Upgrade (plaintext
+     * variant → data variant when payload non-empty) avoids handing
+     * an SCS_15/16 frame plaintext bytes the spec doesn't allow
+     * there — which would either parse as malformed on the peer or
+     * confuse its MAC chain and trip session-loss detection. */
     if (built.payload_len == 0) {
         if (built.scb_type == OSDP_SCS_17) {
             built.scb_type = OSDP_SCS_15;
         } else if (built.scb_type == OSDP_SCS_18) {
             built.scb_type = OSDP_SCS_16;
+        }
+    } else {
+        if (built.scb_type == OSDP_SCS_15) {
+            built.scb_type = OSDP_SCS_17;
+        } else if (built.scb_type == OSDP_SCS_16) {
+            built.scb_type = OSDP_SCS_18;
         }
     }
 

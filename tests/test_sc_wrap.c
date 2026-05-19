@@ -80,12 +80,13 @@ static void build_template(osdp_frame_t *t, uint8_t scb_type,
 
 static void test_wrap_unwrap_scs15_round_trip(void)
 {
+    /* SCS_15 is "no data + MAC" — the canonical case is POLL,
+     * which has an empty payload. */
     osdp_sc_session_t a, b;
     make_paired_sessions(&a, &b);
 
-    static const uint8_t cmd_payload[] = { 0x01, 0x02, 0x03, 0x04, 0x05 };
     osdp_frame_t tmpl;
-    build_template(&tmpl, OSDP_SCS_15, 0x60, cmd_payload, sizeof(cmd_payload));
+    build_template(&tmpl, OSDP_SCS_15, 0x60, NULL, 0);
 
     uint8_t wire[64];
     size_t wire_len = 0;
@@ -103,13 +104,84 @@ static void test_wrap_unwrap_scs15_round_trip(void)
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &b, &decoded,
                              recovered, sizeof(recovered), &recovered_len));
-    TEST_ASSERT_EQUAL_size_t(sizeof(cmd_payload), recovered_len);
-    TEST_ASSERT_EQUAL_MEMORY(cmd_payload, recovered, sizeof(cmd_payload));
+    TEST_ASSERT_EQUAL_size_t(0, recovered_len);
 
     /* Both sides' MAC chains advanced to the same value: A's
      * last_outbound == B's last_inbound. */
     TEST_ASSERT_EQUAL_MEMORY(a.last_outbound_mac, b.last_inbound_mac,
                              OSDP_SC_MAC_LEN);
+}
+
+/* Regression: SCS_15/16 carry only a MAC; passing a non-empty
+ * payload with SCS_15 used to silently emit a malformed frame that
+ * OSDP.Net's ACU rejected, tearing the session down. The wrap step
+ * now upgrades SCS_15→SCS_17 and SCS_16→SCS_18 when the caller
+ * passes data — see wrap.c. */
+static void test_wrap_upgrades_scs15_to_scs17_when_payload_nonempty(void)
+{
+    osdp_sc_session_t a, b;
+    make_paired_sessions(&a, &b);
+
+    static const uint8_t cmd_payload[] = { 0x01, 0x02, 0x03, 0x04, 0x05 };
+    osdp_frame_t tmpl;
+    build_template(&tmpl, OSDP_SCS_15, 0x60, cmd_payload, sizeof(cmd_payload));
+
+    uint8_t wire[64];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &a, &tmpl,
+                           wire, sizeof(wire), &wire_len));
+
+    osdp_frame_t decoded;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    /* The SCB type on the wire must be SCS_17 — the data-bearing
+     * variant — not the SCS_15 we passed in. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_17, decoded.scb_type);
+    /* And the payload bytes must be encrypted (not the plaintext). */
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0,
+        memcmp(cmd_payload, decoded.payload, sizeof(cmd_payload)),
+        "payload was not encrypted on the wire");
+
+    uint8_t recovered[64];
+    size_t recovered_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &b, &decoded,
+                             recovered, sizeof(recovered), &recovered_len));
+    TEST_ASSERT_EQUAL_size_t(sizeof(cmd_payload), recovered_len);
+    TEST_ASSERT_EQUAL_MEMORY(cmd_payload, recovered, sizeof(cmd_payload));
+}
+
+/* Mirror of the above for the reply direction (SCS_16 → SCS_18
+ * when a data-bearing event reply rides on top of an empty POLL). */
+static void test_wrap_upgrades_scs16_to_scs18_when_payload_nonempty(void)
+{
+    osdp_sc_session_t a, b;
+    make_paired_sessions(&a, &b);
+
+    /* Simulate a KEYPAD reply: code 0x53, 5-byte payload. */
+    static const uint8_t reply_payload[] = { 0x00, 0x04, '1', '2', '#' };
+    osdp_frame_t tmpl;
+    build_template(&tmpl, OSDP_SCS_16, 0x53,
+                   reply_payload, sizeof(reply_payload));
+    tmpl.reply = true;
+
+    uint8_t wire[64];
+    size_t wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &a, &tmpl,
+                           wire, sizeof(wire), &wire_len));
+
+    osdp_frame_t decoded;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, decoded.scb_type);
+
+    uint8_t recovered[64];
+    size_t recovered_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &b, &decoded,
+                             recovered, sizeof(recovered), &recovered_len));
+    TEST_ASSERT_EQUAL_size_t(sizeof(reply_payload), recovered_len);
+    TEST_ASSERT_EQUAL_MEMORY(reply_payload, recovered, sizeof(reply_payload));
 }
 
 static void test_wrap_unwrap_scs17_encrypted_round_trip(void)
@@ -149,7 +221,7 @@ static void test_wrap_unwrap_scs17_encrypted_round_trip(void)
 
 static void test_chained_wraps_and_unwraps_advance_sessions_in_lockstep(void)
 {
-    /* Send three SCS_15 frames from A→B, with each side advancing
+    /* Send three SCS_17 frames from A→B, with each side advancing
      * its MAC chain on every operation. After each round, the chain
      * states must remain mirrored. */
     osdp_sc_session_t a, b;
@@ -158,7 +230,7 @@ static void test_chained_wraps_and_unwraps_advance_sessions_in_lockstep(void)
     for (int i = 0; i < 3; i++) {
         const uint8_t payload[] = { (uint8_t)i, 0xAA, 0xBB };
         osdp_frame_t tmpl;
-        build_template(&tmpl, OSDP_SCS_15, 0x60, payload, sizeof(payload));
+        build_template(&tmpl, OSDP_SCS_17, 0x60, payload, sizeof(payload));
 
         uint8_t wire[64];
         size_t wire_len = 0;
@@ -271,6 +343,8 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_wrap_unwrap_scs15_round_trip);
+    RUN_TEST(test_wrap_upgrades_scs15_to_scs17_when_payload_nonempty);
+    RUN_TEST(test_wrap_upgrades_scs16_to_scs18_when_payload_nonempty);
     RUN_TEST(test_wrap_unwrap_scs17_encrypted_round_trip);
     RUN_TEST(test_chained_wraps_and_unwraps_advance_sessions_in_lockstep);
     RUN_TEST(test_unwrap_rejects_tampered_mac);
