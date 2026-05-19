@@ -39,6 +39,95 @@ pub enum Direction {
     Nak,
 }
 
+/// Spec-defined symbolic name for a given `(direction, code)` pair.
+/// Returned in [`LogEntry::name`] / [`LogCodeStat::name`] so an agent
+/// reading the log doesn't have to memorise the OSDP code table.
+///
+/// Command and reply names are taken verbatim from SIA OSDP v2.2.2
+/// Annex A (Tables A.1 and A.2) — the `osdp_NAME` form. NAK reason
+/// names come from §7.3 Table 47 (the spec describes them in prose,
+/// not symbols, so we use human-readable lowercase labels). Unknown
+/// codes return `"?"` — the numeric `code` field is authoritative.
+pub fn code_name(direction: Direction, code: u8) -> &'static str {
+    match direction {
+        // Annex A.1 — Table A.1 Commands.
+        Direction::Cmd => match code {
+            0x60 => "osdp_POLL",
+            0x61 => "osdp_ID",
+            0x62 => "osdp_CAP",
+            0x64 => "osdp_LSTAT",
+            0x65 => "osdp_ISTAT",
+            0x66 => "osdp_OSTAT",
+            0x67 => "osdp_RSTAT",
+            0x68 => "osdp_OUT",
+            0x69 => "osdp_LED",
+            0x6A => "osdp_BUZ",
+            0x6B => "osdp_TEXT",
+            0x6E => "osdp_COMSET",
+            0x73 => "osdp_BIOREAD",
+            0x74 => "osdp_BIOMATCH",
+            0x75 => "osdp_KEYSET",
+            0x76 => "osdp_CHLNG",
+            0x77 => "osdp_SCRYPT",
+            0x7B => "osdp_ACURXSIZE",
+            0x7C => "osdp_FILETRANSFER",
+            0x80 => "osdp_MFG",
+            0xA1 => "osdp_XWR",
+            0xA2 => "osdp_ABORT",
+            0xA3 => "osdp_PIVDATA",
+            0xA4 => "osdp_GENAUTH",
+            0xA5 => "osdp_CRAUTH",
+            0xA7 => "osdp_KEEPACTIVE",
+            _ => "?",
+        },
+        // Annex A.2 — Table A.2 Replies.
+        Direction::Reply => match code {
+            0x40 => "osdp_ACK",
+            0x41 => "osdp_NAK",
+            0x45 => "osdp_PDID",
+            0x46 => "osdp_PDCAP",
+            0x48 => "osdp_LSTATR",
+            0x49 => "osdp_ISTATR",
+            0x4A => "osdp_OSTATR",
+            0x4B => "osdp_RSTATR",
+            0x50 => "osdp_RAW",
+            0x51 => "osdp_FMT",
+            0x53 => "osdp_KEYPAD",
+            0x54 => "osdp_COM",
+            0x57 => "osdp_BIOREADR",
+            0x58 => "osdp_BIOMATCHR",
+            0x76 => "osdp_CCRYPT",
+            0x78 => "osdp_RMAC_I",
+            0x79 => "osdp_BUSY",
+            0x7A => "osdp_FTSTAT",
+            0x80 => "osdp_PIVDATAR",
+            0x81 => "osdp_GENAUTHR",
+            0x82 => "osdp_CRAUTHR",
+            0x83 => "osdp_MFGSTATR",
+            0x84 => "osdp_MFGERRR",
+            0x90 => "osdp_MFGREP",
+            0xB1 => "osdp_XRD",
+            _ => "?",
+        },
+        // §7.3 Table 47 — NAK reason codes. The spec describes them
+        // in prose only, so we use lowercase human-readable labels
+        // rather than invent symbolic names.
+        Direction::Nak => match code {
+            0x00 => "no_error",
+            0x01 => "bad_check",
+            0x02 => "cmd_length",
+            0x03 => "unknown_cmd",
+            0x04 => "unexpected_sequence",
+            0x05 => "unsupported_scb",
+            0x06 => "encryption_required",
+            0x07 => "bio_type_unsupported",
+            0x08 => "bio_format_unsupported",
+            0x09 => "record_invalid",
+            _ => "?",
+        },
+    }
+}
+
 /// One captured event. `payload_hex` is the raw payload as an
 /// uppercase hex string ("ABCD") for friction-free consumption from
 /// JSON-RPC clients. The decoded payload typing belongs to a future
@@ -58,6 +147,10 @@ pub struct LogEntry {
     /// Command code (for `Cmd`), reply code (for `Reply`), or
     /// the NAK error code (for `Nak`).
     pub code: u8,
+    /// Spec-defined symbolic name for `(direction, code)` — e.g.
+    /// "POLL", "PDID", "unknown_cmd". `"?"` if the code is not in
+    /// the v2.2.2 baseline. See [`code_name`].
+    pub name: &'static str,
     pub payload_hex: String,
 }
 
@@ -116,6 +209,7 @@ impl LogInner {
                 direction,
                 pd_address,
                 code,
+                name: code_name(direction, code),
                 payload_hex: hex_encode(payload),
             });
         }
@@ -192,6 +286,7 @@ impl LogInner {
                 .or_insert(LogCodeStat {
                     direction: e.direction,
                     code: e.code,
+                    name: code_name(e.direction, e.code),
                     count: 1,
                     first_seq: e.seq,
                     last_seq: e.seq,
@@ -315,6 +410,9 @@ pub struct Suppressed {
 pub struct LogCodeStat {
     pub direction: Direction,
     pub code: u8,
+    /// Spec-defined symbolic name for `(direction, code)`. See
+    /// [`code_name`].
+    pub name: &'static str,
     pub count: u32,
     pub first_seq: u64,
     pub last_seq: u64,
@@ -409,6 +507,41 @@ mod tests {
         let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         // next_seq kept climbing across clear() — new entry is seq 2.
         assert_eq!(page.entries[0].seq, 2);
+    }
+
+    #[test]
+    fn code_name_disambiguates_overlapping_codes_by_direction() {
+        // Spec codes that agents commonly mix up — 0x69 is osdp_LED
+        // (cmd), 0x6E is osdp_COMSET (cmd), 0x7B is osdp_ACURXSIZE
+        // (cmd, NOT MFG — MFG is 0x80), 0x76 means osdp_CHLNG as a
+        // cmd but osdp_CCRYPT as a reply.
+        assert_eq!(code_name(Direction::Cmd, 0x69), "osdp_LED");
+        assert_eq!(code_name(Direction::Cmd, 0x6E), "osdp_COMSET");
+        assert_eq!(code_name(Direction::Cmd, 0x7B), "osdp_ACURXSIZE");
+        assert_eq!(code_name(Direction::Cmd, 0x80), "osdp_MFG");
+        assert_eq!(code_name(Direction::Cmd, 0x76), "osdp_CHLNG");
+        assert_eq!(code_name(Direction::Reply, 0x76), "osdp_CCRYPT");
+        // Routine codes.
+        assert_eq!(code_name(Direction::Cmd, 0x60), "osdp_POLL");
+        assert_eq!(code_name(Direction::Reply, 0x40), "osdp_ACK");
+        assert_eq!(code_name(Direction::Reply, 0x45), "osdp_PDID");
+        // NAK reason byte labels (Table 47 — prose only in the spec,
+        // so we use human-readable lowercase labels).
+        assert_eq!(code_name(Direction::Nak, 0x03), "unknown_cmd");
+        assert_eq!(code_name(Direction::Nak, 0x09), "record_invalid");
+        // Unknown codes get "?" — agent should fall back to the
+        // numeric code field.
+        assert_eq!(code_name(Direction::Cmd, 0xFF), "?");
+    }
+
+    #[test]
+    fn log_entries_carry_symbolic_names() {
+        let log = LogInner::new(8);
+        log.push(Direction::Cmd, 0, 0x75, &[], 0); // KEYSET
+        log.push(Direction::Nak, 0, 0x09, &[], 1); // record_invalid
+        let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
+        assert_eq!(page.entries[0].name, "osdp_KEYSET");
+        assert_eq!(page.entries[1].name, "record_invalid");
     }
 
     #[test]
