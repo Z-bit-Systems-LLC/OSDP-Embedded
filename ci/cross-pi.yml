@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# Cross-compile gate for 64-bit Raspberry Pi (aarch64-unknown-linux-gnu)
+# — invoked from azure-pipelines.yml's `cross_arm64` job on ubuntu-latest.
+#
+# There are no Microsoft-hosted ARM64 Linux agents (confirmed mid-2026:
+# Linux/Windows ARM64 is self-hosted only), and you can't cross-target
+# Linux/aarch64 from the windows-latest pool, so this runs on a Linux
+# x64 agent and cross-compiles with the GNU aarch64 toolchain.
+#
+# It is a *build-only* gate: it proves the C library, host tools, and the
+# osdp-embedded Rust crate compile and link for the Pi. It cannot run the
+# resulting ARM binaries (the agent is x64); on-device test execution
+# would need a self-hosted Pi agent or QEMU, deferred for now.
+
+steps:
+  - task: Bash@3
+    displayName: 'Install aarch64 cross toolchain'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        sudo apt-get update
+        # Pulls in binutils-aarch64-linux-gnu (ar/ranlib/strip) too.
+        sudo apt-get install -y gcc-aarch64-linux-gnu
+
+  # ---- C library + tools via CMake (cross) -----------------------------
+
+  - task: Bash@3
+    displayName: 'CMake configure (aarch64)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cmake -S . -B build-arm64 \
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DOSDP_BUILD_TESTS=ON \
+          -DOSDP_BUILD_TOOLS=ON
+
+  - task: Bash@3
+    displayName: 'CMake build (aarch64)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cmake --build build-arm64 -j
+
+  # Tests are *built* for aarch64 (compile coverage including the POSIX
+  # serial path the Pi actually uses) but not run — the x64 agent can't
+  # execute ARM. Assert the output is genuinely an aarch64 ELF so a
+  # misconfigured toolchain that silently fell back to the host compiler
+  # is caught instead of producing a green-but-wrong build.
+  - task: Bash@3
+    displayName: 'Verify binaries are aarch64 ELF'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        bin=build-arm64/tools/osdp-pd-mock/osdp-pd-mock
+        file "$bin"
+        if ! file "$bin" | grep -q 'ARM aarch64'; then
+          echo "##vso[task.logissue type=error]$bin is not an aarch64 binary"
+          exit 1
+        fi
+
+  # ---- osdp-embedded Rust crate (cross) --------------------------------
+  #
+  # The cc crate picks aarch64-linux-gnu-gcc for the C sources from the
+  # target triple automatically; rustc needs the cross linker pointed at
+  # it explicitly. Only the library crate is cross-built — osdp-mcp pulls
+  # in serialport (needs aarch64 libudev) and is a host-side dev tool that
+  # won't run on the Pi, so it is out of scope for this gate.
+
+  - task: Bash@3
+    displayName: 'rustup add aarch64 target'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        rustup update stable
+        rustup default stable
+        rustup target add aarch64-unknown-linux-gnu
+
+  - task: Bash@3
+    displayName: 'cargo build osdp-embedded (aarch64)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+        export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+        cargo build \
+          --manifest-path rust/osdp/Cargo.toml \
+          --target aarch64-unknown-linux-gnu \
+          --release

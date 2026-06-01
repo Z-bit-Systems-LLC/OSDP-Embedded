@@ -49,8 +49,24 @@ jobs:
         submodules: true
       - template: build.yml
 
+  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Runs on a
+  # Linux agent: there are no Microsoft-hosted ARM64 agents, and the
+  # windows-latest pool can't cross-target Linux/aarch64. Build-only —
+  # the x64 agent can't run ARM binaries (see ci/cross-pi.yml). Runs on
+  # every push and PR, in parallel with `build`.
+  - job: cross_arm64
+    displayName: 'Cross-compile (Raspberry Pi / aarch64)'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+        submodules: true
+      - template: cross-pi.yml
+
   # Package + publish artifacts. Only runs on tagged commits — push
-  # a tag like `v0.1.0-alpha.2` to trigger a release build.
+  # a tag like `v0.1.0-alpha.2` to trigger a release build. Gated on
+  # both the host build/test and the Pi cross-compile so a release can
+  # never publish while the aarch64 target is broken.
   - job: package
     displayName: 'Package & Publish'
     condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
@@ -58,6 +74,7 @@ jobs:
       vmImage: 'windows-latest'
     dependsOn:
       - build
+      - cross_arm64
     steps:
       - checkout: self
         submodules: true
