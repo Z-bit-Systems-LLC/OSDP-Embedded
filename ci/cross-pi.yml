@@ -10,9 +10,15 @@
 # x64 agent and cross-compiles with the GNU aarch64 toolchain.
 #
 # It is a *build-only* gate: it proves the C library, host tools, and the
-# osdp-embedded Rust crate compile and link for the Pi. It cannot run the
-# resulting ARM binaries (the agent is x64); on-device test execution
-# would need a self-hosted Pi agent or QEMU, deferred for now.
+# Rust crates (osdp-embedded + the osdp-mcp server) compile and link for
+# the Pi. It cannot run the resulting ARM binaries (the agent is x64);
+# on-device test execution would need a self-hosted Pi agent or QEMU,
+# deferred for now.
+#
+# osdp-mcp links libudev (via serialport), so the agent additionally
+# enables arm64 as a foreign apt architecture and installs the arm64
+# libudev — a Raspberry Pi + USB-RS485 adapter running osdp-mcp is a
+# real portable-tester use case, so the server is in scope here.
 
 steps:
   - task: Bash@3
@@ -24,6 +30,40 @@ steps:
         sudo apt-get update
         # Pulls in binutils-aarch64-linux-gnu (ar/ranlib/strip) too.
         sudo apt-get install -y gcc-aarch64-linux-gnu
+
+  - task: Bash@3
+    displayName: 'Enable arm64 multiarch + install libudev (for osdp-mcp)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        sudo dpkg --add-architecture arm64
+
+        # The pre-installed mirror only carries amd64; once arm64 is a
+        # known architecture, apt would try to fetch arm64 indexes from
+        # it and 404. Pin the existing sources to amd64, then add a
+        # separate arm64 source pointing at ports.ubuntu.com (where
+        # non-amd64 Ubuntu packages actually live). Codename is derived
+        # so this survives image bumps (jammy -> noble -> ...).
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          # deb822 format (Ubuntu 24.04+).
+          sudo sed -i '/^Types: deb/a Architectures: amd64' \
+            /etc/apt/sources.list.d/ubuntu.sources
+        else
+          # Classic one-line format (Ubuntu 22.04).
+          sudo sed -i 's/^deb \(\[[^]]*\] \)\?/deb [arch=amd64] /' \
+            /etc/apt/sources.list
+        fi
+
+        sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null <<EOF
+        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${codename} main restricted universe multiverse
+        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${codename}-updates main restricted universe multiverse
+        EOF
+
+        sudo apt-get update
+        sudo apt-get install -y libudev-dev:arm64
 
   # ---- C library + tools via CMake (cross) -----------------------------
 
@@ -65,13 +105,13 @@ steps:
           exit 1
         fi
 
-  # ---- osdp-embedded Rust crate (cross) --------------------------------
+  # ---- Rust crates (cross) ---------------------------------------------
   #
   # The cc crate picks aarch64-linux-gnu-gcc for the C sources from the
   # target triple automatically; rustc needs the cross linker pointed at
-  # it explicitly. Only the library crate is cross-built — osdp-mcp pulls
-  # in serialport (needs aarch64 libudev) and is a host-side dev tool that
-  # won't run on the Pi, so it is out of scope for this gate.
+  # it explicitly. The osdp-embedded library builds first (pure C + Rust,
+  # no system libs); osdp-mcp follows and additionally needs pkg-config
+  # aimed at the arm64 libudev installed above.
 
   - task: Bash@3
     displayName: 'rustup add aarch64 target'
@@ -94,5 +134,25 @@ steps:
         export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
         cargo build \
           --manifest-path rust/osdp/Cargo.toml \
+          --target aarch64-unknown-linux-gnu \
+          --release
+
+  - task: Bash@3
+    displayName: 'cargo build osdp-mcp (aarch64)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+        export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+        # serialport -> libudev-sys resolves the lib via pkg-config.
+        # Allow cross resolution and point it at the arm64 .pc files.
+        export PKG_CONFIG_ALLOW_CROSS=1
+        export PKG_CONFIG_SYSROOT_DIR=/
+        export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+        cargo build \
+          --manifest-path rust/Cargo.toml \
+          -p osdp-mcp \
           --target aarch64-unknown-linux-gnu \
           --release
