@@ -318,7 +318,10 @@ impl OsdpMcp {
 impl OsdpMcp {
     /// Liveness check. Returns a banner string; useful to confirm
     /// the server is up before issuing real tools.
-    #[tool(description = "Liveness check. Returns a banner string.")]
+    #[tool(
+        title = "Ping / Liveness Check",
+        description = "Liveness check. Returns a banner string."
+    )]
     fn ping(&self, Parameters(args): Parameters<PingArgs>) -> String {
         match args.message {
             Some(m) => format!("osdp-mcp pong: {}", m),
@@ -332,6 +335,7 @@ impl OsdpMcp {
     /// basic capability) — per-message overrides land in a later
     /// milestone.
     #[tool(
+        title = "Start PD on Serial Port",
         description = "Configure and start a PD on a serial port. Replaces any existing PD configuration."
     )]
     async fn pd_configure(
@@ -358,7 +362,10 @@ impl OsdpMcp {
 
     /// Stop the current PD. Idempotent — fine to call when nothing
     /// is configured.
-    #[tool(description = "Stop the current PD, if any. Idempotent.")]
+    #[tool(
+        title = "Stop PD",
+        description = "Stop the current PD, if any. Idempotent."
+    )]
     async fn pd_stop(&self) -> Result<String, String> {
         self.pd
             .stop()
@@ -370,6 +377,7 @@ impl OsdpMcp {
     /// Snapshot of the PD's current state (running / online / SC /
     /// most recent cmd+reply). Cheap; safe to poll.
     #[tool(
+        title = "Get PD Status",
         description = "Return a JSON snapshot of the PD's state (running, online, SC, last cmd/reply)."
     )]
     async fn pd_status(&self) -> Result<Json<PdStatus>, String> {
@@ -393,6 +401,7 @@ impl OsdpMcp {
     /// `exclude_codes` / `include_codes` apply on top of that to filter
     /// other codes at read time.
     #[tool(
+        title = "Get Wire Log",
         description = "Return up to `limit` log entries with seq >= since_seq. \
                        By default POLL/ACK heartbeat is filtered out and reported in `suppressed`; \
                        pass `exclude_codes: []` to see every entry. \
@@ -410,6 +419,7 @@ impl OsdpMcp {
     /// cheap "what's interesting in the log?" probe before
     /// committing to a full `get_log` page.
     #[tool(
+        title = "Summarize Wire Log",
         description = "Return per-(direction, code) counts across the entire log ring. \
                        Cheap; payload-free. Useful for spotting noise (POLL/ACK at the top) \
                        and deciding which codes to focus on with get_log."
@@ -420,7 +430,10 @@ impl OsdpMcp {
 
     /// Drop every entry currently in the log. `next_seq` keeps
     /// climbing so cursors from before the clear stay meaningful.
-    #[tool(description = "Drop every entry currently in the log. Idempotent.")]
+    #[tool(
+        title = "Clear Wire Log",
+        description = "Drop every entry currently in the log. Idempotent."
+    )]
     fn clear_log(&self) -> String {
         self.pd.clear_log();
         "log cleared".to_string()
@@ -429,6 +442,7 @@ impl OsdpMcp {
     /// Block until a command with the given code arrives, or the
     /// timeout fires. Returns the matching log entry on success.
     #[tool(
+        title = "Wait for Command",
         description = "Wait up to `timeout_ms` for an inbound command with `cmd_code`. Returns the matching log entry, or errors on timeout."
     )]
     async fn wait_for_command(
@@ -445,6 +459,7 @@ impl OsdpMcp {
     /// for every matching command until you call `clear_overrides`
     /// or replace it with another set_reply_*.
     #[tool(
+        title = "Set Static Reply Override",
         description = "Install a static reply override for a command code. Replies are repeated for every matching command until cleared."
     )]
     fn set_reply_for(
@@ -466,6 +481,7 @@ impl OsdpMcp {
     /// empties, behavior depends on `cycle`: false (default) falls
     /// back to the default handler; true wraps around forever.
     #[tool(
+        title = "Set Scripted Reply Sequence",
         description = "Install a scripted reply sequence for a command code. cycle=false (default) consumes; cycle=true loops forever."
     )]
     fn set_reply_script(
@@ -490,6 +506,7 @@ impl OsdpMcp {
     /// NAK `nak_code`, then resume default behavior. Convenient for
     /// "make the ACU see a single NAK and verify it recovers".
     #[tool(
+        title = "NAK Next Command",
         description = "Make the next inbound command with `cmd_code` reply with NAK `nak_code`, then resume default behavior."
     )]
     fn nak_next(&self, Parameters(args): Parameters<NakNextArgs>) -> String {
@@ -502,7 +519,10 @@ impl OsdpMcp {
 
     /// Drop every installed override. Subsequent commands fall
     /// through to the default handler. Idempotent.
-    #[tool(description = "Drop every installed reply override. Idempotent.")]
+    #[tool(
+        title = "Clear Reply Overrides",
+        description = "Drop every installed reply override. Idempotent."
+    )]
     fn clear_overrides(&self) -> String {
         self.pd.clear_overrides();
         "overrides cleared".to_string()
@@ -511,6 +531,7 @@ impl OsdpMcp {
     /// Queue a card-read event. Surfaces as RAW on the next POLL
     /// (in FIFO order with other queued events).
     #[tool(
+        title = "Inject Card Read (RAW)",
         description = "Inject a card-read event. The PD will reply RAW on its next POLL with the supplied card data."
     )]
     fn inject_raw(&self, Parameters(args): Parameters<InjectRawArgs>) -> Result<String, String> {
@@ -547,6 +568,7 @@ impl OsdpMcp {
 
     /// Queue a keypad event. Surfaces as KEYPAD on the next POLL.
     #[tool(
+        title = "Inject Keypad Entry",
         description = "Inject a keypad event. The PD will reply KEYPAD on its next POLL with the supplied ASCII digits."
     )]
     fn inject_keypad(
@@ -583,6 +605,7 @@ impl OsdpMcp {
     /// LSTATR on the next POLL. Spec D.2.1 — the payload is two
     /// bytes: tamper_status (0/1), power_status (0/1).
     #[tool(
+        title = "Inject Tamper / Power Status",
         description = "Inject a tamper/power state change. The PD will reply LSTATR on its next POLL with the supplied flags."
     )]
     fn inject_local_status(
@@ -609,7 +632,10 @@ impl OsdpMcp {
 
     /// Drop every queued event. The next POLL goes straight to
     /// override-or-ACK. Idempotent.
-    #[tool(description = "Drop every queued PD-initiated event. Idempotent.")]
+    #[tool(
+        title = "Clear Queued Events",
+        description = "Drop every queued PD-initiated event. Idempotent."
+    )]
     fn clear_events(&self) -> String {
         self.pd.clear_events();
         "events cleared".to_string()
@@ -620,6 +646,7 @@ impl OsdpMcp {
     /// can verify which got eaten. Exercises the ACU's offline-
     /// detection path; replaces any previous pending drop count.
     #[tool(
+        title = "Drop Next N Replies",
         description = "Make the PD silently swallow the next `n` replies (tests the ACU's offline-detection path)."
     )]
     fn drop_next_n_replies(&self, Parameters(args): Parameters<DropNextNRepliesArgs>) -> String {
@@ -634,6 +661,7 @@ impl OsdpMcp {
     /// D.1.4 / 5.9 session-loss detection. Errors if no PD is
     /// currently configured.
     #[tool(
+        title = "Force Session Loss",
         description = "Force a session-loss event by rebuilding the current PD. The ACU should re-handshake."
     )]
     async fn force_session_loss(&self) -> Result<String, String> {
