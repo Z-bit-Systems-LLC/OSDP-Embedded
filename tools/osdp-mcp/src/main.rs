@@ -27,7 +27,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{schemars, tool, tool_router, Json, ServiceExt};
+use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::{schemars, tool, tool_handler, tool_router, Json, ServerHandler, ServiceExt};
 use tracing_subscriber::EnvFilter;
 
 // ---- Tool parameter schemas ------------------------------------------
@@ -73,12 +74,16 @@ fn default_baud() -> u32 {
     9600
 }
 
-fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
+/// Resolve a Secure Channel mode + optional key into a `ScConfig`.
+/// Shared by the `pd_configure` tool and the `OSDP_MCP_SC_MODE` /
+/// `OSDP_MCP_SCBK_HEX` startup defaults, so both accept the same
+/// spellings and produce identical errors.
+fn parse_sc_config(
+    sc_mode: Option<&str>,
+    scbk_hex: Option<&str>,
+) -> Result<Option<ScConfig>, String> {
     // Normalise to lowercase so "Install" / "SCBKD" etc. all work.
-    let mode = args
-        .sc_mode
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase());
+    let mode = sc_mode.map(|s| s.trim().to_ascii_lowercase());
     match mode.as_deref() {
         None | Some("") | Some("none") | Some("off") => Ok(None),
         // Install mode = SCBK-D (spec D.4 well-known default key).
@@ -88,7 +93,7 @@ fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
             Ok(Some(ScConfig::Scbkd))
         }
         Some("scbk") | Some("operational") | Some("custom") => {
-            let hex = args.scbk_hex.as_deref().unwrap_or("");
+            let hex = scbk_hex.unwrap_or("");
             let bytes = hex_decode(hex)?;
             if bytes.len() != 16 {
                 return Err(format!(
@@ -104,6 +109,16 @@ fn parse_sc_config(args: &PdConfigureArgs) -> Result<Option<ScConfig>, String> {
             "unknown sc_mode {other:?}; expected one of: \
              none, install (= scbkd / default), scbk (= operational, with scbk_hex)"
         )),
+    }
+}
+
+/// Human-readable one-word summary of an SC config, for log lines and
+/// the `pd_configure` success message.
+fn sc_label(sc: &Option<ScConfig>) -> &'static str {
+    match sc {
+        None => "off",
+        Some(ScConfig::Scbkd) => "install (SCBK-D)",
+        Some(ScConfig::Scbk(_)) => "operational (SCBK)",
     }
 }
 
@@ -300,6 +315,35 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 
 // ---- Service ---------------------------------------------------------
 
+/// Connect-time guidance handed to the MCP client/agent in the
+/// `initialize` response (`ServerInfo.instructions`). Its job is to
+/// make the required first step impossible to miss: nothing works
+/// until a PD is running, and `pd_configure` is how you start one.
+const SERVER_INSTRUCTIONS: &str = "\
+This server drives a single virtual OSDP Peripheral Device (PD) on a serial \
+port so you can test an Access Control Unit (ACU).
+
+FIRST STEP: call `pd_status`. The operator may have pre-configured a PD that \
+is already running (via OSDP_MCP_* environment variables), in which case you \
+can go straight to observing/scripting it. If no PD is running, call \
+`pd_configure` (\"Start PD on Serial Port\") before anything else — every other \
+tool (get_log, the inject_*/set_reply_* fault-injection tools, \
+force_session_loss) errors until a PD is running. `pd_configure` also \
+reconfigures an already-running PD.
+
+`pd_configure` parameters:
+  - port (required): serial device, e.g. \"/dev/ttyUSB0\", \"/dev/serial0\", or \"COM5\".
+  - baud (default 9600): line rate; must match the ACU.
+  - address (default 0): 7-bit PD address 0x00..0x7E; must match what the ACU polls.
+  - sc_mode (default \"none\"): Secure Channel mode —
+      \"none\"    : SC disabled.
+      \"install\" : accept handshakes with the spec's well-known SCBK-D key (first-time keying / dev).
+      \"scbk\"    : operational per-installation key — also pass scbk_hex (32 hex chars / 16 bytes).
+
+If you are unsure of port/baud/address, ask the user before calling pd_configure \
+rather than guessing. After configuring, use `pd_status` to confirm the PD is \
+running and online, then `get_log` to watch ACU traffic.";
+
 #[derive(Clone)]
 struct OsdpMcp {
     pd: Arc<PdHandle>,
@@ -314,7 +358,7 @@ impl OsdpMcp {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl OsdpMcp {
     /// Liveness check. Returns a banner string; useful to confirm
     /// the server is up before issuing real tools.
@@ -342,12 +386,8 @@ impl OsdpMcp {
         &self,
         Parameters(args): Parameters<PdConfigureArgs>,
     ) -> Result<String, String> {
-        let sc = parse_sc_config(&args)?;
-        let sc_label = match &sc {
-            None => "off".to_string(),
-            Some(ScConfig::Scbkd) => "install (SCBK-D)".to_string(),
-            Some(ScConfig::Scbk(_)) => "operational (SCBK)".to_string(),
-        };
+        let sc = parse_sc_config(args.sc_mode.as_deref(), args.scbk_hex.as_deref())?;
+        let sc_label = sc_label(&sc);
         self.pd
             .configure(args.port.clone(), args.baud, args.address, sc)
             .await
@@ -673,6 +713,18 @@ impl OsdpMcp {
     }
 }
 
+// `tool_handler` fills in call_tool / list_tools / get_tool from the
+// router; we supply `get_info` ourselves so the `initialize` response
+// carries SERVER_INSTRUCTIONS, steering the client to call
+// `pd_configure` before anything else.
+#[tool_handler(router = Self::tool_router())]
+impl ServerHandler for OsdpMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
+    }
+}
+
 // ---- Main ------------------------------------------------------------
 
 /// Which transport the server should listen on.
@@ -748,7 +800,14 @@ fn parse_cli() -> Result<Cli, String> {
                        --crypto <name>   AES backend to use for Secure Channel.\n                       \
                                          Available in this build: {available}\n                       \
                                          Default: {default}\n  \
-                       --help, -h        Show this message and exit.\n",
+                       --help, -h        Show this message and exit.\n\n\
+                     Pre-configured PD (auto-start at launch, set via environment):\n  \
+                       OSDP_MCP_PORT      Serial device, e.g. /dev/ttyUSB0. Set this to\n                       \
+                                         auto-start the PD before any client connects.\n  \
+                       OSDP_MCP_BAUD      Line rate (default 9600).\n  \
+                       OSDP_MCP_ADDRESS   7-bit address, decimal or 0x-hex (default 0).\n  \
+                       OSDP_MCP_SC_MODE   Secure Channel: none | install | scbk (default none).\n  \
+                       OSDP_MCP_SCBK_HEX  32-hex-char SCBK, required when SC_MODE=scbk.\n",
                     bind = DEFAULT_HTTP_BIND,
                     available = Selector::available()
                         .into_iter()
@@ -781,6 +840,86 @@ fn parse_cli() -> Result<Cli, String> {
     })
 }
 
+/// Pre-configured PD settings read from the environment at launch.
+///
+/// When `OSDP_MCP_PORT` is set, the server brings the PD up
+/// automatically before accepting any client, so a connecting agent
+/// finds it already running. The other vars fill in the remaining
+/// `pd_configure` parameters; `pd_configure` can still reconfigure the
+/// PD at runtime. With no `OSDP_MCP_PORT`, nothing auto-starts and the
+/// behavior is unchanged (the agent must call `pd_configure`).
+///
+/// Env vars (all optional):
+///   OSDP_MCP_PORT      serial device; presence triggers auto-start.
+///   OSDP_MCP_BAUD      line rate (default 9600).
+///   OSDP_MCP_ADDRESS   7-bit PD address, decimal or 0x-hex (default 0).
+///   OSDP_MCP_SC_MODE   none | install | scbk (default none).
+///   OSDP_MCP_SCBK_HEX  32-hex-char key, required when SC_MODE=scbk.
+struct PdDefaults {
+    port: Option<String>,
+    baud: u32,
+    address: u8,
+    sc: Option<ScConfig>,
+}
+
+/// Read an env var, trim it, and treat empty/whitespace as unset — so
+/// `OSDP_MCP_PORT=` (common in templated unit files) means "no default"
+/// rather than an empty port name.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Parse a 7-bit PD address from a string, accepting decimal or a
+/// `0x`-prefixed hex literal. Rejects the broadcast address 0x7F and
+/// anything above it.
+fn parse_pd_address(s: &str) -> Result<u8, String> {
+    let t = s.trim();
+    let val = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16)
+    } else {
+        t.parse::<u8>()
+    }
+    .map_err(|e| format!("OSDP_MCP_ADDRESS={s:?} is not a valid address: {e}"))?;
+    if val > 0x7E {
+        return Err(format!(
+            "OSDP_MCP_ADDRESS={s:?} out of range; must be 0x00..0x7E (0x7F is broadcast)"
+        ));
+    }
+    Ok(val)
+}
+
+/// Resolve the `OSDP_MCP_*` startup defaults. Malformed values
+/// (bad baud, out-of-range address, unknown SC mode, missing/short
+/// SCBK) fail here so the operator gets a clear error at boot rather
+/// than a silently misconfigured PD.
+fn parse_pd_defaults() -> Result<PdDefaults, String> {
+    let port = env_nonempty("OSDP_MCP_PORT");
+    let baud = match env_nonempty("OSDP_MCP_BAUD") {
+        Some(v) => v
+            .parse::<u32>()
+            .map_err(|e| format!("OSDP_MCP_BAUD={v:?} is not a valid baud rate: {e}"))?,
+        None => default_baud(),
+    };
+    let address = match env_nonempty("OSDP_MCP_ADDRESS") {
+        Some(v) => parse_pd_address(&v)?,
+        None => 0,
+    };
+    let sc = parse_sc_config(
+        env_nonempty("OSDP_MCP_SC_MODE").as_deref(),
+        env_nonempty("OSDP_MCP_SCBK_HEX").as_deref(),
+    )
+    .map_err(|e| format!("OSDP_MCP_SC_MODE/SCBK_HEX: {e}"))?;
+    Ok(PdDefaults {
+        port,
+        baud,
+        address,
+        sc,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // On stdio the JSON-RPC framing owns stdout; we must keep stderr
@@ -800,7 +939,41 @@ async fn main() -> Result<()> {
         anyhow::anyhow!(e)
     })?;
 
+    // Malformed OSDP_MCP_* values are a config error — fail fast with a
+    // clear message rather than booting a misconfigured PD.
+    let defaults = parse_pd_defaults().map_err(|e| {
+        eprintln!("osdp-mcp: {e}");
+        anyhow::anyhow!(e)
+    })?;
+
     let handler = OsdpMcp::new(cli.crypto)?;
+
+    // Auto-start the PD from OSDP_MCP_* when a port was supplied, before
+    // any client connects. A runtime failure here (e.g. the serial port
+    // isn't present yet) is logged but non-fatal: the server stays up so
+    // an agent can fix it and call pd_configure. A bad config would have
+    // already failed in parse_pd_defaults above.
+    if let Some(port) = defaults.port {
+        let label = sc_label(&defaults.sc);
+        match handler
+            .pd
+            .configure(port.clone(), defaults.baud, defaults.address, defaults.sc)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                port = %port,
+                baud = defaults.baud,
+                address = format_args!("0x{:02X}", defaults.address),
+                sc = label,
+                "auto-started PD from OSDP_MCP_* environment"
+            ),
+            Err(e) => tracing::warn!(
+                port = %port,
+                error = %e,
+                "auto-start from OSDP_MCP_* failed; PD not running — use pd_configure"
+            ),
+        }
+    }
 
     match cli.transport {
         TransportKind::Stdio => run_stdio(handler, cli.crypto).await,
