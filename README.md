@@ -253,6 +253,39 @@ cargo run    --manifest-path rust/Cargo.toml --example loopback_sc
 See [docs/PUBLISHING.md](docs/PUBLISHING.md) for the release recipe
 (version bump, vendoring the C tree, `cargo publish`).
 
+### Pre-push checks
+
+Before pushing, run every gate the CI `build` job enforces in one shot:
+
+```sh
+./scripts/Check-Code.ps1
+```
+
+It mirrors [ci/build.yml](ci/build.yml) — CMake configure/build/`ctest`
+(Release preset) for the C library, then `cargo fmt --check`, `cargo
+clippy -D warnings`, `cargo build`/`test --workspace --release`, and the
+two loopback examples for the Rust workspace. A clean run means the
+pipeline should pass. Every gate runs even if an earlier one fails, so a
+single invocation surfaces all problems; the script exits non-zero if any
+gate failed, so it drops straight into a git `pre-push` hook.
+
+The C gates use the Ninja-based `release` preset, so on Windows run from a
+*Developer PowerShell for VS* (it skips the CMake stack with a hint if
+`cmake` isn't on PATH). Handy flags: `-Fix` auto-applies `cargo fmt`
+instead of failing on it; `-SkipC` / `-SkipRust` run just one stack.
+
+To run the suite automatically on every `git push`, enable the
+version-controlled hook once per clone:
+
+```sh
+git config core.hooksPath scripts/hooks
+```
+
+[`scripts/hooks/pre-push`](scripts/hooks/pre-push) then runs the checks
+and aborts the push if any gate fails. It needs PowerShell (`pwsh` or
+Windows `powershell`) on PATH; bypass in a pinch with
+`git push --no-verify`.
+
 ### Inspecting a capture
 
 ```sh

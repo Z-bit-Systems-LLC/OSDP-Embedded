@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# pre-push hook — run the full local quality-gate suite before any push.
+#
+# Delegates to scripts/Check-Code.ps1, which mirrors ci/build.yml: a
+# non-zero exit from that script aborts the push, so a green CI run is
+# the expected outcome. Bypass in a pinch with `git push --no-verify`.
+#
+# This hook is version-controlled under scripts/hooks/ and activated by
+# pointing git at it: `git config core.hooksPath scripts/hooks` (run once
+# per clone — see the README's "Pre-push checks" section).
+
+set -e
+
+# Hooks normally run from the repo root, but don't rely on it — resolve
+# the top level so the script path is correct regardless of how git
+# invoked us.
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+# Find a PowerShell to run the .ps1 with. Prefer pwsh (PowerShell 7,
+# cross-platform); fall back to Windows PowerShell.
+if command -v pwsh >/dev/null 2>&1; then
+    ps=pwsh
+elif command -v powershell >/dev/null 2>&1; then
+    ps=powershell
+else
+    echo "pre-push: no PowerShell (pwsh/powershell) on PATH; cannot run checks." >&2
+    echo "          install PowerShell 7, or bypass once with: git push --no-verify" >&2
+    exit 1
+fi
+
+exec "$ps" -NoProfile -ExecutionPolicy Bypass -File scripts/Check-Code.ps1
