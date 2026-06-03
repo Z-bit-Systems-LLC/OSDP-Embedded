@@ -260,7 +260,8 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         buf[off++] = (uint8_t)(crc & 0xFFu);
         buf[off++] = (uint8_t)((crc >> 8) & 0xFFu);
     } else {
-        buf[off++] = osdp_checksum(buf, off);
+        buf[off] = osdp_checksum(buf, off);
+        off++;
     }
 
     *written = off;
