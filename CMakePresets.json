@@ -1,0 +1,138 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "OSDP_BUILD_TESTS": "ON",
+        "OSDP_BUILD_TOOLS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (tests + tools)",
+      "description": "Single-config Debug build with tests and host tools. On Windows, run from a VS Developer shell so cl/rc are on PATH.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (tests + tools)",
+      "description": "Optimised build with tests and host tools.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + AddressSanitizer",
+      "description": "Debug build with AddressSanitizer (UBSan too on GCC/Clang). Isolated build dir so instrumented and plain objects never mix.",
+      "inherits": "debug",
+      "cacheVariables": {
+        "OSDP_SANITIZE": "ON"
+      }
+    },
+    {
+      "name": "lib-only",
+      "displayName": "Library only (no tests/tools)",
+      "description": "Builds just core + pd + acu, mirroring an embedded consumer's footprint.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OSDP_BUILD_TESTS": "OFF",
+        "OSDP_BUILD_TOOLS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "displayName": "Build (Debug)",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "displayName": "Build (Release)",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "displayName": "Build (ASan)",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "lib-only",
+      "displayName": "Build (library only)",
+      "configurePreset": "lib-only"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "displayName": "Test (Debug)",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Test (Release)",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Test (ASan)",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "debug",
+      "displayName": "Configure + build + test (Debug)",
+      "steps": [
+        { "type": "configure", "name": "debug" },
+        { "type": "build", "name": "debug" },
+        { "type": "test", "name": "debug" }
+      ]
+    },
+    {
+      "name": "asan",
+      "displayName": "Configure + build + test (ASan)",
+      "steps": [
+        { "type": "configure", "name": "asan" },
+        { "type": "build", "name": "asan" },
+        { "type": "test", "name": "asan" }
+      ]
+    }
+  ]
+}

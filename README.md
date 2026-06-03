@@ -137,6 +137,36 @@ docs/                         # design docs and plan; spec/ is gitignored
 CMake-based; targets Windows host first (MSVC, clang, MinGW) and any
 embedded toolchain with a C11 compiler.
 
+### With CMake presets (recommended)
+
+`CMakePresets.json` ships ready-made `debug`, `release`, `asan`, and
+`lib-only` configurations (Ninja generator, each in its own
+`build/<preset>/` directory). The whole configure → build → test loop
+is one command:
+
+```sh
+cmake --workflow --preset debug
+```
+
+Or run the steps individually:
+
+```sh
+cmake --preset debug          # configure  -> build/debug/
+cmake --build --preset debug  # build
+ctest --preset debug          # test (output-on-failure baked in)
+```
+
+`cmake --list-presets` shows them all. On **Windows + MSVC**, run these
+from a *Developer PowerShell for VS* (or after
+`Launch-VsDevShell.ps1 -Arch amd64`) so `cl` and `rc` are on `PATH` —
+the presets use the single-config Ninja generator, which doesn't locate
+the toolchain on its own the way the Visual Studio generator does.
+
+### Manual configure
+
+Without presets (e.g. to pick a different generator), the classic form
+still works:
+
 ```sh
 cmake -S . -B build
 cmake --build build --config Debug
@@ -153,8 +183,15 @@ Useful CMake options:
 
 ### Debugging with sanitizers
 
-To investigate a crash or suspected memory bug, configure a separate
-build directory with `OSDP_SANITIZE=ON`:
+To investigate a crash or suspected memory bug, use the `asan` preset
+(its own `build/asan/` directory, kept apart from the regular cache so
+instrumented and plain objects never mix):
+
+```sh
+cmake --workflow --preset asan
+```
+
+Or manually, with a separate build directory:
 
 ```sh
 cmake -S . -B build-asan -DOSDP_SANITIZE=ON
