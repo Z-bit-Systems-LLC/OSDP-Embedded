@@ -1013,9 +1013,9 @@ static void test_keyset_under_sc_rotates_scbk_without_restart(void)
     uint8_t s_enc_before [OSDP_SC_KEY_LEN];
     uint8_t s_mac1_before[OSDP_SC_KEY_LEN];
     uint8_t s_mac2_before[OSDP_SC_KEY_LEN];
-    (void)memcpy(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
-    (void)memcpy(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
-    (void)memcpy(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+    (void)memcpy(s_enc_before,  pd.sc.session.keys.s_enc,  OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac1_before, pd.sc.session.keys.s_mac1, OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac2_before, pd.sc.session.keys.s_mac2, OSDP_SC_KEY_LEN);
 
     /* The new SCBK that the ACU is rotating us to. Deliberately
      * different from kSCBK / kSCBK_D so the assertion below is sharp. */
@@ -1066,9 +1066,9 @@ static void test_keyset_under_sc_rotates_scbk_without_restart(void)
      * and the session state is unchanged. */
     TEST_ASSERT_TRUE(pd.sc.scbk_set);
     TEST_ASSERT_EQUAL_MEMORY(kNewSCBK, pd.sc.scbk, OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_enc_before,  pd.sc.session.keys.s_enc,  OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac1_before, pd.sc.session.keys.s_mac1, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac2_before, pd.sc.session.keys.s_mac2, OSDP_SC_KEY_LEN);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 }
 
