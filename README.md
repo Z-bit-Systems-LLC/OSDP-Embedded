@@ -250,8 +250,13 @@ cargo run    --manifest-path rust/Cargo.toml --example loopback
 cargo run    --manifest-path rust/Cargo.toml --example loopback_sc
 ```
 
-See [docs/PUBLISHING.md](docs/PUBLISHING.md) for the release recipe
-(version bump, vendoring the C tree, `cargo publish`).
+To cut a release, run `./scripts/New-Release.ps1` (patch bump by default;
+`-IncrementType Minor`/`Major` or `-Version x.y.z` to override, `-DryRun`
+to preview). It bumps the version, verifies, commits, tags `v<version>`,
+and pushes — the tag drives the pipeline, and the Azure DevOps Release
+pipeline publishes to crates.io and uploads the tool binaries after
+approval. See [docs/PUBLISHING.md](docs/PUBLISHING.md) for the full
+recipe and the manual fallback.
 
 ### Pre-push checks
 

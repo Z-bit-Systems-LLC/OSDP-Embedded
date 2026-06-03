@@ -1,11 +1,34 @@
 # Publishing `osdp-embedded` to crates.io
 
-This is the manual recipe a Z-bit Systems maintainer follows to ship a
-new release of the `osdp-embedded` Rust crate. The Azure Pipelines
-build produces an `osdp-embedded-X.Y.Z.crate` artifact on every tagged
-build (see `ci/package.yml`); the actual `cargo publish` step is kept
-manual so a human reviews each release before it lands on a public
-registry.
+This documents how a Z-bit Systems maintainer ships a new release of the
+`osdp-embedded` Rust crate. The Azure Pipelines build produces an
+`osdp-embedded-X.Y.Z.crate` artifact plus the Windows tool binaries on
+every tagged build (see `ci/package.yml`); the actual publish to
+crates.io and the binary upload run in the downstream Azure DevOps
+**Release pipeline**, behind its approval gate — so a human reviews each
+release before it lands on a public registry.
+
+## Cutting a release (scripted)
+
+The normal path is one command:
+
+```pwsh
+./scripts/New-Release.ps1            # patch bump (e.g. 0.1.0 -> 0.1.1)
+./scripts/New-Release.ps1 -IncrementType Minor   # 0.1.0 -> 0.2.0
+./scripts/New-Release.ps1 -Version 0.2.0-alpha.1 # explicit
+./scripts/New-Release.ps1 -DryRun    # preview the whole flow, no writes
+```
+
+`New-Release.ps1` validates the repo (on `main`, clean tree, synced with
+origin), resolves the new version, bumps it via `Set-Version.ps1`, runs
+the `Check-Code.ps1` verification gates so the tagged commit is
+known-green, then commits, tags `v<version>`, and pushes `main` + the
+tag. Pushing the tag triggers the pipeline; approving the Release
+pipeline does the irreversible `cargo publish` and uploads the binaries.
+
+The manual recipe below is what that automation does under the hood —
+follow it directly only when you need to deviate (e.g. a local dry-run of
+`cargo package`, or publishing from a workstation outside CI).
 
 ## One-time setup
 
