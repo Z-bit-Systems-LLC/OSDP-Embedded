@@ -24,10 +24,10 @@ use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{schemars, tool, tool_handler, tool_router, Json, ServerHandler, ServiceExt};
 use tracing_subscriber::EnvFilter;
 
@@ -982,7 +982,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run_stdio(handler: OsdpMcp, crypto: Selector) -> Result<()> {
-    tracing::info!(crypto = crypto.name(), "osdp-mcp starting (stdio transport)");
+    tracing::info!(
+        crypto = crypto.name(),
+        "osdp-mcp starting (stdio transport)"
+    );
 
     // .inspect_err is Rust 1.76+; workspace MSRV is 1.70 so use map_err.
     let service = handler.serve(stdio()).await.map_err(|e| {

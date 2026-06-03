@@ -27,7 +27,9 @@ use tokio::sync::Notify;
 pub const DEFAULT_NOISE_CODES: &[u8] = &[0x60, 0x40];
 
 /// Where a logged frame came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// ACU → PD command accepted by the handler.
@@ -227,13 +229,10 @@ impl LogInner {
                 // seq advance, no notify — `wait_for_command` on a
                 // push-filtered code is intentionally unsupported
                 // (those codes are noise by definition).
-                let entry = s
-                    .push_counts
-                    .entry((direction, code))
-                    .or_insert(PushCount {
-                        count: 0,
-                        last_timestamp_ms: timestamp_ms,
-                    });
+                let entry = s.push_counts.entry((direction, code)).or_insert(PushCount {
+                    count: 0,
+                    last_timestamp_ms: timestamp_ms,
+                });
                 entry.count = entry.count.saturating_add(1);
                 entry.last_timestamp_ms = timestamp_ms;
                 return;
@@ -580,7 +579,10 @@ mod tests {
         log.push(Direction::Cmd, 0, 0x61, &[], 0);
         log.push(Direction::Cmd, 0, 0x62, &[], 1);
         log.clear();
-        assert!(log.snapshot(0, 100, EffectiveFilter::Exclude(vec![])).entries.is_empty());
+        assert!(log
+            .snapshot(0, 100, EffectiveFilter::Exclude(vec![]))
+            .entries
+            .is_empty());
         log.push(Direction::Cmd, 0, 0x75, &[], 2);
         let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
         // next_seq kept climbing across clear() — new entry is seq 2.

@@ -337,10 +337,7 @@ fn pd_replies_to_empty_poll_with_data_bearing_event_under_sc() {
             let w = wire.borrow();
             w.p2a.clone()
         };
-        assert!(
-            !p2a_bytes.is_empty(),
-            "PD didn't emit a reply on the wire"
-        );
+        assert!(!p2a_bytes.is_empty(), "PD didn't emit a reply on the wire");
         let f = osdp_embedded::frame::decode(&p2a_bytes).expect("decode PD reply");
         let scb = f.scb.as_ref().expect("reply lacks SCB block");
         // SCS_18 = 0x18. Anything else (SCS_16, SCS_15, ...) is wrong

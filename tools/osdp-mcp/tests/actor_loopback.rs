@@ -174,7 +174,11 @@ fn default_handler_handles_baseline() {
     );
     // The heartbeat IS visible — just aggregated. The suppression
     // report carries POLL/ACK counts from the push counter.
-    assert!(page.suppressed.total >= 2, "expected POLL/ACK in suppressed counter, got {:?}", page.suppressed);
+    assert!(
+        page.suppressed.total >= 2,
+        "expected POLL/ACK in suppressed counter, got {:?}",
+        page.suppressed
+    );
     drop(page);
 
     // ---- nak_next override: next POLL → NAK 0x03, then default ----
