@@ -77,7 +77,15 @@ anyhow = "1"
 
 # Cross-platform serial port access for the PD-side wire.
 # Same shape osdp-pd-mock would use if it were Rust.
-serialport = "4"
+#
+# default-features = false drops the Linux `libudev` backend, which only
+# powers port *enumeration* (available_ports()). osdp-mcp always opens a
+# port by path (serialport::new(name, baud).open()), so libudev is dead
+# weight: removing it drops a native C dependency, shrinks the binary,
+# lets the tool cross-compile to aarch64-unknown-linux-gnu (Raspberry Pi)
+# without an arm64 libudev, and frees the target from the libudev.so.1
+# runtime requirement.
+serialport = { version = "4", default-features = false }
 
 # Stderr logging — never write to stdout when MCP is on stdio.
 tracing            = "0.1"

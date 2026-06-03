@@ -64,3 +64,19 @@ jobs:
         persistCredentials: true
         clean: true
       - template: package.yml
+
+  # Linux ARM64 artifacts (osdp-mcp for Raspberry Pi). Separate job
+  # because the Windows agent can't build Linux binaries; runs on the
+  # same `v*` tag trigger and publishes its own pipeline artifact
+  # (`osdp-embedded-linux-arm64`).
+  - job: package_linux
+    displayName: 'Package (Linux ARM64)'
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    dependsOn:
+      - build
+    steps:
+      - checkout: self
+        submodules: true
+      - template: package-linux.yml

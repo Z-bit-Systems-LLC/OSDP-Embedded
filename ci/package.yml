@@ -9,9 +9,10 @@
 #                        osdp-acu-mock.exe
 #   - Rust crate package: osdp-embedded-X.Y.Z.crate
 #
-# Multi-OS native binaries (Linux x64/ARM64, macOS) aren't built here
-# yet; for those we'd matrix the package job across `ubuntu-latest`
-# and `macos-latest`. Easy to add later when there's demand.
+# This template covers the Windows artifacts. Linux ARM64 (osdp-mcp for
+# Raspberry Pi) is built by the sibling `package_linux` job via
+# package-linux.yml. macOS / Linux-x64 binaries aren't built yet; add
+# more jobs alongside when there's demand.
 
 steps:
   # ---- Native Windows binaries via CMake -------------------------------
