@@ -602,10 +602,12 @@ static void test_scs_17_encrypted_round_trip(void)
     TEST_ASSERT_EQUAL_MEMORY(kSamplePdid, plain, sizeof(kSamplePdid));
 }
 
-static void test_scs_15_unknown_command_yields_scs_16_nak(void)
+static void test_scs_15_unknown_command_yields_scs_18_nak(void)
 {
     /* Send a TEXT command under SCS_15. The default handler doesn't
-     * know TEXT, so the PD wraps a NAK reply under SCS_16. */
+     * know TEXT, so the PD replies with a NAK. The NAK carries a
+     * 1-byte reason payload, so per the symmetric wrap rule it goes
+     * out as data-bearing SCS_18, not the MAC-only SCS_16. */
     mock_transport_t m;
     osdp_pd_transport_t t;
     osdp_pd_t pd;
@@ -640,7 +642,7 @@ static void test_scs_15_unknown_command_yields_scs_16_nak(void)
 
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
 
     uint8_t plain[16]; size_t plain_len = 0;
     TEST_ASSERT_EQUAL(OSDP_OK,
@@ -1144,7 +1146,7 @@ int main(void)
     /* Phase 3b: operational SCS_15..18. */
     RUN_TEST(test_scs_15_round_trip_yields_scs_16_ack);
     RUN_TEST(test_scs_17_encrypted_round_trip);
-    RUN_TEST(test_scs_15_unknown_command_yields_scs_16_nak);
+    RUN_TEST(test_scs_15_unknown_command_yields_scs_18_nak);
     RUN_TEST(test_scs_15_with_tampered_mac_drops_silently);
     /* Regression: same-SQN-different-bytes must process fresh. */
     RUN_TEST(test_scs_15_different_cmd_same_sqn_processes_fresh);

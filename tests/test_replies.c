@@ -97,7 +97,16 @@ static void test_pdid_round_trip_known_values(void)
 
     osdp_pdid_t got;
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdid_decode(buf, w, &got));
-    TEST_ASSERT_EQUAL_MEMORY(&in, &got, sizeof(in));
+    /* Compare field-by-field: osdp_pdid_t has alignment padding before
+     * `serial`, so a whole-struct memcmp would trip over uninitialised
+     * padding bytes in the decoded copy. */
+    TEST_ASSERT_EQUAL_MEMORY(in.vendor_code, got.vendor_code, sizeof(in.vendor_code));
+    TEST_ASSERT_EQUAL_HEX8(in.model, got.model);
+    TEST_ASSERT_EQUAL_HEX8(in.version, got.version);
+    TEST_ASSERT_EQUAL_HEX32(in.serial, got.serial);
+    TEST_ASSERT_EQUAL_HEX8(in.firmware_major, got.firmware_major);
+    TEST_ASSERT_EQUAL_HEX8(in.firmware_minor, got.firmware_minor);
+    TEST_ASSERT_EQUAL_HEX8(in.firmware_build, got.firmware_build);
 }
 
 static void test_pdid_decode_rejects_wrong_length(void)
