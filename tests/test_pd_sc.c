@@ -602,10 +602,13 @@ static void test_scs_17_encrypted_round_trip(void)
     TEST_ASSERT_EQUAL_MEMORY(kSamplePdid, plain, sizeof(kSamplePdid));
 }
 
-static void test_scs_15_unknown_command_yields_scs_16_nak(void)
+static void test_scs_15_unknown_command_yields_scs_18_nak(void)
 {
-    /* Send a TEXT command under SCS_15. The default handler doesn't
-     * know TEXT, so the PD wraps a NAK reply under SCS_16. */
+    /* Send a TEXT command under SCS_15. The default handler doesn't know
+     * TEXT, so the PD replies NAK. The NAK carries a 1-byte reason
+     * payload, so it is data-bearing and the wrap step picks the
+     * encrypted variant SCS_18 (CLAUDE.md SC conventions; wrap.c coerces
+     * only *empty* replies down to SCS_16). */
     mock_transport_t m;
     osdp_pd_transport_t t;
     osdp_pd_t pd;
@@ -640,7 +643,7 @@ static void test_scs_15_unknown_command_yields_scs_16_nak(void)
 
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, reply.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
 
     uint8_t plain[16]; size_t plain_len = 0;
     TEST_ASSERT_EQUAL(OSDP_OK,
@@ -1013,9 +1016,9 @@ static void test_keyset_under_sc_rotates_scbk_without_restart(void)
     uint8_t s_enc_before [OSDP_SC_KEY_LEN];
     uint8_t s_mac1_before[OSDP_SC_KEY_LEN];
     uint8_t s_mac2_before[OSDP_SC_KEY_LEN];
-    (void)memcpy(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
-    (void)memcpy(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
-    (void)memcpy(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+    (void)memcpy(s_enc_before,  pd.sc.session.keys.s_enc,  OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac1_before, pd.sc.session.keys.s_mac1, OSDP_SC_KEY_LEN);
+    (void)memcpy(s_mac2_before, pd.sc.session.keys.s_mac2, OSDP_SC_KEY_LEN);
 
     /* The new SCBK that the ACU is rotating us to. Deliberately
      * different from kSCBK / kSCBK_D so the assertion below is sharp. */
@@ -1066,9 +1069,9 @@ static void test_keyset_under_sc_rotates_scbk_without_restart(void)
      * and the session state is unchanged. */
     TEST_ASSERT_TRUE(pd.sc.scbk_set);
     TEST_ASSERT_EQUAL_MEMORY(kNewSCBK, pd.sc.scbk, OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_enc_before,  pd.sc.session.s_enc,  OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_mac1_before, pd.sc.session.s_mac1, OSDP_SC_KEY_LEN);
-    TEST_ASSERT_EQUAL_MEMORY(s_mac2_before, pd.sc.session.s_mac2, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_enc_before,  pd.sc.session.keys.s_enc,  OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac1_before, pd.sc.session.keys.s_mac1, OSDP_SC_KEY_LEN);
+    TEST_ASSERT_EQUAL_MEMORY(s_mac2_before, pd.sc.session.keys.s_mac2, OSDP_SC_KEY_LEN);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 }
 
@@ -1130,6 +1133,105 @@ static void test_keyset_with_malformed_payload_naks_and_preserves_scbk(void)
     TEST_ASSERT_EQUAL_MEMORY(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
 }
 
+/* ---- Regression: clear-text SQN 0 drops a stale SC session -------------
+ *
+ * Mirrors OSDP.Net commit 02e478476. A clear-text command at sequence 0
+ * means the ACU is (re)starting the connection, so any established Secure
+ * Channel session is stale: the PD must drop it and answer the ACU's
+ * rediscovery (osdp_CAP / osdp_ID) in the clear until a fresh handshake
+ * runs. A *secure* frame at sequence 0 is part of a handshake and must
+ * NOT trigger the drop; a non-zero-sequence clear-text command must leave
+ * the session intact. */
+
+static void inject_plaintext_command(mock_transport_t *m, uint8_t cmd_code,
+                                     const uint8_t *payload, size_t payload_len,
+                                     uint8_t sequence)
+{
+    osdp_frame_t f = {0};
+    f.address     = 0x05;
+    f.reply       = false;
+    f.sequence    = sequence;
+    f.integrity   = OSDP_INTEGRITY_CRC;
+    f.has_scb     = false;
+    f.code        = cmd_code;
+    f.payload     = payload;
+    f.payload_len = payload_len;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &built));
+    mock_reset_incoming(m);
+    (void)memcpy(m->incoming, buf, built);
+    m->incoming_len = built;
+}
+
+static void test_cleartext_sqn0_drops_established_session(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    /* Clear-text POLL at SQN 0 → ACU restart → drop the session. */
+    m.outgoing_len = 0;
+    inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+
+    /* The PD still answers the POLL in the clear. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
+static void test_cleartext_nonzero_sqn_keeps_session(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    /* Clear-text POLL at SQN 2 is NOT a restart signal; the session
+     * stays established. */
+    m.outgoing_len = 0;
+    inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 2);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+}
+
+static void test_cleartext_sqn0_on_unsecured_is_noop(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    /* No handshake performed: session not established. A SQN-0 command
+     * must be a clean no-op and still get its normal clear-text ACK. */
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+    inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1144,7 +1246,7 @@ int main(void)
     /* Phase 3b: operational SCS_15..18. */
     RUN_TEST(test_scs_15_round_trip_yields_scs_16_ack);
     RUN_TEST(test_scs_17_encrypted_round_trip);
-    RUN_TEST(test_scs_15_unknown_command_yields_scs_16_nak);
+    RUN_TEST(test_scs_15_unknown_command_yields_scs_18_nak);
     RUN_TEST(test_scs_15_with_tampered_mac_drops_silently);
     /* Regression: same-SQN-different-bytes must process fresh. */
     RUN_TEST(test_scs_15_different_cmd_same_sqn_processes_fresh);
@@ -1155,5 +1257,9 @@ int main(void)
     /* KEYSET runtime rotation. */
     RUN_TEST(test_keyset_under_sc_rotates_scbk_without_restart);
     RUN_TEST(test_keyset_with_malformed_payload_naks_and_preserves_scbk);
+    /* Regression: clear-text SQN 0 drops a stale SC session. */
+    RUN_TEST(test_cleartext_sqn0_drops_established_session);
+    RUN_TEST(test_cleartext_nonzero_sqn_keeps_session);
+    RUN_TEST(test_cleartext_sqn0_on_unsecured_is_noop);
     return UNITY_END();
 }

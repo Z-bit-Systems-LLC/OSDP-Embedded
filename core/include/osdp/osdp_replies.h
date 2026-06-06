@@ -117,6 +117,75 @@ osdp_status_t osdp_pdcap_build(const osdp_pdcap_record_t *records,
                                size_t *written);
 
 /* ========================================================================
+ * osdp_LSTATR (0x48) — local status report, 2 bytes (tamper, power)
+ * ====================================================================== */
+
+#define OSDP_LSTATR_PAYLOAD_BYTES 2U
+
+/* Status byte values (spec Table 50). The same 0x00/0x01 convention
+ * applies to both bytes: 0x00 is the healthy state. */
+#define OSDP_LSTATR_NORMAL        0x00U  /* tamper or power: normal        */
+#define OSDP_LSTATR_TAMPER        0x01U  /* tamper byte: tamper detected   */
+#define OSDP_LSTATR_POWER_FAILURE 0x01U  /* power byte: power failure       */
+
+typedef struct osdp_lstatr {
+    uint8_t tamper;   /* 0x00 normal, 0x01 tamper detected   */
+    uint8_t power;    /* 0x00 normal, 0x01 power failure      */
+} osdp_lstatr_t;
+
+osdp_status_t osdp_lstatr_decode(const uint8_t *payload, size_t len,
+                                 osdp_lstatr_t *out);
+osdp_status_t osdp_lstatr_build(const osdp_lstatr_t *in,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_ISTATR (0x49) — input status report, one status byte per input
+ * ====================================================================== */
+
+/* Input status values (spec Table 52). */
+#define OSDP_ISTATR_INACTIVE  0x00U
+#define OSDP_ISTATR_ACTIVE    0x01U
+#define OSDP_ISTATR_SHORT     0x02U
+#define OSDP_ISTATR_OPEN      0x03U
+#define OSDP_ISTATR_FAULT     0x04U
+#define OSDP_ISTATR_UNKNOWN   0x05U
+
+osdp_status_t osdp_istatr_decode(const uint8_t *payload, size_t len,
+                                 uint8_t *statuses, size_t statuses_cap,
+                                 size_t *statuses_written);
+osdp_status_t osdp_istatr_build(const uint8_t *statuses, size_t count,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_OSTATR (0x4A) — output status report, one status byte per output
+ * ====================================================================== */
+
+/* Output status values (spec Table 53). */
+#define OSDP_OSTATR_INACTIVE  0x00U
+#define OSDP_OSTATR_ACTIVE    0x01U
+
+osdp_status_t osdp_ostatr_decode(const uint8_t *payload, size_t len,
+                                 uint8_t *statuses, size_t statuses_cap,
+                                 size_t *statuses_written);
+osdp_status_t osdp_ostatr_build(const uint8_t *statuses, size_t count,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_RSTATR (0x4B) — reader tamper status report, one byte per reader
+ * ====================================================================== */
+
+/* Reader tamper status values (spec Table 54). */
+#define OSDP_RSTATR_NORMAL         0x00U
+#define OSDP_RSTATR_NOT_CONNECTED  0x01U
+#define OSDP_RSTATR_TAMPER         0x02U
+
+osdp_status_t osdp_rstatr_decode(const uint8_t *payload, size_t len,
+                                 uint8_t *statuses, size_t statuses_cap,
+                                 size_t *statuses_written);
+osdp_status_t osdp_rstatr_build(const uint8_t *statuses, size_t count,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
  * osdp_RAW (0x50) — card data, 4-byte header + bit-packed data
  * ====================================================================== */
 
