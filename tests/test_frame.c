@@ -407,6 +407,40 @@ static void test_build_rejects_inconsistent_scb(void)
                       osdp_frame_build(&f, buf, sizeof(buf), &n));
 }
 
+/* Regression: the checksum must cover the frame body only, never the
+ * (stale) integrity slot itself. The original builder folded the slot
+ * into the sum via an unsequenced `buf[off++] = osdp_checksum(buf, off)`,
+ * which on some toolchains checksummed `off + 1` bytes — producing a
+ * wrong, buffer-history-dependent value (the a5/99 ping-pong seen on the
+ * wire). Pre-poison the whole buffer, including the slot, so any such
+ * regression yields a checksum that disagrees with a clean recompute. */
+static void test_build_checksum_excludes_stale_integrity_slot(void)
+{
+    static const uint8_t payload[3] = { 0xAA, 0xBB, 0xCC };
+
+    osdp_frame_t f = {0};
+    f.address     = 0x00;
+    f.reply       = true;
+    f.integrity   = OSDP_INTEGRITY_CHECKSUM;
+    f.code        = 0x46;     /* osdp_PDCAP */
+    f.payload     = payload;
+    f.payload_len = sizeof(payload);
+
+    uint8_t buf[32];
+    (void)memset(buf, 0x99, sizeof(buf));  /* poison incl. the slot */
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &n));
+
+    /* Emitted checksum must equal a clean checksum over the body. */
+    TEST_ASSERT_EQUAL_HEX8(osdp_checksum(buf, n - 1), buf[n - 1]);
+
+    /* And the frame must round-trip through the decoder. */
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_EQUAL_size_t(sizeof(payload), got.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(payload, got.payload, sizeof(payload));
+}
+
 /* ---- SCS_15..18 MAC handling -------------------------------------------*/
 
 static void test_decode_splits_mac_for_scs_15_frame(void)
@@ -641,6 +675,7 @@ int main(void)
     RUN_TEST(test_build_rejects_address_out_of_range);
     RUN_TEST(test_build_rejects_sequence_out_of_range);
     RUN_TEST(test_build_rejects_inconsistent_scb);
+    RUN_TEST(test_build_checksum_excludes_stale_integrity_slot);
     /* SCS MAC handling. */
     RUN_TEST(test_decode_splits_mac_for_scs_15_frame);
     RUN_TEST(test_decode_handles_scs_15_with_zero_inner_payload);

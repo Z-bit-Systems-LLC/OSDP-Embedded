@@ -260,7 +260,14 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         buf[off++] = (uint8_t)(crc & 0xFFu);
         buf[off++] = (uint8_t)((crc >> 8) & 0xFFu);
     } else {
-        buf[off++] = osdp_checksum(buf, off);
+        /* Compute into a temp on its own statement, exactly like the CRC
+         * branch above. Folding this into `buf[off++] = osdp_checksum(buf,
+         * off)` is undefined behaviour (C11 6.5p2): the read of `off` in
+         * the argument is unsequenced relative to the `off++` side effect,
+         * so a compiler may pass `off + 1` and checksum the (stale)
+         * integrity slot itself. */
+        const uint8_t cksum = osdp_checksum(buf, off);
+        buf[off++] = cksum;
     }
 
     *written = off;
