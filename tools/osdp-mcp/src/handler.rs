@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use osdp_embedded::messages::{
     Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_COMSET, OSDP_CMD_ID,
-    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
-    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
+    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{CommandHandler, Reply};
 
@@ -285,6 +285,18 @@ impl CommandHandler for DefaultHandler {
             }
             OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET
             | OSDP_CMD_COMSET => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_LSTAT => {
+                // Local status query. Hard-coded "all clear" for now:
+                // tamper=0, power=0 (spec D.2.1 LSTATR payload is two
+                // bytes). TODO: the library has no way for a consumer
+                // to supply real tamper/power state in response to an
+                // LSTAT *command* — only via the inject_local_status
+                // POLL event. A future API should let the application
+                // own this reply rather than us synthesising a constant.
+                self.scratch[0] = 0; // tamper: not tampered
+                self.scratch[1] = 0; // power: OK
+                (OSDP_REPLY_LSTATR, 2)
+            }
             _ => {
                 // Library will synthesise NAK 0x03; record it now
                 // since we won't get a hook on the outbound path.
