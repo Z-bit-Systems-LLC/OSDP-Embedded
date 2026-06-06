@@ -55,7 +55,34 @@ impl Transport for SerialTransport {
     }
 
     fn write(&mut self, buf: &[u8]) -> usize {
-        self.port.write(buf).unwrap_or_default()
+        // Push the whole frame out. A single `port.write` may accept fewer
+        // bytes than offered (non-blocking port, full kernel TX buffer),
+        // and the OSDP state machine ignores the returned count — so a
+        // short write would silently truncate a reply (e.g. dropping the
+        // trailing integrity byte). Loop until the buffer drains, retrying
+        // transient `WouldBlock`/`Interrupted`. The retry budget is bounded
+        // so a wedged port can't spin the actor thread forever; it is far
+        // larger than any OSDP-sized frame needs at real baud rates.
+        let mut sent = 0;
+        let mut budget = 10_000u32;
+        while sent < buf.len() && budget > 0 {
+            budget -= 1;
+            match self.port.write(&buf[sent..]) {
+                Ok(0) => break,
+                Ok(n) => sent += n,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue
+                }
+                Err(_) => break,
+            }
+        }
+        // Block until the bytes are actually transmitted, so a half-duplex
+        // RS-485 line isn't turned around before the last byte clears.
+        let _ = self.port.flush();
+        sent
     }
 
     fn now_ms(&mut self) -> Option<u32> {
