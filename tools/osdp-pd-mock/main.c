@@ -61,17 +61,29 @@ static const osdp_pdid_t kDefaultPdid = {
     .firmware_build = 0,
 };
 
-/* Modest default capability set. Matches what a small access-control
- * PD with one output, one buzzer, one LED, one reader, and a small
- * text display might report. */
+/* Default capability set, mirroring OSDP.Net's PDConsole reference PD
+ * (src/PDConsole/appsettings.json) so an ACU that interoperates with
+ * PDConsole treats this mock identically. Function codes follow spec
+ * Annex B (== OSDP.Net's CapabilityFunction enum).
+ *
+ * The Communication Security record (FC 9) is what gates Secure Channel:
+ * per spec B.10 BOTH bytes are "Bit 0 = AES128 support", so the
+ * key-exchange (num_objects) byte must be 0x01. The previous value 0x04
+ * left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
+ * spec-conformant ACU would never initiate a handshake. */
 static const osdp_pdcap_record_t kDefaultPdcap[] = {
-    { .function_code = 1,  .compliance_level = 1, .num_objects = 1 }, /* contact monitor */
-    { .function_code = 2,  .compliance_level = 1, .num_objects = 1 }, /* output control */
-    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* card data fmt */
-    { .function_code = 4,  .compliance_level = 1, .num_objects = 1 }, /* reader LED ctrl */
-    { .function_code = 5,  .compliance_level = 1, .num_objects = 1 }, /* audible (buzzer) */
-    { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* text output */
-    { .function_code = 9,  .compliance_level = 1, .num_objects = 4 }, /* CRC support, etc. */
+    { .function_code = 1,  .compliance_level = 4, .num_objects = 1 }, /* ContactStatusMonitoring */
+    { .function_code = 2,  .compliance_level = 4, .num_objects = 1 }, /* OutputControl */
+    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* CardDataFormat */
+    { .function_code = 4,  .compliance_level = 4, .num_objects = 1 }, /* ReaderLEDControl */
+    { .function_code = 5,  .compliance_level = 2, .num_objects = 1 }, /* ReaderAudibleOutput */
+    { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* ReaderTextOutput */
+    { .function_code = 8,  .compliance_level = 1, .num_objects = 1 }, /* CheckCharacterSupport */
+    { .function_code = 9,  .compliance_level = 1, .num_objects = 1 }, /* CommunicationSecurity (AES128) */
+    { .function_code = 12, .compliance_level = 0, .num_objects = 0 }, /* SmartCardSupport */
+    { .function_code = 13, .compliance_level = 0, .num_objects = 1 }, /* Readers */
+    { .function_code = 16, .compliance_level = 2, .num_objects = 0 }, /* OSDPVersion */
+    { .function_code = 17, .compliance_level = 1, .num_objects = 0 }, /* ExtendedIdResponse */
 };
 #define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
 
@@ -283,9 +295,7 @@ static osdp_status_t app_handler(void           *user,
 
     case OSDP_CMD_RSTAT: {
         uint8_t statuses[256];
-        /* The baseline capability set has no "number of readers" record;
-         * a single-reader PD reports one byte. */
-        const uint8_t n = 1;
+        const uint8_t n = cap_num_objects(s, 13 /* readers */, 1);
         (void)memset(statuses, OSDP_RSTATR_NORMAL, n);
         size_t built = 0;
         r = osdp_rstatr_build(statuses, n, s->scratch, sizeof(s->scratch),
