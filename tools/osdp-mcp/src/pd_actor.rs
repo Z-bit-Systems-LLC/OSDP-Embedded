@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +29,41 @@ use crate::handler::{DefaultHandler, DropCounter, PdStats};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
+
+/// How long after the most recent inbound command the link still
+/// counts as "actively polled". OSDP ACUs poll on a sub-second
+/// cadence, so a 2 s window catches a stalled poll loop promptly
+/// while tolerating a slow ACU. Independent of the C library's
+/// (reply-based) ~8 s online window — see [`PdStatus::actively_polling`].
+const POLLING_WINDOW_MS: u32 = 2_000;
+
+/// Configured Secure Channel posture of a running PD — the answer to
+/// "is this link clear text, install-keyed, or operationally keyed?".
+/// Reflects how the PD was configured (which key it will handshake
+/// with), independent of whether a handshake has actually completed
+/// yet (that's [`PdStatus::sc_established`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScMode {
+    /// No Secure Channel — the link is clear text. The PD NAKs any
+    /// SCB-bearing frame.
+    None,
+    /// Install mode: the PD accepts handshakes with the spec's
+    /// well-known default key (SCBK-D, D.4). First-time keying / dev.
+    Install,
+    /// Operational mode: the PD uses a per-installation 16-byte SCBK.
+    Scbk,
+}
+
+impl ScMode {
+    fn from_cfg(sc: &Option<ScConfig>) -> Self {
+        match sc {
+            None => ScMode::None,
+            Some(ScConfig::Scbkd) => ScMode::Install,
+            Some(ScConfig::Scbk(_)) => ScMode::Scbk,
+        }
+    }
+}
 
 /// Snapshot of the PD's current state, returned by `pd_status`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -42,10 +77,23 @@ pub struct PdStatus {
     /// accepted in addition to this one.
     pub address: Option<u8>,
     /// True iff the PD has sent at least one reply within the last
-    /// 8 seconds (`osdp_pd_is_online`).
+    /// 8 seconds (`osdp_pd_is_online`). Reply-based: if replies are
+    /// being dropped (`drop_next_n_replies`) this trends false even
+    /// while the ACU keeps polling — compare `actively_polling`.
     pub is_online: bool,
-    /// True iff the SCS_11..14 handshake completed (always false in
-    /// milestone 2 — SC is wired up in milestone 5).
+    /// True iff the ACU is actively polling: a command (POLL or any
+    /// other) arrived within the last [`POLLING_WINDOW_MS`]. Unlike
+    /// `is_online` this is command-based, so it stays true through a
+    /// reply-drop fault while `is_online` decays.
+    pub actively_polling: bool,
+    /// Configured Secure Channel posture — clear text (`none`),
+    /// install-keyed (`install`, SCBK-D), or operationally keyed
+    /// (`scbk`). Answers "which key is this PD using" regardless of
+    /// handshake state.
+    pub sc_mode: ScMode,
+    /// True iff the SCS_11..14 handshake has completed and the PD is
+    /// handling SCS_15..18 operational traffic. With `sc_mode` this
+    /// separates "keyed for SC" from "SC actually up right now".
     pub sc_established: bool,
     /// Most recent command code accepted from the ACU, ms since the
     /// PD epoch (32-bit wrap is fine).
@@ -71,6 +119,8 @@ impl PdStatus {
             baud: None,
             address: None,
             is_online: false,
+            actively_polling: false,
+            sc_mode: ScMode::None,
             sc_established: false,
             last_command_at_ms: None,
             last_reply_at_ms: None,
@@ -365,6 +415,11 @@ struct Slot {
     /// SC posture as the original.
     sc: Option<ScConfig>,
     stats: Arc<Mutex<PdStats>>,
+    /// PD-local clock zero. Shares the same wall-clock basis as the
+    /// handler's `last_command_at_ms` stamps (both anchored at
+    /// `open_pd`), so `status` can age the last command to decide
+    /// `actively_polling`.
+    epoch: Instant,
 }
 
 fn actor_loop(
@@ -499,12 +554,21 @@ fn handle_cmd(
                 },
                 Some(s) => {
                     let stats = s.stats.lock().map(|g| g.clone()).unwrap_or_default();
+                    // Age the most recent command against the shared
+                    // PD clock. wrapping_sub keeps us safe across the
+                    // u32-ms wrap and any sub-ms epoch skew.
+                    let now_ms = s.epoch.elapsed().as_millis() as u32;
+                    let actively_polling = stats
+                        .last_command_at_ms
+                        .is_some_and(|t| now_ms.wrapping_sub(t) <= POLLING_WINDOW_MS);
                     PdStatus {
                         running: true,
                         port: Some(s.port.clone()),
                         baud: Some(s.baud),
                         address: Some(s.address),
                         is_online: s.pd.is_online(),
+                        actively_polling,
+                        sc_mode: ScMode::from_cfg(&s.sc),
                         sc_established: s.pd.sc_established(),
                         last_command_at_ms: stats.last_command_at_ms,
                         last_reply_at_ms: stats.last_reply_at_ms,
@@ -538,6 +602,12 @@ fn open_pd(
 ) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
+    // Anchor the PD-local clock before the handler is built so the
+    // Slot and the handler's `last_command_at_ms` stamps share a zero
+    // (the handler mints its own Instant a few µs later, which only
+    // makes its stamps marginally smaller than `epoch.elapsed()` —
+    // never larger, so no underflow in the `actively_polling` math).
+    let epoch = Instant::now();
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
@@ -587,6 +657,7 @@ fn open_pd(
         address,
         sc,
         stats,
+        epoch,
     })
 }
 

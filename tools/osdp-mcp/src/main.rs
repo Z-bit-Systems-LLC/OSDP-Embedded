@@ -418,7 +418,10 @@ impl OsdpMcp {
     /// most recent cmd+reply). Cheap; safe to poll.
     #[tool(
         title = "Get PD Status",
-        description = "Return a JSON snapshot of the PD's state (running, online, SC, last cmd/reply)."
+        description = "Return a JSON snapshot of the PD's state: running, \
+                       online, actively_polling, sc_mode (none/install/scbk = \
+                       clear text / SCBK-D / operational), sc_established, and \
+                       the last cmd/reply."
     )]
     async fn pd_status(&self) -> Result<Json<PdStatus>, String> {
         self.pd
