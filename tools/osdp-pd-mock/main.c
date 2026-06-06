@@ -61,17 +61,29 @@ static const osdp_pdid_t kDefaultPdid = {
     .firmware_build = 0,
 };
 
-/* Modest default capability set. Matches what a small access-control
- * PD with one output, one buzzer, one LED, one reader, and a small
- * text display might report. */
+/* Default capability set, mirroring OSDP.Net's PDConsole reference PD
+ * (src/PDConsole/appsettings.json) so an ACU that interoperates with
+ * PDConsole treats this mock identically. Function codes follow spec
+ * Annex B (== OSDP.Net's CapabilityFunction enum).
+ *
+ * The Communication Security record (FC 9) is what gates Secure Channel:
+ * per spec B.10 BOTH bytes are "Bit 0 = AES128 support", so the
+ * key-exchange (num_objects) byte must be 0x01. The previous value 0x04
+ * left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
+ * spec-conformant ACU would never initiate a handshake. */
 static const osdp_pdcap_record_t kDefaultPdcap[] = {
-    { .function_code = 1,  .compliance_level = 1, .num_objects = 1 }, /* contact monitor */
-    { .function_code = 2,  .compliance_level = 1, .num_objects = 1 }, /* output control */
-    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* card data fmt */
-    { .function_code = 4,  .compliance_level = 1, .num_objects = 1 }, /* reader LED ctrl */
-    { .function_code = 5,  .compliance_level = 1, .num_objects = 1 }, /* audible (buzzer) */
-    { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* text output */
-    { .function_code = 9,  .compliance_level = 1, .num_objects = 4 }, /* CRC support, etc. */
+    { .function_code = 1,  .compliance_level = 4, .num_objects = 1 }, /* ContactStatusMonitoring */
+    { .function_code = 2,  .compliance_level = 4, .num_objects = 1 }, /* OutputControl */
+    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* CardDataFormat */
+    { .function_code = 4,  .compliance_level = 4, .num_objects = 1 }, /* ReaderLEDControl */
+    { .function_code = 5,  .compliance_level = 2, .num_objects = 1 }, /* ReaderAudibleOutput */
+    { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* ReaderTextOutput */
+    { .function_code = 8,  .compliance_level = 1, .num_objects = 1 }, /* CheckCharacterSupport */
+    { .function_code = 9,  .compliance_level = 1, .num_objects = 1 }, /* CommunicationSecurity (AES128) */
+    { .function_code = 12, .compliance_level = 0, .num_objects = 0 }, /* SmartCardSupport */
+    { .function_code = 13, .compliance_level = 0, .num_objects = 1 }, /* Readers */
+    { .function_code = 16, .compliance_level = 2, .num_objects = 0 }, /* OSDPVersion */
+    { .function_code = 17, .compliance_level = 1, .num_objects = 0 }, /* ExtendedIdResponse */
 };
 #define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
 
@@ -100,6 +112,10 @@ static const char *cmd_name(uint8_t code)
     case OSDP_CMD_OUT:    return "OUT";
     case OSDP_CMD_COMSET: return "COMSET";
     case OSDP_CMD_KEYSET: return "KEYSET";
+    case OSDP_CMD_LSTAT:  return "LSTAT";
+    case OSDP_CMD_ISTAT:  return "ISTAT";
+    case OSDP_CMD_OSTAT:  return "OSTAT";
+    case OSDP_CMD_RSTAT:  return "RSTAT";
     case OSDP_CMD_CHLNG:  return "CHLNG";
     case OSDP_CMD_SCRYPT: return "SCRYPT";
     default:              return "?";
@@ -132,6 +148,44 @@ static void hex_dump(FILE *f, const uint8_t *buf, size_t len)
     for (size_t i = 0; i < len; i++) {
         fprintf(f, "%s%02X", i ? " " : "", buf[i]);
     }
+}
+
+/* ---- Raw RX tap (-vv) ------------------------------------------------ *
+ * The application command handler only sees decoded, non-SCB commands;
+ * Secure Channel handshake frames (CHLNG/SCRYPT) and SCS_15..18 wraps
+ * are consumed below it and never surface. To diagnose whether an ACU
+ * is even attempting SC, -vv wraps the transport read callback and dumps
+ * every inbound byte chunk as it arrives off the wire. Tools may use
+ * globals; the core library never does. */
+static struct {
+    int (*real_read)(void *user, uint8_t *buf, size_t cap);
+    int verbose;
+} g_tap;
+
+static int read_tap(void *user, uint8_t *buf, size_t cap)
+{
+    const int n = g_tap.real_read(user, buf, cap);
+    if (n > 0 && g_tap.verbose >= 2) {
+        fprintf(stderr, "    rx[%d] ", n);
+        hex_dump(stderr, buf, (size_t)n);
+        fputc('\n', stderr);
+    }
+    return n;
+}
+
+/* Look up the declared object count for a PDCAP function code (e.g. the
+ * number of inputs for FC1, outputs for FC2). Status reports must carry
+ * one byte per declared object, so the report length is derived from the
+ * advertised capabilities. Returns `dflt` when the function code isn't
+ * present in the capability set. */
+static uint8_t cap_num_objects(const app_state_t *s, uint8_t fc, uint8_t dflt)
+{
+    for (size_t i = 0; i < s->pdcap_count; i++) {
+        if (s->pdcap[i].function_code == fc) {
+            return s->pdcap[i].num_objects;
+        }
+    }
+    return dflt;
 }
 
 static osdp_status_t app_handler(void           *user,
@@ -192,6 +246,66 @@ static osdp_status_t app_handler(void           *user,
         reply->payload     = NULL;
         reply->payload_len = 0;
         break;
+
+    /* Status requests must be answered with the mandated report, not an
+     * ACK (spec 7.6-7.9; mirrors OSDP.Net commit d42c1cad5). We report
+     * a healthy device: no tamper, no power failure, all inputs/outputs
+     * inactive, all readers normal. */
+    case OSDP_CMD_LSTAT: {
+        const osdp_lstatr_t st = {
+            .tamper = OSDP_LSTATR_NORMAL,
+            .power  = OSDP_LSTATR_NORMAL,
+        };
+        size_t built = 0;
+        r = osdp_lstatr_build(&st, s->scratch, sizeof(s->scratch), &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
+        reply->code        = OSDP_REPLY_LSTATR;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        break;
+    }
+
+    case OSDP_CMD_ISTAT: {
+        uint8_t statuses[256];
+        const uint8_t n = cap_num_objects(s, 1 /* contact monitor */, 1);
+        (void)memset(statuses, OSDP_ISTATR_INACTIVE, n);
+        size_t built = 0;
+        r = osdp_istatr_build(statuses, n, s->scratch, sizeof(s->scratch),
+                              &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
+        reply->code        = OSDP_REPLY_ISTATR;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        break;
+    }
+
+    case OSDP_CMD_OSTAT: {
+        uint8_t statuses[256];
+        const uint8_t n = cap_num_objects(s, 2 /* output control */, 1);
+        (void)memset(statuses, OSDP_OSTATR_INACTIVE, n);
+        size_t built = 0;
+        r = osdp_ostatr_build(statuses, n, s->scratch, sizeof(s->scratch),
+                              &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
+        reply->code        = OSDP_REPLY_OSTATR;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        break;
+    }
+
+    case OSDP_CMD_RSTAT: {
+        uint8_t statuses[256];
+        const uint8_t n = cap_num_objects(s, 13 /* readers */, 1);
+        (void)memset(statuses, OSDP_RSTATR_NORMAL, n);
+        size_t built = 0;
+        r = osdp_rstatr_build(statuses, n, s->scratch, sizeof(s->scratch),
+                              &built);
+        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
+        reply->code        = OSDP_REPLY_RSTATR;
+        reply->payload     = s->scratch;
+        reply->payload_len = built;
+        break;
+    }
 
     default:
         r = OSDP_ERR_NOT_SUPPORTED;
@@ -365,6 +479,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Install the raw-RX tap (-vv) by wrapping the transport's read
+     * callback before the PD copies the vtable. */
+    g_tap.real_read = transport.read;
+    g_tap.verbose   = cli.verbose;
+    transport.read  = read_tap;
+
     /* Initialise the PD. */
     osdp_pd_t pd;
     osdp_pd_init(&pd, cli.address);
@@ -397,9 +517,22 @@ int main(int argc, char **argv)
     /* Catch Ctrl-C for orderly shutdown. */
     signal(SIGINT, on_signal);
 
-    /* Tick loop. */
+    /* Tick loop. The application command callback can't observe Secure
+     * Channel (CHLNG/SCRYPT and SCS_15..18 wrap/unwrap happen below it),
+     * so watch the established flag here and announce transitions. */
+    bool sc_was_up = false;
     while (!g_should_exit) {
         osdp_pd_tick(&pd);
+
+        if (cli.sc_mode != SC_NONE) {
+            const bool sc_now = osdp_pd_sc_established(&pd);
+            if (sc_now != sc_was_up) {
+                fprintf(stderr, "=== Secure Channel %s ===\n",
+                        sc_now ? "ESTABLISHED" : "torn down");
+                sc_was_up = sc_now;
+            }
+        }
+
         serial_sleep_ms(2);  /* a 9600-baud byte is ~1ms; 2ms is fine */
     }
 

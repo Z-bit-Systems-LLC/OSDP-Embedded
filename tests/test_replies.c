@@ -159,6 +159,125 @@ static void test_pdcap_accepts_empty_list(void)
 }
 
 /* ========================================================================
+ * osdp_LSTATR
+ * ====================================================================== */
+
+static void test_lstatr_round_trip(void)
+{
+    osdp_lstatr_t in = {
+        .tamper = OSDP_LSTATR_TAMPER,
+        .power  = OSDP_LSTATR_NORMAL,
+    };
+    uint8_t buf[OSDP_LSTATR_PAYLOAD_BYTES]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_lstatr_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_LSTATR_PAYLOAD_BYTES, w);
+    TEST_ASSERT_EQUAL_HEX8(0x01, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[1]);
+
+    osdp_lstatr_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_lstatr_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(in.tamper, got.tamper);
+    TEST_ASSERT_EQUAL_HEX8(in.power,  got.power);
+}
+
+static void test_lstatr_decode_rejects_wrong_size(void)
+{
+    osdp_lstatr_t got;
+    static const uint8_t one[1] = { 0 };
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_lstatr_decode(one, 1, &got));
+}
+
+/* ========================================================================
+ * osdp_ISTATR
+ * ====================================================================== */
+
+static void test_istatr_round_trip(void)
+{
+    static const uint8_t in[] = {
+        OSDP_ISTATR_INACTIVE, OSDP_ISTATR_ACTIVE,
+        OSDP_ISTATR_OPEN,     OSDP_ISTATR_FAULT,
+    };
+    uint8_t buf[16]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_istatr_build(in, sizeof(in), buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), w);
+    TEST_ASSERT_EQUAL_MEMORY(in, buf, sizeof(in));
+
+    uint8_t got[8]; size_t n;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_istatr_decode(buf, w, got, sizeof(got), &n));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), n);
+    TEST_ASSERT_EQUAL_MEMORY(in, got, sizeof(in));
+}
+
+static void test_istatr_decode_rejects_overflow(void)
+{
+    static const uint8_t three[] = { 0, 1, 2 };
+    uint8_t got[2]; size_t n;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_istatr_decode(three, sizeof(three), got, 2, &n));
+}
+
+/* ========================================================================
+ * osdp_OSTATR
+ * ====================================================================== */
+
+static void test_ostatr_round_trip(void)
+{
+    static const uint8_t in[] = { OSDP_OSTATR_ACTIVE, OSDP_OSTATR_INACTIVE };
+    uint8_t buf[8]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_ostatr_build(in, sizeof(in), buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), w);
+    /* Encoding sanity: active encodes as 0x01, inactive as 0x00. Guards
+     * against the OSDP.Net OutputStatus inversion regression (d42c1cad5). */
+    TEST_ASSERT_EQUAL_HEX8(0x01, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[1]);
+
+    uint8_t got[8]; size_t n;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_ostatr_decode(buf, w, got, sizeof(got), &n));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), n);
+    TEST_ASSERT_EQUAL_MEMORY(in, got, sizeof(in));
+}
+
+static void test_ostatr_build_rejects_small_buffer(void)
+{
+    static const uint8_t in[] = { 1, 0, 1 };
+    uint8_t buf[2]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_ostatr_build(in, sizeof(in), buf, sizeof(buf), &w));
+}
+
+/* ========================================================================
+ * osdp_RSTATR
+ * ====================================================================== */
+
+static void test_rstatr_round_trip(void)
+{
+    static const uint8_t in[] = { OSDP_RSTATR_NORMAL, OSDP_RSTATR_TAMPER };
+    uint8_t buf[8]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_rstatr_build(in, sizeof(in), buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), w);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x02, buf[1]);
+
+    uint8_t got[8]; size_t n;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_rstatr_decode(buf, w, got, sizeof(got), &n));
+    TEST_ASSERT_EQUAL_size_t(sizeof(in), n);
+    TEST_ASSERT_EQUAL_MEMORY(in, got, sizeof(in));
+}
+
+static void test_rstatr_accepts_empty_list(void)
+{
+    uint8_t got[1]; size_t n = 99;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_rstatr_decode(NULL, 0, got, 1, &n));
+    TEST_ASSERT_EQUAL_size_t(0, n);
+}
+
+/* ========================================================================
  * osdp_RAW
  * ====================================================================== */
 
@@ -282,6 +401,18 @@ int main(void)
     RUN_TEST(test_pdcap_round_trip);
     RUN_TEST(test_pdcap_decode_rejects_partial_record);
     RUN_TEST(test_pdcap_accepts_empty_list);
+    /* LSTATR */
+    RUN_TEST(test_lstatr_round_trip);
+    RUN_TEST(test_lstatr_decode_rejects_wrong_size);
+    /* ISTATR */
+    RUN_TEST(test_istatr_round_trip);
+    RUN_TEST(test_istatr_decode_rejects_overflow);
+    /* OSTATR */
+    RUN_TEST(test_ostatr_round_trip);
+    RUN_TEST(test_ostatr_build_rejects_small_buffer);
+    /* RSTATR */
+    RUN_TEST(test_rstatr_round_trip);
+    RUN_TEST(test_rstatr_accepts_empty_list);
     /* RAW */
     RUN_TEST(test_raw_round_trip_26bit_wiegand);
     RUN_TEST(test_raw_decode_rejects_data_length_mismatch);

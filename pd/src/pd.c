@@ -141,6 +141,19 @@ static void check_offline_timeout(osdp_pd_t *pd)
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
+    /* OSDP.Net parity (commit 02e478476): a CLEAR-TEXT command at
+     * sequence 0 means the ACU is (re)starting the connection, so any
+     * established Secure Channel session is stale and must be dropped.
+     * The ACU then re-discovers the PD (osdp_CAP / osdp_ID answered in
+     * the clear) and drives a fresh handshake — e.g. after osdp_KEYSET —
+     * rather than the PD tearing down the session off the back of the
+     * KEYSET itself. A *secure* (SCB-bearing) frame at sequence 0 is part
+     * of an in-progress handshake and must NOT reset anything. */
+    if (!cmd->has_scb && cmd->sequence == 0 && pd->sc.session.established) {
+        osdp_sc_session_init(&pd->sc.session);
+        pd->sc.got_chlng = false;
+    }
+
     /* Secure Channel: dispatch to the SC handler if the application
      * has supplied enough configuration; otherwise fall back to the
      * historical "NAK 0x05" behaviour. */
