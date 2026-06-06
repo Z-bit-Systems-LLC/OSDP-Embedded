@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(osdp-embedded
-    VERSION 0.1.6
+    VERSION 0.1.7
     DESCRIPTION "Portable C11 SIA OSDP v2.2.2 implementation"
     LANGUAGES C
 )
