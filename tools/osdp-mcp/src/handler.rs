@@ -60,47 +60,80 @@ pub fn default_pdid() -> Pdid {
     }
 }
 
-/// Default PDCAP — same minimal set as osdp-pd-mock: one contact
-/// monitor / output / card-data-format / reader-LED / buzzer / text
-/// output, plus four "CRC support" objects on function code 9.
+/// Default PDCAP, mirroring OSDP.Net's PDConsole reference PD
+/// (src/PDConsole/appsettings.json) so an ACU that interoperates with
+/// PDConsole treats this PD identically. Kept in lockstep with
+/// osdp-pd-mock's `kDefaultPdcap`. Function codes follow spec Annex B.
+///
+/// Function code 9 (Communication Security) is what gates Secure
+/// Channel: per spec B.10 BOTH bytes are "Bit 0 = AES128 support", so
+/// the key-exchange (num_objects) byte must be 0x01. The previous value
+/// 0x04 left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
+/// spec-conformant ACU never initiated a handshake and the link stayed
+/// clear-text.
 pub fn default_pdcap() -> Pdcap {
     Pdcap {
         records: vec![
             PdcapRecord {
                 function_code: 1,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // contact monitor
+            }, // ContactStatusMonitoring
             PdcapRecord {
                 function_code: 2,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // output control
+            }, // OutputControl
             PdcapRecord {
                 function_code: 3,
                 compliance_level: 1,
                 num_objects: 1,
-            }, // card data fmt
+            }, // CardDataFormat
             PdcapRecord {
                 function_code: 4,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // reader LED ctrl
+            }, // ReaderLEDControl
             PdcapRecord {
                 function_code: 5,
-                compliance_level: 1,
+                compliance_level: 2,
                 num_objects: 1,
-            }, // audible
+            }, // ReaderAudibleOutput
             PdcapRecord {
                 function_code: 6,
                 compliance_level: 1,
                 num_objects: 1,
-            }, // text output
+            }, // ReaderTextOutput
+            PdcapRecord {
+                function_code: 8,
+                compliance_level: 1,
+                num_objects: 1,
+            }, // CheckCharacterSupport
             PdcapRecord {
                 function_code: 9,
                 compliance_level: 1,
-                num_objects: 4,
-            }, // CRC support
+                num_objects: 1,
+            }, // CommunicationSecurity (AES128)
+            PdcapRecord {
+                function_code: 12,
+                compliance_level: 0,
+                num_objects: 0,
+            }, // SmartCardSupport
+            PdcapRecord {
+                function_code: 13,
+                compliance_level: 0,
+                num_objects: 1,
+            }, // Readers
+            PdcapRecord {
+                function_code: 16,
+                compliance_level: 2,
+                num_objects: 0,
+            }, // OSDPVersion
+            PdcapRecord {
+                function_code: 17,
+                compliance_level: 1,
+                num_objects: 0,
+            }, // ExtendedIdResponse
         ],
     }
 }
