@@ -137,7 +137,7 @@ steps:
     displayName: 'Cache cargo registry'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      key: 'cargo | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
       path: $(CARGO_HOME)
@@ -146,7 +146,7 @@ steps:
     displayName: 'Cache cargo target'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      key: 'target | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'target | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         target | "$(Agent.OS)"
       path: rust/target

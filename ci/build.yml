@@ -72,15 +72,16 @@ steps:
   # toolchain would go in rust-toolchain.toml instead.
 
   # Restore the crate registry + downloaded sources and the compiled
-  # target/ from a prior run. Keyed on Cargo.lock so a dependency change
-  # invalidates the cache; restoreKeys fall back to the newest partial
-  # match so an unrelated lock bump still reuses most of the cache. Each
-  # task saves automatically in a post-job step.
+  # target/ from a prior run. Cargo.lock is gitignored in this repo, so
+  # it isn't present on a fresh checkout — key on the tracked manifests
+  # instead (a manifest edit invalidates the cache). restoreKeys fall
+  # back to the newest partial match so an unrelated change still reuses
+  # most of the cache. Each task saves automatically in a post-job step.
   - task: Cache@2
     displayName: 'Cache cargo registry'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      key: 'cargo | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
       path: $(CARGO_HOME)
@@ -89,7 +90,7 @@ steps:
     displayName: 'Cache cargo target'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      key: 'target | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'target | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         target | "$(Agent.OS)"
       path: rust/target

@@ -56,12 +56,13 @@ steps:
 
   # Same registry cache key as the build job — its post-job save lands
   # before this (tag-only) job starts, since `package` dependsOn `build`,
-  # so the crate downloads are already warm here. The verify build uses a
-  # dedicated target dir (rust/target/package), cached separately.
+  # so the crate downloads are already warm here. Cargo.lock is gitignored
+  # so the key hashes the tracked manifests instead. The verify build uses
+  # a dedicated target dir (rust/target/package), cached separately.
   - task: Cache@2
     displayName: 'Cache cargo registry'
     inputs:
-      key: 'cargo | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
       path: $(CARGO_HOME)
@@ -69,7 +70,7 @@ steps:
   - task: Cache@2
     displayName: 'Cache cargo package target'
     inputs:
-      key: 'target-package | "$(Agent.OS)" | rust/Cargo.lock'
+      key: 'target-package | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         target-package | "$(Agent.OS)"
       path: rust/target/package
