@@ -16,12 +16,36 @@
 #   - `cargo fmt --check` enforces consistent Rust formatting.
 #   - `cargo clippy -D warnings` treats lint warnings as errors,
 #     mirroring the ReSharper code-inspection gate used in OSDP.Net.
+#
+# Releasing pushes the bump commit to `main` and then the `v*` tag as two
+# separate pushes (scripts/New-Release.ps1), so Azure builds the same
+# commit twice: once for the tag (which also packages) and once for the
+# branch. The branch run is pure waste. We can't [skip ci] the bump
+# commit — that key is per-commit and would also skip the tag build — so
+# the first step below detects "branch push of a `Bump version to`
+# commit" and the heavy steps skip themselves on that run via
+# `ne(variables['skipRedundant'], 'true')`. The tag run is unaffected
+# (its SourceBranch is refs/tags/v*), and if BUILD_SOURCEVERSIONMESSAGE
+# is ever unavailable the flag stays 'false' and we simply build as
+# before — a safe fallback, never a skipped release.
 
 steps:
+  - pwsh: |
+      $msg = "$env:BUILD_SOURCEVERSIONMESSAGE"
+      $isBump = ('$(Build.SourceBranch)' -eq 'refs/heads/main') -and $msg.StartsWith('Bump version to')
+      Write-Host "SourceBranch=$(Build.SourceBranch); redundant release-bump build = $isBump"
+      Write-Host "##vso[task.setvariable variable=skipRedundant]$($isBump.ToString().ToLower())"
+      # Cache the crate registry at cargo's real default home — do NOT
+      # relocate CARGO_HOME, or the pre-installed rustup can't find its
+      # install and `rustup target add` fails.
+      Write-Host "##vso[task.setvariable variable=cargoRegistry]$env:USERPROFILE\.cargo\registry"
+    displayName: 'Detect redundant release-bump build'
+
   # ---- C library + tools -----------------------------------------------
 
   - task: CmdLine@2
     displayName: 'CMake configure (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: |
         cmake -S . -B build ^
@@ -29,13 +53,19 @@ steps:
           -DOSDP_BUILD_TESTS=ON ^
           -DOSDP_BUILD_TOOLS=ON
 
+  # --parallel lets CMake pass /m to MSBuild so targets build
+  # concurrently; the /MP added in CMakeLists.txt parallelises the
+  # compiles within each target. Together they keep the Windows agent's
+  # cores busy instead of compiling one .c file at a time.
   - task: CmdLine@2
     displayName: 'CMake build (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      script: 'cmake --build build --config $(buildConfiguration)'
+      script: 'cmake --build build --config $(buildConfiguration) --parallel'
 
   - task: CmdLine@2
     displayName: 'ctest (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'ctest --test-dir build -C $(buildConfiguration) --output-on-failure'
 
@@ -45,8 +75,33 @@ steps:
   # update gives us the latest stable each run; pinning a specific
   # toolchain would go in rust-toolchain.toml instead.
 
+  # Restore the crate registry + downloaded sources and the compiled
+  # target/ from a prior run. Cargo.lock is gitignored in this repo, so
+  # it isn't present on a fresh checkout — key on the tracked manifests
+  # instead (a manifest edit invalidates the cache). restoreKeys fall
+  # back to the newest partial match so an unrelated change still reuses
+  # most of the cache. Each task saves automatically in a post-job step.
+  - task: Cache@2
+    displayName: 'Cache cargo registry'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        cargo | "$(Agent.OS)"
+      path: $(cargoRegistry)
+
+  - task: Cache@2
+    displayName: 'Cache cargo target'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'target | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        target | "$(Agent.OS)"
+      path: rust/target
+
   - task: CmdLine@2
     displayName: 'rustup update stable'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: |
         rustup update stable
@@ -56,21 +111,25 @@ steps:
 
   - task: CmdLine@2
     displayName: 'cargo fmt --check'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo fmt --manifest-path rust/Cargo.toml --all -- --check'
 
   - task: CmdLine@2
     displayName: 'cargo clippy (warnings = errors)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings'
 
   - task: CmdLine@2
     displayName: 'cargo build --workspace'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo build --manifest-path rust/Cargo.toml --workspace --release'
 
   - task: CmdLine@2
     displayName: 'cargo test --workspace'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo test --manifest-path rust/Cargo.toml --workspace --release'
 
@@ -78,10 +137,12 @@ steps:
   # with `assert!()`, so a non-zero exit means the API regressed.
   - task: CmdLine@2
     displayName: 'cargo run --example loopback'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo run --manifest-path rust/Cargo.toml --release --example loopback'
 
   - task: CmdLine@2
     displayName: 'cargo run --example loopback_sc'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       script: 'cargo run --manifest-path rust/Cargo.toml --release --example loopback_sc'
