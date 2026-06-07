@@ -2,7 +2,8 @@
 # Copyright (C) 2026 Z-bit Systems, LLC
 
 # Cross-compile gate for 64-bit Raspberry Pi (aarch64-unknown-linux-gnu)
-# — invoked from azure-pipelines.yml's `cross_arm64` job on ubuntu-latest.
+# — invoked from azure-pipelines.yml's `cross_arm64` job on the self-hosted
+# Default pool (Linux agent advertising the aarch64Toolchain capability).
 #
 # There are no Microsoft-hosted ARM64 Linux agents (confirmed mid-2026:
 # Linux/Windows ARM64 is self-hosted only), and you can't cross-target

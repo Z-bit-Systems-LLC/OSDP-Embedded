@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# Rust workspace build/test template — invoked from azure-pipelines.yml's
+# `build_rust` job. Runs on a self-hosted Linux agent (Default pool): native
+# x86_64 Linux cargo build + nextest execution, the fmt/clippy gates, and the
+# loopback examples.
+#
+# Split out from the former monolithic build.yml so the Rust (cargo) and C
+# (CMake/ctest) stacks run as independent, concurrent jobs. See build-c.yml
+# for the C half.
+#
+# The self-hosted agent provides the full toolchain via
+# scripts/provision-linux-agent.sh — rustup stable + clippy/rustfmt +
+# cargo-nextest + gcc. We still `rustup update`, re-add the components, and
+# fetch nextest-if-missing so the gate self-corrects on an agent provisioned
+# before those were added. None of that needs sudo, so it can't hang the
+# non-interactive agent the way runtime apt did.
+#
+# Releasing pushes the bump commit to main and then the v* tag as two
+# separate pushes (scripts/New-Release.ps1), so Azure builds the same commit
+# twice: once for the tag (which also packages) and once for the branch. The
+# branch run is pure waste. We can't [skip ci] the bump commit — that key is
+# per-commit and would also skip the tag build — so the first step below
+# detects "branch push of a `Bump version to` commit" and the heavy steps
+# skip themselves via ne(variables['skipRedundant'], 'true'). The tag run is
+# unaffected (its SourceBranch is refs/tags/v*), and if
+# BUILD_SOURCEVERSIONMESSAGE is ever unavailable the flag stays 'false' and
+# we simply build as before — a safe fallback, never a skipped release.
+
+steps:
+  - bash: |
+      msg="${BUILD_SOURCEVERSIONMESSAGE:-}"
+      if [ "$(Build.SourceBranch)" = "refs/heads/main" ] && [ "${msg#Bump version to}" != "$msg" ]; then
+        echo "##vso[task.setvariable variable=skipRedundant]true"
+        echo "redundant release-bump build → skipping heavy steps"
+      else
+        echo "##vso[task.setvariable variable=skipRedundant]false"
+      fi
+      # Cache the crate registry at cargo's real default home — do NOT
+      # relocate CARGO_HOME, or the pre-installed rustup can't find its
+      # install and `rustup component/target add` fails.
+      echo "##vso[task.setvariable variable=cargoRegistry]$HOME/.cargo/registry"
+    displayName: 'Detect redundant release-bump build'
+
+  # Restore the crate registry + downloaded sources and the compiled target/
+  # from a prior run. Cargo.lock is gitignored here so it isn't present on a
+  # fresh checkout — key on the tracked manifests instead (a manifest edit
+  # invalidates the cache). restoreKeys fall back to the newest partial match.
+  # Each task saves automatically in a post-job step.
+  - task: Cache@2
+    displayName: 'Cache cargo registry'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        cargo | "$(Agent.OS)"
+      path: $(cargoRegistry)
+
+  - task: Cache@2
+    displayName: 'Cache cargo target'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'target | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        target | "$(Agent.OS)"
+      path: rust/target
+
+  # Agent provides rustup stable; keep it current and ensure the gate
+  # components are present (provision installs them, but re-adding is cheap
+  # and makes this job correct on an agent provisioned before they existed).
+  - task: Bash@3
+    displayName: 'rustup update + components'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        rustup update stable
+        rustup default stable
+        rustup component add clippy rustfmt
+        rustc --version
+        cargo --version
+
+  # cargo-nextest emits a JUnit report on stable (plain `cargo test` can't).
+  # Pre-installed by the provision script; fetch the official Linux binary
+  # into ~/.cargo/bin (already on PATH) only if it's somehow missing.
+  - task: Bash@3
+    displayName: 'Ensure cargo-nextest'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        if ! cargo nextest --version >/dev/null 2>&1; then
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+        fi
+        cargo nextest --version
+
+  - task: Bash@3
+    displayName: 'cargo fmt --check'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+
+  - task: Bash@3
+    displayName: 'cargo clippy (warnings = errors)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+
+  - task: Bash@3
+    displayName: 'cargo build --workspace'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo build --manifest-path rust/Cargo.toml --workspace --release
+
+  # nextest runs the unit/integration tests and writes the JUnit report
+  # configured in rust/.config/nextest.toml (-> rust/target/nextest/ci/
+  # junit.xml). It doesn't run doctests, so those follow in a plain
+  # `cargo test --doc` (not in the Tests tab, but still gated).
+  - task: Bash@3
+    displayName: 'cargo nextest run (JUnit)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo nextest run --manifest-path rust/Cargo.toml --workspace --release --profile ci
+
+  - task: Bash@3
+    displayName: 'cargo test --doc'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo test --manifest-path rust/Cargo.toml --workspace --release --doc
+
+  # succeededOrFailed() so results still publish when tests fail; skip on the
+  # redundant release-bump build (no results there).
+  - task: PublishTestResults@2
+    displayName: 'Publish test results (Rust)'
+    condition: and(succeededOrFailed(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: 'rust/target/nextest/ci/junit.xml'
+      searchFolder: '$(Build.SourcesDirectory)'
+      mergeTestResults: true
+      testRunTitle: 'OSDP-Embedded Rust ($(buildConfiguration))'
+
+  # Smoke-run the loopback examples — they assert their own results with
+  # assert!(), so a non-zero exit means the API regressed.
+  - task: Bash@3
+    displayName: 'cargo run --example loopback'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo run --manifest-path rust/Cargo.toml --release --example loopback
+
+  - task: Bash@3
+    displayName: 'cargo run --example loopback_sc'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cargo run --manifest-path rust/Cargo.toml --release --example loopback_sc

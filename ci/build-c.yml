@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# C library + tools build/test template — invoked from azure-pipelines.yml's
+# `build_c` job. Runs on a Microsoft-hosted `ubuntu-latest` agent (the free
+# hosted parallel slot): native x86_64 Linux compile *and* ctest execution.
+#
+# Split out from the former monolithic build.yml so the C (CMake/ctest) and
+# Rust (cargo) stacks run as independent, concurrent jobs. See build-rust.yml
+# for the Rust half and azure-pipelines.yml for how the jobs are scheduled
+# across the hosted + self-hosted parallel slots.
+#
+# Note on coverage: per-push test *execution* now happens on Linux (here +
+# build-rust.yml), not Windows. The Windows tools are still compiled at
+# release time by package.yml; cross-pi.yml builds aarch64 but can't run it.
+#
+# Like build-rust.yml, the heavy steps skip themselves on the redundant
+# branch-push run of a release-bump commit; the v* tag run is unaffected.
+# (Full rationale in build-rust.yml's detect step.)
+
+steps:
+  - bash: |
+      msg="${BUILD_SOURCEVERSIONMESSAGE:-}"
+      if [ "$(Build.SourceBranch)" = "refs/heads/main" ] && [ "${msg#Bump version to}" != "$msg" ]; then
+        echo "##vso[task.setvariable variable=skipRedundant]true"
+        echo "redundant release-bump build → skipping heavy steps"
+      else
+        echo "##vso[task.setvariable variable=skipRedundant]false"
+      fi
+    displayName: 'Detect redundant release-bump build'
+
+  # On Linux CMake defaults to the single-config "Unix Makefiles" generator,
+  # so the build type is fixed at configure time via CMAKE_BUILD_TYPE; there
+  # is no per-build `--config` (that's a multi-config / MSVC concept).
+  - task: Bash@3
+    displayName: 'CMake configure (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=$(buildConfiguration) \
+          -DOSDP_BUILD_TESTS=ON \
+          -DOSDP_BUILD_TOOLS=ON
+
+  # --parallel keeps all agent cores busy compiling.
+  - task: Bash@3
+    displayName: 'CMake build (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        cmake --build build --parallel
+
+  # --output-junit writes a JUnit XML report (CMake 3.21+) for the Tests tab.
+  - task: Bash@3
+    displayName: 'ctest (Release)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        ctest --test-dir build --output-on-failure --output-junit ctest-results.xml
+
+  # succeededOrFailed() so results still publish when tests fail — that's the
+  # point — but skip on the redundant release-bump build (no results there).
+  - task: PublishTestResults@2
+    displayName: 'Publish test results (C)'
+    condition: and(succeededOrFailed(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: '**/ctest-results.xml'
+      searchFolder: '$(Build.SourcesDirectory)'
+      mergeTestResults: true
+      testRunTitle: 'OSDP-Embedded C ($(buildConfiguration))'

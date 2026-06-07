@@ -9,9 +9,11 @@
 #
 # Installs: base build tools (cmake, ninja, gcc, pkg-config, ...), the
 # aarch64 cross toolchain, arm64 multiarch + libudev-dev:arm64 (for
-# osdp-mcp's serialport dep), and rustup stable + the
-# aarch64-unknown-linux-gnu target; then exposes the rust proxies on the
-# default PATH so the agent's non-login shell can find them.
+# osdp-mcp's serialport dep), and rustup stable + the clippy/rustfmt
+# components + cargo-nextest + the aarch64-unknown-linux-gnu target; then
+# exposes the rust proxies on the default PATH so the agent's non-login
+# shell can find them. This covers both the `cross_arm64` job (cross build)
+# and the `build_rust` job (native fmt/clippy/build/nextest).
 #
 # Works on Debian and Ubuntu. The two differ in how arm64 packages are
 # served: Debian's normal mirrors carry every architecture, while Ubuntu
@@ -102,7 +104,18 @@ fi
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 rustup default stable
 rustup target add aarch64-unknown-linux-gnu
-ok "rust stable + aarch64-unknown-linux-gnu target installed"
+# clippy + rustfmt are NOT in the minimal profile but the build_rust job
+# needs them (cargo fmt --check, cargo clippy -D warnings).
+rustup component add clippy rustfmt
+ok "rust stable + aarch64-unknown-linux-gnu target + clippy/rustfmt installed"
+
+# cargo-nextest: build_rust runs the Rust tests through it (JUnit on stable).
+# Pull the official pre-built Linux binary into ~/.cargo/bin (on PATH).
+log "Installing cargo-nextest"
+if ! cargo nextest --version >/dev/null 2>&1; then
+  curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+fi
+cargo nextest --version && ok "cargo-nextest installed"
 
 # ---- 4. make cargo/rustc/rustup visible to the (non-login) agent -----
 # Azure's Bash task runs non-interactive, non-login shells that don't
@@ -123,6 +136,9 @@ ninja --version >/dev/null && ok "ninja $(ninja --version)"
 aarch64-linux-gnu-gcc --version | head -1
 cargo --version
 rustc --version
+cargo fmt --version >/dev/null && ok "rustfmt present"
+cargo clippy --version >/dev/null && ok "clippy present"
+cargo nextest --version >/dev/null && ok "cargo-nextest present"
 rustup target list --installed | grep -qx 'aarch64-unknown-linux-gnu' \
   && ok "aarch64-unknown-linux-gnu target present" \
   || die "aarch64 Rust target missing"
