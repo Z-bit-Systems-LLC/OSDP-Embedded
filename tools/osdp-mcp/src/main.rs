@@ -40,6 +40,26 @@ struct PingArgs {
     message: Option<String>,
 }
 
+/// Build identity reported by the `version` tool. Lets an operator
+/// confirm a deployed binary includes a given fix instead of guessing
+/// from file timestamps.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct VersionInfo {
+    /// Crate package name — always "osdp-mcp".
+    name: &'static str,
+    /// Semantic version from Cargo.toml (e.g. "0.1.7"). Bumped per
+    /// release commit, so this is the quickest "is the running binary
+    /// current" check.
+    version: &'static str,
+    /// Short git commit the binary was built from, or "unknown" when
+    /// built outside a git checkout. Pin-points the exact source even
+    /// between version bumps.
+    git_commit: &'static str,
+    /// True when the working tree had uncommitted changes at build
+    /// time — a red flag for a binary that's meant to match a tag.
+    git_dirty: bool,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PdConfigureArgs {
     /// Serial port name. Windows: "COM5". POSIX: "/dev/ttyUSB0".
@@ -371,6 +391,26 @@ impl OsdpMcp {
             Some(m) => format!("osdp-mcp pong: {}", m),
             None => "osdp-mcp pong".to_string(),
         }
+    }
+
+    /// Report the running server's build identity. Use this to confirm
+    /// a deployed binary actually includes a given fix before chasing a
+    /// bug that's already patched in source.
+    #[tool(
+        title = "Get Server Version",
+        description = "Return the running osdp-mcp build identity: package \
+                       name, semantic version (Cargo.toml), the git commit \
+                       it was built from, and whether the build tree was \
+                       dirty. Use it to confirm a deployed binary includes \
+                       a given fix rather than guessing from file timestamps."
+    )]
+    fn version(&self) -> Json<VersionInfo> {
+        Json(VersionInfo {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            git_commit: option_env!("OSDP_MCP_GIT_HASH").unwrap_or("unknown"),
+            git_dirty: matches!(option_env!("OSDP_MCP_GIT_DIRTY"), Some("true")),
+        })
     }
 
     /// Bring up a PD on a serial port. Any previously-configured PD
