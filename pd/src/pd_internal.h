@@ -14,6 +14,14 @@
  * attempt the handshake. */
 bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd);
 
+/* Build a NAK reply into pd->tx_buf for `cmd` carrying `error_code`,
+ * writing the frame length to *out_len. Defined in pd.c (wrapping the
+ * static build_nak helper) and shared with the SC handlers in pd_sc.c. */
+osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
+                                         const osdp_frame_t *cmd,
+                                         uint8_t             error_code,
+                                         size_t             *out_len);
+
 /* Process a SCB-bearing inbound frame: handshake messages produce
  * inline replies (built into pd->tx_buf), operational SCS_15..18
  * traffic dispatches into the existing application handler with

@@ -29,17 +29,6 @@
 
 /* ---- Helpers ---------------------------------------------------------- */
 
-/* Pick the active key for this slot's currently-requested handshake
- * mode. Returns NULL if the requested key hasn't been set. */
-static const uint8_t *select_key(const osdp_acu_pd_slot_t *slot,
-                                 bool                      use_default_key)
-{
-    if (use_default_key) {
-        return slot->scbk_d_set ? slot->scbk_d : NULL;
-    }
-    return slot->scbk_set ? slot->scbk : NULL;
-}
-
 /* Reset a slot's SC handshake-in-progress fields (RND.A, RND.B, etc.)
  * back to IDLE. Leaves the configured keys + the established
  * sc_session intact unless `clear_session` is true. */

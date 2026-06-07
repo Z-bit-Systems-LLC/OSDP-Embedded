@@ -85,13 +85,13 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
     return OSDP_OK;
 }
 
-/* Exposed under a stable name so the SC handlers (in pd_sc.c) can
- * build NAKs without duplicating the helper. Same signature as the
- * static `build_nak` above. */
-osdp_status_t pd_build_nak(osdp_pd_t          *pd,
-                           const osdp_frame_t *cmd,
-                           uint8_t             error_code,
-                           size_t             *out_len)
+/* Exposed under a stable name (declared in pd_internal.h) so the SC
+ * handlers in pd_sc.c can build NAKs without duplicating the helper.
+ * Same signature as the static `build_nak` above. */
+osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
+                                         const osdp_frame_t *cmd,
+                                         uint8_t             error_code,
+                                         size_t             *out_len)
 {
     return build_nak(pd, cmd, error_code, out_len);
 }
