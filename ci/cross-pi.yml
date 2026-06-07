@@ -40,51 +40,18 @@ steps:
       echo "##vso[task.setvariable variable=cargoRegistry]$HOME/.cargo/registry"
     displayName: 'Detect redundant release-bump build'
 
-  - task: Bash@3
-    displayName: 'Install aarch64 cross toolchain'
-    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
-    inputs:
-      targetType: 'inline'
-      script: |
-        set -euo pipefail
-        sudo apt-get update
-        # Pulls in binutils-aarch64-linux-gnu (ar/ranlib/strip) too.
-        sudo apt-get install -y gcc-aarch64-linux-gnu
-
-  - task: Bash@3
-    displayName: 'Enable arm64 multiarch + install libudev (for osdp-mcp)'
-    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
-    inputs:
-      targetType: 'inline'
-      script: |
-        set -euo pipefail
-        sudo dpkg --add-architecture arm64
-
-        # The pre-installed mirror only carries amd64; once arm64 is a
-        # known architecture, apt would try to fetch arm64 indexes from
-        # it and 404. Pin the existing sources to amd64, then add a
-        # separate arm64 source pointing at ports.ubuntu.com (where
-        # non-amd64 Ubuntu packages actually live). Codename is derived
-        # so this survives image bumps (jammy -> noble -> ...).
-        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-
-        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-          # deb822 format (Ubuntu 24.04+).
-          sudo sed -i '/^Types: deb/a Architectures: amd64' \
-            /etc/apt/sources.list.d/ubuntu.sources
-        else
-          # Classic one-line format (Ubuntu 22.04).
-          sudo sed -i 's/^deb \(\[[^]]*\] \)\?/deb [arch=amd64] /' \
-            /etc/apt/sources.list
-        fi
-
-        sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null <<EOF
-        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${codename} main restricted universe multiverse
-        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ ${codename}-updates main restricted universe multiverse
-        EOF
-
-        sudo apt-get update
-        sudo apt-get install -y libudev-dev:arm64
+  # The aarch64 cross toolchain (gcc-aarch64-linux-gnu + binutils) and the
+  # arm64 multiarch libudev (libudev-dev:arm64, needed to link osdp-mcp's
+  # serialport dep) are provided by the self-hosted agent image — NOT
+  # installed at runtime. Runtime `sudo apt-get` hangs forever on a
+  # non-interactive agent without passwordless sudo, which is what bit us.
+  # The `aarch64Toolchain` demand (azure-pipelines.yml) keeps this job off
+  # any agent that doesn't advertise the toolchain. Provision the agent:
+  #   sudo apt-get install -y gcc-aarch64-linux-gnu
+  #   sudo dpkg --add-architecture arm64 && <add ports.ubuntu.com arm64 src>
+  #   sudo apt-get update && sudo apt-get install -y libudev-dev:arm64
+  #   rustup target add aarch64-unknown-linux-gnu
+  # then add a user capability `aarch64Toolchain` to the agent.
 
   # ---- C library + tools via CMake (cross) -----------------------------
 
@@ -135,7 +102,9 @@ steps:
   # target triple automatically; rustc needs the cross linker pointed at
   # it explicitly. The osdp-embedded library builds first (pure C + Rust,
   # no system libs); osdp-mcp follows and additionally needs pkg-config
-  # aimed at the arm64 libudev installed above.
+  # aimed at the agent-provided arm64 libudev. The agent also supplies
+  # rustup stable + the aarch64-unknown-linux-gnu target (no `rustup`
+  # step here), per the aarch64Toolchain capability.
 
   - task: Cache@2
     displayName: 'Cache cargo registry'
@@ -154,17 +123,6 @@ steps:
       restoreKeys: |
         target | "$(Agent.OS)"
       path: rust/target
-
-  - task: Bash@3
-    displayName: 'rustup add aarch64 target'
-    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
-    inputs:
-      targetType: 'inline'
-      script: |
-        set -euo pipefail
-        rustup update stable
-        rustup default stable
-        rustup target add aarch64-unknown-linux-gnu
 
   - task: Bash@3
     displayName: 'cargo build osdp-embedded (aarch64)'

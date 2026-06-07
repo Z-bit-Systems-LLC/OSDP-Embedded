@@ -49,15 +49,30 @@ jobs:
         submodules: true
       - template: build.yml
 
-  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Runs on a
-  # Linux agent: there are no Microsoft-hosted ARM64 agents, and the
-  # windows-latest pool can't cross-target Linux/aarch64. Build-only —
+  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Build-only —
   # the x64 agent can't run ARM binaries (see ci/cross-pi.yml). Runs on
-  # every push and PR, in parallel with `build`.
+  # every push and PR.
+  #
+  # Runs on the self-hosted Proxmox LXC agent in the `Default` pool. That
+  # puts this Linux job on a *self-hosted* parallel slot so it runs
+  # concurrently with the Microsoft-hosted Windows `build` job, instead of
+  # both queuing on the single free hosted slot.
+  #
+  # The agent image must provide the full toolchain — the pipeline does NO
+  # runtime apt/sudo (that hangs on a non-interactive agent without
+  # passwordless sudo): cmake, ninja-build/make, build-essential, git,
+  # curl, file, rustup (stable) + the aarch64-unknown-linux-gnu target,
+  # gcc-aarch64-linux-gnu + binutils, and the arm64 libudev-dev. The
+  # `aarch64Toolchain` demand makes Azure schedule this job only on an
+  # agent advertising that user capability, so a half-provisioned agent
+  # leaves the job clearly queued instead of failing mid-build.
   - job: cross_arm64
     displayName: 'Cross-compile (Raspberry Pi / aarch64)'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'Default'
+      demands:
+        - Agent.OS -equals Linux
+        - aarch64Toolchain
     steps:
       - checkout: self
         submodules: true
