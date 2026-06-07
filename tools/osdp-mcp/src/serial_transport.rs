@@ -32,6 +32,9 @@ pub struct SerialTransport {
     port: Box<dyn SerialPort>,
     epoch: Instant,
     wire: Arc<WireTrace>,
+    /// Line rate, kept so `write` can derive the spec-5.7 ¶1 idle
+    /// guard (2 character-times) from it.
+    baud: u32,
 }
 
 impl SerialTransport {
@@ -51,6 +54,7 @@ impl SerialTransport {
             port,
             epoch: Instant::now(),
             wire,
+            baud,
         })
     }
 }
@@ -71,11 +75,24 @@ impl Transport for SerialTransport {
     }
 
     fn write(&mut self, buf: &[u8]) -> usize {
-        // Stamp the outbound frame the instant we begin transmitting,
-        // before the send loop + flush — this is the timestamp to
-        // compare against the preceding rx (the ACU's reply-latency /
-        // firstByte window). The trace carries the whole frame the PD
-        // built, regardless of how many write() calls the OS needs.
+        // Spec 5.7 ¶1: guarantee >= 2 character-times of idle before
+        // accessing the channel so the ACU's RS-485 signal converter /
+        // multiplexer senses the line idle and is ready to receive
+        // before our first byte (the frame builder supplies the ¶2
+        // marking byte). Without this the PD answers within
+        // microseconds of the command's last byte and the converter
+        // misses the reply — the "firstByte timeout, bytes tossed" the
+        // z9 ACU logs. 2 chars = 20 bit-times: ~2.1 ms at 9600 baud,
+        // far under the 200 ms REPLY_DELAY ceiling.
+        let idle = Duration::from_micros(20_000_000 / u64::from(self.baud.max(1)));
+        std::thread::sleep(idle);
+
+        // Stamp the outbound frame the instant we begin transmitting
+        // (after the idle guard), before the send loop + flush — the
+        // timestamp to compare against the preceding rx for reply
+        // latency. Carries the whole frame the PD built (including the
+        // leading 0xFF marking byte), regardless of how many write()
+        // calls the OS needs.
         self.wire.record(WireDir::Tx, buf);
 
         // Push the whole frame out. A single `port.write` may accept fewer

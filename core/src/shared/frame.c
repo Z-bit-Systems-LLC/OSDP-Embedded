@@ -215,61 +215,78 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
     if (total > OSDP_FRAME_MAX_LEN) {
         return OSDP_ERR_INVALID_ARG;
     }
-    if (total > buf_cap) {
+    /* The transmitted buffer is the marking byte(s) plus the OSDP
+     * frame; the LEN field and the CRC/checksum still cover only the
+     * frame (SOM..integrity), so the cap must hold both. */
+    if (OSDP_FRAME_MARK_LEN + total > buf_cap) {
         return OSDP_ERR_BUFFER_TOO_SMALL;
     }
 
+    /* Spec 5.7 line marking: drive the line to a marking state for one
+     * character time before the SOM (sent as a 0xFF byte) so the
+     * receiver's signal converter locks on before the message starts.
+     * Lives ahead of the SOM — excluded from LEN and integrity. */
+    for (size_t m = 0; m < OSDP_FRAME_MARK_LEN; m++) {
+        buf[m] = OSDP_FRAME_MARK;
+    }
+
+    /* Build the frame just past the marking byte(s). Every offset
+     * below, the LEN field, and the integrity computation are relative
+     * to this SOM-aligned base `f`, so the marking never enters the
+     * frame body. */
+    uint8_t *const f = buf + OSDP_FRAME_MARK_LEN;
+
     /* Write header. */
     size_t off = 0;
-    buf[off++] = OSDP_SOM;
-    buf[off++] = (uint8_t)((in->address & OSDP_ADDR_MASK) |
-                           (in->reply ? OSDP_REPLY_FLAG : 0u));
-    buf[off++] = (uint8_t)(total & 0xFFu);
-    buf[off++] = (uint8_t)((total >> 8) & 0xFFu);
-    buf[off++] = (uint8_t)((in->sequence & OSDP_CTRL_SQN_MASK) |
-                           ((in->integrity == OSDP_INTEGRITY_CRC)
-                                ? OSDP_CTRL_USE_CRC : 0u) |
-                           (in->has_scb ? OSDP_CTRL_SCB : 0u));
+    f[off++] = OSDP_SOM;
+    f[off++] = (uint8_t)((in->address & OSDP_ADDR_MASK) |
+                         (in->reply ? OSDP_REPLY_FLAG : 0u));
+    f[off++] = (uint8_t)(total & 0xFFu);
+    f[off++] = (uint8_t)((total >> 8) & 0xFFu);
+    f[off++] = (uint8_t)((in->sequence & OSDP_CTRL_SQN_MASK) |
+                         ((in->integrity == OSDP_INTEGRITY_CRC)
+                              ? OSDP_CTRL_USE_CRC : 0u) |
+                         (in->has_scb ? OSDP_CTRL_SCB : 0u));
 
     /* SCB. */
     if (in->has_scb) {
-        buf[off++] = in->scb_length;
-        buf[off++] = in->scb_type;
+        f[off++] = in->scb_length;
+        f[off++] = in->scb_type;
         if (in->scb_data_len > 0) {
-            (void)memcpy(&buf[off], in->scb_data, in->scb_data_len);
+            (void)memcpy(&f[off], in->scb_data, in->scb_data_len);
             off += in->scb_data_len;
         }
     }
 
     /* Code + payload. */
-    buf[off++] = in->code;
+    f[off++] = in->code;
     if (in->payload_len > 0) {
-        (void)memcpy(&buf[off], in->payload, in->payload_len);
+        (void)memcpy(&f[off], in->payload, in->payload_len);
         off += in->payload_len;
     }
 
     /* Truncated MAC for SCS_15..18, before integrity bytes. */
     if (mac_total > 0) {
-        (void)memcpy(&buf[off], in->mac, mac_total);
+        (void)memcpy(&f[off], in->mac, mac_total);
         off += mac_total;
     }
 
     /* Integrity. */
     if (in->integrity == OSDP_INTEGRITY_CRC) {
-        const uint16_t crc = osdp_crc16(buf, off);
-        buf[off++] = (uint8_t)(crc & 0xFFu);
-        buf[off++] = (uint8_t)((crc >> 8) & 0xFFu);
+        const uint16_t crc = osdp_crc16(f, off);
+        f[off++] = (uint8_t)(crc & 0xFFu);
+        f[off++] = (uint8_t)((crc >> 8) & 0xFFu);
     } else {
         /* Compute into a temp on its own statement, exactly like the CRC
-         * branch above. Folding this into `buf[off++] = osdp_checksum(buf,
+         * branch above. Folding this into `f[off++] = osdp_checksum(f,
          * off)` is undefined behaviour (C11 6.5p2): the read of `off` in
          * the argument is unsequenced relative to the `off++` side effect,
          * so a compiler may pass `off + 1` and checksum the (stale)
          * integrity slot itself. */
-        const uint8_t cksum = osdp_checksum(buf, off);
-        buf[off++] = cksum;
+        const uint8_t cksum = osdp_checksum(f, off);
+        f[off++] = cksum;
     }
 
-    *written = off;
+    *written = OSDP_FRAME_MARK_LEN + off;
     return OSDP_OK;
 }

@@ -448,8 +448,10 @@ static void test_corrupted_mac_in_flight_terminates_acu_session(void)
     const size_t crc_off = reply_end - 2;
     const size_t mac_off = crc_off - OSDP_FRAME_MAC_LEN;
     r.wire.p2a[mac_off] ^= 0x10U;
-    const uint16_t crc = osdp_crc16(&r.wire.p2a[reply_start],
-                                    crc_off - reply_start);
+    /* Recompute CRC over the frame only — the reply on the wire carries
+     * the spec-5.7 marking byte(s) ahead of its SOM. */
+    const uint16_t crc = osdp_crc16(&r.wire.p2a[reply_start + OSDP_FRAME_MARK_LEN],
+                                    crc_off - reply_start - OSDP_FRAME_MARK_LEN);
     r.wire.p2a[crc_off]     = (uint8_t)(crc & 0xFFU);
     r.wire.p2a[crc_off + 1] = (uint8_t)((crc >> 8) & 0xFFU);
 
@@ -519,9 +521,12 @@ static void test_send_command_after_session_loss_is_plaintext(void)
     TEST_ASSERT_GREATER_THAN_size_t(a2p_before, r.wire.a2p_len);
 
     osdp_frame_t frame;
+    /* The new command starts at a2p_before with the spec-5.7 marking
+     * byte(s) ahead of its SOM; decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-        osdp_frame_decode(&r.wire.a2p[a2p_before],
-                          r.wire.a2p_len - a2p_before, &frame));
+        osdp_frame_decode(&r.wire.a2p[a2p_before + OSDP_FRAME_MARK_LEN],
+                          r.wire.a2p_len - a2p_before - OSDP_FRAME_MARK_LEN,
+                          &frame));
     TEST_ASSERT_FALSE(frame.has_scb);
     TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, frame.code);
 }

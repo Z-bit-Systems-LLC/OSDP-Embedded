@@ -78,6 +78,18 @@ static void build_template(osdp_frame_t *t, uint8_t scb_type,
     t->payload_len  = payload_len;
 }
 
+/* Decode the SOM-aligned frame inside wrap output, skipping the
+ * spec-5.7 marking byte(s) osdp_frame_build prepends ahead of the SOM. */
+static osdp_status_t decode_wire(const uint8_t *wire, size_t wire_len,
+                                 osdp_frame_t *out)
+{
+    if (wire_len < OSDP_FRAME_MARK_LEN) {
+        return OSDP_ERR_TRUNCATED;
+    }
+    return osdp_frame_decode(wire + OSDP_FRAME_MARK_LEN,
+                             wire_len - OSDP_FRAME_MARK_LEN, out);
+}
+
 static void test_wrap_unwrap_scs15_round_trip(void)
 {
     /* SCS_15 is "no data + MAC" — the canonical case is POLL,
@@ -96,7 +108,7 @@ static void test_wrap_unwrap_scs15_round_trip(void)
 
     /* Decode the wire bytes from B's side and verify MAC. */
     osdp_frame_t decoded;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
     TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_15, decoded.scb_type);
 
     uint8_t recovered[64];
@@ -133,7 +145,7 @@ static void test_wrap_upgrades_scs15_to_scs17_when_payload_nonempty(void)
                            wire, sizeof(wire), &wire_len));
 
     osdp_frame_t decoded;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
     /* The SCB type on the wire must be SCS_17 — the data-bearing
      * variant — not the SCS_15 we passed in. */
     TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_17, decoded.scb_type);
@@ -172,7 +184,7 @@ static void test_wrap_upgrades_scs16_to_scs18_when_payload_nonempty(void)
                            wire, sizeof(wire), &wire_len));
 
     osdp_frame_t decoded;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
     TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, decoded.scb_type);
 
     uint8_t recovered[64];
@@ -204,7 +216,7 @@ static void test_wrap_unwrap_scs17_encrypted_round_trip(void)
      * decoded payload length should be 16 (one full pad block, since
      * the plaintext is 10 bytes). */
     osdp_frame_t decoded;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
     TEST_ASSERT_EQUAL_size_t(16, decoded.payload_len);
     TEST_ASSERT_NOT_EQUAL_MESSAGE(0,
         memcmp(cmd_payload, decoded.payload, 10),
@@ -238,7 +250,7 @@ static void test_chained_wraps_and_unwraps_advance_sessions_in_lockstep(void)
             osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &a, &tmpl,
                                wire, sizeof(wire), &wire_len));
         osdp_frame_t decoded;
-        TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+        TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
         uint8_t recovered[64];
         size_t recovered_len = 0;
         TEST_ASSERT_EQUAL(OSDP_OK,
@@ -276,12 +288,15 @@ static void test_unwrap_rejects_tampered_mac(void)
     const size_t crc_offset = wire_len - 2;
     const size_t mac_offset = crc_offset - OSDP_FRAME_MAC_LEN;
     wire[mac_offset] ^= 0x01;
-    const uint16_t crc = osdp_crc16(wire, crc_offset);
+    /* Recompute CRC over the frame only — exclude the leading marking
+     * byte(s), matching what the decoder checks. */
+    const uint16_t crc = osdp_crc16(wire + OSDP_FRAME_MARK_LEN,
+                                    crc_offset - OSDP_FRAME_MARK_LEN);
     wire[crc_offset]     = (uint8_t)(crc & 0xFFu);
     wire[crc_offset + 1] = (uint8_t)((crc >> 8) & 0xFFu);
 
     osdp_frame_t decoded;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(wire, wire_len, &decoded));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_wire(wire, wire_len, &decoded));
     uint8_t recovered[64];
     size_t recovered_len = 0;
     TEST_ASSERT_EQUAL(OSDP_ERR_BAD_CRC,

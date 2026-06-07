@@ -161,8 +161,12 @@ static void decode_first_outgoing(const mock_transport_t *m,
                                   osdp_frame_t *out)
 {
     TEST_ASSERT_GREATER_OR_EQUAL(OSDP_FRAME_MIN_LEN_CKSUM, m->outgoing_len);
+    /* The builder prepends spec-5.7 marking byte(s) ahead of the SOM;
+     * decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_frame_decode(m->outgoing, m->outgoing_len, out));
+                      osdp_frame_decode(m->outgoing + OSDP_FRAME_MARK_LEN,
+                                        m->outgoing_len - OSDP_FRAME_MARK_LEN,
+                                        out));
 }
 
 /* ---- Tests --------------------------------------------------------------*/
@@ -687,7 +691,9 @@ static void test_scs_15_with_tampered_mac_drops_silently(void)
     const size_t crc_offset = cmd_wire_len - 2;
     const size_t mac_offset = crc_offset - OSDP_FRAME_MAC_LEN;
     cmd_wire[mac_offset] ^= 0x10;
-    const uint16_t crc = osdp_crc16(cmd_wire, crc_offset);
+    /* Recompute CRC over the frame only (skip the marking byte(s)). */
+    const uint16_t crc = osdp_crc16(cmd_wire + OSDP_FRAME_MARK_LEN,
+                                    crc_offset - OSDP_FRAME_MARK_LEN);
     cmd_wire[crc_offset]     = (uint8_t)(crc & 0xFFu);
     cmd_wire[crc_offset + 1] = (uint8_t)((crc >> 8) & 0xFFu);
 

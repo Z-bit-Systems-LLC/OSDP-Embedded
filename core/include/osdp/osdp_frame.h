@@ -27,6 +27,23 @@ extern "C" {
 #define OSDP_FRAME_MIN_LEN_CRC    8U   /* hdr + code + crc(2)            */
 #define OSDP_FRAME_MAX_LEN     1440U   /* spec 5.6 (other-device limit)  */
 
+/* Driver "marking" byte and how many of them precede the SOM in a
+ * transmitted frame. Per spec 5.7: before the first character of a
+ * message the transmitter must drive the line to a marking state for
+ * a minimum of one character time, "which can be achieved by sending
+ * a character with all bits set to '1'" — i.e. one 0xFF byte. It lets
+ * the receiver's RS-485 signal converter / multiplexer lock onto the
+ * line before the SOM arrives. The marking byte is NOT part of the
+ * OSDP message: it sits ahead of the SOM, is excluded from the LEN
+ * field and the CRC/checksum, and is stripped on receive by the
+ * stream decoder's SOM resync. osdp_frame_build emits it so every
+ * consumer is wire-conformant; osdp_frame_decode still expects its
+ * input to start at the SOM. (The companion 5.7 requirement — >=2
+ * character-times of idle BEFORE transmitting — is wall-clock timing
+ * and belongs to the transport layer, not this builder.) */
+#define OSDP_FRAME_MARK         0xFFU
+#define OSDP_FRAME_MARK_LEN        1U
+
 #define OSDP_SCB_MIN_LEN          2U   /* SEC_BLK_LEN + SEC_BLK_TYPE     */
 
 /* Security Block (SB) type values from SIA OSDP v2.2.2 Annex D.1.3.

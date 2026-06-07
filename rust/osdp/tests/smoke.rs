@@ -16,7 +16,7 @@
 //!      register_pd(...)` does the same. Bad struct-layout assumptions
 //!      (size or alignment) would crash inside the C-side memset-zero.
 
-use osdp_embedded::frame::{build, checksum, crc16, decode, FrameBuild, Integrity};
+use osdp_embedded::frame::{build, checksum, crc16, decode, FrameBuild, Integrity, FRAME_MARK_LEN};
 use osdp_embedded::messages::OSDP_CMD_POLL;
 
 #[test]
@@ -45,7 +45,9 @@ fn poll_frame_round_trips() {
     let mut buf = [0u8; 16];
     let n = build(&frame_in, &mut buf).expect("frame::build");
 
-    let frame_out = decode(&buf[..n]).expect("frame::decode");
+    // build() prepends the spec-5.7 marking byte(s) ahead of the SOM;
+    // decode() expects SOM-aligned input, so skip them.
+    let frame_out = decode(&buf[FRAME_MARK_LEN..n]).expect("frame::decode");
     assert_eq!(frame_out.address, 0x10);
     assert!(!frame_out.reply);
     assert_eq!(frame_out.sequence, 1);
