@@ -194,6 +194,20 @@ void tearDown(void)
     sc_test_crypto_set_fixed_rand(NULL, 0);
 }
 
+/* The PD now prepends spec-5.7 marking byte(s) ahead of the SOM, which
+ * the captured reference frames (taken from a device that didn't emit
+ * them) lack. Assert the PD's output is the marking followed by a
+ * byte-identical copy of the captured frame. */
+static void assert_outgoing_is_marked_capture(const mock_transport_t *m,
+                                              const uint8_t *captured,
+                                              size_t captured_len)
+{
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MARK_LEN + captured_len,
+                             m->outgoing_len);
+    TEST_ASSERT_EQUAL_MEMORY(captured, m->outgoing + OSDP_FRAME_MARK_LEN,
+                             captured_len);
+}
+
 /* ---- Tests --------------------------------------------------------------- */
 
 /* Step 1 of the handshake: replay CHLNG, expect byte-identical CCRYPT. */
@@ -207,9 +221,8 @@ static void test_chlng_replay_yields_identical_ccrypt(void)
     mock_load_incoming(&m, kCapturedChlng, sizeof(kCapturedChlng));
     osdp_pd_tick(&pd);
 
-    TEST_ASSERT_EQUAL_size_t(sizeof(kExpectedCcrypt), m.outgoing_len);
-    TEST_ASSERT_EQUAL_MEMORY(kExpectedCcrypt, m.outgoing,
-                             sizeof(kExpectedCcrypt));
+    assert_outgoing_is_marked_capture(&m, kExpectedCcrypt,
+                                      sizeof(kExpectedCcrypt));
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
 }
 
@@ -225,9 +238,8 @@ static void test_full_handshake_replay_yields_identical_rmac_i(void)
     /* CHLNG → CCRYPT. */
     mock_load_incoming(&m, kCapturedChlng, sizeof(kCapturedChlng));
     osdp_pd_tick(&pd);
-    TEST_ASSERT_EQUAL_size_t(sizeof(kExpectedCcrypt), m.outgoing_len);
-    TEST_ASSERT_EQUAL_MEMORY(kExpectedCcrypt, m.outgoing,
-                             sizeof(kExpectedCcrypt));
+    assert_outgoing_is_marked_capture(&m, kExpectedCcrypt,
+                                      sizeof(kExpectedCcrypt));
 
     /* Drain the CCRYPT bytes from outgoing so the next assertion can
      * see RMAC_I cleanly. */
@@ -236,9 +248,8 @@ static void test_full_handshake_replay_yields_identical_rmac_i(void)
     /* SCRYPT → RMAC_I. */
     mock_load_incoming(&m, kCapturedScrypt, sizeof(kCapturedScrypt));
     osdp_pd_tick(&pd);
-    TEST_ASSERT_EQUAL_size_t(sizeof(kExpectedRmacI), m.outgoing_len);
-    TEST_ASSERT_EQUAL_MEMORY(kExpectedRmacI, m.outgoing,
-                             sizeof(kExpectedRmacI));
+    assert_outgoing_is_marked_capture(&m, kExpectedRmacI,
+                                      sizeof(kExpectedRmacI));
 
     /* Session is now established; both MAC chain entries seeded with
      * the captured Initial R-MAC. */
