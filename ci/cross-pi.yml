@@ -19,10 +19,26 @@
 # enables arm64 as a foreign apt architecture and installs the arm64
 # libudev — a Raspberry Pi + USB-RS485 adapter running osdp-mcp is a
 # real portable-tester use case, so the server is in scope here.
+#
+# Like build.yml, the heavy steps skip themselves on the redundant
+# branch-push run of a release-bump commit (see the comment there); the
+# `v*` tag run still does the full cross-compile and publishes the
+# Linux ARM64 artifact.
 
 steps:
+  - bash: |
+      msg="${BUILD_SOURCEVERSIONMESSAGE:-}"
+      if [ "$(Build.SourceBranch)" = "refs/heads/main" ] && [ "${msg#Bump version to}" != "$msg" ]; then
+        echo "##vso[task.setvariable variable=skipRedundant]true"
+        echo "redundant release-bump build → skipping heavy steps"
+      else
+        echo "##vso[task.setvariable variable=skipRedundant]false"
+      fi
+    displayName: 'Detect redundant release-bump build'
+
   - task: Bash@3
     displayName: 'Install aarch64 cross toolchain'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -33,6 +49,7 @@ steps:
 
   - task: Bash@3
     displayName: 'Enable arm64 multiarch + install libudev (for osdp-mcp)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -69,6 +86,7 @@ steps:
 
   - task: Bash@3
     displayName: 'CMake configure (aarch64)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -81,6 +99,7 @@ steps:
 
   - task: Bash@3
     displayName: 'CMake build (aarch64)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -94,6 +113,7 @@ steps:
   # is caught instead of producing a green-but-wrong build.
   - task: Bash@3
     displayName: 'Verify binaries are aarch64 ELF'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -113,8 +133,27 @@ steps:
   # no system libs); osdp-mcp follows and additionally needs pkg-config
   # aimed at the arm64 libudev installed above.
 
+  - task: Cache@2
+    displayName: 'Cache cargo registry'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.lock'
+      restoreKeys: |
+        cargo | "$(Agent.OS)"
+      path: $(CARGO_HOME)
+
+  - task: Cache@2
+    displayName: 'Cache cargo target'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'target | "$(Agent.OS)" | rust/Cargo.lock'
+      restoreKeys: |
+        target | "$(Agent.OS)"
+      path: rust/target
+
   - task: Bash@3
     displayName: 'rustup add aarch64 target'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -125,6 +164,7 @@ steps:
 
   - task: Bash@3
     displayName: 'cargo build osdp-embedded (aarch64)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -139,6 +179,7 @@ steps:
 
   - task: Bash@3
     displayName: 'cargo build osdp-mcp (aarch64)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
       targetType: 'inline'
       script: |
@@ -156,3 +197,31 @@ steps:
           -p osdp-mcp \
           --target aarch64-unknown-linux-gnu \
           --release
+
+  # ---- Release packaging (tag builds only) -----------------------------
+  #
+  # On a `v*` tag this gate has already produced the exact release binary
+  # (osdp-mcp, aarch64, release) that the old standalone `package_linux`
+  # job used to rebuild from scratch. Stage + publish it straight from
+  # here instead, eliminating a second cross toolchain install, rustup
+  # run, and full cross-compile. The steps are skipped on push/PR builds,
+  # so the gate stays build-only there. The artifact name is unchanged
+  # (`osdp-embedded-linux-arm64`) so the downstream Release pipeline
+  # needs no changes. The tag-only condition is naturally mutually
+  # exclusive with the redundant-branch-build skip above.
+
+  - task: CopyFiles@2
+    displayName: 'Stage osdp-mcp Linux ARM64 binary'
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    inputs:
+      sourceFolder: 'rust/target/aarch64-unknown-linux-gnu/release'
+      contents: 'osdp-mcp'
+      targetFolder: '$(Build.ArtifactStagingDirectory)/tools/linux-arm64'
+      flattenFolders: true
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Linux ARM64 artifact'
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifactName: 'osdp-embedded-linux-arm64'

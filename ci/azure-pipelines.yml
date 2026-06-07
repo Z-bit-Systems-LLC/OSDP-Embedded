@@ -32,6 +32,13 @@ pool:
 
 variables:
   buildConfiguration: 'Release'
+  # Pin CARGO_HOME inside the pipeline workspace so the Cache@2 tasks in
+  # the templates can cache the crate registry + downloaded sources at a
+  # stable, known path across runs (the default ~/.cargo lives outside
+  # the workspace and varies by agent OS). RUSTUP_HOME is left at its
+  # default — we only cache the registry, not the toolchain, since
+  # `rustup update stable` intentionally refreshes that each run.
+  CARGO_HOME: $(Pipeline.Workspace)/.cargo
 
 jobs:
   # Build + test, runs on every push and PR.
@@ -82,18 +89,8 @@ jobs:
         clean: true
       - template: package.yml
 
-  # Linux ARM64 artifacts (osdp-mcp for Raspberry Pi). Separate job
-  # because the Windows agent can't build Linux binaries; runs on the
-  # same `v*` tag trigger and publishes its own pipeline artifact
-  # (`osdp-embedded-linux-arm64`).
-  - job: package_linux
-    displayName: 'Package (Linux ARM64)'
-    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
-    pool:
-      vmImage: 'ubuntu-latest'
-    dependsOn:
-      - build
-    steps:
-      - checkout: self
-        submodules: true
-      - template: package-linux.yml
+  # Note: the Linux ARM64 artifact (osdp-mcp for Raspberry Pi) is no
+  # longer a separate job. The `cross_arm64` gate above already
+  # cross-compiles that exact binary, so on a `v*` tag it stages and
+  # publishes `osdp-embedded-linux-arm64` directly (see cross-pi.yml),
+  # avoiding a second toolchain install + cross-compile of the same code.
