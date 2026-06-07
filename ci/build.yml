@@ -35,6 +35,10 @@ steps:
       $isBump = ('$(Build.SourceBranch)' -eq 'refs/heads/main') -and $msg.StartsWith('Bump version to')
       Write-Host "SourceBranch=$(Build.SourceBranch); redundant release-bump build = $isBump"
       Write-Host "##vso[task.setvariable variable=skipRedundant]$($isBump.ToString().ToLower())"
+      # Cache the crate registry at cargo's real default home — do NOT
+      # relocate CARGO_HOME, or the pre-installed rustup can't find its
+      # install and `rustup target add` fails.
+      Write-Host "##vso[task.setvariable variable=cargoRegistry]$env:USERPROFILE\.cargo\registry"
     displayName: 'Detect redundant release-bump build'
 
   # ---- C library + tools -----------------------------------------------
@@ -84,7 +88,7 @@ steps:
       key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
-      path: $(CARGO_HOME)
+      path: $(cargoRegistry)
 
   - task: Cache@2
     displayName: 'Cache cargo target'

@@ -32,13 +32,6 @@ pool:
 
 variables:
   buildConfiguration: 'Release'
-  # Pin CARGO_HOME inside the pipeline workspace so the Cache@2 tasks in
-  # the templates can cache the crate registry + downloaded sources at a
-  # stable, known path across runs (the default ~/.cargo lives outside
-  # the workspace and varies by agent OS). RUSTUP_HOME is left at its
-  # default — we only cache the registry, not the toolchain, since
-  # `rustup update stable` intentionally refreshes that each run.
-  CARGO_HOME: $(Pipeline.Workspace)/.cargo
 
 jobs:
   # Build + test, runs on every push and PR.

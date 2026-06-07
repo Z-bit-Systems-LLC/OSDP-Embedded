@@ -34,6 +34,10 @@ steps:
       else
         echo "##vso[task.setvariable variable=skipRedundant]false"
       fi
+      # Cache the crate registry at cargo's real default home — do NOT
+      # relocate CARGO_HOME, or the pre-installed rustup can't find its
+      # install and `rustup target add` fails.
+      echo "##vso[task.setvariable variable=cargoRegistry]$HOME/.cargo/registry"
     displayName: 'Detect redundant release-bump build'
 
   - task: Bash@3
@@ -140,7 +144,7 @@ steps:
       key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
-      path: $(CARGO_HOME)
+      path: $(cargoRegistry)
 
   - task: Cache@2
     displayName: 'Cache cargo target'

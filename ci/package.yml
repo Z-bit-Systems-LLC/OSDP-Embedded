@@ -54,6 +54,12 @@ steps:
   # `cargo publish` after reviewing the staged artifact. See
   # docs/PUBLISHING.md.
 
+  # Resolve cargo's real default registry path (do NOT relocate
+  # CARGO_HOME — that breaks the pre-installed rustup). This Windows-only
+  # job uses %USERPROFILE%.
+  - pwsh: Write-Host "##vso[task.setvariable variable=cargoRegistry]$env:USERPROFILE\.cargo\registry"
+    displayName: 'Resolve cargo registry path'
+
   # Same registry cache key as the build job — its post-job save lands
   # before this (tag-only) job starts, since `package` dependsOn `build`,
   # so the crate downloads are already warm here. Cargo.lock is gitignored
@@ -65,7 +71,7 @@ steps:
       key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
       restoreKeys: |
         cargo | "$(Agent.OS)"
-      path: $(CARGO_HOME)
+      path: $(cargoRegistry)
 
   - task: Cache@2
     displayName: 'Cache cargo package target'
