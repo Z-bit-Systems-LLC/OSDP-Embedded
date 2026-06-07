@@ -9,10 +9,13 @@
 //! `now_ms()` whenever the state machine needs a timestamp.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use osdp_embedded::Transport;
 use serialport::SerialPort;
+
+use crate::wire::{WireDir, WireTrace};
 
 /// Single PD-side serial wire. Reads are non-blocking (zero timeout);
 /// writes attempt to send the whole buffer, returning the actual
@@ -20,16 +23,23 @@ use serialport::SerialPort;
 /// the OSDP state machine treats a "no bytes available" the same as
 /// "no bytes available, no error," so smoothing over transient
 /// `WouldBlock` etc. is the safe behavior.
+///
+/// Every non-empty read and every write is mirrored into a shared
+/// [`WireTrace`] (raw bytes + microsecond timestamp) so the
+/// `get_wire_trace` tool can reconstruct exact on-wire timing and
+/// framing — see [`crate::wire`].
 pub struct SerialTransport {
     port: Box<dyn SerialPort>,
     epoch: Instant,
+    wire: Arc<WireTrace>,
 }
 
 impl SerialTransport {
-    /// Open `port_name` at `baud` with 8N1 framing. Returns an
-    /// `anyhow::Error` wrapping `serialport::Error` on failure so the
-    /// MCP tool can surface a useful message to the agent.
-    pub fn open(port_name: &str, baud: u32) -> anyhow::Result<Self> {
+    /// Open `port_name` at `baud` with 8N1 framing, mirroring all I/O
+    /// into `wire`. Returns an `anyhow::Error` wrapping
+    /// `serialport::Error` on failure so the MCP tool can surface a
+    /// useful message to the agent.
+    pub fn open(port_name: &str, baud: u32, wire: Arc<WireTrace>) -> anyhow::Result<Self> {
         let port = serialport::new(port_name, baud)
             .timeout(Duration::from_millis(0))
             .data_bits(serialport::DataBits::Eight)
@@ -40,6 +50,7 @@ impl SerialTransport {
         Ok(Self {
             port,
             epoch: Instant::now(),
+            wire,
         })
     }
 }
@@ -51,10 +62,22 @@ impl Transport for SerialTransport {
         // tick loop will retry next iteration. Real serial errors
         // would also surface in `write` and any subsequent open
         // failure on reconnect, so dropping them here is fine.
-        self.port.read(buf).unwrap_or_default()
+        let n = self.port.read(buf).unwrap_or_default();
+        // Mirror inbound bytes (timestamped) so the wire trace shows
+        // byte-arrival pacing — a frame trickles in across ticks, each
+        // a separate rx chunk.
+        self.wire.record(WireDir::Rx, &buf[..n]);
+        n
     }
 
     fn write(&mut self, buf: &[u8]) -> usize {
+        // Stamp the outbound frame the instant we begin transmitting,
+        // before the send loop + flush — this is the timestamp to
+        // compare against the preceding rx (the ACU's reply-latency /
+        // firstByte window). The trace carries the whole frame the PD
+        // built, regardless of how many write() calls the OS needs.
+        self.wire.record(WireDir::Tx, buf);
+
         // Push the whole frame out. A single `port.write` may accept fewer
         // bytes than offered (non-blocking port, full kernel TX buffer),
         // and the OSDP state machine ignores the returned count — so a

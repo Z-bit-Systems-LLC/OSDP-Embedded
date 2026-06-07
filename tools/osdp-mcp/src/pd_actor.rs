@@ -29,6 +29,7 @@ use crate::handler::{DefaultHandler, DropCounter, PdStats};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
+use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
 /// How long after the most recent inbound command the link still
 /// counts as "actively polled". OSDP ACUs poll on a sub-second
@@ -181,6 +182,10 @@ pub struct PdHandle {
     /// Shared with the handler so reads (`get_log`, `wait_for_command`,
     /// `clear_log`) can bypass the actor channel for minimal latency.
     log: Arc<LogInner>,
+    /// Shared with the serial transport. Captures raw TX/RX bytes +
+    /// microsecond timestamps for `get_wire_trace`; bypasses the actor
+    /// channel just like `log`.
+    wire: Arc<WireTrace>,
     /// Shared with the handler. Writers (the override-related tools)
     /// modify it directly; the handler reads + consumes script steps
     /// inside `take_for`.
@@ -206,10 +211,12 @@ impl PdHandle {
     pub fn spawn(crypto_factory: CryptoFactory) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
+        let wire = Arc::new(WireTrace::new(DEFAULT_WIRE_CAPACITY));
         let overrides = overrides::new_map();
         let events = events::new_queue();
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
         let log_for_thread = Arc::clone(&log);
+        let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
         let events_for_thread = Arc::clone(&events);
         let drop_for_thread = Arc::clone(&drop_remaining);
@@ -219,6 +226,7 @@ impl PdHandle {
                 actor_loop(
                     rx,
                     log_for_thread,
+                    wire_for_thread,
                     overrides_for_thread,
                     events_for_thread,
                     drop_for_thread,
@@ -229,6 +237,7 @@ impl PdHandle {
         Self {
             tx,
             log,
+            wire,
             overrides,
             events,
             drop_remaining,
@@ -294,6 +303,19 @@ impl PdHandle {
     /// preserved so any outstanding cursor stays meaningful.
     pub fn clear_log(&self) {
         self.log.clear();
+    }
+
+    /// Read up to `limit` raw wire chunks (TX/RX bytes + µs
+    /// timestamps) with `seq >= since_seq`. Straight to the shared
+    /// trace — no actor round-trip.
+    pub fn get_wire_trace(&self, since_seq: u64, limit: usize) -> WirePage {
+        self.wire.snapshot(since_seq, limit)
+    }
+
+    /// Drop every captured wire chunk. `next_seq` is preserved.
+    /// Clear → reproduce → snapshot gives a clean capture window.
+    pub fn clear_wire_trace(&self) {
+        self.wire.clear();
     }
 
     /// Install a static reply override for `cmd_code` — every
@@ -422,9 +444,11 @@ struct Slot {
     epoch: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn actor_loop(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     log: Arc<LogInner>,
+    wire: Arc<WireTrace>,
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
@@ -444,6 +468,7 @@ fn actor_loop(
                     cmd,
                     &mut slot,
                     &log,
+                    &wire,
                     &overrides,
                     &events,
                     &drop_remaining,
@@ -470,6 +495,7 @@ fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
     log: &Arc<LogInner>,
+    wire: &Arc<WireTrace>,
     overrides: &OverrideMap,
     events: &EventQueue,
     drop_remaining: &DropCounter,
@@ -490,6 +516,7 @@ fn handle_cmd(
                 baud,
                 address,
                 Arc::clone(log),
+                Arc::clone(wire),
                 Arc::clone(overrides),
                 Arc::clone(events),
                 Arc::clone(drop_remaining),
@@ -523,6 +550,7 @@ fn handle_cmd(
                         old.baud,
                         old.address,
                         Arc::clone(log),
+                        Arc::clone(wire),
                         Arc::clone(overrides),
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
@@ -594,13 +622,14 @@ fn open_pd(
     baud: u32,
     address: u8,
     log: Arc<LogInner>,
+    wire: Arc<WireTrace>,
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
-    let transport = SerialTransport::open(port, baud)?;
+    let transport = SerialTransport::open(port, baud, wire)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
     // Anchor the PD-local clock before the handler is built so the
     // Slot and the handler's `last_command_at_ms` stamps share a zero

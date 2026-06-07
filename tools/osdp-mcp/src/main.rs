@@ -23,6 +23,7 @@ use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
+use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
@@ -180,6 +181,21 @@ impl GetLogArgs {
 
 fn default_log_limit() -> u32 {
     DEFAULT_CAPACITY as u32
+}
+
+fn default_wire_limit() -> u32 {
+    DEFAULT_WIRE_CAPACITY as u32
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WireTraceArgs {
+    /// Skip chunks with `seq < since_seq`. Pass the previous response's
+    /// `next_seq` to page only newer chunks. Defaults to 0 (all).
+    #[serde(default)]
+    since_seq: u64,
+    /// Cap the number of chunks returned. Defaults to the full ring.
+    #[serde(default = "default_wire_limit")]
+    limit: u32,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -520,6 +536,40 @@ impl OsdpMcp {
     fn clear_log(&self) -> String {
         self.pd.clear_log();
         "log cleared".to_string()
+    }
+
+    /// Raw byte-level wire trace — every TX/RX chunk the serial
+    /// transport moved, with a microsecond timestamp and the full hex
+    /// (SOM, control byte, SCB, integrity), cursor-paged via
+    /// `since_seq`. This is the low-level companion to `get_log`:
+    /// `get_log` shows decoded frames but drops POLL/ACK timing and the
+    /// control byte; this shows neither-decoded-nor-filtered bytes so
+    /// you can measure reply latency (last `rx` → next `tx` vs the
+    /// ACU's firstByte window) and inspect on-wire framing (SQN,
+    /// CRC-vs-checksum, SC vs plaintext). Typical use: `clear_wire_trace`
+    /// → reproduce the fault → `get_wire_trace`.
+    #[tool(
+        title = "Get Raw Wire Trace",
+        description = "Return up to `limit` raw serial chunks (seq >= since_seq), each with a \
+                       microsecond timestamp `t_us`, direction (rx/tx), and full hex bytes \
+                       incl. control + integrity. Use it to measure reply latency and inspect \
+                       on-wire framing the decoded get_log can't show. `dropped` > 0 means older \
+                       chunks scrolled off the ring."
+    )]
+    fn get_wire_trace(&self, Parameters(args): Parameters<WireTraceArgs>) -> Json<WirePage> {
+        Json(self.pd.get_wire_trace(args.since_seq, args.limit as usize))
+    }
+
+    /// Drop every captured wire chunk. Pair with `get_wire_trace`:
+    /// clear, reproduce the fault, then snapshot a clean window.
+    #[tool(
+        title = "Clear Raw Wire Trace",
+        description = "Drop every captured raw wire chunk. Idempotent. Clear before reproducing \
+                       a fault so the next get_wire_trace is a clean capture window."
+    )]
+    fn clear_wire_trace(&self) -> String {
+        self.pd.clear_wire_trace();
+        "wire trace cleared".to_string()
     }
 
     /// Block until a command with the given code arrives, or the
