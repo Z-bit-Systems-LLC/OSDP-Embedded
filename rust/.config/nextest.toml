@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Z-bit Systems, LLC
+
+# nextest configuration for the OSDP-Embedded Rust workspace.
+#
+# The `ci` profile emits a JUnit report so the Azure DevOps pipeline
+# (ci/build.yml) can publish it to the run summary's Tests tab. The file
+# lands at <target-dir>/nextest/ci/junit.xml (rust/target/nextest/ci/
+# junit.xml). Run locally with: cargo nextest run --profile ci
+[profile.ci.junit]
+path = "junit.xml"

@@ -63,11 +63,13 @@ steps:
     inputs:
       script: 'cmake --build build --config $(buildConfiguration) --parallel'
 
+  # --output-junit writes a JUnit XML report (CMake 3.21+) that the
+  # PublishTestResults task below surfaces in the run summary's Tests tab.
   - task: CmdLine@2
     displayName: 'ctest (Release)'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      script: 'ctest --test-dir build -C $(buildConfiguration) --output-on-failure'
+      script: 'ctest --test-dir build -C $(buildConfiguration) --output-on-failure --output-junit ctest-results.xml'
 
   # ---- Rust workspace --------------------------------------------------
   #
@@ -109,6 +111,18 @@ steps:
         rustc --version
         cargo --version
 
+  # cargo-nextest runs the Rust tests and emits a JUnit report (stable
+  # toolchain; plain `cargo test` can't). Pull the official pre-built
+  # binary into ~/.cargo/bin (already on PATH) — faster and more reliable
+  # than `cargo install` recompiling it each run.
+  - pwsh: |
+      $zip = "$env:TEMP\cargo-nextest.zip"
+      Invoke-WebRequest -Uri 'https://get.nexte.st/latest/windows' -OutFile $zip
+      Expand-Archive -Path $zip -DestinationPath "$env:USERPROFILE\.cargo\bin" -Force
+      cargo nextest --version
+    displayName: 'Install cargo-nextest'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+
   - task: CmdLine@2
     displayName: 'cargo fmt --check'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
@@ -127,11 +141,37 @@ steps:
     inputs:
       script: 'cargo build --manifest-path rust/Cargo.toml --workspace --release'
 
+  # nextest runs the unit/integration tests and writes the JUnit report
+  # configured in rust/.config/nextest.toml (-> rust/target/nextest/ci/
+  # junit.xml). It doesn't run doctests, so those follow in a plain
+  # `cargo test --doc` (not reflected in the Tests tab, but still gated).
   - task: CmdLine@2
-    displayName: 'cargo test --workspace'
+    displayName: 'cargo nextest run (JUnit)'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
     inputs:
-      script: 'cargo test --manifest-path rust/Cargo.toml --workspace --release'
+      script: 'cargo nextest run --manifest-path rust/Cargo.toml --workspace --release --profile ci'
+
+  - task: CmdLine@2
+    displayName: 'cargo test --doc'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      script: 'cargo test --manifest-path rust/Cargo.toml --workspace --release --doc'
+
+  # Surface both test suites in the run summary's Tests tab. Both reports
+  # are JUnit (ctest --output-junit + nextest), so one task merges them.
+  # succeededOrFailed() so results still publish when tests fail — that's
+  # the point — but skip on the redundant release-bump build (no results).
+  - task: PublishTestResults@2
+    displayName: 'Publish test results (C + Rust)'
+    condition: and(succeededOrFailed(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: |
+        **/ctest-results.xml
+        rust/target/nextest/ci/junit.xml
+      searchFolder: '$(Build.SourcesDirectory)'
+      mergeTestResults: true
+      testRunTitle: 'OSDP-Embedded ($(buildConfiguration))'
 
   # Smoke-run the loopback examples — they assert their own results
   # with `assert!()`, so a non-zero exit means the API regressed.
