@@ -69,9 +69,13 @@ steps:
         codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
 
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-          # deb822 format (Ubuntu 24.04+).
-          sudo sed -i '/^Types: deb/a Architectures: amd64' \
-            /etc/apt/sources.list.d/ubuntu.sources
+          # deb822 format (Ubuntu 24.04+). Guard the insert so a
+          # persistent self-hosted agent doesn't append a duplicate
+          # `Architectures:` line on every run (Microsoft-hosted agents
+          # are fresh each time, so this only matters on self-hosted).
+          grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources \
+            || sudo sed -i '/^Types: deb/a Architectures: amd64' \
+                 /etc/apt/sources.list.d/ubuntu.sources
         else
           # Classic one-line format (Ubuntu 22.04).
           sudo sed -i 's/^deb \(\[[^]]*\] \)\?/deb [arch=amd64] /' \

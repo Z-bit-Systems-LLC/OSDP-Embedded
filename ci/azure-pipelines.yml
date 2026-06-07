@@ -49,15 +49,25 @@ jobs:
         submodules: true
       - template: build.yml
 
-  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Runs on a
-  # Linux agent: there are no Microsoft-hosted ARM64 agents, and the
-  # windows-latest pool can't cross-target Linux/aarch64. Build-only —
+  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Build-only —
   # the x64 agent can't run ARM binaries (see ci/cross-pi.yml). Runs on
-  # every push and PR, in parallel with `build`.
+  # every push and PR.
+  #
+  # Runs on the self-hosted Proxmox LXC agent in the `Default` pool. That
+  # puts this Linux job on a *self-hosted* parallel slot so it runs
+  # concurrently with the Microsoft-hosted Windows `build` job, instead of
+  # both queuing on the single free hosted slot. The agent must supply the
+  # prerequisites cross-pi.yml can't install for itself: passwordless
+  # sudo, cmake, ninja-build (or make), build-essential, git, curl, file,
+  # and rustup (stable). cross-pi.yml installs gcc-aarch64, the arm64
+  # libudev, and the aarch64 Rust target at runtime (idempotently), so
+  # they can later be baked into the LXC template and dropped from here.
   - job: cross_arm64
     displayName: 'Cross-compile (Raspberry Pi / aarch64)'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'Default'
+      demands:
+        - Agent.OS -equals Linux
     steps:
       - checkout: self
         submodules: true
