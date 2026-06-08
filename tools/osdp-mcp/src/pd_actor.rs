@@ -161,6 +161,12 @@ enum Cmd {
     Stop {
         reply: oneshot::Sender<()>,
     },
+    /// Bring the PD back up using the configuration remembered from the
+    /// last `Configure` (which survives a `Stop`). Errors if the PD has
+    /// never been configured this process, or if it is already running.
+    Start {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Status {
         reply: oneshot::Sender<PdStatus>,
     },
@@ -208,7 +214,12 @@ impl PdHandle {
     /// factory is invoked once per `pd_configure` that enables SC,
     /// so each PD has its own fresh `ScCrypto` instance (and RNG
     /// state, if the backend keeps any).
-    pub fn spawn(crypto_factory: CryptoFactory) -> Self {
+    ///
+    /// `startup` carries the operator's `OSDP_MCP_*` values (if any).
+    /// It seeds the actor's remembered config so `pd_start` can bring
+    /// the PD up from the startup posture even before — and regardless
+    /// of whether — the boot-time auto-start ran.
+    pub fn spawn(crypto_factory: CryptoFactory, startup: Option<StartupConfig>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
         let wire = Arc::new(WireTrace::new(DEFAULT_WIRE_CAPACITY));
@@ -231,6 +242,7 @@ impl PdHandle {
                     events_for_thread,
                     drop_for_thread,
                     crypto_factory,
+                    startup,
                 )
             })
             .expect("spawn PD actor thread");
@@ -274,6 +286,20 @@ impl PdHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?;
         Ok(())
+    }
+
+    /// Restart the PD from the configuration remembered at the last
+    /// `configure`. The remembered config survives a `stop`, so this is
+    /// how you bring a stopped PD back without re-supplying port/baud/
+    /// address/SCBK. Errors if nothing was ever configured, or if the
+    /// PD is already running.
+    pub async fn start(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Start { reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?
     }
 
     pub async fn status(&self) -> anyhow::Result<PdStatus> {
@@ -426,6 +452,35 @@ impl PdHandle {
     }
 }
 
+/// The parameters of the most recent [`Cmd::Configure`], retained by
+/// the actor across a [`Cmd::Stop`] so [`Cmd::Start`] can bring the PD
+/// back up without the caller re-supplying them — notably the SCBK,
+/// which `pd_status` deliberately never exposes. Captured when a
+/// configure is requested (before the serial port is opened), so a
+/// `start` retries the exact same request even if the first attempt
+/// failed to open the port.
+#[derive(Clone)]
+struct RememberedConfig {
+    port: String,
+    baud: u32,
+    address: u8,
+    sc: Option<ScConfig>,
+}
+
+/// The operator's `OSDP_MCP_*` startup values, handed to [`PdHandle::spawn`]
+/// and used to seed the actor's remembered config before any interactive
+/// `pd_configure` runs. This makes `pd_start` able to bring the PD up from
+/// the startup posture out of the box — independent of whether the boot-time
+/// auto-start succeeded — and gives it a baseline to fall back to even after
+/// an interactive reconfigure.
+#[derive(Clone)]
+pub struct StartupConfig {
+    pub port: String,
+    pub baud: u32,
+    pub address: u8,
+    pub sc: Option<ScConfig>,
+}
+
 /// Runtime state held by the actor thread itself.
 struct Slot {
     pd: Pd,
@@ -453,8 +508,18 @@ fn actor_loop(
     events: EventQueue,
     drop_remaining: DropCounter,
     crypto_factory: CryptoFactory,
+    startup: Option<StartupConfig>,
 ) {
     let mut slot: Option<Slot> = None;
+    // Survives `Stop` so `Start` can rebuild the PD from it. Seeded
+    // from the operator's `OSDP_MCP_*` startup values so `pd_start`
+    // has the startup posture as a baseline from the very first tick.
+    let mut last_config: Option<RememberedConfig> = startup.map(|s| RememberedConfig {
+        port: s.port,
+        baud: s.baud,
+        address: s.address,
+        sc: s.sc,
+    });
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
     let tick_period = Duration::from_millis(1);
@@ -467,6 +532,7 @@ fn actor_loop(
                 Ok(cmd) => handle_cmd(
                     cmd,
                     &mut slot,
+                    &mut last_config,
                     &log,
                     &wire,
                     &overrides,
@@ -494,6 +560,7 @@ fn actor_loop(
 fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
+    last_config: &mut Option<RememberedConfig>,
     log: &Arc<LogInner>,
     wire: &Arc<WireTrace>,
     overrides: &OverrideMap,
@@ -509,6 +576,15 @@ fn handle_cmd(
             sc,
             reply,
         } => {
+            // Remember the request before doing anything, so a later
+            // `Start` (or a retry) replays these exact parameters even
+            // if the open below fails.
+            *last_config = Some(RememberedConfig {
+                port: port.clone(),
+                baud,
+                address,
+                sc: sc.clone(),
+            });
             // Tear down any existing PD first; one slot per actor.
             *slot = None;
             let result = open_pd(
@@ -529,8 +605,39 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
+            // Drop the running PD but keep `last_config` so `Start` can
+            // bring it back.
             *slot = None;
             let _ = reply.send(());
+        }
+        Cmd::Start { reply } => {
+            let result = if slot.is_some() {
+                Err(anyhow::anyhow!(
+                    "PD is already running; stop it first or use pd_configure to reconfigure"
+                ))
+            } else {
+                match last_config.as_ref() {
+                    None => Err(anyhow::anyhow!(
+                        "no remembered configuration; call pd_configure first"
+                    )),
+                    Some(cfg) => open_pd(
+                        &cfg.port,
+                        cfg.baud,
+                        cfg.address,
+                        Arc::clone(log),
+                        Arc::clone(wire),
+                        Arc::clone(overrides),
+                        Arc::clone(events),
+                        Arc::clone(drop_remaining),
+                        cfg.sc.clone(),
+                        crypto_factory,
+                    )
+                    .map(|s| {
+                        *slot = Some(s);
+                    }),
+                }
+            };
+            let _ = reply.send(result);
         }
         Cmd::ForceSessionLoss { reply } => {
             let result = match slot.take() {

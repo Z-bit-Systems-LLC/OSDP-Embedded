@@ -22,7 +22,7 @@ use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR,
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
-use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
+use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig, StartupConfig};
 use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -367,6 +367,14 @@ tool (get_log, the inject_*/set_reply_* fault-injection tools, \
 force_session_loss) errors until a PD is running. `pd_configure` also \
 reconfigures an already-running PD.
 
+Lifecycle: `pd_stop` tears the PD down but the actor remembers its \
+configuration; `pd_start` (no arguments) brings it back up with the same \
+port/baud/address/SC key. The OSDP_MCP_* startup values seed that \
+remembered config, so `pd_start` works for an env-auto-started PD too. \
+Use `pd_start` after a `pd_stop` instead of re-issuing `pd_configure` — \
+you don't have to re-supply the SCBK (which `pd_status` never exposes). \
+`pd_configure` is for the first start or to change settings.
+
 `pd_configure` parameters:
   - port (required): serial device, e.g. \"/dev/ttyUSB0\", \"/dev/serial0\", or \"COM5\".
   - baud (default 9600): line rate; must match the ACU.
@@ -386,10 +394,10 @@ struct OsdpMcp {
 }
 
 impl OsdpMcp {
-    fn new(crypto: Selector) -> anyhow::Result<Self> {
+    fn new(crypto: Selector, startup: Option<StartupConfig>) -> anyhow::Result<Self> {
         let factory = crypto.factory().map_err(|e| anyhow::anyhow!(e))?;
         Ok(Self {
-            pd: Arc::new(PdHandle::spawn(factory)),
+            pd: Arc::new(PdHandle::spawn(factory, startup)),
         })
     }
 }
@@ -468,6 +476,39 @@ impl OsdpMcp {
             .await
             .map(|()| "PD stopped".to_string())
             .map_err(|e| format!("pd_stop failed: {}", e))
+    }
+
+    /// Restart a stopped PD using the configuration remembered from
+    /// the last `pd_configure`. The remembered config (port, baud,
+    /// address, and SC key) survives a `pd_stop`, so this brings the
+    /// PD back without re-supplying it — in particular the SCBK, which
+    /// `pd_status` never exposes.
+    #[tool(
+        title = "Start PD",
+        description = "Restart a stopped PD using the configuration from the last \
+                       pd_configure. No arguments. Errors if the PD was never configured \
+                       this session, or if it is already running (stop it first, or use \
+                       pd_configure to change settings)."
+    )]
+    async fn pd_start(&self) -> Result<String, String> {
+        self.pd
+            .start()
+            .await
+            .map_err(|e| format!("pd_start failed: {}", e))?;
+        // Report what came back up. status() is cheap and gives the
+        // caller the same confirmation pd_configure does.
+        let s = self
+            .pd
+            .status()
+            .await
+            .map_err(|e| format!("pd_start: started, but status read failed: {}", e))?;
+        Ok(format!(
+            "PD started on {} @ {}bps addr=0x{:02X} sc={:?}",
+            s.port.as_deref().unwrap_or("?"),
+            s.baud.unwrap_or(0),
+            s.address.unwrap_or(0),
+            s.sc_mode
+        ))
     }
 
     /// Snapshot of the PD's current state (running / online / SC /
@@ -1039,7 +1080,17 @@ async fn main() -> Result<()> {
         anyhow::anyhow!(e)
     })?;
 
-    let handler = OsdpMcp::new(cli.crypto)?;
+    // Seed the actor with the startup posture so `pd_start` can bring
+    // the PD up from the OSDP_MCP_* values regardless of whether the
+    // boot-time auto-start below succeeds. Only meaningful when a port
+    // was supplied — without one there's nothing to start.
+    let startup = defaults.port.as_ref().map(|port| StartupConfig {
+        port: port.clone(),
+        baud: defaults.baud,
+        address: defaults.address,
+        sc: defaults.sc.clone(),
+    });
+    let handler = OsdpMcp::new(cli.crypto, startup)?;
 
     // Auto-start the PD from OSDP_MCP_* when a port was supplied, before
     // any client connects. A runtime failure here (e.g. the serial port

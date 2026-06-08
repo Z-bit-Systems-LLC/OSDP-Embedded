@@ -58,6 +58,19 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
     let status = res.structured_content.as_ref().unwrap();
     assert_eq!(status.get("running").and_then(|v| v.as_bool()), Some(false));
 
+    // ---- pd_start before any configure → no remembered config ----
+    // Nothing has been configured this process, so there's nothing to
+    // restart. Must error clearly rather than silently no-op.
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_start"))
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("no remembered configuration"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
     // ---- pd_configure against a bogus port should fail loudly ----
     let res = service
         .call_tool(
@@ -337,6 +350,52 @@ async fn ping_and_lifecycle() -> anyhow::Result<()> {
         first_text(&res).contains("invalid hex"),
         "got: {:?}",
         first_text(&res)
+    );
+
+    service.cancel().await?;
+    Ok(())
+}
+
+/// When the operator supplies `OSDP_MCP_*` startup values, the actor
+/// seeds them as the remembered config so `pd_start` can bring the PD
+/// up from the startup posture even if the boot-time auto-start failed
+/// (here: a bogus port that can't be opened). The tell is that
+/// `pd_start` tries to *open the port* and fails with "pd_start failed"
+/// — NOT "no remembered configuration", which would mean the startup
+/// values never reached the actor.
+#[tokio::test]
+async fn pd_start_uses_startup_values() -> anyhow::Result<()> {
+    let exe = env!("CARGO_BIN_EXE_osdp-mcp");
+
+    let mut cmd = Command::new(exe);
+    cmd.env("OSDP_MCP_PORT", "startup-port-does-not-exist-COM999")
+        .env("OSDP_MCP_BAUD", "19200")
+        .env("OSDP_MCP_ADDRESS", "5");
+    let transport = TokioChildProcess::new(cmd)?;
+    let service = ().serve(transport).await?;
+
+    // Boot-time auto-start failed on the bogus port, so no PD is
+    // running — but the startup config was seeded.
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_status"))
+        .await?;
+    let status = res.structured_content.as_ref().unwrap();
+    assert_eq!(status.get("running").and_then(|v| v.as_bool()), Some(false));
+
+    // pd_start replays the startup values: it reaches the serial open
+    // (and fails there) rather than reporting nothing-to-start.
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_start"))
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    let text = first_text(&res);
+    assert!(
+        text.contains("pd_start failed"),
+        "expected a serial-open failure (startup values were replayed), got: {text:?}"
+    );
+    assert!(
+        !text.contains("no remembered configuration"),
+        "startup values did not reach the actor: {text:?}"
     );
 
     service.cancel().await?;
