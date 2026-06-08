@@ -81,6 +81,19 @@ jobs:
   # + clippy/rustfmt + cargo-nextest, which this job needs.
   - job: build_rust
     displayName: 'Build & Test (Rust / Linux)'
+    variables:
+      # CI compile-time tuning (see ci/build-rust.yml header). The Rust
+      # workspace builds in the dev/test profile — no release optimisation
+      # of the large osdp-mcp dependency tree (tokio/axum/rmcp/schemars),
+      # which dominated this job. Debuginfo off and incremental disabled:
+      # faster clean compiles and a smaller rust/target cache (quicker
+      # Azure cache up/download). Panic file:line is embedded by the panic
+      # macros, so test failures still point at the right line. Release
+      # compilation of the shipping osdp-mcp binary stays covered by the
+      # aarch64 cross_arm64 job, and the C Release path by build_c.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
     pool:
       name: 'Default'
       demands:

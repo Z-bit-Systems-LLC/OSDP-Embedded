@@ -17,6 +17,19 @@
 # before those were added. None of that needs sudo, so it can't hang the
 # non-interactive agent the way runtime apt did.
 #
+# Compile-time tuning (this was the pipeline's long pole). The dominant cost
+# is osdp-mcp's dependency tree (tokio/axum/rmcp/schemars/serialport), so:
+#   - everything builds in the dev/test profile, NOT --release. Tests don't
+#     need optimised code, and release-optimising that dep tree is what made
+#     this slow. Debuginfo + incremental are disabled via job variables (see
+#     azure-pipelines.yml) for faster clean builds and a smaller target cache.
+#   - there is NO standalone `cargo build --workspace`: cargo clippy
+#     --all-targets type-checks the whole workspace (incl. the osdp-mcp bin),
+#     and nextest codegens the osdp-mcp binary anyway (its integration tests
+#     spawn it), so a separate build step only re-compiled the same code.
+# Release compilation of the shipping osdp-mcp binary is still exercised by
+# the aarch64 cross_arm64 job, and the C library's Release path by build_c.
+#
 # Releasing pushes the bump commit to main and then the v* tag as two
 # separate pushes (scripts/New-Release.ps1), so Azure builds the same commit
 # twice: once for the tag (which also packages) and once for the branch. The
@@ -115,19 +128,12 @@ steps:
         set -euo pipefail
         cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
 
-  - task: Bash@3
-    displayName: 'cargo build --workspace'
-    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
-    inputs:
-      targetType: 'inline'
-      script: |
-        set -euo pipefail
-        cargo build --manifest-path rust/Cargo.toml --workspace --release
-
   # nextest runs the unit/integration tests and writes the JUnit report
   # configured in rust/.config/nextest.toml (-> rust/target/nextest/ci/
-  # junit.xml). It doesn't run doctests, so those follow in a plain
-  # `cargo test --doc` (not in the Tests tab, but still gated).
+  # junit.xml). It also codegens the osdp-mcp binary (its integration tests
+  # spawn it), which is why no separate `cargo build --workspace` is needed.
+  # It doesn't run doctests, so those follow in a plain `cargo test --doc`
+  # (not in the Tests tab, but still gated).
   - task: Bash@3
     displayName: 'cargo nextest run (JUnit)'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
@@ -135,7 +141,7 @@ steps:
       targetType: 'inline'
       script: |
         set -euo pipefail
-        cargo nextest run --manifest-path rust/Cargo.toml --workspace --release --profile ci
+        cargo nextest run --manifest-path rust/Cargo.toml --workspace --profile ci
 
   - task: Bash@3
     displayName: 'cargo test --doc'
@@ -144,7 +150,7 @@ steps:
       targetType: 'inline'
       script: |
         set -euo pipefail
-        cargo test --manifest-path rust/Cargo.toml --workspace --release --doc
+        cargo test --manifest-path rust/Cargo.toml --workspace --doc
 
   # succeededOrFailed() so results still publish when tests fail; skip on the
   # redundant release-bump build (no results there).
@@ -167,7 +173,7 @@ steps:
       targetType: 'inline'
       script: |
         set -euo pipefail
-        cargo run --manifest-path rust/Cargo.toml --release --example loopback
+        cargo run --manifest-path rust/Cargo.toml --example loopback
 
   - task: Bash@3
     displayName: 'cargo run --example loopback_sc'
@@ -176,4 +182,4 @@ steps:
       targetType: 'inline'
       script: |
         set -euo pipefail
-        cargo run --manifest-path rust/Cargo.toml --release --example loopback_sc
+        cargo run --manifest-path rust/Cargo.toml --example loopback_sc
