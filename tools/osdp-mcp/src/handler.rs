@@ -46,8 +46,8 @@ pub struct PdStats {
 
 /// Default PDID — matches the osdp-pd-mock CLI tool so behavior is
 /// consistent across the two interop harnesses. Vendor "ZBC" is a
-/// placeholder; consumers should override via a future pd_set_pdid
-/// tool once they want a realistic device identity.
+/// placeholder; consumers override it at runtime via the `pd_set_pdid`
+/// tool when they want a realistic device identity.
 pub fn default_pdid() -> Pdid {
     Pdid {
         vendor_code: [b'Z', b'B', b'C'],
@@ -143,11 +143,20 @@ pub fn default_pdcap() -> Pdcap {
 /// `drop_next_n_replies` can write it while the handler decrements.
 pub type DropCounter = Arc<AtomicU32>;
 
-/// Application handler. Owns the PDID/PDCAP it reports and a scratch
-/// buffer the build helpers serialize into; the `Reply.payload` slice
-/// the PD copies out borrows from this buffer.
+/// The PD identity reported in the `osdp_PDID` (0x45) reply. Shared
+/// (`Arc<Mutex<_>>`) so the `pd_get_pdid` / `pd_set_pdid` tools on the
+/// async side can read and mutate it while the handler — pinned to the
+/// PD actor thread — serves the reply from the current value. Created
+/// once per process in `PdHandle::spawn`, so edits persist across
+/// `pd_stop` / `pd_configure` like the override and event state do.
+pub type SharedPdid = Arc<Mutex<Pdid>>;
+
+/// Application handler. Owns the PDCAP it reports and a scratch buffer
+/// the build helpers serialize into; the `Reply.payload` slice the PD
+/// copies out borrows from this buffer. The PDID is held behind a
+/// shared handle so it can be edited at runtime.
 pub struct DefaultHandler {
-    pub pdid: Pdid,
+    pub pdid: SharedPdid,
     pub pdcap: Pdcap,
     scratch: [u8; SCRATCH_LEN],
     stats: Arc<Mutex<PdStats>>,
@@ -160,6 +169,8 @@ pub struct DefaultHandler {
 }
 
 impl DefaultHandler {
+    /// Build a handler with a private, default PDID. Convenient for
+    /// tests that don't need to share identity with the async side.
     pub fn new(
         stats: Arc<Mutex<PdStats>>,
         log: Arc<LogInner>,
@@ -168,8 +179,32 @@ impl DefaultHandler {
         drop_remaining: DropCounter,
         pd_address: u8,
     ) -> Self {
+        Self::with_pdid(
+            Arc::new(Mutex::new(default_pdid())),
+            stats,
+            log,
+            overrides,
+            events,
+            drop_remaining,
+            pd_address,
+        )
+    }
+
+    /// Build a handler that serves its `osdp_PDID` reply from the given
+    /// shared PDID, so the `pd_set_pdid` tool can mutate the reported
+    /// identity live.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_pdid(
+        pdid: SharedPdid,
+        stats: Arc<Mutex<PdStats>>,
+        log: Arc<LogInner>,
+        overrides: OverrideMap,
+        events: EventQueue,
+        drop_remaining: DropCounter,
+        pd_address: u8,
+    ) -> Self {
         Self {
-            pdid: default_pdid(),
+            pdid,
             pdcap: default_pdcap(),
             scratch: [0; SCRATCH_LEN],
             stats,
@@ -276,7 +311,14 @@ impl CommandHandler for DefaultHandler {
         let (reply_code, payload_len) = match cmd_code {
             OSDP_CMD_POLL => (OSDP_REPLY_ACK, 0),
             OSDP_CMD_ID => {
-                let n = self.pdid.build(&mut self.scratch)?;
+                // Snapshot the shared PDID (a poisoned lock falls back
+                // to the default identity rather than failing the reply).
+                let pdid = self
+                    .pdid
+                    .lock()
+                    .map(|g| *g)
+                    .unwrap_or_else(|_| default_pdid());
+                let n = pdid.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDID, n)
             }
             OSDP_CMD_CAP => {

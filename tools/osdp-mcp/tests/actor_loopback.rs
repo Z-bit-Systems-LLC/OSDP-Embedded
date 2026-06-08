@@ -86,6 +86,83 @@ fn cycle(pd: &mut Pd, acu: &mut Acu, n: usize) {
     }
 }
 
+/// A handler built with `with_pdid` serves the `osdp_ID` reply from the
+/// shared PDID, and an edit to that shared value shows up in the very
+/// next reply — the mechanism behind the `pd_set_pdid` tool.
+#[test]
+fn pdid_edit_reflected_in_next_id_reply() {
+    let wire = Rc::new(RefCell::new(Wire::default()));
+
+    let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(16));
+    let ovmap = overrides::new_map();
+    let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Shared PDID, owned here and by the handler — exactly how the actor
+    // wires it so `pd_set_pdid` can mutate a live PD's identity.
+    let shared_pdid = Arc::new(Mutex::new(handler::default_pdid()));
+
+    let mut pd = Pd::new(0x10);
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    pd.set_command_handler(handler::DefaultHandler::with_pdid(
+        Arc::clone(&shared_pdid),
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
+        StdArc::clone(&drops),
+        0x10,
+    ));
+
+    let captured = Rc::new(RefCell::new(Captured::default()));
+    let mut acu = Acu::new(1);
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.register_pd(0, 0x10).expect("register_pd");
+
+    // First ID → default identity.
+    acu.send_command(0x10, OSDP_CMD_ID, &[0x00]).unwrap();
+    cycle(&mut pd, &mut acu, 4);
+    {
+        let cap = captured.borrow();
+        let (_, _, reply, payload) = cap.log.last().expect("an ID reply");
+        assert_eq!(*reply, OSDP_REPLY_PDID);
+        assert_eq!(Pdid::decode(payload).unwrap(), handler::default_pdid());
+    }
+
+    // Edit the shared identity, then poll ID again.
+    let edited = Pdid {
+        vendor_code: [0xAC, 0x4E, 0x01],
+        model: 7,
+        version: 3,
+        serial: 0x1234_5678,
+        firmware_major: 2,
+        firmware_minor: 5,
+        firmware_build: 9,
+    };
+    *shared_pdid.lock().unwrap() = edited;
+
+    acu.send_command(0x10, OSDP_CMD_ID, &[0x00]).unwrap();
+    cycle(&mut pd, &mut acu, 4);
+    {
+        let cap = captured.borrow();
+        let (_, _, reply, payload) = cap.log.last().expect("a second ID reply");
+        assert_eq!(*reply, OSDP_REPLY_PDID);
+        assert_eq!(
+            Pdid::decode(payload).unwrap(),
+            edited,
+            "the edited PDID should appear in the next ID reply"
+        );
+    }
+}
+
 #[test]
 fn default_handler_handles_baseline() {
     let wire = Rc::new(RefCell::new(Wire::default()));

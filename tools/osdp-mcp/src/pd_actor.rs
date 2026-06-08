@@ -20,12 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use osdp_embedded::messages::Pdid;
 use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, DropCounter, PdStats};
+use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
@@ -204,6 +205,10 @@ pub struct PdHandle {
     /// swallow. `drop_next_n_replies` writes this; the handler
     /// decrements once per dropped reply.
     drop_remaining: DropCounter,
+    /// The PD identity reported in `osdp_PDID`. Shared with the handler
+    /// so `get_pdid` / `set_pdid` can read and mutate it live. Created
+    /// once at spawn, so edits persist across `configure` / `stop`.
+    pdid: SharedPdid,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -226,11 +231,13 @@ impl PdHandle {
         let overrides = overrides::new_map();
         let events = events::new_queue();
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
+        let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
         let log_for_thread = Arc::clone(&log);
         let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
         let events_for_thread = Arc::clone(&events);
         let drop_for_thread = Arc::clone(&drop_remaining);
+        let pdid_for_thread = Arc::clone(&pdid);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -241,6 +248,7 @@ impl PdHandle {
                     overrides_for_thread,
                     events_for_thread,
                     drop_for_thread,
+                    pdid_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -253,6 +261,7 @@ impl PdHandle {
             overrides,
             events,
             drop_remaining,
+            pdid,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -367,6 +376,28 @@ impl PdHandle {
     /// Drop every installed override.
     pub fn clear_overrides(&self) {
         overrides::clear(&self.overrides);
+    }
+
+    /// Snapshot the PD identity currently reported in `osdp_PDID`.
+    /// Reads the shared value directly — no actor round-trip — so it
+    /// works whether or not a PD is running. A poisoned lock falls back
+    /// to the default identity.
+    pub fn get_pdid(&self) -> Pdid {
+        self.pdid
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| crate::handler::default_pdid())
+    }
+
+    /// Replace the PD identity reported in `osdp_PDID`. Takes effect on
+    /// the next `osdp_ID` command. The new identity also feeds the SC
+    /// cUID the *next* handshake derives — an established session keeps
+    /// its current cUID until it re-handshakes. Persists across
+    /// `configure` / `stop`.
+    pub fn set_pdid(&self, pdid: Pdid) {
+        if let Ok(mut g) = self.pdid.lock() {
+            *g = pdid;
+        }
     }
 
     /// Queue a pre-baked reply to be emitted on the next POLL
@@ -507,6 +538,7 @@ fn actor_loop(
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
+    pdid: SharedPdid,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
@@ -538,6 +570,7 @@ fn actor_loop(
                     &overrides,
                     &events,
                     &drop_remaining,
+                    &pdid,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -566,6 +599,7 @@ fn handle_cmd(
     overrides: &OverrideMap,
     events: &EventQueue,
     drop_remaining: &DropCounter,
+    pdid: &SharedPdid,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -596,6 +630,7 @@ fn handle_cmd(
                 Arc::clone(overrides),
                 Arc::clone(events),
                 Arc::clone(drop_remaining),
+                Arc::clone(pdid),
                 sc,
                 crypto_factory,
             )
@@ -629,6 +664,7 @@ fn handle_cmd(
                         Arc::clone(overrides),
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
+                        Arc::clone(pdid),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -661,6 +697,7 @@ fn handle_cmd(
                         Arc::clone(overrides),
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
+                        Arc::clone(pdid),
                         old.sc.clone(),
                         crypto_factory,
                     );
@@ -733,6 +770,7 @@ fn open_pd(
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
+    pdid: SharedPdid,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -745,9 +783,21 @@ fn open_pd(
     // never larger, so no underflow in the `actively_polling` math).
     let epoch = Instant::now();
 
+    // Snapshot the shared PDID for the cUID derivation below. The
+    // handler keeps the shared handle so later `set_pdid` edits show up
+    // in the `osdp_ID` reply; the cUID, by contrast, is fixed for the
+    // life of this PD instance (a real device's cUID doesn't change
+    // without a reboot — re-handshake by reconfiguring to pick up an
+    // edited identity).
+    let pdid_snapshot = pdid
+        .lock()
+        .map(|g| *g)
+        .unwrap_or_else(|_| crate::handler::default_pdid());
+
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::new(
+    pd.set_command_handler(DefaultHandler::with_pdid(
+        pdid,
         Arc::clone(&stats),
         log,
         overrides,
@@ -759,13 +809,13 @@ fn open_pd(
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is
     // independent across configures. The cUID is derived from the
-    // default PDID we report (spec D.4.3 — first 8 bytes of the PDID
-    // byte stream: vendor[3] + model + version + serial[0..2]).
+    // PDID we report (spec D.4.3 — first 8 bytes of the PDID byte
+    // stream: vendor[3] + model + version + serial[0..2]).
     let mut sc_mode_label = "none";
     if let Some(cfg) = sc.as_ref() {
         let crypto = crypto_factory();
         pd.set_sc_crypto(BoxedSc(crypto));
-        let cuid = derive_cuid_from_default_pdid();
+        let cuid = derive_cuid_from_pdid(&pdid_snapshot);
         pd.set_sc_cuid(&cuid);
         match cfg {
             ScConfig::Scbkd => {
@@ -797,11 +847,10 @@ fn open_pd(
     })
 }
 
-/// Build the 8-byte cUID from the default PDID. Spec D.4.3:
+/// Build the 8-byte cUID from a PDID. Spec D.4.3:
 /// `vendor[0..3] + model + version + serial[0..2]` (the first two
 /// bytes of serial in transmission order — little-endian on the wire).
-fn derive_cuid_from_default_pdid() -> [u8; 8] {
-    let p = crate::handler::default_pdid();
+fn derive_cuid_from_pdid(p: &Pdid) -> [u8; 8] {
     let serial_le = p.serial.to_le_bytes();
     [
         p.vendor_code[0],

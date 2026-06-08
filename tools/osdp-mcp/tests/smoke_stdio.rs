@@ -398,6 +398,69 @@ async fn pd_start_uses_startup_values() -> anyhow::Result<()> {
         "startup values did not reach the actor: {text:?}"
     );
 
+    // ---- pd_get_pdid returns the default identity ----
+    // No PD running — the PDID is process state, independent of the slot.
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_get_pdid"))
+        .await?;
+    let pdid = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        pdid.get("vendor_code_hex").and_then(|v| v.as_str()),
+        Some("5A4243"), // "ZBC"
+        "default vendor code, got {:?}",
+        pdid.get("vendor_code_hex")
+    );
+    assert_eq!(pdid.get("model").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(pdid.get("firmware").and_then(|v| v.as_str()), Some("0.1.0"));
+
+    // ---- pd_set_pdid partial update: only the given fields change ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_pdid").with_arguments(object!({
+                "vendor_code_hex": "AC4E01",
+                "serial": 305419896, // 0x12345678
+                "firmware_major": 2,
+                "firmware_minor": 5,
+                "firmware_build": 9
+            })),
+        )
+        .await?;
+    let pdid = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        pdid.get("vendor_code_hex").and_then(|v| v.as_str()),
+        Some("AC4E01")
+    );
+    assert_eq!(pdid.get("serial").and_then(|v| v.as_u64()), Some(305419896));
+    assert_eq!(pdid.get("firmware").and_then(|v| v.as_str()), Some("2.5.9"));
+    // model/version were not supplied — they keep the defaults.
+    assert_eq!(pdid.get("model").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(pdid.get("version").and_then(|v| v.as_u64()), Some(0));
+
+    // ---- the update persists: a fresh get reflects it ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_get_pdid"))
+        .await?;
+    let pdid = res.structured_content.as_ref().unwrap();
+    assert_eq!(
+        pdid.get("vendor_code_hex").and_then(|v| v.as_str()),
+        Some("AC4E01")
+    );
+    assert_eq!(pdid.get("firmware").and_then(|v| v.as_str()), Some("2.5.9"));
+
+    // ---- bad vendor_code_hex length is rejected ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_pdid")
+                .with_arguments(object!({ "vendor_code_hex": "ABCD" })), // 2 bytes, not 3
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("6 hex chars"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
     service.cancel().await?;
     Ok(())
 }

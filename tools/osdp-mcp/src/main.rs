@@ -18,7 +18,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
+use osdp_embedded::messages::{
+    Keypad, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
+};
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
@@ -322,6 +324,73 @@ struct DropNextNRepliesArgs {
     n: u32,
 }
 
+/// The PD identity reported in the `osdp_PDID` (0x45) reply, returned
+/// by `pd_get_pdid` / `pd_set_pdid`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdidView {
+    /// IEEE OUI (3 bytes) as 6 uppercase hex chars, transmission order
+    /// (e.g. "5A4243" for the ASCII vendor tag "ZBC").
+    vendor_code_hex: String,
+    /// Manufacturer-defined model number.
+    model: u8,
+    /// Manufacturer-defined version.
+    version: u8,
+    /// 32-bit device serial number.
+    serial: u32,
+    /// Firmware version as "major.minor.build" (convenience view of the
+    /// three fields below).
+    firmware: String,
+    firmware_major: u8,
+    firmware_minor: u8,
+    firmware_build: u8,
+}
+
+impl From<Pdid> for PdidView {
+    fn from(p: Pdid) -> Self {
+        Self {
+            vendor_code_hex: format!(
+                "{:02X}{:02X}{:02X}",
+                p.vendor_code[0], p.vendor_code[1], p.vendor_code[2]
+            ),
+            model: p.model,
+            version: p.version,
+            serial: p.serial,
+            firmware: format!(
+                "{}.{}.{}",
+                p.firmware_major, p.firmware_minor, p.firmware_build
+            ),
+            firmware_major: p.firmware_major,
+            firmware_minor: p.firmware_minor,
+            firmware_build: p.firmware_build,
+        }
+    }
+}
+
+/// Partial-update args for `pd_set_pdid`. Every field is optional; only
+/// the ones supplied are changed, the rest keep their current value.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PdSetPdidArgs {
+    /// IEEE OUI (3 bytes) as 6 hex chars, transmission order (e.g.
+    /// "5A4243"). Omit to leave the vendor code unchanged.
+    #[serde(default)]
+    vendor_code_hex: Option<String>,
+    /// Manufacturer-defined model number.
+    #[serde(default)]
+    model: Option<u8>,
+    /// Manufacturer-defined version.
+    #[serde(default)]
+    version: Option<u8>,
+    /// 32-bit device serial number.
+    #[serde(default)]
+    serial: Option<u32>,
+    #[serde(default)]
+    firmware_major: Option<u8>,
+    #[serde(default)]
+    firmware_minor: Option<u8>,
+    #[serde(default)]
+    firmware_build: Option<u8>,
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -526,6 +595,70 @@ impl OsdpMcp {
             .await
             .map(Json)
             .map_err(|e| format!("pd_status failed: {}", e))
+    }
+
+    /// Read the PD identity reported in the `osdp_ID` reply (`osdp_PDID`,
+    /// 0x45). Independent of whether a PD is running — the identity is
+    /// process state that persists across `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Get PDID",
+        description = "Return the PD identity reported in the osdp_PDID (0x45) reply: \
+                       vendor code (hex), model, version, serial, and firmware version. \
+                       Edit it with pd_set_pdid."
+    )]
+    fn pd_get_pdid(&self) -> Json<PdidView> {
+        Json(self.pd.get_pdid().into())
+    }
+
+    /// Update the PD identity reported in the `osdp_ID` reply. Partial:
+    /// only the fields you pass change; the rest keep their current
+    /// value. Takes effect on the next `osdp_ID` command. The new
+    /// identity also feeds the SC cUID derived at the *next* handshake —
+    /// an already-established SC session keeps its current cUID until it
+    /// re-handshakes (reconfigure to force that). Persists across
+    /// `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Set PDID",
+        description = "Update the PD identity reported in osdp_PDID (0x45). Partial update: \
+                       pass only the fields to change (vendor_code_hex = 6 hex chars / 3 bytes, \
+                       model, version, serial, firmware_major/minor/build). Returns the resulting \
+                       identity. Affects the next osdp_ID reply and the next SC handshake's cUID."
+    )]
+    fn pd_set_pdid(
+        &self,
+        Parameters(args): Parameters<PdSetPdidArgs>,
+    ) -> Result<Json<PdidView>, String> {
+        let mut pdid = self.pd.get_pdid();
+        if let Some(hex) = args.vendor_code_hex.as_deref() {
+            let bytes = hex_decode(hex)?;
+            if bytes.len() != 3 {
+                return Err(format!(
+                    "vendor_code_hex must be 6 hex chars (3 bytes); got {} byte(s)",
+                    bytes.len()
+                ));
+            }
+            pdid.vendor_code = [bytes[0], bytes[1], bytes[2]];
+        }
+        if let Some(v) = args.model {
+            pdid.model = v;
+        }
+        if let Some(v) = args.version {
+            pdid.version = v;
+        }
+        if let Some(v) = args.serial {
+            pdid.serial = v;
+        }
+        if let Some(v) = args.firmware_major {
+            pdid.firmware_major = v;
+        }
+        if let Some(v) = args.firmware_minor {
+            pdid.firmware_minor = v;
+        }
+        if let Some(v) = args.firmware_build {
+            pdid.firmware_build = v;
+        }
+        self.pd.set_pdid(pdid);
+        Ok(Json(pdid.into()))
     }
 
     /// Read recent on-wire events (commands accepted, replies sent,
