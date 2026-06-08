@@ -20,13 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use osdp_embedded::messages::Pdid;
+use osdp_embedded::messages::{Pdcap, Pdid};
 use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdid};
+use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
@@ -209,6 +209,11 @@ pub struct PdHandle {
     /// so `get_pdid` / `set_pdid` can read and mutate it live. Created
     /// once at spawn, so edits persist across `configure` / `stop`.
     pdid: SharedPdid,
+    /// The capability set reported in `osdp_PDCAP`. Shared with the
+    /// handler so `get_pdcap` / `set_pdcap` can read and mutate it live.
+    /// Created once at spawn, so edits persist across `configure` /
+    /// `stop`.
+    pdcap: SharedPdcap,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -232,12 +237,14 @@ impl PdHandle {
         let events = events::new_queue();
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
+        let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let log_for_thread = Arc::clone(&log);
         let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
         let events_for_thread = Arc::clone(&events);
         let drop_for_thread = Arc::clone(&drop_remaining);
         let pdid_for_thread = Arc::clone(&pdid);
+        let pdcap_for_thread = Arc::clone(&pdcap);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -249,6 +256,7 @@ impl PdHandle {
                     events_for_thread,
                     drop_for_thread,
                     pdid_for_thread,
+                    pdcap_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -262,6 +270,7 @@ impl PdHandle {
             events,
             drop_remaining,
             pdid,
+            pdcap,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -397,6 +406,27 @@ impl PdHandle {
     pub fn set_pdid(&self, pdid: Pdid) {
         if let Ok(mut g) = self.pdid.lock() {
             *g = pdid;
+        }
+    }
+
+    /// Snapshot the capability set currently reported in `osdp_PDCAP`.
+    /// Reads the shared value directly — no actor round-trip — so it
+    /// works whether or not a PD is running. A poisoned lock falls back
+    /// to the default capability set.
+    pub fn get_pdcap(&self) -> Pdcap {
+        self.pdcap
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| crate::handler::default_pdcap())
+    }
+
+    /// Replace the capability set reported in `osdp_PDCAP`. Takes effect
+    /// on the next `osdp_CAP` command. Persists across `configure` /
+    /// `stop`. Validation against the OSDP spec is the caller's
+    /// responsibility (see `crate::pdcap_spec`).
+    pub fn set_pdcap(&self, pdcap: Pdcap) {
+        if let Ok(mut g) = self.pdcap.lock() {
+            *g = pdcap;
         }
     }
 
@@ -539,6 +569,7 @@ fn actor_loop(
     events: EventQueue,
     drop_remaining: DropCounter,
     pdid: SharedPdid,
+    pdcap: SharedPdcap,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
@@ -571,6 +602,7 @@ fn actor_loop(
                     &events,
                     &drop_remaining,
                     &pdid,
+                    &pdcap,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -600,6 +632,7 @@ fn handle_cmd(
     events: &EventQueue,
     drop_remaining: &DropCounter,
     pdid: &SharedPdid,
+    pdcap: &SharedPdcap,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -631,6 +664,7 @@ fn handle_cmd(
                 Arc::clone(events),
                 Arc::clone(drop_remaining),
                 Arc::clone(pdid),
+                Arc::clone(pdcap),
                 sc,
                 crypto_factory,
             )
@@ -665,6 +699,7 @@ fn handle_cmd(
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
+                        Arc::clone(pdcap),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -698,6 +733,7 @@ fn handle_cmd(
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
+                        Arc::clone(pdcap),
                         old.sc.clone(),
                         crypto_factory,
                     );
@@ -771,6 +807,7 @@ fn open_pd(
     events: EventQueue,
     drop_remaining: DropCounter,
     pdid: SharedPdid,
+    pdcap: SharedPdcap,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -798,6 +835,7 @@ fn open_pd(
     pd.set_transport(transport);
     pd.set_command_handler(DefaultHandler::with_pdid(
         pdid,
+        pdcap,
         Arc::clone(&stats),
         log,
         overrides,

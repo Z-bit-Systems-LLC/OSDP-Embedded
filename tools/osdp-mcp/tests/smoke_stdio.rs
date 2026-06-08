@@ -461,6 +461,131 @@ async fn pd_start_uses_startup_values() -> anyhow::Result<()> {
         first_text(&res)
     );
 
+    // ---- pd_get_pdcap returns the annotated default capability set ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_get_pdcap"))
+        .await?;
+    let pdcap = res.structured_content.as_ref().unwrap();
+    let records = pdcap
+        .get("records")
+        .and_then(|v| v.as_array())
+        .expect("records array");
+    let find = |records: &[serde_json::Value], fc: u64| -> Option<serde_json::Value> {
+        records
+            .iter()
+            .find(|r| r.get("function_code").and_then(|v| v.as_u64()) == Some(fc))
+            .cloned()
+    };
+    // FC4 (Reader LED Control) is annotated with its spec name.
+    let fc4 = find(records, 4).expect("FC4 present in default");
+    assert_eq!(
+        fc4.get("function_name").and_then(|v| v.as_str()),
+        Some("Reader LED Control")
+    );
+    // The default we ship is spec-conformant: FC3 (Card Data Format)
+    // carries num_objects == 0 (spec B.4 requires it).
+    let fc3 = find(records, 3).expect("FC3 present in default");
+    assert_eq!(fc3.get("num_objects").and_then(|v| v.as_u64()), Some(0));
+
+    // ---- pd_set_capability updates an existing record ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_capability").with_arguments(object!({
+                "function_code": 4,
+                "compliance_level": 5,
+                "num_objects": 2
+            })),
+        )
+        .await?;
+    let pdcap = res.structured_content.as_ref().unwrap();
+    let records = pdcap.get("records").and_then(|v| v.as_array()).unwrap();
+    let fc4 = find(records, 4).unwrap();
+    assert_eq!(
+        fc4.get("compliance_level").and_then(|v| v.as_u64()),
+        Some(5)
+    );
+    assert_eq!(fc4.get("num_objects").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(
+        fc4.get("compliance_meaning").and_then(|v| v.as_str()),
+        Some("+ RGB, colors 0-7")
+    );
+
+    // ---- validation rejects an out-of-range compliance level ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_capability").with_arguments(object!({
+                "function_code": 4,
+                "compliance_level": 7
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("invalid"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
+    // ---- validation rejects a non-zero required-zero field ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_capability").with_arguments(object!({
+                "function_code": 3,      // Card Data Format
+                "compliance_level": 1,
+                "num_objects": 1         // spec B.4: must be 0x00
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("must be 0x00"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
+    // ---- unknown function code is rejected ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_capability").with_arguments(object!({
+                "function_code": 99,
+                "compliance_level": 0
+            })),
+        )
+        .await?;
+    assert_eq!(res.is_error, Some(true));
+    assert!(
+        first_text(&res).contains("unknown function code"),
+        "got: {:?}",
+        first_text(&res)
+    );
+
+    // ---- remove a record ----
+    let res = service
+        .call_tool(
+            CallToolRequestParams::new("pd_set_capability").with_arguments(object!({
+                "function_code": 5,
+                "remove": true
+            })),
+        )
+        .await?;
+    let pdcap = res.structured_content.as_ref().unwrap();
+    let records = pdcap.get("records").and_then(|v| v.as_array()).unwrap();
+    assert!(find(records, 5).is_none(), "FC5 should be removed");
+
+    // ---- pd_reset_pdcap restores the default ----
+    let res = service
+        .call_tool(CallToolRequestParams::new("pd_reset_pdcap"))
+        .await?;
+    let pdcap = res.structured_content.as_ref().unwrap();
+    let records = pdcap.get("records").and_then(|v| v.as_array()).unwrap();
+    let fc4 = find(records, 4).unwrap();
+    assert_eq!(
+        fc4.get("compliance_level").and_then(|v| v.as_u64()),
+        Some(4),
+        "reset restores the default FC4 compliance level"
+    );
+    assert!(find(records, 5).is_some(), "reset restores FC5");
+
     service.cancel().await?;
     Ok(())
 }

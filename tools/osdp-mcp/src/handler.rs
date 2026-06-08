@@ -87,8 +87,8 @@ pub fn default_pdcap() -> Pdcap {
             PdcapRecord {
                 function_code: 3,
                 compliance_level: 1,
-                num_objects: 1,
-            }, // CardDataFormat
+                num_objects: 0,
+            }, // CardDataFormat (num must be 0x00 per spec B.4)
             PdcapRecord {
                 function_code: 4,
                 compliance_level: 4,
@@ -107,8 +107,8 @@ pub fn default_pdcap() -> Pdcap {
             PdcapRecord {
                 function_code: 8,
                 compliance_level: 1,
-                num_objects: 1,
-            }, // CheckCharacterSupport
+                num_objects: 0,
+            }, // CheckCharacterSupport (num must be 0x00 per spec B.9)
             PdcapRecord {
                 function_code: 9,
                 compliance_level: 1,
@@ -133,7 +133,7 @@ pub fn default_pdcap() -> Pdcap {
                 function_code: 17,
                 compliance_level: 1,
                 num_objects: 0,
-            }, // ExtendedIdResponse
+            }, // SecurePDBiometricsMatchSupport (spec B.18)
         ],
     }
 }
@@ -151,13 +151,22 @@ pub type DropCounter = Arc<AtomicU32>;
 /// `pd_stop` / `pd_configure` like the override and event state do.
 pub type SharedPdid = Arc<Mutex<Pdid>>;
 
-/// Application handler. Owns the PDCAP it reports and a scratch buffer
-/// the build helpers serialize into; the `Reply.payload` slice the PD
-/// copies out borrows from this buffer. The PDID is held behind a
-/// shared handle so it can be edited at runtime.
+/// The capability set reported in the `osdp_PDCAP` (0x46) reply. Shared
+/// (`Arc<Mutex<_>>`) so the `pd_get_pdcap` / `pd_set_capability` /
+/// `pd_reset_pdcap` tools on the async side can read and mutate it while
+/// the handler — pinned to the PD actor thread — serves the reply from
+/// the current value. Created once per process in `PdHandle::spawn`, so
+/// edits persist across `pd_stop` / `pd_configure` like the PDID and
+/// override state do.
+pub type SharedPdcap = Arc<Mutex<Pdcap>>;
+
+/// Application handler. Reports its PDID and PDCAP from shared handles
+/// (so the `pd_set_*` tools can edit them live) and serialises replies
+/// into a scratch buffer; the `Reply.payload` slice the PD copies out
+/// borrows from that buffer.
 pub struct DefaultHandler {
     pub pdid: SharedPdid,
-    pub pdcap: Pdcap,
+    pub pdcap: SharedPdcap,
     scratch: [u8; SCRATCH_LEN],
     stats: Arc<Mutex<PdStats>>,
     log: Arc<LogInner>,
@@ -181,6 +190,7 @@ impl DefaultHandler {
     ) -> Self {
         Self::with_pdid(
             Arc::new(Mutex::new(default_pdid())),
+            Arc::new(Mutex::new(default_pdcap())),
             stats,
             log,
             overrides,
@@ -190,12 +200,14 @@ impl DefaultHandler {
         )
     }
 
-    /// Build a handler that serves its `osdp_PDID` reply from the given
-    /// shared PDID, so the `pd_set_pdid` tool can mutate the reported
-    /// identity live.
+    /// Build a handler that serves its `osdp_PDID` and `osdp_PDCAP`
+    /// replies from the given shared handles, so the `pd_set_pdid` /
+    /// `pd_set_capability` tools can mutate the reported identity and
+    /// capabilities live.
     #[allow(clippy::too_many_arguments)]
     pub fn with_pdid(
         pdid: SharedPdid,
+        pdcap: SharedPdcap,
         stats: Arc<Mutex<PdStats>>,
         log: Arc<LogInner>,
         overrides: OverrideMap,
@@ -205,7 +217,7 @@ impl DefaultHandler {
     ) -> Self {
         Self {
             pdid,
-            pdcap: default_pdcap(),
+            pdcap,
             scratch: [0; SCRATCH_LEN],
             stats,
             log,
@@ -322,7 +334,15 @@ impl CommandHandler for DefaultHandler {
                 (OSDP_REPLY_PDID, n)
             }
             OSDP_CMD_CAP => {
-                let n = self.pdcap.build(&mut self.scratch)?;
+                // Snapshot the shared PDCAP (a poisoned lock falls back
+                // to the default capability set rather than failing the
+                // reply).
+                let pdcap = self
+                    .pdcap
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| default_pdcap());
+                let n = pdcap.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDCAP, n)
             }
             OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET

@@ -19,12 +19,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use osdp_embedded::messages::{
-    Keypad, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
+    Keypad, Pdcap, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
 };
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig, StartupConfig};
+use osdp_mcp::pdcap_spec;
 use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -391,6 +392,85 @@ struct PdSetPdidArgs {
     firmware_build: Option<u8>,
 }
 
+/// One capability record as seen through `pd_get_pdcap` /
+/// `pd_set_capability` — the three wire bytes plus the spec
+/// interpretation of each, so an agent reading the view understands what
+/// every value means without consulting Annex B.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdcapRecordView {
+    /// OSDP function code (spec Annex B), e.g. 4 = Reader LED Control.
+    function_code: u8,
+    /// Human name of the function code, or "unknown function code".
+    function_name: String,
+    /// Compliance-level byte as sent on the wire.
+    compliance_level: u8,
+    /// What `compliance_level` means for this function code.
+    compliance_meaning: String,
+    /// "Number of objects" byte as sent on the wire.
+    num_objects: u8,
+    /// What `num_objects` means for this function code (a count, a
+    /// bitmap, the MSB of a size, or "must be 0x00").
+    num_objects_meaning: String,
+}
+
+impl From<&PdcapRecord> for PdcapRecordView {
+    fn from(r: &PdcapRecord) -> Self {
+        let (function_name, compliance_meaning, num_objects_meaning) =
+            pdcap_spec::interpret(r.function_code, r.compliance_level, r.num_objects);
+        Self {
+            function_code: r.function_code,
+            function_name,
+            compliance_level: r.compliance_level,
+            compliance_meaning,
+            num_objects: r.num_objects,
+            num_objects_meaning,
+        }
+    }
+}
+
+/// The capability set reported in `osdp_PDCAP` (0x46), returned by the
+/// `pd_get_pdcap` / `pd_set_capability` / `pd_reset_pdcap` tools.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdcapView {
+    /// Capability records, in the order they are sent on the wire.
+    records: Vec<PdcapRecordView>,
+}
+
+impl From<&Pdcap> for PdcapView {
+    fn from(p: &Pdcap) -> Self {
+        Self {
+            records: p.records.iter().map(PdcapRecordView::from).collect(),
+        }
+    }
+}
+
+/// Args for `pd_set_capability` — upsert or remove a single capability
+/// record, keyed by function code.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PdSetCapabilityArgs {
+    /// OSDP function code to edit (spec Annex B, 1..=17). Examples:
+    /// 1 = Contact Status Monitoring, 2 = Output Control,
+    /// 4 = Reader LED Control, 5 = Reader Audible Output,
+    /// 6 = Reader Text Output, 8 = Check Character Support,
+    /// 9 = Communication Security, 16 = OSDP Version.
+    function_code: u8,
+    /// Compliance level for this function code. Required unless
+    /// `remove` is true. Meaning is function-code-specific — see the
+    /// error message or `pd_get_pdcap` for valid values.
+    #[serde(default)]
+    compliance_level: Option<u8>,
+    /// "Number of objects" byte. Optional; defaults to 0 when adding a
+    /// new record. Meaning is function-code-specific (a count, a
+    /// bitmap, the MSB of a size, or required-zero).
+    #[serde(default)]
+    num_objects: Option<u8>,
+    /// When true, remove the record for `function_code` instead of
+    /// adding/updating it. `compliance_level` / `num_objects` are then
+    /// ignored.
+    #[serde(default)]
+    remove: bool,
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -452,6 +532,13 @@ you don't have to re-supply the SCBK (which `pd_status` never exposes). \
       \"none\"    : SC disabled.
       \"install\" : accept handshakes with the spec's well-known SCBK-D key (first-time keying / dev).
       \"scbk\"    : operational per-installation key — also pass scbk_hex (32 hex chars / 16 bytes).
+
+Identity & capabilities: `pd_get_pdid` / `pd_set_pdid` read and edit the device \
+identity reported in the osdp_ID reply; `pd_get_pdcap` / `pd_set_capability` / \
+`pd_reset_pdcap` read and edit the capability set reported in the osdp_CAP reply. \
+Capability edits are validated against OSDP v2.2.2 Annex B and the get-view \
+annotates every byte with its spec meaning. Both the identity and the capability \
+set persist across `pd_stop` / `pd_configure`.
 
 If you are unsure of port/baud/address, ask the user before calling pd_configure \
 rather than guessing. After configuring, use `pd_status` to confirm the PD is \
@@ -659,6 +746,112 @@ impl OsdpMcp {
         }
         self.pd.set_pdid(pdid);
         Ok(Json(pdid.into()))
+    }
+
+    /// Read the capability set reported in the `osdp_CAP` reply
+    /// (`osdp_PDCAP`, 0x46). Each record is annotated with the spec
+    /// (Annex B) meaning of its function code and both data bytes, so
+    /// you can see what the PD advertises without consulting the spec.
+    /// Independent of whether a PD is running — the capability set is
+    /// process state that persists across `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Get PDCAP",
+        description = "Return the capability set reported in the osdp_PDCAP (0x46) reply: \
+                       one record per function code (Annex B), each annotated with its name and \
+                       the meaning of its compliance-level and number-of-objects bytes. \
+                       Edit it with pd_set_capability or restore defaults with pd_reset_pdcap."
+    )]
+    fn pd_get_pdcap(&self) -> Json<PdcapView> {
+        Json((&self.pd.get_pdcap()).into())
+    }
+
+    /// Add, update, or remove a single capability record, keyed by
+    /// function code. Adds/updates are validated against OSDP v2.2.2
+    /// Annex B — an out-of-range compliance level, a non-zero
+    /// "number of objects" where the spec requires zero, reserved
+    /// bitmap bits, or an unknown function code are all rejected with a
+    /// message listing the valid values. Takes effect on the next
+    /// `osdp_CAP` command and persists across `pd_stop` /
+    /// `pd_configure`.
+    #[tool(
+        title = "Set Capability",
+        description = "Add/update or remove one osdp_PDCAP capability record by function code \
+                       (spec Annex B, 1..=17). Pass compliance_level (required to add/update) and \
+                       optionally num_objects; or remove=true to delete the record. The record is \
+                       validated against the spec (valid compliance levels, required-zero fields, \
+                       bitmap masks) and rejected with the allowed values on a violation. Returns \
+                       the full resulting capability set."
+    )]
+    fn pd_set_capability(
+        &self,
+        Parameters(args): Parameters<PdSetCapabilityArgs>,
+    ) -> Result<Json<PdcapView>, String> {
+        let mut pdcap = self.pd.get_pdcap();
+
+        if args.remove {
+            let before = pdcap.records.len();
+            pdcap
+                .records
+                .retain(|r| r.function_code != args.function_code);
+            if pdcap.records.len() == before {
+                return Err(format!(
+                    "no capability record with function code {} to remove",
+                    args.function_code
+                ));
+            }
+            self.pd.set_pdcap(pdcap.clone());
+            return Ok(Json((&pdcap).into()));
+        }
+
+        // Add/update path. compliance_level is required; num_objects
+        // defaults to 0 (the most common required value, and a safe
+        // default for count/bitmap fields).
+        let compliance_level = args.compliance_level.ok_or_else(|| {
+            "compliance_level is required when adding or updating a capability \
+             (pass remove=true to delete instead)"
+                .to_string()
+        })?;
+        // Reuse the existing num_objects when updating and the caller
+        // didn't supply one; otherwise default to 0.
+        let existing_num = pdcap
+            .records
+            .iter()
+            .find(|r| r.function_code == args.function_code)
+            .map(|r| r.num_objects);
+        let num_objects = args.num_objects.or(existing_num).unwrap_or(0);
+
+        // Validate against the spec before mutating anything.
+        pdcap_spec::validate_record(args.function_code, compliance_level, num_objects)?;
+
+        let record = PdcapRecord {
+            function_code: args.function_code,
+            compliance_level,
+            num_objects,
+        };
+        match pdcap
+            .records
+            .iter_mut()
+            .find(|r| r.function_code == args.function_code)
+        {
+            Some(existing) => *existing = record,
+            None => pdcap.records.push(record),
+        }
+        self.pd.set_pdcap(pdcap.clone());
+        Ok(Json((&pdcap).into()))
+    }
+
+    /// Restore the capability set to the built-in default (the same
+    /// spec-conformant set a freshly-configured PD reports). Useful to
+    /// undo experimentation. Returns the restored set.
+    #[tool(
+        title = "Reset PDCAP",
+        description = "Restore the osdp_PDCAP capability set to the built-in default \
+                       (vendor reference set, spec-conformant). Returns the restored set."
+    )]
+    fn pd_reset_pdcap(&self) -> Json<PdcapView> {
+        let pdcap = osdp_mcp::handler::default_pdcap();
+        self.pd.set_pdcap(pdcap.clone());
+        Json((&pdcap).into())
     }
 
     /// Read recent on-wire events (commands accepted, replies sent,

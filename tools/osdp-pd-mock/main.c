@@ -74,16 +74,16 @@ static const osdp_pdid_t kDefaultPdid = {
 static const osdp_pdcap_record_t kDefaultPdcap[] = {
     { .function_code = 1,  .compliance_level = 4, .num_objects = 1 }, /* ContactStatusMonitoring */
     { .function_code = 2,  .compliance_level = 4, .num_objects = 1 }, /* OutputControl */
-    { .function_code = 3,  .compliance_level = 1, .num_objects = 1 }, /* CardDataFormat */
+    { .function_code = 3,  .compliance_level = 1, .num_objects = 0 }, /* CardDataFormat (num must be 0x00 per spec B.4) */
     { .function_code = 4,  .compliance_level = 4, .num_objects = 1 }, /* ReaderLEDControl */
     { .function_code = 5,  .compliance_level = 2, .num_objects = 1 }, /* ReaderAudibleOutput */
     { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* ReaderTextOutput */
-    { .function_code = 8,  .compliance_level = 1, .num_objects = 1 }, /* CheckCharacterSupport */
+    { .function_code = 8,  .compliance_level = 1, .num_objects = 0 }, /* CheckCharacterSupport (num must be 0x00 per spec B.9) */
     { .function_code = 9,  .compliance_level = 1, .num_objects = 1 }, /* CommunicationSecurity (AES128) */
     { .function_code = 12, .compliance_level = 0, .num_objects = 0 }, /* SmartCardSupport */
     { .function_code = 13, .compliance_level = 0, .num_objects = 1 }, /* Readers */
     { .function_code = 16, .compliance_level = 2, .num_objects = 0 }, /* OSDPVersion */
-    { .function_code = 17, .compliance_level = 1, .num_objects = 0 }, /* ExtendedIdResponse */
+    { .function_code = 17, .compliance_level = 1, .num_objects = 0 }, /* SecurePDBiometricsMatchSupport (spec B.18) */
 };
 #define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
 
