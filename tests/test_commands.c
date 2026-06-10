@@ -197,7 +197,26 @@ static void test_led_round_trip(void)
     TEST_ASSERT_EQUAL(OSDP_OK,
                       osdp_led_decode(buf, w, &got, 1, &n));
     TEST_ASSERT_EQUAL_size_t(1, n);
-    TEST_ASSERT_EQUAL_MEMORY(&in, &got, sizeof(in));
+
+    /* Compare field-by-field, NOT memcmp over the whole struct: the
+     * uint16_t temp_timer_100ms is preceded by 7 uint8_t fields, so the
+     * compiler inserts a padding byte at offset 7 to 2-byte-align it.
+     * Padding contents are unspecified in C (C11 6.2.6.1p6), so a
+     * TEST_ASSERT_EQUAL_MEMORY over sizeof(struct) is non-portable — it
+     * happened to match on MSVC but mismatched the pad byte on GCC. */
+    TEST_ASSERT_EQUAL_HEX8(in.reader_no,          got.reader_no);
+    TEST_ASSERT_EQUAL_HEX8(in.led_no,             got.led_no);
+    TEST_ASSERT_EQUAL_HEX8(in.temp_control_code,  got.temp_control_code);
+    TEST_ASSERT_EQUAL_HEX8(in.temp_on_time,       got.temp_on_time);
+    TEST_ASSERT_EQUAL_HEX8(in.temp_off_time,      got.temp_off_time);
+    TEST_ASSERT_EQUAL_HEX8(in.temp_on_color,      got.temp_on_color);
+    TEST_ASSERT_EQUAL_HEX8(in.temp_off_color,     got.temp_off_color);
+    TEST_ASSERT_EQUAL_UINT16(in.temp_timer_100ms, got.temp_timer_100ms);
+    TEST_ASSERT_EQUAL_HEX8(in.perm_control_code,  got.perm_control_code);
+    TEST_ASSERT_EQUAL_HEX8(in.perm_on_time,       got.perm_on_time);
+    TEST_ASSERT_EQUAL_HEX8(in.perm_off_time,      got.perm_off_time);
+    TEST_ASSERT_EQUAL_HEX8(in.perm_on_color,      got.perm_on_color);
+    TEST_ASSERT_EQUAL_HEX8(in.perm_off_color,     got.perm_off_color);
 }
 
 static void test_led_decode_rejects_wrong_size(void)

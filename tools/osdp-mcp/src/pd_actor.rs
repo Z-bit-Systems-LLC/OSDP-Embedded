@@ -18,17 +18,54 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use osdp_embedded::messages::{Pdcap, Pdid};
 use osdp_embedded::pd::Pd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, DropCounter, PdStats};
+use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::SerialTransport;
+use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
+
+/// How long after the most recent inbound command the link still
+/// counts as "actively polled". OSDP ACUs poll on a sub-second
+/// cadence, so a 2 s window catches a stalled poll loop promptly
+/// while tolerating a slow ACU. Independent of the C library's
+/// (reply-based) ~8 s online window — see [`PdStatus::actively_polling`].
+const POLLING_WINDOW_MS: u32 = 2_000;
+
+/// Configured Secure Channel posture of a running PD — the answer to
+/// "is this link clear text, install-keyed, or operationally keyed?".
+/// Reflects how the PD was configured (which key it will handshake
+/// with), independent of whether a handshake has actually completed
+/// yet (that's [`PdStatus::sc_established`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScMode {
+    /// No Secure Channel — the link is clear text. The PD NAKs any
+    /// SCB-bearing frame.
+    None,
+    /// Install mode: the PD accepts handshakes with the spec's
+    /// well-known default key (SCBK-D, D.4). First-time keying / dev.
+    Install,
+    /// Operational mode: the PD uses a per-installation 16-byte SCBK.
+    Scbk,
+}
+
+impl ScMode {
+    fn from_cfg(sc: &Option<ScConfig>) -> Self {
+        match sc {
+            None => ScMode::None,
+            Some(ScConfig::Scbkd) => ScMode::Install,
+            Some(ScConfig::Scbk(_)) => ScMode::Scbk,
+        }
+    }
+}
 
 /// Snapshot of the PD's current state, returned by `pd_status`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -42,10 +79,23 @@ pub struct PdStatus {
     /// accepted in addition to this one.
     pub address: Option<u8>,
     /// True iff the PD has sent at least one reply within the last
-    /// 8 seconds (`osdp_pd_is_online`).
+    /// 8 seconds (`osdp_pd_is_online`). Reply-based: if replies are
+    /// being dropped (`drop_next_n_replies`) this trends false even
+    /// while the ACU keeps polling — compare `actively_polling`.
     pub is_online: bool,
-    /// True iff the SCS_11..14 handshake completed (always false in
-    /// milestone 2 — SC is wired up in milestone 5).
+    /// True iff the ACU is actively polling: a command (POLL or any
+    /// other) arrived within the last [`POLLING_WINDOW_MS`]. Unlike
+    /// `is_online` this is command-based, so it stays true through a
+    /// reply-drop fault while `is_online` decays.
+    pub actively_polling: bool,
+    /// Configured Secure Channel posture — clear text (`none`),
+    /// install-keyed (`install`, SCBK-D), or operationally keyed
+    /// (`scbk`). Answers "which key is this PD using" regardless of
+    /// handshake state.
+    pub sc_mode: ScMode,
+    /// True iff the SCS_11..14 handshake has completed and the PD is
+    /// handling SCS_15..18 operational traffic. With `sc_mode` this
+    /// separates "keyed for SC" from "SC actually up right now".
     pub sc_established: bool,
     /// Most recent command code accepted from the ACU, ms since the
     /// PD epoch (32-bit wrap is fine).
@@ -71,6 +121,8 @@ impl PdStatus {
             baud: None,
             address: None,
             is_online: false,
+            actively_polling: false,
+            sc_mode: ScMode::None,
             sc_established: false,
             last_command_at_ms: None,
             last_reply_at_ms: None,
@@ -110,6 +162,12 @@ enum Cmd {
     Stop {
         reply: oneshot::Sender<()>,
     },
+    /// Bring the PD back up using the configuration remembered from the
+    /// last `Configure` (which survives a `Stop`). Errors if the PD has
+    /// never been configured this process, or if it is already running.
+    Start {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Status {
         reply: oneshot::Sender<PdStatus>,
     },
@@ -131,6 +189,10 @@ pub struct PdHandle {
     /// Shared with the handler so reads (`get_log`, `wait_for_command`,
     /// `clear_log`) can bypass the actor channel for minimal latency.
     log: Arc<LogInner>,
+    /// Shared with the serial transport. Captures raw TX/RX bytes +
+    /// microsecond timestamps for `get_wire_trace`; bypasses the actor
+    /// channel just like `log`.
+    wire: Arc<WireTrace>,
     /// Shared with the handler. Writers (the override-related tools)
     /// modify it directly; the handler reads + consumes script steps
     /// inside `take_for`.
@@ -143,6 +205,15 @@ pub struct PdHandle {
     /// swallow. `drop_next_n_replies` writes this; the handler
     /// decrements once per dropped reply.
     drop_remaining: DropCounter,
+    /// The PD identity reported in `osdp_PDID`. Shared with the handler
+    /// so `get_pdid` / `set_pdid` can read and mutate it live. Created
+    /// once at spawn, so edits persist across `configure` / `stop`.
+    pdid: SharedPdid,
+    /// The capability set reported in `osdp_PDCAP`. Shared with the
+    /// handler so `get_pdcap` / `set_pdcap` can read and mutate it live.
+    /// Created once at spawn, so edits persist across `configure` /
+    /// `stop`.
+    pdcap: SharedPdcap,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -153,35 +224,53 @@ impl PdHandle {
     /// factory is invoked once per `pd_configure` that enables SC,
     /// so each PD has its own fresh `ScCrypto` instance (and RNG
     /// state, if the backend keeps any).
-    pub fn spawn(crypto_factory: CryptoFactory) -> Self {
+    ///
+    /// `startup` carries the operator's `OSDP_MCP_*` values (if any).
+    /// It seeds the actor's remembered config so `pd_start` can bring
+    /// the PD up from the startup posture even before — and regardless
+    /// of whether — the boot-time auto-start ran.
+    pub fn spawn(crypto_factory: CryptoFactory, startup: Option<StartupConfig>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let log = Arc::new(LogInner::new(DEFAULT_CAPACITY));
+        let wire = Arc::new(WireTrace::new(DEFAULT_WIRE_CAPACITY));
         let overrides = overrides::new_map();
         let events = events::new_queue();
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
+        let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
+        let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let log_for_thread = Arc::clone(&log);
+        let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
         let events_for_thread = Arc::clone(&events);
         let drop_for_thread = Arc::clone(&drop_remaining);
+        let pdid_for_thread = Arc::clone(&pdid);
+        let pdcap_for_thread = Arc::clone(&pdcap);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
                 actor_loop(
                     rx,
                     log_for_thread,
+                    wire_for_thread,
                     overrides_for_thread,
                     events_for_thread,
                     drop_for_thread,
+                    pdid_for_thread,
+                    pdcap_for_thread,
                     crypto_factory,
+                    startup,
                 )
             })
             .expect("spawn PD actor thread");
         Self {
             tx,
             log,
+            wire,
             overrides,
             events,
             drop_remaining,
+            pdid,
+            pdcap,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -217,6 +306,20 @@ impl PdHandle {
         Ok(())
     }
 
+    /// Restart the PD from the configuration remembered at the last
+    /// `configure`. The remembered config survives a `stop`, so this is
+    /// how you bring a stopped PD back without re-supplying port/baud/
+    /// address/SCBK. Errors if nothing was ever configured, or if the
+    /// PD is already running.
+    pub async fn start(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Start { reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))?
+    }
+
     pub async fn status(&self) -> anyhow::Result<PdStatus> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -246,6 +349,19 @@ impl PdHandle {
         self.log.clear();
     }
 
+    /// Read up to `limit` raw wire chunks (TX/RX bytes + µs
+    /// timestamps) with `seq >= since_seq`. Straight to the shared
+    /// trace — no actor round-trip.
+    pub fn get_wire_trace(&self, since_seq: u64, limit: usize) -> WirePage {
+        self.wire.snapshot(since_seq, limit)
+    }
+
+    /// Drop every captured wire chunk. `next_seq` is preserved.
+    /// Clear → reproduce → snapshot gives a clean capture window.
+    pub fn clear_wire_trace(&self) {
+        self.wire.clear();
+    }
+
     /// Install a static reply override for `cmd_code` — every
     /// matching command gets the same canned reply until cleared or
     /// replaced.
@@ -269,6 +385,49 @@ impl PdHandle {
     /// Drop every installed override.
     pub fn clear_overrides(&self) {
         overrides::clear(&self.overrides);
+    }
+
+    /// Snapshot the PD identity currently reported in `osdp_PDID`.
+    /// Reads the shared value directly — no actor round-trip — so it
+    /// works whether or not a PD is running. A poisoned lock falls back
+    /// to the default identity.
+    pub fn get_pdid(&self) -> Pdid {
+        self.pdid
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| crate::handler::default_pdid())
+    }
+
+    /// Replace the PD identity reported in `osdp_PDID`. Takes effect on
+    /// the next `osdp_ID` command. The new identity also feeds the SC
+    /// cUID the *next* handshake derives — an established session keeps
+    /// its current cUID until it re-handshakes. Persists across
+    /// `configure` / `stop`.
+    pub fn set_pdid(&self, pdid: Pdid) {
+        if let Ok(mut g) = self.pdid.lock() {
+            *g = pdid;
+        }
+    }
+
+    /// Snapshot the capability set currently reported in `osdp_PDCAP`.
+    /// Reads the shared value directly — no actor round-trip — so it
+    /// works whether or not a PD is running. A poisoned lock falls back
+    /// to the default capability set.
+    pub fn get_pdcap(&self) -> Pdcap {
+        self.pdcap
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| crate::handler::default_pdcap())
+    }
+
+    /// Replace the capability set reported in `osdp_PDCAP`. Takes effect
+    /// on the next `osdp_CAP` command. Persists across `configure` /
+    /// `stop`. Validation against the OSDP spec is the caller's
+    /// responsibility (see `crate::pdcap_spec`).
+    pub fn set_pdcap(&self, pdcap: Pdcap) {
+        if let Ok(mut g) = self.pdcap.lock() {
+            *g = pdcap;
+        }
     }
 
     /// Queue a pre-baked reply to be emitted on the next POLL
@@ -354,6 +513,35 @@ impl PdHandle {
     }
 }
 
+/// The parameters of the most recent [`Cmd::Configure`], retained by
+/// the actor across a [`Cmd::Stop`] so [`Cmd::Start`] can bring the PD
+/// back up without the caller re-supplying them — notably the SCBK,
+/// which `pd_status` deliberately never exposes. Captured when a
+/// configure is requested (before the serial port is opened), so a
+/// `start` retries the exact same request even if the first attempt
+/// failed to open the port.
+#[derive(Clone)]
+struct RememberedConfig {
+    port: String,
+    baud: u32,
+    address: u8,
+    sc: Option<ScConfig>,
+}
+
+/// The operator's `OSDP_MCP_*` startup values, handed to [`PdHandle::spawn`]
+/// and used to seed the actor's remembered config before any interactive
+/// `pd_configure` runs. This makes `pd_start` able to bring the PD up from
+/// the startup posture out of the box — independent of whether the boot-time
+/// auto-start succeeded — and gives it a baseline to fall back to even after
+/// an interactive reconfigure.
+#[derive(Clone)]
+pub struct StartupConfig {
+    pub port: String,
+    pub baud: u32,
+    pub address: u8,
+    pub sc: Option<ScConfig>,
+}
+
 /// Runtime state held by the actor thread itself.
 struct Slot {
     pd: Pd,
@@ -365,17 +553,36 @@ struct Slot {
     /// SC posture as the original.
     sc: Option<ScConfig>,
     stats: Arc<Mutex<PdStats>>,
+    /// PD-local clock zero. Shares the same wall-clock basis as the
+    /// handler's `last_command_at_ms` stamps (both anchored at
+    /// `open_pd`), so `status` can age the last command to decide
+    /// `actively_polling`.
+    epoch: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn actor_loop(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     log: Arc<LogInner>,
+    wire: Arc<WireTrace>,
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
+    pdid: SharedPdid,
+    pdcap: SharedPdcap,
     crypto_factory: CryptoFactory,
+    startup: Option<StartupConfig>,
 ) {
     let mut slot: Option<Slot> = None;
+    // Survives `Stop` so `Start` can rebuild the PD from it. Seeded
+    // from the operator's `OSDP_MCP_*` startup values so `pd_start`
+    // has the startup posture as a baseline from the very first tick.
+    let mut last_config: Option<RememberedConfig> = startup.map(|s| RememberedConfig {
+        port: s.port,
+        baud: s.baud,
+        address: s.address,
+        sc: s.sc,
+    });
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
     let tick_period = Duration::from_millis(1);
@@ -388,10 +595,14 @@ fn actor_loop(
                 Ok(cmd) => handle_cmd(
                     cmd,
                     &mut slot,
+                    &mut last_config,
                     &log,
+                    &wire,
                     &overrides,
                     &events,
                     &drop_remaining,
+                    &pdid,
+                    &pdcap,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -414,10 +625,14 @@ fn actor_loop(
 fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
+    last_config: &mut Option<RememberedConfig>,
     log: &Arc<LogInner>,
+    wire: &Arc<WireTrace>,
     overrides: &OverrideMap,
     events: &EventQueue,
     drop_remaining: &DropCounter,
+    pdid: &SharedPdid,
+    pdcap: &SharedPdcap,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -428,6 +643,15 @@ fn handle_cmd(
             sc,
             reply,
         } => {
+            // Remember the request before doing anything, so a later
+            // `Start` (or a retry) replays these exact parameters even
+            // if the open below fails.
+            *last_config = Some(RememberedConfig {
+                port: port.clone(),
+                baud,
+                address,
+                sc: sc.clone(),
+            });
             // Tear down any existing PD first; one slot per actor.
             *slot = None;
             let result = open_pd(
@@ -435,9 +659,12 @@ fn handle_cmd(
                 baud,
                 address,
                 Arc::clone(log),
+                Arc::clone(wire),
                 Arc::clone(overrides),
                 Arc::clone(events),
                 Arc::clone(drop_remaining),
+                Arc::clone(pdid),
+                Arc::clone(pdcap),
                 sc,
                 crypto_factory,
             )
@@ -447,8 +674,41 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
+            // Drop the running PD but keep `last_config` so `Start` can
+            // bring it back.
             *slot = None;
             let _ = reply.send(());
+        }
+        Cmd::Start { reply } => {
+            let result = if slot.is_some() {
+                Err(anyhow::anyhow!(
+                    "PD is already running; stop it first or use pd_configure to reconfigure"
+                ))
+            } else {
+                match last_config.as_ref() {
+                    None => Err(anyhow::anyhow!(
+                        "no remembered configuration; call pd_configure first"
+                    )),
+                    Some(cfg) => open_pd(
+                        &cfg.port,
+                        cfg.baud,
+                        cfg.address,
+                        Arc::clone(log),
+                        Arc::clone(wire),
+                        Arc::clone(overrides),
+                        Arc::clone(events),
+                        Arc::clone(drop_remaining),
+                        Arc::clone(pdid),
+                        Arc::clone(pdcap),
+                        cfg.sc.clone(),
+                        crypto_factory,
+                    )
+                    .map(|s| {
+                        *slot = Some(s);
+                    }),
+                }
+            };
+            let _ = reply.send(result);
         }
         Cmd::ForceSessionLoss { reply } => {
             let result = match slot.take() {
@@ -468,9 +728,12 @@ fn handle_cmd(
                         old.baud,
                         old.address,
                         Arc::clone(log),
+                        Arc::clone(wire),
                         Arc::clone(overrides),
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
+                        Arc::clone(pdid),
+                        Arc::clone(pdcap),
                         old.sc.clone(),
                         crypto_factory,
                     );
@@ -499,12 +762,21 @@ fn handle_cmd(
                 },
                 Some(s) => {
                     let stats = s.stats.lock().map(|g| g.clone()).unwrap_or_default();
+                    // Age the most recent command against the shared
+                    // PD clock. wrapping_sub keeps us safe across the
+                    // u32-ms wrap and any sub-ms epoch skew.
+                    let now_ms = s.epoch.elapsed().as_millis() as u32;
+                    let actively_polling = stats
+                        .last_command_at_ms
+                        .is_some_and(|t| now_ms.wrapping_sub(t) <= POLLING_WINDOW_MS);
                     PdStatus {
                         running: true,
                         port: Some(s.port.clone()),
                         baud: Some(s.baud),
                         address: Some(s.address),
                         is_online: s.pd.is_online(),
+                        actively_polling,
+                        sc_mode: ScMode::from_cfg(&s.sc),
                         sc_established: s.pd.sc_established(),
                         last_command_at_ms: stats.last_command_at_ms,
                         last_reply_at_ms: stats.last_reply_at_ms,
@@ -530,18 +802,40 @@ fn open_pd(
     baud: u32,
     address: u8,
     log: Arc<LogInner>,
+    wire: Arc<WireTrace>,
     overrides: OverrideMap,
     events: EventQueue,
     drop_remaining: DropCounter,
+    pdid: SharedPdid,
+    pdcap: SharedPdcap,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
-    let transport = SerialTransport::open(port, baud)?;
+    let transport = SerialTransport::open(port, baud, wire)?;
     let stats = Arc::new(Mutex::new(PdStats::default()));
+    // Anchor the PD-local clock before the handler is built so the
+    // Slot and the handler's `last_command_at_ms` stamps share a zero
+    // (the handler mints its own Instant a few µs later, which only
+    // makes its stamps marginally smaller than `epoch.elapsed()` —
+    // never larger, so no underflow in the `actively_polling` math).
+    let epoch = Instant::now();
+
+    // Snapshot the shared PDID for the cUID derivation below. The
+    // handler keeps the shared handle so later `set_pdid` edits show up
+    // in the `osdp_ID` reply; the cUID, by contrast, is fixed for the
+    // life of this PD instance (a real device's cUID doesn't change
+    // without a reboot — re-handshake by reconfiguring to pick up an
+    // edited identity).
+    let pdid_snapshot = pdid
+        .lock()
+        .map(|g| *g)
+        .unwrap_or_else(|_| crate::handler::default_pdid());
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::new(
+    pd.set_command_handler(DefaultHandler::with_pdid(
+        pdid,
+        pdcap,
         Arc::clone(&stats),
         log,
         overrides,
@@ -553,13 +847,13 @@ fn open_pd(
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is
     // independent across configures. The cUID is derived from the
-    // default PDID we report (spec D.4.3 — first 8 bytes of the PDID
-    // byte stream: vendor[3] + model + version + serial[0..2]).
+    // PDID we report (spec D.4.3 — first 8 bytes of the PDID byte
+    // stream: vendor[3] + model + version + serial[0..2]).
     let mut sc_mode_label = "none";
     if let Some(cfg) = sc.as_ref() {
         let crypto = crypto_factory();
         pd.set_sc_crypto(BoxedSc(crypto));
-        let cuid = derive_cuid_from_default_pdid();
+        let cuid = derive_cuid_from_pdid(&pdid_snapshot);
         pd.set_sc_cuid(&cuid);
         match cfg {
             ScConfig::Scbkd => {
@@ -587,14 +881,14 @@ fn open_pd(
         address,
         sc,
         stats,
+        epoch,
     })
 }
 
-/// Build the 8-byte cUID from the default PDID. Spec D.4.3:
+/// Build the 8-byte cUID from a PDID. Spec D.4.3:
 /// `vendor[0..3] + model + version + serial[0..2]` (the first two
 /// bytes of serial in transmission order — little-endian on the wire).
-fn derive_cuid_from_default_pdid() -> [u8; 8] {
-    let p = crate::handler::default_pdid();
+fn derive_cuid_from_pdid(p: &Pdid) -> [u8; 8] {
     let serial_le = p.serial.to_le_bytes();
     [
         p.vendor_code[0],

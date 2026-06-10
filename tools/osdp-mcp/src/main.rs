@@ -18,11 +18,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
+use osdp_embedded::messages::{
+    Keypad, Pdcap, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
+};
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
-use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig};
+use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig, StartupConfig};
+use osdp_mcp::pdcap_spec;
+use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
@@ -38,6 +42,26 @@ struct PingArgs {
     /// Echoed back verbatim. Optional.
     #[serde(default)]
     message: Option<String>,
+}
+
+/// Build identity reported by the `version` tool. Lets an operator
+/// confirm a deployed binary includes a given fix instead of guessing
+/// from file timestamps.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct VersionInfo {
+    /// Crate package name — always "osdp-mcp".
+    name: &'static str,
+    /// Semantic version from Cargo.toml (e.g. "0.1.7"). Bumped per
+    /// release commit, so this is the quickest "is the running binary
+    /// current" check.
+    version: &'static str,
+    /// Short git commit the binary was built from, or "unknown" when
+    /// built outside a git checkout. Pin-points the exact source even
+    /// between version bumps.
+    git_commit: &'static str,
+    /// True when the working tree had uncommitted changes at build
+    /// time — a red flag for a binary that's meant to match a tag.
+    git_dirty: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -160,6 +184,21 @@ impl GetLogArgs {
 
 fn default_log_limit() -> u32 {
     DEFAULT_CAPACITY as u32
+}
+
+fn default_wire_limit() -> u32 {
+    DEFAULT_WIRE_CAPACITY as u32
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WireTraceArgs {
+    /// Skip chunks with `seq < since_seq`. Pass the previous response's
+    /// `next_seq` to page only newer chunks. Defaults to 0 (all).
+    #[serde(default)]
+    since_seq: u64,
+    /// Cap the number of chunks returned. Defaults to the full ring.
+    #[serde(default = "default_wire_limit")]
+    limit: u32,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -286,6 +325,152 @@ struct DropNextNRepliesArgs {
     n: u32,
 }
 
+/// The PD identity reported in the `osdp_PDID` (0x45) reply, returned
+/// by `pd_get_pdid` / `pd_set_pdid`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdidView {
+    /// IEEE OUI (3 bytes) as 6 uppercase hex chars, transmission order
+    /// (e.g. "5A4243" for the ASCII vendor tag "ZBC").
+    vendor_code_hex: String,
+    /// Manufacturer-defined model number.
+    model: u8,
+    /// Manufacturer-defined version.
+    version: u8,
+    /// 32-bit device serial number.
+    serial: u32,
+    /// Firmware version as "major.minor.build" (convenience view of the
+    /// three fields below).
+    firmware: String,
+    firmware_major: u8,
+    firmware_minor: u8,
+    firmware_build: u8,
+}
+
+impl From<Pdid> for PdidView {
+    fn from(p: Pdid) -> Self {
+        Self {
+            vendor_code_hex: format!(
+                "{:02X}{:02X}{:02X}",
+                p.vendor_code[0], p.vendor_code[1], p.vendor_code[2]
+            ),
+            model: p.model,
+            version: p.version,
+            serial: p.serial,
+            firmware: format!(
+                "{}.{}.{}",
+                p.firmware_major, p.firmware_minor, p.firmware_build
+            ),
+            firmware_major: p.firmware_major,
+            firmware_minor: p.firmware_minor,
+            firmware_build: p.firmware_build,
+        }
+    }
+}
+
+/// Partial-update args for `pd_set_pdid`. Every field is optional; only
+/// the ones supplied are changed, the rest keep their current value.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PdSetPdidArgs {
+    /// IEEE OUI (3 bytes) as 6 hex chars, transmission order (e.g.
+    /// "5A4243"). Omit to leave the vendor code unchanged.
+    #[serde(default)]
+    vendor_code_hex: Option<String>,
+    /// Manufacturer-defined model number.
+    #[serde(default)]
+    model: Option<u8>,
+    /// Manufacturer-defined version.
+    #[serde(default)]
+    version: Option<u8>,
+    /// 32-bit device serial number.
+    #[serde(default)]
+    serial: Option<u32>,
+    #[serde(default)]
+    firmware_major: Option<u8>,
+    #[serde(default)]
+    firmware_minor: Option<u8>,
+    #[serde(default)]
+    firmware_build: Option<u8>,
+}
+
+/// One capability record as seen through `pd_get_pdcap` /
+/// `pd_set_capability` — the three wire bytes plus the spec
+/// interpretation of each, so an agent reading the view understands what
+/// every value means without consulting Annex B.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdcapRecordView {
+    /// OSDP function code (spec Annex B), e.g. 4 = Reader LED Control.
+    function_code: u8,
+    /// Human name of the function code, or "unknown function code".
+    function_name: String,
+    /// Compliance-level byte as sent on the wire.
+    compliance_level: u8,
+    /// What `compliance_level` means for this function code.
+    compliance_meaning: String,
+    /// "Number of objects" byte as sent on the wire.
+    num_objects: u8,
+    /// What `num_objects` means for this function code (a count, a
+    /// bitmap, the MSB of a size, or "must be 0x00").
+    num_objects_meaning: String,
+}
+
+impl From<&PdcapRecord> for PdcapRecordView {
+    fn from(r: &PdcapRecord) -> Self {
+        let (function_name, compliance_meaning, num_objects_meaning) =
+            pdcap_spec::interpret(r.function_code, r.compliance_level, r.num_objects);
+        Self {
+            function_code: r.function_code,
+            function_name,
+            compliance_level: r.compliance_level,
+            compliance_meaning,
+            num_objects: r.num_objects,
+            num_objects_meaning,
+        }
+    }
+}
+
+/// The capability set reported in `osdp_PDCAP` (0x46), returned by the
+/// `pd_get_pdcap` / `pd_set_capability` / `pd_reset_pdcap` tools.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct PdcapView {
+    /// Capability records, in the order they are sent on the wire.
+    records: Vec<PdcapRecordView>,
+}
+
+impl From<&Pdcap> for PdcapView {
+    fn from(p: &Pdcap) -> Self {
+        Self {
+            records: p.records.iter().map(PdcapRecordView::from).collect(),
+        }
+    }
+}
+
+/// Args for `pd_set_capability` — upsert or remove a single capability
+/// record, keyed by function code.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PdSetCapabilityArgs {
+    /// OSDP function code to edit (spec Annex B, 1..=17). Examples:
+    /// 1 = Contact Status Monitoring, 2 = Output Control,
+    /// 4 = Reader LED Control, 5 = Reader Audible Output,
+    /// 6 = Reader Text Output, 8 = Check Character Support,
+    /// 9 = Communication Security, 16 = OSDP Version.
+    function_code: u8,
+    /// Compliance level for this function code. Required unless
+    /// `remove` is true. Meaning is function-code-specific — see the
+    /// error message or `pd_get_pdcap` for valid values.
+    #[serde(default)]
+    compliance_level: Option<u8>,
+    /// "Number of objects" byte. Optional; defaults to 0 when adding a
+    /// new record. Meaning is function-code-specific (a count, a
+    /// bitmap, the MSB of a size, or required-zero).
+    #[serde(default)]
+    num_objects: Option<u8>,
+    /// When true, remove the record for `function_code` instead of
+    /// adding/updating it. `compliance_level` / `num_objects` are then
+    /// ignored.
+    #[serde(default)]
+    remove: bool,
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -331,6 +516,14 @@ tool (get_log, the inject_*/set_reply_* fault-injection tools, \
 force_session_loss) errors until a PD is running. `pd_configure` also \
 reconfigures an already-running PD.
 
+Lifecycle: `pd_stop` tears the PD down but the actor remembers its \
+configuration; `pd_start` (no arguments) brings it back up with the same \
+port/baud/address/SC key. The OSDP_MCP_* startup values seed that \
+remembered config, so `pd_start` works for an env-auto-started PD too. \
+Use `pd_start` after a `pd_stop` instead of re-issuing `pd_configure` — \
+you don't have to re-supply the SCBK (which `pd_status` never exposes). \
+`pd_configure` is for the first start or to change settings.
+
 `pd_configure` parameters:
   - port (required): serial device, e.g. \"/dev/ttyUSB0\", \"/dev/serial0\", or \"COM5\".
   - baud (default 9600): line rate; must match the ACU.
@@ -339,6 +532,13 @@ reconfigures an already-running PD.
       \"none\"    : SC disabled.
       \"install\" : accept handshakes with the spec's well-known SCBK-D key (first-time keying / dev).
       \"scbk\"    : operational per-installation key — also pass scbk_hex (32 hex chars / 16 bytes).
+
+Identity & capabilities: `pd_get_pdid` / `pd_set_pdid` read and edit the device \
+identity reported in the osdp_ID reply; `pd_get_pdcap` / `pd_set_capability` / \
+`pd_reset_pdcap` read and edit the capability set reported in the osdp_CAP reply. \
+Capability edits are validated against OSDP v2.2.2 Annex B and the get-view \
+annotates every byte with its spec meaning. Both the identity and the capability \
+set persist across `pd_stop` / `pd_configure`.
 
 If you are unsure of port/baud/address, ask the user before calling pd_configure \
 rather than guessing. After configuring, use `pd_status` to confirm the PD is \
@@ -350,10 +550,10 @@ struct OsdpMcp {
 }
 
 impl OsdpMcp {
-    fn new(crypto: Selector) -> anyhow::Result<Self> {
+    fn new(crypto: Selector, startup: Option<StartupConfig>) -> anyhow::Result<Self> {
         let factory = crypto.factory().map_err(|e| anyhow::anyhow!(e))?;
         Ok(Self {
-            pd: Arc::new(PdHandle::spawn(factory)),
+            pd: Arc::new(PdHandle::spawn(factory, startup)),
         })
     }
 }
@@ -371,6 +571,26 @@ impl OsdpMcp {
             Some(m) => format!("osdp-mcp pong: {}", m),
             None => "osdp-mcp pong".to_string(),
         }
+    }
+
+    /// Report the running server's build identity. Use this to confirm
+    /// a deployed binary actually includes a given fix before chasing a
+    /// bug that's already patched in source.
+    #[tool(
+        title = "Get Server Version",
+        description = "Return the running osdp-mcp build identity: package \
+                       name, semantic version (Cargo.toml), the git commit \
+                       it was built from, and whether the build tree was \
+                       dirty. Use it to confirm a deployed binary includes \
+                       a given fix rather than guessing from file timestamps."
+    )]
+    fn version(&self) -> Json<VersionInfo> {
+        Json(VersionInfo {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            git_commit: option_env!("OSDP_MCP_GIT_HASH").unwrap_or("unknown"),
+            git_dirty: matches!(option_env!("OSDP_MCP_GIT_DIRTY"), Some("true")),
+        })
     }
 
     /// Bring up a PD on a serial port. Any previously-configured PD
@@ -414,11 +634,47 @@ impl OsdpMcp {
             .map_err(|e| format!("pd_stop failed: {}", e))
     }
 
+    /// Restart a stopped PD using the configuration remembered from
+    /// the last `pd_configure`. The remembered config (port, baud,
+    /// address, and SC key) survives a `pd_stop`, so this brings the
+    /// PD back without re-supplying it — in particular the SCBK, which
+    /// `pd_status` never exposes.
+    #[tool(
+        title = "Start PD",
+        description = "Restart a stopped PD using the configuration from the last \
+                       pd_configure. No arguments. Errors if the PD was never configured \
+                       this session, or if it is already running (stop it first, or use \
+                       pd_configure to change settings)."
+    )]
+    async fn pd_start(&self) -> Result<String, String> {
+        self.pd
+            .start()
+            .await
+            .map_err(|e| format!("pd_start failed: {}", e))?;
+        // Report what came back up. status() is cheap and gives the
+        // caller the same confirmation pd_configure does.
+        let s = self
+            .pd
+            .status()
+            .await
+            .map_err(|e| format!("pd_start: started, but status read failed: {}", e))?;
+        Ok(format!(
+            "PD started on {} @ {}bps addr=0x{:02X} sc={:?}",
+            s.port.as_deref().unwrap_or("?"),
+            s.baud.unwrap_or(0),
+            s.address.unwrap_or(0),
+            s.sc_mode
+        ))
+    }
+
     /// Snapshot of the PD's current state (running / online / SC /
     /// most recent cmd+reply). Cheap; safe to poll.
     #[tool(
         title = "Get PD Status",
-        description = "Return a JSON snapshot of the PD's state (running, online, SC, last cmd/reply)."
+        description = "Return a JSON snapshot of the PD's state: running, \
+                       online, actively_polling, sc_mode (none/install/scbk = \
+                       clear text / SCBK-D / operational), sc_established, and \
+                       the last cmd/reply."
     )]
     async fn pd_status(&self) -> Result<Json<PdStatus>, String> {
         self.pd
@@ -426,6 +682,176 @@ impl OsdpMcp {
             .await
             .map(Json)
             .map_err(|e| format!("pd_status failed: {}", e))
+    }
+
+    /// Read the PD identity reported in the `osdp_ID` reply (`osdp_PDID`,
+    /// 0x45). Independent of whether a PD is running — the identity is
+    /// process state that persists across `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Get PDID",
+        description = "Return the PD identity reported in the osdp_PDID (0x45) reply: \
+                       vendor code (hex), model, version, serial, and firmware version. \
+                       Edit it with pd_set_pdid."
+    )]
+    fn pd_get_pdid(&self) -> Json<PdidView> {
+        Json(self.pd.get_pdid().into())
+    }
+
+    /// Update the PD identity reported in the `osdp_ID` reply. Partial:
+    /// only the fields you pass change; the rest keep their current
+    /// value. Takes effect on the next `osdp_ID` command. The new
+    /// identity also feeds the SC cUID derived at the *next* handshake —
+    /// an already-established SC session keeps its current cUID until it
+    /// re-handshakes (reconfigure to force that). Persists across
+    /// `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Set PDID",
+        description = "Update the PD identity reported in osdp_PDID (0x45). Partial update: \
+                       pass only the fields to change (vendor_code_hex = 6 hex chars / 3 bytes, \
+                       model, version, serial, firmware_major/minor/build). Returns the resulting \
+                       identity. Affects the next osdp_ID reply and the next SC handshake's cUID."
+    )]
+    fn pd_set_pdid(
+        &self,
+        Parameters(args): Parameters<PdSetPdidArgs>,
+    ) -> Result<Json<PdidView>, String> {
+        let mut pdid = self.pd.get_pdid();
+        if let Some(hex) = args.vendor_code_hex.as_deref() {
+            let bytes = hex_decode(hex)?;
+            if bytes.len() != 3 {
+                return Err(format!(
+                    "vendor_code_hex must be 6 hex chars (3 bytes); got {} byte(s)",
+                    bytes.len()
+                ));
+            }
+            pdid.vendor_code = [bytes[0], bytes[1], bytes[2]];
+        }
+        if let Some(v) = args.model {
+            pdid.model = v;
+        }
+        if let Some(v) = args.version {
+            pdid.version = v;
+        }
+        if let Some(v) = args.serial {
+            pdid.serial = v;
+        }
+        if let Some(v) = args.firmware_major {
+            pdid.firmware_major = v;
+        }
+        if let Some(v) = args.firmware_minor {
+            pdid.firmware_minor = v;
+        }
+        if let Some(v) = args.firmware_build {
+            pdid.firmware_build = v;
+        }
+        self.pd.set_pdid(pdid);
+        Ok(Json(pdid.into()))
+    }
+
+    /// Read the capability set reported in the `osdp_CAP` reply
+    /// (`osdp_PDCAP`, 0x46). Each record is annotated with the spec
+    /// (Annex B) meaning of its function code and both data bytes, so
+    /// you can see what the PD advertises without consulting the spec.
+    /// Independent of whether a PD is running — the capability set is
+    /// process state that persists across `pd_stop` / `pd_configure`.
+    #[tool(
+        title = "Get PDCAP",
+        description = "Return the capability set reported in the osdp_PDCAP (0x46) reply: \
+                       one record per function code (Annex B), each annotated with its name and \
+                       the meaning of its compliance-level and number-of-objects bytes. \
+                       Edit it with pd_set_capability or restore defaults with pd_reset_pdcap."
+    )]
+    fn pd_get_pdcap(&self) -> Json<PdcapView> {
+        Json((&self.pd.get_pdcap()).into())
+    }
+
+    /// Add, update, or remove a single capability record, keyed by
+    /// function code. Adds/updates are validated against OSDP v2.2.2
+    /// Annex B — an out-of-range compliance level, a non-zero
+    /// "number of objects" where the spec requires zero, reserved
+    /// bitmap bits, or an unknown function code are all rejected with a
+    /// message listing the valid values. Takes effect on the next
+    /// `osdp_CAP` command and persists across `pd_stop` /
+    /// `pd_configure`.
+    #[tool(
+        title = "Set Capability",
+        description = "Add/update or remove one osdp_PDCAP capability record by function code \
+                       (spec Annex B, 1..=17). Pass compliance_level (required to add/update) and \
+                       optionally num_objects; or remove=true to delete the record. The record is \
+                       validated against the spec (valid compliance levels, required-zero fields, \
+                       bitmap masks) and rejected with the allowed values on a violation. Returns \
+                       the full resulting capability set."
+    )]
+    fn pd_set_capability(
+        &self,
+        Parameters(args): Parameters<PdSetCapabilityArgs>,
+    ) -> Result<Json<PdcapView>, String> {
+        let mut pdcap = self.pd.get_pdcap();
+
+        if args.remove {
+            let before = pdcap.records.len();
+            pdcap
+                .records
+                .retain(|r| r.function_code != args.function_code);
+            if pdcap.records.len() == before {
+                return Err(format!(
+                    "no capability record with function code {} to remove",
+                    args.function_code
+                ));
+            }
+            self.pd.set_pdcap(pdcap.clone());
+            return Ok(Json((&pdcap).into()));
+        }
+
+        // Add/update path. compliance_level is required; num_objects
+        // defaults to 0 (the most common required value, and a safe
+        // default for count/bitmap fields).
+        let compliance_level = args.compliance_level.ok_or_else(|| {
+            "compliance_level is required when adding or updating a capability \
+             (pass remove=true to delete instead)"
+                .to_string()
+        })?;
+        // Reuse the existing num_objects when updating and the caller
+        // didn't supply one; otherwise default to 0.
+        let existing_num = pdcap
+            .records
+            .iter()
+            .find(|r| r.function_code == args.function_code)
+            .map(|r| r.num_objects);
+        let num_objects = args.num_objects.or(existing_num).unwrap_or(0);
+
+        // Validate against the spec before mutating anything.
+        pdcap_spec::validate_record(args.function_code, compliance_level, num_objects)?;
+
+        let record = PdcapRecord {
+            function_code: args.function_code,
+            compliance_level,
+            num_objects,
+        };
+        match pdcap
+            .records
+            .iter_mut()
+            .find(|r| r.function_code == args.function_code)
+        {
+            Some(existing) => *existing = record,
+            None => pdcap.records.push(record),
+        }
+        self.pd.set_pdcap(pdcap.clone());
+        Ok(Json((&pdcap).into()))
+    }
+
+    /// Restore the capability set to the built-in default (the same
+    /// spec-conformant set a freshly-configured PD reports). Useful to
+    /// undo experimentation. Returns the restored set.
+    #[tool(
+        title = "Reset PDCAP",
+        description = "Restore the osdp_PDCAP capability set to the built-in default \
+                       (vendor reference set, spec-conformant). Returns the restored set."
+    )]
+    fn pd_reset_pdcap(&self) -> Json<PdcapView> {
+        let pdcap = osdp_mcp::handler::default_pdcap();
+        self.pd.set_pdcap(pdcap.clone());
+        Json((&pdcap).into())
     }
 
     /// Read recent on-wire events (commands accepted, replies sent,
@@ -477,6 +903,40 @@ impl OsdpMcp {
     fn clear_log(&self) -> String {
         self.pd.clear_log();
         "log cleared".to_string()
+    }
+
+    /// Raw byte-level wire trace — every TX/RX chunk the serial
+    /// transport moved, with a microsecond timestamp and the full hex
+    /// (SOM, control byte, SCB, integrity), cursor-paged via
+    /// `since_seq`. This is the low-level companion to `get_log`:
+    /// `get_log` shows decoded frames but drops POLL/ACK timing and the
+    /// control byte; this shows neither-decoded-nor-filtered bytes so
+    /// you can measure reply latency (last `rx` → next `tx` vs the
+    /// ACU's firstByte window) and inspect on-wire framing (SQN,
+    /// CRC-vs-checksum, SC vs plaintext). Typical use: `clear_wire_trace`
+    /// → reproduce the fault → `get_wire_trace`.
+    #[tool(
+        title = "Get Raw Wire Trace",
+        description = "Return up to `limit` raw serial chunks (seq >= since_seq), each with a \
+                       microsecond timestamp `t_us`, direction (rx/tx), and full hex bytes \
+                       incl. control + integrity. Use it to measure reply latency and inspect \
+                       on-wire framing the decoded get_log can't show. `dropped` > 0 means older \
+                       chunks scrolled off the ring."
+    )]
+    fn get_wire_trace(&self, Parameters(args): Parameters<WireTraceArgs>) -> Json<WirePage> {
+        Json(self.pd.get_wire_trace(args.since_seq, args.limit as usize))
+    }
+
+    /// Drop every captured wire chunk. Pair with `get_wire_trace`:
+    /// clear, reproduce the fault, then snapshot a clean window.
+    #[tool(
+        title = "Clear Raw Wire Trace",
+        description = "Drop every captured raw wire chunk. Idempotent. Clear before reproducing \
+                       a fault so the next get_wire_trace is a clean capture window."
+    )]
+    fn clear_wire_trace(&self) -> String {
+        self.pd.clear_wire_trace();
+        "wire trace cleared".to_string()
     }
 
     /// Block until a command with the given code arrives, or the
@@ -946,7 +1406,17 @@ async fn main() -> Result<()> {
         anyhow::anyhow!(e)
     })?;
 
-    let handler = OsdpMcp::new(cli.crypto)?;
+    // Seed the actor with the startup posture so `pd_start` can bring
+    // the PD up from the OSDP_MCP_* values regardless of whether the
+    // boot-time auto-start below succeeds. Only meaningful when a port
+    // was supplied — without one there's nothing to start.
+    let startup = defaults.port.as_ref().map(|port| StartupConfig {
+        port: port.clone(),
+        baud: defaults.baud,
+        address: defaults.address,
+        sc: defaults.sc.clone(),
+    });
+    let handler = OsdpMcp::new(cli.crypto, startup)?;
 
     // Auto-start the PD from OSDP_MCP_* when a port was supplied, before
     // any client connects. A runtime failure here (e.g. the serial port

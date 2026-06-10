@@ -13,7 +13,13 @@
  *
  * Linux supports custom baud via ioctl(TIOCSSERIAL) or termios2;
  * macOS uses ioctl(IOSSIOSPEED). If we ever need non-standard rates
- * we can add per-platform branches here. */
+ * we can add per-platform branches here.
+ *
+ * Built with strict -std=c11, so glibc hides BSD/POSIX symbols
+ * (cfmakeraw, CRTSCTS, clock_gettime/CLOCK_MONOTONIC, nanosleep) by
+ * default. _DEFAULT_SOURCE re-exposes them; it must be defined before
+ * any system header is included. */
+#define _DEFAULT_SOURCE 1
 
 #include "serial.h"
 

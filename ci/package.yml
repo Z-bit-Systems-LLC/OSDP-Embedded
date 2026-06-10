@@ -10,9 +10,10 @@
 #   - Rust crate package: osdp-embedded-X.Y.Z.crate
 #
 # This template covers the Windows artifacts. Linux ARM64 (osdp-mcp for
-# Raspberry Pi) is built by the sibling `package_linux` job via
-# package-linux.yml. macOS / Linux-x64 binaries aren't built yet; add
-# more jobs alongside when there's demand.
+# Raspberry Pi) is published by the `cross_arm64` gate itself on tag
+# builds (see cross-pi.yml) — it already cross-compiles that binary, so
+# there's no separate package job to rebuild it. macOS / Linux-x64
+# binaries aren't built yet; add more jobs alongside when there's demand.
 
 steps:
   # ---- Native Windows binaries via CMake -------------------------------
@@ -26,10 +27,12 @@ steps:
           -DOSDP_BUILD_TESTS=OFF ^
           -DOSDP_BUILD_TOOLS=ON
 
+  # --parallel (MSBuild /m across targets) + the /MP in CMakeLists.txt
+  # (parallel compiles within a target) keep all agent cores busy.
   - task: CmdLine@2
     displayName: 'CMake build (Release)'
     inputs:
-      script: 'cmake --build build-release --config Release'
+      script: 'cmake --build build-release --config Release --parallel'
 
   # Stage the .exe files into the artifact directory.
   - task: CopyFiles@2
@@ -50,6 +53,33 @@ steps:
   # CRATES_IO token and is best done as a manual step with
   # `cargo publish` after reviewing the staged artifact. See
   # docs/PUBLISHING.md.
+
+  # Resolve cargo's real default registry path (do NOT relocate
+  # CARGO_HOME — that breaks the pre-installed rustup). This Windows-only
+  # job uses %USERPROFILE%.
+  - pwsh: Write-Host "##vso[task.setvariable variable=cargoRegistry]$env:USERPROFILE\.cargo\registry"
+    displayName: 'Resolve cargo registry path'
+
+  # Same registry cache key as the build job — its post-job save lands
+  # before this (tag-only) job starts, since `package` dependsOn `build`,
+  # so the crate downloads are already warm here. Cargo.lock is gitignored
+  # so the key hashes the tracked manifests instead. The verify build uses
+  # a dedicated target dir (rust/target/package), cached separately.
+  - task: Cache@2
+    displayName: 'Cache cargo registry'
+    inputs:
+      key: 'cargo | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        cargo | "$(Agent.OS)"
+      path: $(cargoRegistry)
+
+  - task: Cache@2
+    displayName: 'Cache cargo package target'
+    inputs:
+      key: 'target-package | "$(Agent.OS)" | rust/Cargo.toml | rust/osdp/Cargo.toml | tools/osdp-mcp/Cargo.toml'
+      restoreKeys: |
+        target-package | "$(Agent.OS)"
+      path: rust/target/package
 
   - task: CmdLine@2
     displayName: 'rustup update stable'

@@ -46,6 +46,10 @@ add_library(osdp_messages STATIC
     src/replies/reply_nak.c
     src/replies/reply_pdid.c
     src/replies/reply_pdcap.c
+    src/replies/reply_lstatr.c
+    src/replies/reply_istatr.c
+    src/replies/reply_ostatr.c
+    src/replies/reply_rstatr.c
     src/replies/reply_raw.c
     src/replies/reply_keypad.c
     src/replies/reply_com.c

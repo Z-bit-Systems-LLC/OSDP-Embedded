@@ -34,7 +34,14 @@ static size_t build_checksum_frame(uint8_t *buf, size_t cap,
     size_t written = 0;
     const osdp_status_t s = osdp_frame_build(&f, buf, cap, &written);
     TEST_ASSERT_EQUAL(OSDP_OK, s);
-    return written;
+    /* osdp_frame_build prepends the spec-5.7 marking byte(s) ahead of
+     * the SOM. These helpers hand back a SOM-aligned frame (the form
+     * the decode/inspect tests expect), so drop the marking and return
+     * the frame length. test_build_prepends_marking_byte covers that
+     * the marking is actually emitted. */
+    TEST_ASSERT_TRUE(written >= OSDP_FRAME_MARK_LEN);
+    (void)memmove(buf, buf + OSDP_FRAME_MARK_LEN, written - OSDP_FRAME_MARK_LEN);
+    return written - OSDP_FRAME_MARK_LEN;
 }
 
 static size_t build_crc_frame(uint8_t *buf, size_t cap,
@@ -53,7 +60,27 @@ static size_t build_crc_frame(uint8_t *buf, size_t cap,
     size_t written = 0;
     const osdp_status_t s = osdp_frame_build(&f, buf, cap, &written);
     TEST_ASSERT_EQUAL(OSDP_OK, s);
-    return written;
+    /* osdp_frame_build prepends the spec-5.7 marking byte(s) ahead of
+     * the SOM. These helpers hand back a SOM-aligned frame (the form
+     * the decode/inspect tests expect), so drop the marking and return
+     * the frame length. test_build_prepends_marking_byte covers that
+     * the marking is actually emitted. */
+    TEST_ASSERT_TRUE(written >= OSDP_FRAME_MARK_LEN);
+    (void)memmove(buf, buf + OSDP_FRAME_MARK_LEN, written - OSDP_FRAME_MARK_LEN);
+    return written - OSDP_FRAME_MARK_LEN;
+}
+
+/* Decode the SOM-aligned frame inside a freshly-built buffer, skipping
+ * the spec-5.7 marking byte(s) osdp_frame_build prepends ahead of the
+ * SOM. Use after a direct osdp_frame_build into `buf`. */
+static osdp_status_t decode_built(const uint8_t *buf, size_t n,
+                                  osdp_frame_t *out)
+{
+    if (n < OSDP_FRAME_MARK_LEN) {
+        return OSDP_ERR_TRUNCATED;
+    }
+    return osdp_frame_decode(buf + OSDP_FRAME_MARK_LEN,
+                             n - OSDP_FRAME_MARK_LEN, out);
 }
 
 /* ---- Decode happy-path tests ---------------------------------------------*/
@@ -192,8 +219,12 @@ static void test_decode_with_scb_data_round_trip(void)
     size_t n = 0;
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
 
+    /* Build prepends the spec-5.7 marking byte(s); decode expects
+     * SOM-aligned input, so skip past them. */
     osdp_frame_t got = {0};
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_TRUE(n >= OSDP_FRAME_MARK_LEN);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf + OSDP_FRAME_MARK_LEN,
+                                                 n - OSDP_FRAME_MARK_LEN, &got));
     TEST_ASSERT_EQUAL_HEX8(built.address, got.address);
     TEST_ASSERT_EQUAL_UINT8(built.sequence, got.sequence);
     TEST_ASSERT_EQUAL(OSDP_INTEGRITY_CRC, got.integrity);
@@ -228,8 +259,50 @@ static void test_decode_then_rebuild_produces_byte_identical_output(void)
     size_t n = 0;
     TEST_ASSERT_EQUAL(OSDP_OK,
                       osdp_frame_build(&f, rebuilt, sizeof(rebuilt), &n));
-    TEST_ASSERT_EQUAL_size_t(sizeof(original), n);
-    TEST_ASSERT_EQUAL_MEMORY(frame, rebuilt, n);
+    /* Rebuilt output carries the marking byte(s) ahead of the SOM; the
+     * frame proper (past the marking) must match the original bytes. */
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MARK_LEN + sizeof(original), n);
+    TEST_ASSERT_EQUAL_MEMORY(frame, rebuilt + OSDP_FRAME_MARK_LEN, sizeof(original));
+}
+
+/* ---- Marking-byte (spec 5.7) tests --------------------------------------*/
+
+static void test_build_prepends_marking_byte(void)
+{
+    /* osdp_frame_build must emit OSDP_FRAME_MARK_LEN 0xFF marking
+     * byte(s) ahead of the SOM (spec 5.7), excluded from the LEN field
+     * and the integrity check. */
+    osdp_frame_t f = {0};
+    f.address   = 0x10;
+    f.reply     = true;
+    f.sequence  = 1;
+    f.integrity = OSDP_INTEGRITY_CRC;
+    f.code      = 0x40;  /* osdp_ACK */
+
+    uint8_t buf[16];
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &n));
+
+    /* Leading byte(s) are the marking; the frame proper starts at SOM. */
+    for (size_t m = 0; m < OSDP_FRAME_MARK_LEN; m++) {
+        TEST_ASSERT_EQUAL_HEX8(OSDP_FRAME_MARK, buf[m]);
+    }
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SOM, buf[OSDP_FRAME_MARK_LEN]);
+
+    /* The LEN field (frame bytes 2..3, i.e. buf MARK_LEN+2..+3) counts
+     * only the frame, not the marking: 5 hdr + 1 code + 2 CRC = 8. */
+    const uint16_t len_field =
+        (uint16_t)((uint16_t)buf[OSDP_FRAME_MARK_LEN + 2] |
+                   ((uint16_t)buf[OSDP_FRAME_MARK_LEN + 3] << 8));
+    TEST_ASSERT_EQUAL_size_t(8, len_field);
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MARK_LEN + 8, n);
+
+    /* The SOM-aligned frame must decode cleanly. */
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf + OSDP_FRAME_MARK_LEN,
+                                                 n - OSDP_FRAME_MARK_LEN, &got));
+    TEST_ASSERT_EQUAL_HEX8(0x40, got.code);
+    TEST_ASSERT_TRUE(got.reply);
 }
 
 /* ---- Decode error-path tests --------------------------------------------*/
@@ -361,7 +434,9 @@ static void test_build_rejects_buffer_too_small(void)
     f.integrity = OSDP_INTEGRITY_CHECKSUM;
     f.code = 0x60;
 
-    uint8_t buf[6];   /* 1 byte short of minimum */
+    /* Min checksum frame is 7 bytes; with the marking byte the builder
+     * needs 8. 6 is short either way. */
+    uint8_t buf[6];
     size_t n = 0;
     TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
                       osdp_frame_build(&f, buf, sizeof(buf), &n));
@@ -407,6 +482,45 @@ static void test_build_rejects_inconsistent_scb(void)
                       osdp_frame_build(&f, buf, sizeof(buf), &n));
 }
 
+/* Regression: the checksum must cover the frame body only, never the
+ * (stale) integrity slot itself. The original builder folded the slot
+ * into the sum via an unsequenced `buf[off++] = osdp_checksum(buf, off)`,
+ * which on some toolchains checksummed `off + 1` bytes — producing a
+ * wrong, buffer-history-dependent value (the a5/99 ping-pong seen on the
+ * wire). Pre-poison the whole buffer, including the slot, so any such
+ * regression yields a checksum that disagrees with a clean recompute. */
+static void test_build_checksum_excludes_stale_integrity_slot(void)
+{
+    static const uint8_t payload[3] = { 0xAA, 0xBB, 0xCC };
+
+    osdp_frame_t f = {0};
+    f.address     = 0x00;
+    f.reply       = true;
+    f.integrity   = OSDP_INTEGRITY_CHECKSUM;
+    f.code        = 0x46;     /* osdp_PDCAP */
+    f.payload     = payload;
+    f.payload_len = sizeof(payload);
+
+    uint8_t buf[32];
+    (void)memset(buf, 0x99, sizeof(buf));  /* poison incl. the slot */
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &n));
+
+    /* Emitted checksum must equal a clean checksum over the frame body
+     * only — i.e. excluding both the marking byte(s) ahead of the SOM
+     * and the trailing checksum slot itself. */
+    const uint8_t *frame = buf + OSDP_FRAME_MARK_LEN;
+    const size_t frame_len = n - OSDP_FRAME_MARK_LEN;
+    TEST_ASSERT_EQUAL_HEX8(osdp_checksum(frame, frame_len - 1),
+                           frame[frame_len - 1]);
+
+    /* And the frame must round-trip through the decoder. */
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_built(buf, n, &got));
+    TEST_ASSERT_EQUAL_size_t(sizeof(payload), got.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(payload, got.payload, sizeof(payload));
+}
+
 /* ---- SCS_15..18 MAC handling -------------------------------------------*/
 
 static void test_decode_splits_mac_for_scs_15_frame(void)
@@ -436,7 +550,7 @@ static void test_decode_splits_mac_for_scs_15_frame(void)
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
 
     osdp_frame_t got = {0};
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_built(buf, n, &got));
     TEST_ASSERT_TRUE(got.has_scb);
     TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_15, got.scb_type);
     TEST_ASSERT_EQUAL_size_t(sizeof(inner_payload), got.payload_len);
@@ -468,7 +582,7 @@ static void test_decode_handles_scs_15_with_zero_inner_payload(void)
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
 
     osdp_frame_t got = {0};
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_decode(buf, n, &got));
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_built(buf, n, &got));
     TEST_ASSERT_EQUAL_size_t(0, got.payload_len);
     TEST_ASSERT_NULL(got.payload);
     TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN, got.mac_len);
@@ -602,9 +716,11 @@ static void test_build_decode_build_is_symmetric(void)
 
                     osdp_frame_t got = {0};
                     TEST_ASSERT_EQUAL(OSDP_OK,
-                                      osdp_frame_decode(buf1, n1, &got));
+                                      decode_built(buf1, n1, &got));
                     TEST_ASSERT_EQUAL(OSDP_OK,
                                       osdp_frame_build(&got, buf2, sizeof(buf2), &n2));
+                    /* Both builds emit the same marking prefix, so the
+                     * full buffers (marking + frame) stay byte-identical. */
                     TEST_ASSERT_EQUAL_size_t(n1, n2);
                     TEST_ASSERT_EQUAL_MEMORY(buf1, buf2, n1);
                 }
@@ -641,6 +757,9 @@ int main(void)
     RUN_TEST(test_build_rejects_address_out_of_range);
     RUN_TEST(test_build_rejects_sequence_out_of_range);
     RUN_TEST(test_build_rejects_inconsistent_scb);
+    RUN_TEST(test_build_checksum_excludes_stale_integrity_slot);
+    /* Spec 5.7 marking byte. */
+    RUN_TEST(test_build_prepends_marking_byte);
     /* SCS MAC handling. */
     RUN_TEST(test_decode_splits_mac_for_scs_15_frame);
     RUN_TEST(test_decode_handles_scs_15_with_zero_inner_payload);

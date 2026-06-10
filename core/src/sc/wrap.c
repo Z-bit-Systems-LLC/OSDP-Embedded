@@ -100,35 +100,45 @@ osdp_status_t osdp_sc_wrap_frame(
         return s;
     }
 
+    /* osdp_frame_build prepends the spec-5.7 marking byte(s) ahead of
+     * the SOM. The MAC and CRC cover only the frame (SOM..integrity) —
+     * the marking is not part of the OSDP message — so work relative
+     * to the SOM, exactly like the unwrap/decode side, which operates
+     * on frame->raw (a SOM-based slice). out_len still carries the
+     * full buffer (marking + frame) for transmission. */
+    uint8_t *const frame   = out_buf + OSDP_FRAME_MARK_LEN;
+    const size_t   frame_len = built_len - OSDP_FRAME_MARK_LEN;
+
     const size_t integrity_size =
         (built.integrity == OSDP_INTEGRITY_CRC) ? 2u : 1u;
     const size_t mac_offset =
-        built_len - integrity_size - OSDP_FRAME_MAC_LEN;
-    const size_t crc_offset = built_len - integrity_size;
+        frame_len - integrity_size - OSDP_FRAME_MAC_LEN;
+    const size_t crc_offset = frame_len - integrity_size;
 
     /* Compute the real MAC over [SOM .. last data byte). Spec D.5
      * specifies that the MAC range covers the entire message except
-     * the trailing MAC and CRC bytes. */
+     * the trailing MAC and CRC bytes (and excludes the marking byte,
+     * which is not part of the message). */
     uint8_t mac_full[OSDP_SC_MAC_LEN];
     s = osdp_sc_compute_mac(crypto,
                             session->keys.s_mac1,
                             session->keys.s_mac2,
                             session->last_inbound_mac,
-                            out_buf, mac_offset, mac_full);
+                            frame, mac_offset, mac_full);
     if (s != OSDP_OK) {
         return s;
     }
 
     /* Patch in the truncated MAC (first 4 bytes). */
-    (void)memcpy(&out_buf[mac_offset], mac_full, OSDP_FRAME_MAC_LEN);
+    (void)memcpy(&frame[mac_offset], mac_full, OSDP_FRAME_MAC_LEN);
 
     /* Recompute integrity now that the MAC is real. */
     if (built.integrity == OSDP_INTEGRITY_CRC) {
-        const uint16_t crc = osdp_crc16(out_buf, crc_offset);
-        out_buf[crc_offset]     = (uint8_t)(crc & 0xFFu);
-        out_buf[crc_offset + 1] = (uint8_t)((crc >> 8) & 0xFFu);
+        const uint16_t crc = osdp_crc16(frame, crc_offset);
+        frame[crc_offset]     = (uint8_t)(crc & 0xFFu);
+        frame[crc_offset + 1] = (uint8_t)((crc >> 8) & 0xFFu);
     } else {
-        out_buf[crc_offset] = osdp_checksum(out_buf, crc_offset);
+        frame[crc_offset] = osdp_checksum(frame, crc_offset);
     }
 
     /* Advance the rolling MAC chain. Outbound C-MAC (or R-MAC) is now

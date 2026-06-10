@@ -131,10 +131,14 @@ static void decode_next_outgoing(mock_transport_t *m, osdp_frame_t *out,
                                  size_t *consumed_out)
 {
     TEST_ASSERT_GREATER_OR_EQUAL(OSDP_FRAME_MIN_LEN_CKSUM, m->outgoing_len);
+    /* The builder prepends spec-5.7 marking byte(s) ahead of the SOM;
+     * decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-        osdp_frame_decode(m->outgoing, m->outgoing_len, out));
+        osdp_frame_decode(m->outgoing + OSDP_FRAME_MARK_LEN,
+                          m->outgoing_len - OSDP_FRAME_MARK_LEN, out));
     if (consumed_out) {
-        *consumed_out = out->raw_len;
+        /* Bytes this frame occupied on the wire, marking included. */
+        *consumed_out = OSDP_FRAME_MARK_LEN + out->raw_len;
     }
 }
 
@@ -851,7 +855,9 @@ static void test_mac_failure_terminates_session_and_fires_event(void)
     const size_t crc_off = built - 2;
     const size_t mac_off = crc_off - OSDP_FRAME_MAC_LEN;
     buf[mac_off] ^= 0x10;
-    const uint16_t crc = osdp_crc16(buf, crc_off);
+    /* Recompute CRC over the frame only (skip the marking byte(s)). */
+    const uint16_t crc = osdp_crc16(buf + OSDP_FRAME_MARK_LEN,
+                                    crc_off - OSDP_FRAME_MARK_LEN);
     buf[crc_off]     = (uint8_t)(crc & 0xFFu);
     buf[crc_off + 1] = (uint8_t)((crc >> 8) & 0xFFu);
 
@@ -945,7 +951,9 @@ static void test_send_command_after_session_loss_uses_plaintext(void)
     const size_t crc_off = bad_len - 2;
     const size_t mac_off = crc_off - OSDP_FRAME_MAC_LEN;
     bad_buf[mac_off] ^= 0x10;
-    const uint16_t crc = osdp_crc16(bad_buf, crc_off);
+    /* Recompute CRC over the frame only (skip the marking byte(s)). */
+    const uint16_t crc = osdp_crc16(bad_buf + OSDP_FRAME_MARK_LEN,
+                                    crc_off - OSDP_FRAME_MARK_LEN);
     bad_buf[crc_off]     = (uint8_t)(crc & 0xFFu);
     bad_buf[crc_off + 1] = (uint8_t)((crc >> 8) & 0xFFu);
     mock_reset_incoming(&m);

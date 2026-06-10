@@ -9,13 +9,6 @@
 
 #include <string.h>
 
-/* Forward decls of helpers defined in pd.c. We keep build_reply /
- * build_nak there since they're shared with the non-SC path. */
-extern osdp_status_t pd_build_nak(osdp_pd_t          *pd,
-                                  const osdp_frame_t *cmd,
-                                  uint8_t             error_code,
-                                  size_t             *out_len);
-
 /* ---- Helpers ---------------------------------------------------------- */
 
 bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd)
@@ -79,33 +72,33 @@ static size_t handle_chlng(osdp_pd_t *pd, const osdp_frame_t *cmd)
     /* Frame validity. CHLNG always has command code osdp_CHLNG (0x76). */
     if (cmd->code != OSDP_CMD_CHLNG) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &n);
         return n;
     }
     /* Payload must be exactly the 8-byte RND.A. */
     if (cmd->payload_len != OSDP_SC_RND_LEN) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
         return n;
     }
     /* SCB data must carry the 1-byte key selector. */
     if (cmd->scb_data_len < 1U || cmd->scb_data == NULL) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
     const uint8_t selector = cmd->scb_data[0];
     const uint8_t *key = select_handshake_key(pd, selector);
     if (key == NULL) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
 
     /* Generate RND.B. We need a working RNG callback. */
     if (pd->sc.crypto.rand_bytes == NULL) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
     osdp_status_t s = pd->sc.crypto.rand_bytes(
@@ -161,23 +154,23 @@ static size_t handle_scrypt(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
     if (cmd->code != OSDP_CMD_SCRYPT) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &n);
         return n;
     }
     if (cmd->payload_len != OSDP_SC_CRYPTOGRAM_LEN) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
         return n;
     }
     if (!pd->sc.got_chlng) {
         /* SCRYPT without prior CHLNG is a protocol violation. */
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
     if (cmd->scb_data_len < 1U || cmd->scb_data == NULL) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
 
@@ -247,7 +240,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
     if (!pd->sc.session.established) {
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
 
@@ -359,7 +352,7 @@ size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
          * (SCS_12/14/16/18 are reply-direction; anything else is
          * out-of-spec). NAK with unsupported-SCB. */
         size_t n = 0;
-        (void)pd_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
+        (void)osdp_pd_internal_build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n);
         return n;
     }
     }

@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(osdp-embedded
-    VERSION 0.1.2
+    VERSION 0.1.16
     DESCRIPTION "Portable C11 SIA OSDP v2.2.2 implementation"
     LANGUAGES C
 )
@@ -21,6 +21,15 @@ option(OSDP_SANITIZE    "Build with AddressSanitizer (and UBSan on GCC/Clang)" O
 # --gc-sections to drop any unused per-message codecs.
 if(MSVC)
     add_compile_options(/W4 /permissive-)
+    # /MP compiles the translation units within a single target in
+    # parallel. CMake does not add it by default, so on the MSBuild
+    # (Visual Studio) generator every .c file in a static lib compiles
+    # serially. The codec libraries have ~30 small TUs each, so this is
+    # the dominant cost of the CI Windows build. `cmake --build
+    # --parallel` only parallelises *across* targets; /MP parallelises
+    # *within* one. We want both. (No effect under Ninja, which already
+    # schedules every compile concurrently.)
+    add_compile_options(/MP)
     # MSVC equivalent of function/data sections is on by default for /O*; nothing to add.
 else()
     add_compile_options(

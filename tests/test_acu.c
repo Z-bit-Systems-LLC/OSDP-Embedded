@@ -147,8 +147,12 @@ static void wire_callbacks(osdp_acu_t *acu, acu_test_ctx_t *ctx)
 static void decode_outgoing(const mock_transport_t *m, osdp_frame_t *out)
 {
     TEST_ASSERT_GREATER_OR_EQUAL(OSDP_FRAME_MIN_LEN_CKSUM, m->outgoing_len);
+    /* The builder prepends spec-5.7 marking byte(s) ahead of the SOM;
+     * decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_frame_decode(m->outgoing, m->outgoing_len, out));
+                      osdp_frame_decode(m->outgoing + OSDP_FRAME_MARK_LEN,
+                                        m->outgoing_len - OSDP_FRAME_MARK_LEN,
+                                        out));
 }
 
 /* ---- Tests --------------------------------------------------------------*/
@@ -436,10 +440,13 @@ static void test_timeout_then_retry_reuses_same_sqn(void)
                       osdp_acu_send_command(&acu, 0x10, OSDP_CMD_POLL,
                                             NULL, 0));
     osdp_frame_t cmd;
+    /* The retry frame starts at prev_outgoing with the spec-5.7 marking
+     * byte(s) ahead of its SOM; decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_frame_decode(&m.outgoing[prev_outgoing],
-                                        m.outgoing_len - prev_outgoing,
-                                        &cmd));
+                      osdp_frame_decode(
+                          &m.outgoing[prev_outgoing + OSDP_FRAME_MARK_LEN],
+                          m.outgoing_len - prev_outgoing - OSDP_FRAME_MARK_LEN,
+                          &cmd));
     TEST_ASSERT_EQUAL_UINT8(0, cmd.sequence);
 }
 

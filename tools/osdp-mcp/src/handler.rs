@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use osdp_embedded::messages::{
     Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_COMSET, OSDP_CMD_ID,
-    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
-    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
+    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{CommandHandler, Reply};
 
@@ -46,8 +46,8 @@ pub struct PdStats {
 
 /// Default PDID — matches the osdp-pd-mock CLI tool so behavior is
 /// consistent across the two interop harnesses. Vendor "ZBC" is a
-/// placeholder; consumers should override via a future pd_set_pdid
-/// tool once they want a realistic device identity.
+/// placeholder; consumers override it at runtime via the `pd_set_pdid`
+/// tool when they want a realistic device identity.
 pub fn default_pdid() -> Pdid {
     Pdid {
         vendor_code: [b'Z', b'B', b'C'],
@@ -60,47 +60,80 @@ pub fn default_pdid() -> Pdid {
     }
 }
 
-/// Default PDCAP — same minimal set as osdp-pd-mock: one contact
-/// monitor / output / card-data-format / reader-LED / buzzer / text
-/// output, plus four "CRC support" objects on function code 9.
+/// Default PDCAP, mirroring OSDP.Net's PDConsole reference PD
+/// (src/PDConsole/appsettings.json) so an ACU that interoperates with
+/// PDConsole treats this PD identically. Kept in lockstep with
+/// osdp-pd-mock's `kDefaultPdcap`. Function codes follow spec Annex B.
+///
+/// Function code 9 (Communication Security) is what gates Secure
+/// Channel: per spec B.10 BOTH bytes are "Bit 0 = AES128 support", so
+/// the key-exchange (num_objects) byte must be 0x01. The previous value
+/// 0x04 left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
+/// spec-conformant ACU never initiated a handshake and the link stayed
+/// clear-text.
 pub fn default_pdcap() -> Pdcap {
     Pdcap {
         records: vec![
             PdcapRecord {
                 function_code: 1,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // contact monitor
+            }, // ContactStatusMonitoring
             PdcapRecord {
                 function_code: 2,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // output control
+            }, // OutputControl
             PdcapRecord {
                 function_code: 3,
                 compliance_level: 1,
-                num_objects: 1,
-            }, // card data fmt
+                num_objects: 0,
+            }, // CardDataFormat (num must be 0x00 per spec B.4)
             PdcapRecord {
                 function_code: 4,
-                compliance_level: 1,
+                compliance_level: 4,
                 num_objects: 1,
-            }, // reader LED ctrl
+            }, // ReaderLEDControl
             PdcapRecord {
                 function_code: 5,
-                compliance_level: 1,
+                compliance_level: 2,
                 num_objects: 1,
-            }, // audible
+            }, // ReaderAudibleOutput
             PdcapRecord {
                 function_code: 6,
                 compliance_level: 1,
                 num_objects: 1,
-            }, // text output
+            }, // ReaderTextOutput
+            PdcapRecord {
+                function_code: 8,
+                compliance_level: 1,
+                num_objects: 0,
+            }, // CheckCharacterSupport (num must be 0x00 per spec B.9)
             PdcapRecord {
                 function_code: 9,
                 compliance_level: 1,
-                num_objects: 4,
-            }, // CRC support
+                num_objects: 1,
+            }, // CommunicationSecurity (AES128)
+            PdcapRecord {
+                function_code: 12,
+                compliance_level: 0,
+                num_objects: 0,
+            }, // SmartCardSupport
+            PdcapRecord {
+                function_code: 13,
+                compliance_level: 0,
+                num_objects: 1,
+            }, // Readers
+            PdcapRecord {
+                function_code: 16,
+                compliance_level: 2,
+                num_objects: 0,
+            }, // OSDPVersion
+            PdcapRecord {
+                function_code: 17,
+                compliance_level: 1,
+                num_objects: 0,
+            }, // SecurePDBiometricsMatchSupport (spec B.18)
         ],
     }
 }
@@ -110,12 +143,30 @@ pub fn default_pdcap() -> Pdcap {
 /// `drop_next_n_replies` can write it while the handler decrements.
 pub type DropCounter = Arc<AtomicU32>;
 
-/// Application handler. Owns the PDID/PDCAP it reports and a scratch
-/// buffer the build helpers serialize into; the `Reply.payload` slice
-/// the PD copies out borrows from this buffer.
+/// The PD identity reported in the `osdp_PDID` (0x45) reply. Shared
+/// (`Arc<Mutex<_>>`) so the `pd_get_pdid` / `pd_set_pdid` tools on the
+/// async side can read and mutate it while the handler — pinned to the
+/// PD actor thread — serves the reply from the current value. Created
+/// once per process in `PdHandle::spawn`, so edits persist across
+/// `pd_stop` / `pd_configure` like the override and event state do.
+pub type SharedPdid = Arc<Mutex<Pdid>>;
+
+/// The capability set reported in the `osdp_PDCAP` (0x46) reply. Shared
+/// (`Arc<Mutex<_>>`) so the `pd_get_pdcap` / `pd_set_capability` /
+/// `pd_reset_pdcap` tools on the async side can read and mutate it while
+/// the handler — pinned to the PD actor thread — serves the reply from
+/// the current value. Created once per process in `PdHandle::spawn`, so
+/// edits persist across `pd_stop` / `pd_configure` like the PDID and
+/// override state do.
+pub type SharedPdcap = Arc<Mutex<Pdcap>>;
+
+/// Application handler. Reports its PDID and PDCAP from shared handles
+/// (so the `pd_set_*` tools can edit them live) and serialises replies
+/// into a scratch buffer; the `Reply.payload` slice the PD copies out
+/// borrows from that buffer.
 pub struct DefaultHandler {
-    pub pdid: Pdid,
-    pub pdcap: Pdcap,
+    pub pdid: SharedPdid,
+    pub pdcap: SharedPdcap,
     scratch: [u8; SCRATCH_LEN],
     stats: Arc<Mutex<PdStats>>,
     log: Arc<LogInner>,
@@ -127,6 +178,8 @@ pub struct DefaultHandler {
 }
 
 impl DefaultHandler {
+    /// Build a handler with a private, default PDID. Convenient for
+    /// tests that don't need to share identity with the async side.
     pub fn new(
         stats: Arc<Mutex<PdStats>>,
         log: Arc<LogInner>,
@@ -135,9 +188,36 @@ impl DefaultHandler {
         drop_remaining: DropCounter,
         pd_address: u8,
     ) -> Self {
+        Self::with_pdid(
+            Arc::new(Mutex::new(default_pdid())),
+            Arc::new(Mutex::new(default_pdcap())),
+            stats,
+            log,
+            overrides,
+            events,
+            drop_remaining,
+            pd_address,
+        )
+    }
+
+    /// Build a handler that serves its `osdp_PDID` and `osdp_PDCAP`
+    /// replies from the given shared handles, so the `pd_set_pdid` /
+    /// `pd_set_capability` tools can mutate the reported identity and
+    /// capabilities live.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_pdid(
+        pdid: SharedPdid,
+        pdcap: SharedPdcap,
+        stats: Arc<Mutex<PdStats>>,
+        log: Arc<LogInner>,
+        overrides: OverrideMap,
+        events: EventQueue,
+        drop_remaining: DropCounter,
+        pd_address: u8,
+    ) -> Self {
         Self {
-            pdid: default_pdid(),
-            pdcap: default_pdcap(),
+            pdid,
+            pdcap,
             scratch: [0; SCRATCH_LEN],
             stats,
             log,
@@ -243,15 +323,42 @@ impl CommandHandler for DefaultHandler {
         let (reply_code, payload_len) = match cmd_code {
             OSDP_CMD_POLL => (OSDP_REPLY_ACK, 0),
             OSDP_CMD_ID => {
-                let n = self.pdid.build(&mut self.scratch)?;
+                // Snapshot the shared PDID (a poisoned lock falls back
+                // to the default identity rather than failing the reply).
+                let pdid = self
+                    .pdid
+                    .lock()
+                    .map(|g| *g)
+                    .unwrap_or_else(|_| default_pdid());
+                let n = pdid.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDID, n)
             }
             OSDP_CMD_CAP => {
-                let n = self.pdcap.build(&mut self.scratch)?;
+                // Snapshot the shared PDCAP (a poisoned lock falls back
+                // to the default capability set rather than failing the
+                // reply).
+                let pdcap = self
+                    .pdcap
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| default_pdcap());
+                let n = pdcap.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDCAP, n)
             }
             OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET
             | OSDP_CMD_COMSET => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_LSTAT => {
+                // Local status query. Hard-coded "all clear" for now:
+                // tamper=0, power=0 (spec D.2.1 LSTATR payload is two
+                // bytes). TODO: the library has no way for a consumer
+                // to supply real tamper/power state in response to an
+                // LSTAT *command* — only via the inject_local_status
+                // POLL event. A future API should let the application
+                // own this reply rather than us synthesising a constant.
+                self.scratch[0] = 0; // tamper: not tampered
+                self.scratch[1] = 0; // power: OK
+                (OSDP_REPLY_LSTATR, 2)
+            }
             _ => {
                 // Library will synthesise NAK 0x03; record it now
                 // since we won't get a hook on the outbound path.

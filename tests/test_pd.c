@@ -105,8 +105,12 @@ static void decode_first_outgoing(const mock_transport_t *m,
 {
     TEST_ASSERT_GREATER_OR_EQUAL(OSDP_FRAME_MIN_LEN_CKSUM,
                                  m->outgoing_len);
+    /* The builder prepends spec-5.7 marking byte(s) ahead of the SOM;
+     * decode the SOM-aligned frame. */
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_frame_decode(m->outgoing, m->outgoing_len, out));
+                      osdp_frame_decode(m->outgoing + OSDP_FRAME_MARK_LEN,
+                                        m->outgoing_len - OSDP_FRAME_MARK_LEN,
+                                        out));
 }
 
 /* ---- Application handlers ----------------------------------------------*/

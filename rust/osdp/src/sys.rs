@@ -99,6 +99,11 @@ pub const OSDP_FRAME_HEADER_LEN: usize = 5;
 pub const OSDP_FRAME_MIN_LEN_CKSUM: usize = 7;
 pub const OSDP_FRAME_MIN_LEN_CRC: usize = 8;
 pub const OSDP_FRAME_MAX_LEN: usize = 1440;
+/// Spec 5.7 marking byte (0xFF) and how many `osdp_frame_build`
+/// prepends ahead of the SOM. Excluded from the LEN field and
+/// integrity; stripped on receive by the stream decoder.
+pub const OSDP_FRAME_MARK: u8 = 0xFF;
+pub const OSDP_FRAME_MARK_LEN: usize = 1;
 
 pub const OSDP_SCB_MIN_LEN: u8 = 2;
 

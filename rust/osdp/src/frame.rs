@@ -24,6 +24,11 @@ pub const FRAME_MAX_LEN: usize = sys::OSDP_FRAME_MAX_LEN;
 pub const FRAME_MIN_LEN_CRC: usize = sys::OSDP_FRAME_MIN_LEN_CRC;
 /// Smallest valid checksum-mode frame.
 pub const FRAME_MIN_LEN_CKSUM: usize = sys::OSDP_FRAME_MIN_LEN_CKSUM;
+/// Number of spec-5.7 marking bytes (`0xFF`) [`build`] prepends ahead
+/// of the SOM. The returned byte count includes them; they're excluded
+/// from the LEN field and integrity, and [`decode`] expects its input
+/// to start at the SOM (i.e. past these bytes).
+pub const FRAME_MARK_LEN: usize = sys::OSDP_FRAME_MARK_LEN;
 
 /// Whether a frame uses the 16-bit CRC or the legacy 8-bit checksum.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -232,9 +237,15 @@ mod tests {
         };
         let mut buf = [0u8; FRAME_MAX_LEN];
         let n = build(&build_in, &mut buf).unwrap();
-        assert!(n >= FRAME_MIN_LEN_CRC);
+        assert!(n >= FRAME_MARK_LEN + FRAME_MIN_LEN_CRC);
 
-        let frame = decode(&buf[..n]).unwrap();
+        // build() prepends the spec-5.7 marking byte(s) ahead of the
+        // SOM; decode() expects SOM-aligned input, so skip them.
+        assert!(buf[..FRAME_MARK_LEN]
+            .iter()
+            .all(|&b| b == sys::OSDP_FRAME_MARK));
+        assert_eq!(buf[FRAME_MARK_LEN], sys::OSDP_SOM);
+        let frame = decode(&buf[FRAME_MARK_LEN..n]).unwrap();
         assert_eq!(frame.address, 0x10);
         assert_eq!(frame.sequence, 1);
         assert_eq!(frame.code, sys::OSDP_CMD_POLL);

@@ -99,9 +99,14 @@ static void test_capture_file_can_be_consumed(void)
                     osdp_frame_build(&fr, rebuilt, sizeof(rebuilt), &built);
                 TEST_ASSERT_EQUAL_MESSAGE(OSDP_OK, br,
                     "frame_build refused a frame the decoder accepted");
-                TEST_ASSERT_EQUAL_size_t_MESSAGE(fr.raw_len, built,
+                /* osdp_frame_build prepends the spec-5.7 marking byte(s)
+                 * ahead of the SOM; the frame proper (past the marking)
+                 * must match the original wire frame byte-for-byte. */
+                TEST_ASSERT_EQUAL_size_t_MESSAGE(
+                    OSDP_FRAME_MARK_LEN + fr.raw_len, built,
                     "rebuilt frame length differs from wire frame");
-                TEST_ASSERT_EQUAL_MEMORY_MESSAGE(fr.raw, rebuilt, built,
+                TEST_ASSERT_EQUAL_MEMORY_MESSAGE(
+                    fr.raw, rebuilt + OSDP_FRAME_MARK_LEN, fr.raw_len,
                     "rebuilt frame bytes differ from wire frame");
                 roundtrip_ok++;
             } else if (r == OSDP_ERR_TRUNCATED) {

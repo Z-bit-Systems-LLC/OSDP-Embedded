@@ -85,13 +85,13 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
     return OSDP_OK;
 }
 
-/* Exposed under a stable name so the SC handlers (in pd_sc.c) can
- * build NAKs without duplicating the helper. Same signature as the
- * static `build_nak` above. */
-osdp_status_t pd_build_nak(osdp_pd_t          *pd,
-                           const osdp_frame_t *cmd,
-                           uint8_t             error_code,
-                           size_t             *out_len)
+/* Exposed under a stable name (declared in pd_internal.h) so the SC
+ * handlers in pd_sc.c can build NAKs without duplicating the helper.
+ * Same signature as the static `build_nak` above. */
+osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
+                                         const osdp_frame_t *cmd,
+                                         uint8_t             error_code,
+                                         size_t             *out_len)
 {
     return build_nak(pd, cmd, error_code, out_len);
 }
@@ -141,6 +141,19 @@ static void check_offline_timeout(osdp_pd_t *pd)
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
+    /* OSDP.Net parity (commit 02e478476): a CLEAR-TEXT command at
+     * sequence 0 means the ACU is (re)starting the connection, so any
+     * established Secure Channel session is stale and must be dropped.
+     * The ACU then re-discovers the PD (osdp_CAP / osdp_ID answered in
+     * the clear) and drives a fresh handshake — e.g. after osdp_KEYSET —
+     * rather than the PD tearing down the session off the back of the
+     * KEYSET itself. A *secure* (SCB-bearing) frame at sequence 0 is part
+     * of an in-progress handshake and must NOT reset anything. */
+    if (!cmd->has_scb && cmd->sequence == 0 && pd->sc.session.established) {
+        osdp_sc_session_init(&pd->sc.session);
+        pd->sc.got_chlng = false;
+    }
+
     /* Secure Channel: dispatch to the SC handler if the application
      * has supplied enough configuration; otherwise fall back to the
      * historical "NAK 0x05" behaviour. */

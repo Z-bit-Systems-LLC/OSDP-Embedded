@@ -5,6 +5,12 @@
  * tools/osdp-pd-mock/serial_posix.c — see that file for rationale on
  * O_NONBLOCK reads and the cfmakeraw/cfsetispeed configuration. */
 
+/* Built with strict -std=c11, so glibc hides BSD/POSIX symbols
+ * (cfmakeraw, CRTSCTS, clock_gettime/CLOCK_MONOTONIC, nanosleep) by
+ * default. _DEFAULT_SOURCE re-exposes them; it must be defined before
+ * any system header is included. */
+#define _DEFAULT_SOURCE 1
+
 #include "serial.h"
 
 #include <errno.h>

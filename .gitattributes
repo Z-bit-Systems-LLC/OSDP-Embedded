@@ -1,3 +1,7 @@
 # Git hooks are executed via /bin/sh; CRLF endings break the shebang on
 # POSIX checkouts, so keep them LF regardless of the committer's platform.
 scripts/hooks/* text eol=lf
+
+# Shell scripts (e.g. the Linux agent provisioning script) run on POSIX
+# hosts; CRLF would break their shebang too. Force LF everywhere.
+*.sh text eol=lf

@@ -5,13 +5,36 @@
 #
 # Layout matches Z-bit Systems' Azure DevOps CI guide
 # (https://github.com/Z-bit-Systems-LLC/Guidelines/blob/main/docs/azure-devops-ci-guide.md):
-# this file is the entry point that defines triggers and orchestrates
-# the two jobs; the steps themselves live in build.yml and package.yml
-# templates next to this file.
+# this file is the entry point that defines triggers and orchestrates the
+# jobs; the steps themselves live in the build-c.yml / build-rust.yml /
+# cross-pi.yml / package.yml templates next to this file.
 #
-# Trunk-based: every push to `main` runs `build`. Tagging a commit
-# `v*` (e.g. `v0.1.0` or `v0.1.0-alpha.2`) additionally runs
-# `package` to produce release artifacts.
+# Trunk-based: every push to `main` (and every PR) runs the three build
+# jobs. Tagging a commit `v*` (e.g. `v0.1.0` or `v0.1.0-alpha.2`)
+# additionally runs `package` to produce release artifacts.
+#
+# Parallelism / cost model. Azure DevOps bills *parallel jobs*, not agents,
+# so concurrency is capped by the parallel-job grants, not by how many
+# agents are installed. The job→slot mapping below is tuned to run three
+# build jobs concurrently for the cost of one paid self-hosted parallel job
+# (~$15/mo) on top of the two free grants:
+#
+#   build_c      -> Microsoft-hosted ubuntu-latest  (free hosted grant)
+#   build_rust   -> self-hosted Default (Linux)      (free self-hosted grant)
+#   cross_arm64  -> self-hosted Default (Linux)      (paid self-hosted slot)
+#
+# Putting build_c on the hosted slot is what keeps it at one paid slot: all
+# three self-hosted would need two paid slots (~$30/mo). PREREQS for true
+# 3-wide concurrency: (1) buy a 2nd self-hosted parallel job in Azure
+# billing, and (2) stand up a 2nd LXC agent in Default provisioned with
+# scripts/provision-linux-agent.sh. Until both exist, build_rust and
+# cross_arm64 simply serialize on the single self-hosted slot — still
+# correct, just not concurrent.
+#
+# Per-push test EXECUTION now runs on Linux only (build_c + build_rust).
+# Windows is no longer tested on every push; its tools are still compiled
+# at release time by package.yml (tag-only). cross_arm64 is build-only (an
+# x64 agent can't run ARM binaries).
 
 trigger:
   branches:
@@ -28,17 +51,19 @@ pr:
       - main
 
 pool:
-  vmImage: 'windows-latest'
+  vmImage: 'ubuntu-latest'
 
 variables:
   buildConfiguration: 'Release'
 
 jobs:
-  # Build + test, runs on every push and PR.
-  - job: build
-    displayName: 'Build & Test'
+  # C library + tools (CMake/ctest), runs on every push and PR. Native
+  # x86_64 Linux build *and* test execution on the free Microsoft-hosted
+  # slot.
+  - job: build_c
+    displayName: 'Build & Test (C / Linux)'
     pool:
-      vmImage: 'windows-latest'
+      vmImage: 'ubuntu-latest'
     steps:
       - checkout: self
         # The repo currently has no submodules. Keeping
@@ -47,17 +72,83 @@ jobs:
         # shared library this way we won't have to remember to flip
         # it on.
         submodules: true
-      - template: build.yml
+      - template: build-c.yml
+
+  # Rust workspace (fmt/clippy/build/nextest/doc/examples), runs on every
+  # push and PR. Native x86_64 Linux build + test execution on a self-hosted
+  # agent. The aarch64Toolchain demand doubles as a "fully provisioned by
+  # provision-linux-agent.sh" marker — those agents also carry rustup stable
+  # + clippy/rustfmt + cargo-nextest, which this job needs.
+  - job: build_rust
+    displayName: 'Build & Test (Rust / Linux)'
+    variables:
+      # CI compile-time tuning (see ci/build-rust.yml header). The Rust
+      # workspace builds in the dev/test profile — no release optimisation
+      # of the large osdp-mcp dependency tree (tokio/axum/rmcp/schemars),
+      # which dominated this job. Debuginfo off and incremental disabled:
+      # faster clean compiles and a smaller rust/target cache (quicker
+      # Azure cache up/download). Panic file:line is embedded by the panic
+      # macros, so test failures still point at the right line. Release
+      # compilation of the shipping osdp-mcp binary stays covered by the
+      # aarch64 cross_arm64 job, and the C Release path by build_c.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    pool:
+      name: 'Default'
+      demands:
+        - Agent.OS -equals Linux
+        - aarch64Toolchain
+    steps:
+      - checkout: self
+        submodules: true
+      - template: build-rust.yml
+
+  # Cross-compile gate for 64-bit Raspberry Pi (aarch64). Build-only —
+  # the x64 agent can't run ARM binaries (see ci/cross-pi.yml). Runs on
+  # every push and PR.
+  #
+  # Runs on the self-hosted Proxmox LXC agent in the `Default` pool. That
+  # puts this Linux job on a *self-hosted* parallel slot so it runs
+  # concurrently with the Microsoft-hosted Windows `build` job, instead of
+  # both queuing on the single free hosted slot.
+  #
+  # The agent image must provide the full toolchain — the pipeline does NO
+  # runtime apt/sudo (that hangs on a non-interactive agent without
+  # passwordless sudo): cmake, ninja-build/make, build-essential, git,
+  # curl, file, rustup (stable) + the aarch64-unknown-linux-gnu target,
+  # gcc-aarch64-linux-gnu + binutils, and the arm64 libudev-dev. The
+  # `aarch64Toolchain` demand makes Azure schedule this job only on an
+  # agent advertising that user capability, so a half-provisioned agent
+  # leaves the job clearly queued instead of failing mid-build.
+  - job: cross_arm64
+    displayName: 'Cross-compile (Raspberry Pi / aarch64)'
+    pool:
+      name: 'Default'
+      demands:
+        - Agent.OS -equals Linux
+        - aarch64Toolchain
+    steps:
+      - checkout: self
+        submodules: true
+      - template: cross-pi.yml
 
   # Package + publish artifacts. Only runs on tagged commits — push
-  # a tag like `v0.1.0-alpha.2` to trigger a release build.
+  # a tag like `v0.1.0-alpha.2` to trigger a release build. Gated on the
+  # Linux C + Rust build/test jobs and the Pi cross-compile so a release can
+  # never publish while any target is broken. This is also where the Win32
+  # release binaries are compiled (the only Windows build in the pipeline now
+  # that Build & Test moved to Linux), so the package job stays on
+  # windows-latest.
   - job: package
     displayName: 'Package & Publish'
     condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
     pool:
       vmImage: 'windows-latest'
     dependsOn:
-      - build
+      - build_c
+      - build_rust
+      - cross_arm64
     steps:
       - checkout: self
         submodules: true
@@ -65,18 +156,8 @@ jobs:
         clean: true
       - template: package.yml
 
-  # Linux ARM64 artifacts (osdp-mcp for Raspberry Pi). Separate job
-  # because the Windows agent can't build Linux binaries; runs on the
-  # same `v*` tag trigger and publishes its own pipeline artifact
-  # (`osdp-embedded-linux-arm64`).
-  - job: package_linux
-    displayName: 'Package (Linux ARM64)'
-    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
-    pool:
-      vmImage: 'ubuntu-latest'
-    dependsOn:
-      - build
-    steps:
-      - checkout: self
-        submodules: true
-      - template: package-linux.yml
+  # Note: the Linux ARM64 artifact (osdp-mcp for Raspberry Pi) is no
+  # longer a separate job. The `cross_arm64` gate above already
+  # cross-compiles that exact binary, so on a `v*` tag it stages and
+  # publishes `osdp-embedded-linux-arm64` directly (see cross-pi.yml),
+  # avoiding a second toolchain install + cross-compile of the same code.

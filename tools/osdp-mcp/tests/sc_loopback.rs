@@ -338,7 +338,14 @@ fn pd_replies_to_empty_poll_with_data_bearing_event_under_sc() {
             w.p2a.clone()
         };
         assert!(!p2a_bytes.is_empty(), "PD didn't emit a reply on the wire");
-        let f = osdp_embedded::frame::decode(&p2a_bytes).expect("decode PD reply");
+        // The PD prepends the spec-5.7 marking byte(s) (0xFF) ahead of
+        // the SOM; frame::decode expects SOM-aligned input, so skip to
+        // the SOM before decoding the sniffed wire bytes.
+        let som = p2a_bytes
+            .iter()
+            .position(|&b| b == 0x53)
+            .expect("no SOM in PD reply");
+        let f = osdp_embedded::frame::decode(&p2a_bytes[som..]).expect("decode PD reply");
         let scb = f.scb.as_ref().expect("reply lacks SCB block");
         // SCS_18 = 0x18. Anything else (SCS_16, SCS_15, ...) is wrong
         // for a data-bearing event reply.
