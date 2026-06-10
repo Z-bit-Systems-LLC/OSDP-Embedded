@@ -352,14 +352,21 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   everything else stays read-only. The `reader_demo` example turns a
   press into a confirmation beep. Tested:
   `tools/osdp-mcp/tests/ui_server.rs::keypad_press_enqueues_a_pd_event`.
+- ☑ **Interactive card read.** A card-number input + "Tap card" button on
+  the page POST `/api/card`; the value is packed MSB-aligned into a
+  (default 26-bit Wiegand) `osdp_RAW` event and enqueued on the PD, so the
+  ACU under test sees the presented card on its next POLL. `card_event()`
+  is shared with the demo, where a tap becomes an "access granted" green
+  pulse + beep. Tested:
+  `tools/osdp-mcp/tests/ui_server.rs::card_tap_enqueues_a_pd_event`.
 - ☐ **Live wire-log panel** on the page, reusing the `code_name` labels.
 
 ### Deferred
 
-- Interactive `POST /api/card` button reusing `enqueue_event` (the
-  keypad equivalent is done; a card-read injector is the remaining one).
 - Multi-reader support beyond reader 0.
 - Temporary-LED / temporary-text timer accuracy.
+- Card-read format/parity options (today the value is sent MSB-aligned as
+  Wiegand without computed parity, matching the `inject_raw` tool).
 
 ## Iteration 6+ — Optional extensions (not yet planned)
 

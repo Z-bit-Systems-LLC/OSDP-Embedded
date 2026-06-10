@@ -114,3 +114,50 @@ async fn keypad_press_enqueues_a_pd_event() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(pd.event_queue_depth(), 1);
 }
+
+#[tokio::test]
+async fn card_tap_enqueues_a_pd_event() {
+    let pd = spawn_pd();
+    let app = ui::router(Arc::clone(&pd));
+    assert_eq!(pd.event_queue_depth(), 0);
+
+    // A numeric card value enqueues one RAW event for the next POLL.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/card")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"12345"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pd.event_queue_depth(), 1);
+
+    // A non-numeric card value is rejected.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/card")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A value that doesn't fit a 16-bit card number is rejected too.
+    let resp = app
+        .oneshot(
+            Request::post("/api/card")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"70000"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(pd.event_queue_depth(), 1);
+}

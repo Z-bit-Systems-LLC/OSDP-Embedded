@@ -164,11 +164,18 @@ fn temporary(
     }
 }
 
+/// A page interaction forwarded to the driver thread.
+enum DemoEvent {
+    /// A keypad key was pressed → a short confirmation beep.
+    Keypress,
+    /// A card was tapped → "access granted": green LED + a beep.
+    CardTap,
+}
+
 /// Drive the PD↔ACU loopback forever, feeding the shared reader state.
-/// Runs on its own std::thread because `Pd`/`Acu` are `!Send`. Keypresses
-/// arrive over `key_rx` (from the page) and trigger a short confirmation
-/// beep.
-fn run_driver(reader_state: SharedReaderState, mut key_rx: mpsc::UnboundedReceiver<()>) {
+/// Runs on its own std::thread because `Pd`/`Acu` are `!Send`. Page
+/// interactions arrive over `event_rx`.
+fn run_driver(reader_state: SharedReaderState, mut event_rx: mpsc::UnboundedReceiver<DemoEvent>) {
     let start = Instant::now();
     let wire = Rc::new(RefCell::new(Wire::default()));
 
@@ -205,10 +212,19 @@ fn run_driver(reader_state: SharedReaderState, mut key_rx: mpsc::UnboundedReceiv
         pd.tick();
         acu.tick();
 
-        // Each keypress from the page → a short confirmation beep, queued
-        // ahead of the idle grant loop.
-        while key_rx.try_recv().is_ok() {
-            queue.push_back((OSDP_CMD_BUZ, buz_payload(1, 0, 1)));
+        // Page interactions, queued ahead of the idle grant loop.
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                DemoEvent::Keypress => {
+                    queue.push_back((OSDP_CMD_BUZ, buz_payload(1, 0, 1)));
+                }
+                DemoEvent::CardTap => {
+                    // Access granted: a green pulse + a short beep.
+                    let led = temporary(0, LedColor::Red, LedColor::Green, 18, 0, 0);
+                    queue.push_back((OSDP_CMD_LED, led_payload(vec![led])));
+                    queue.push_back((OSDP_CMD_BUZ, buz_payload(1, 1, 2)));
+                }
+            }
         }
 
         if !acu.is_pd_busy(PD_ADDR) {
@@ -242,12 +258,12 @@ fn run_driver(reader_state: SharedReaderState, mut key_rx: mpsc::UnboundedReceiv
 
 // ---- UI server (reuses the osdp-mcp embedded page) -------------------
 
-/// Shared axum state: the reader snapshot plus a channel that forwards
-/// keypresses to the driver thread.
+/// Shared axum state: the reader snapshot plus a channel that forwards page
+/// interactions (keypresses, card taps) to the driver thread.
 #[derive(Clone)]
 struct DemoState {
     reader: SharedReaderState,
-    keypress: mpsc::UnboundedSender<()>,
+    events: mpsc::UnboundedSender<DemoEvent>,
 }
 
 async fn index() -> Html<&'static str> {
@@ -282,13 +298,34 @@ async fn api_keypad(State(st): State<DemoState>, Json(body): Json<KeypadPress>) 
     if osdp_mcp::ui::keypad_event(&body.key).is_err() {
         return StatusCode::BAD_REQUEST;
     }
-    let _ = st.keypress.send(());
+    let _ = st.events.send(DemoEvent::Keypress);
+    StatusCode::NO_CONTENT
+}
+
+/// Card tap from the page → an "access granted" green pulse + beep. (The
+/// real osdp-mcp instead injects an osdp_RAW event for the ACU.)
+async fn api_card(State(st): State<DemoState>, Json(body): Json<CardTap>) -> StatusCode {
+    let card: u32 = match body.value.trim().parse() {
+        Ok(v) if v <= u16::MAX as u32 => v,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    if osdp_mcp::ui::card_event(body.facility.unwrap_or(0), card as u16).is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let _ = st.events.send(DemoEvent::CardTap);
     StatusCode::NO_CONTENT
 }
 
 #[derive(serde::Deserialize)]
 struct KeypadPress {
     key: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CardTap {
+    value: String,
+    #[serde(default)]
+    facility: Option<u8>,
 }
 
 #[tokio::main]
@@ -300,21 +337,22 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
 
     let reader_state = reader_state::new_shared();
-    let (keypress_tx, keypress_rx) = mpsc::unbounded_channel::<()>();
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<DemoEvent>();
 
     // PD/ACU loopback driver on its own thread (the state machines are
-    // !Send); it feeds `reader_state` and turns keypresses into beeps.
+    // !Send); it feeds `reader_state` and reacts to page interactions.
     let driver_state = Arc::clone(&reader_state);
-    std::thread::spawn(move || run_driver(driver_state, keypress_rx));
+    std::thread::spawn(move || run_driver(driver_state, event_rx));
 
     let app = Router::new()
         .route("/", get(index))
         .route("/api/state", get(api_state))
         .route("/api/events", get(api_events))
         .route("/api/keypad", post(api_keypad))
+        .route("/api/card", post(api_card))
         .with_state(DemoState {
             reader: reader_state,
-            keypress: keypress_tx,
+            events: event_tx,
         });
 
     println!("reader demo: open http://{bind}/ in a browser (Ctrl-C to quit)");

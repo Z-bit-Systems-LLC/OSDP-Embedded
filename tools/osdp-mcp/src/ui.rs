@@ -19,10 +19,12 @@
 //!   page prefers this over polling.
 //! - `POST /api/keypad` → inject one keypad press; the PD surfaces it as
 //!   an `osdp_KEYPAD` reply on its next POLL (the reader's keypad, driven
-//!   from the browser). The only write the UI performs.
+//!   from the browser).
+//! - `POST /api/card` → inject a card read; the PD surfaces it as an
+//!   `osdp_RAW` reply on its next POLL (a card tapped, from the browser).
 //!
-//! An interactive card-read button is still deferred (see docs/PLAN.md
-//! iteration 5).
+//! The keypad and card POSTs are the only writes the UI performs;
+//! everything else is read-only.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -34,7 +36,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use osdp_embedded::messages::{Keypad, OSDP_REPLY_KEYPAD};
+use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
@@ -68,6 +70,46 @@ pub fn keypad_event(key: &str) -> Result<OverrideReply, &'static str> {
     })
 }
 
+/// Build a card-read `osdp_RAW` event as a standard **26-bit Wiegand**
+/// (H10301) credential: an 8-bit `facility` code, a 16-bit `card` number,
+/// and the two computed parity bits, sent as format 1 on reader 0:
+///
+/// ```text
+///   bit:  0      1 .. 8      9 .. 24     25
+///        [Pe]   [facility]  [card num]  [Po]
+/// ```
+///
+/// `Pe` is even parity over the leading 12 data bits (facility + top 4 of
+/// the card number); `Po` is odd parity over the trailing 12 (bottom 12 of
+/// the card number). Shared by the UI server and the `reader_demo` example.
+pub fn card_event(facility: u8, card: u16) -> Result<OverrideReply, &'static str> {
+    // 24 data bits, MSB-first: facility(8) then card(16).
+    let data24: u32 = ((facility as u32) << 16) | (card as u32);
+    let lead12 = (data24 >> 12) & 0xFFF; // facility(8) + top 4 of card
+    let trail12 = data24 & 0xFFF; // bottom 12 of card
+                                  // Even-parity bit = parity of its data; odd-parity bit = its inverse.
+    let pe = lead12.count_ones() & 1;
+    let po = (trail12.count_ones() & 1) ^ 1;
+    // [Pe | 24 data bits | Po] = 26 bits.
+    let frame26: u32 = (pe << 25) | (data24 << 1) | po;
+    // Left-align the 26 bits into 4 bytes (MSB-first, per spec Table 33).
+    let bit_data = (frame26 << 6).to_be_bytes();
+
+    let raw = Raw {
+        reader_no: 0,
+        format_code: 1, // Wiegand
+        bit_count: 26,
+        bit_data: &bit_data,
+    };
+    let mut buf = vec![0u8; 4 + bit_data.len()];
+    let n = raw.build(&mut buf).map_err(|_| "RAW build failed")?;
+    buf.truncate(n);
+    Ok(OverrideReply {
+        code: OSDP_REPLY_RAW,
+        payload: buf,
+    })
+}
+
 /// The reader visual page. Self-contained (inline CSS + JS, no external
 /// assets), embedded at build time so the binary needs no companion files.
 const INDEX_HTML: &str = include_str!("ui_index.html");
@@ -86,6 +128,7 @@ pub fn router(pd: Arc<PdHandle>) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/events", get(api_events))
         .route("/api/keypad", post(api_keypad))
+        .route("/api/card", post(api_card))
         .with_state(pd)
 }
 
@@ -120,6 +163,34 @@ struct KeypadPress {
 /// read-only.)
 async fn api_keypad(State(pd): State<Arc<PdHandle>>, Json(body): Json<KeypadPress>) -> StatusCode {
     match keypad_event(&body.key) {
+        Ok(ev) => {
+            pd.enqueue_event(ev);
+            StatusCode::NO_CONTENT
+        }
+        Err(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Body of a `POST /api/card`: a card "tap". `value` is the 16-bit card
+/// number (0..=65535); `facility` is the optional 8-bit facility code
+/// (default 0).
+#[derive(serde::Deserialize)]
+struct CardTap {
+    value: String,
+    #[serde(default)]
+    facility: Option<u8>,
+}
+
+/// Inject a card read. The page POSTs this when "Tap card" is pressed; the
+/// PD surfaces it as an `osdp_RAW` reply on its next POLL, so the ACU under
+/// test sees the presented card. The card number must fit a 26-bit Wiegand
+/// credential (0..=65535).
+async fn api_card(State(pd): State<Arc<PdHandle>>, Json(body): Json<CardTap>) -> StatusCode {
+    let card: u32 = match body.value.trim().parse() {
+        Ok(v) if v <= u16::MAX as u32 => v,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    match card_event(body.facility.unwrap_or(0), card as u16) {
         Ok(ev) => {
             pd.enqueue_event(ev);
             StatusCode::NO_CONTENT
@@ -168,4 +239,31 @@ fn to_event(snapshot: &ReaderStateView) -> Event {
         .event("state")
         .json_data(snapshot)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osdp_embedded::messages::Raw;
+
+    /// 26-bit Wiegand framing + parity for known facility/card values.
+    #[test]
+    fn card_event_is_26bit_wiegand_with_parity() {
+        // facility 0, card 1: leading 12 bits all zero → Pe = 0; trailing
+        // 12 bits = ...0001 (odd) → Po = 0. frame = data24<<1 = 2, then
+        // left-aligned by 6 → 0x00000080.
+        let ev = card_event(0, 1).unwrap();
+        let raw = Raw::decode(&ev.payload).unwrap();
+        assert_eq!(raw.bit_count, 26);
+        assert_eq!(raw.format_code, 1);
+        assert_eq!(raw.bit_data, &[0x00, 0x00, 0x00, 0x80]);
+
+        // facility 1, card 0: leading 12 = ...00010000 (one 1) → Pe = 1;
+        // trailing 12 all zero (even) → Po = 1. frame =
+        // (1<<25) | (0x10000<<1) | 1 = 0x2020001, left-aligned by 6.
+        let ev = card_event(1, 0).unwrap();
+        let raw = Raw::decode(&ev.payload).unwrap();
+        let expected = (0x0202_0001u32 << 6).to_be_bytes();
+        assert_eq!(raw.bit_data, &expected);
+    }
 }

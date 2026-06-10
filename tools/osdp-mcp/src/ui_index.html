@@ -160,7 +160,31 @@
     cursor: pointer;
   }
   .soundbtn:hover { border-color: #3a4356; }
+  .soundbtn:active { transform: scale(.95); }
   .soundbtn.on { color: #6ee7a8; border-color: #1f5138; }
+  .soundbtn.flash {
+    color: #6ee7a8;
+    border-color: #1f5138;
+    background: rgba(110,231,168,.14);
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    align-items: center;
+  }
+  .cardinput {
+    font: inherit;
+    font-size: 13px;
+    width: 116px;
+    color: #d8dde6;
+    background: #0f131a;
+    border: 1px solid #2a3140;
+    border-radius: 999px;
+    padding: 5px 12px;
+  }
+  .cardinput:focus { outline: none; border-color: #3a9bff; }
   footer { color: #4d5564; font-size: 12px; padding-bottom: 26px; }
   code { color: #9aa3b2; }
 </style>
@@ -206,7 +230,12 @@
     </div>
 
     <div class="caption">status LED: <b id="state-name">—</b></div>
-    <button id="sound" class="soundbtn" type="button">🔇 Enable sound</button>
+    <div class="controls">
+      <input id="card" class="cardinput" type="text" inputmode="numeric"
+             value="12345" maxlength="20" aria-label="card number" />
+      <button id="tap" class="soundbtn" type="button">Tap card</button>
+      <button id="sound" class="soundbtn" type="button">🔇 Enable sound</button>
+    </div>
   </main>
 
   <footer>live via <code>/api/events</code> · served by osdp-mcp</footer>
@@ -350,6 +379,31 @@
         body: JSON.stringify({ key: key }),
       }).catch(function () { /* press feedback already shown */ });
     });
+  });
+
+  // ---- Card tap: POST a card read -----------------------------------
+  const cardInput = document.getElementById('card');
+  const tapBtn = document.getElementById('tap');
+  tapBtn.addEventListener('click', function () {
+    const value = (cardInput.value || '').trim();
+    if (!/^[0-9]+$/.test(value) || Number(value) > 65535) {
+      cardInput.focus();
+      cardInput.select();
+      return;
+    }
+    // Visual confirmation the tap registered.
+    const label = tapBtn.textContent;
+    tapBtn.classList.add('flash');
+    tapBtn.textContent = 'Tapped ✓';
+    setTimeout(function () {
+      tapBtn.classList.remove('flash');
+      tapBtn.textContent = label;
+    }, 450);
+    fetch('/api/card', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: value }),
+    }).catch(function () {});
   });
 
   subscribe();
