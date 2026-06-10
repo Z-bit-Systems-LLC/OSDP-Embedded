@@ -5,7 +5,9 @@
 
   Self-contained reader-visual page served by osdp-mcp's UI server
   (src/ui.rs) at GET /. No external assets: it polls GET /api/state and
-  renders each reader LED as a glowing circle. View-only for now.
+  drives the reader's status LED bar from the live LED state. Drawn to
+  resemble a typical access-control keypad reader (silver bezel, black
+  touch face, top LED strip, card-tap icon, 3x4 keypad, bell).
 -->
 <html lang="en">
 <head>
@@ -27,8 +29,8 @@
   }
   header {
     width: 100%;
-    max-width: 760px;
-    padding: 22px 24px 8px;
+    max-width: 720px;
+    padding: 22px 24px 4px;
     display: flex;
     align-items: baseline;
     gap: 12px;
@@ -44,42 +46,76 @@
     color: #8a93a4;
   }
   #conn.ok   { color: #6ee7a8; border-color: #1f5138; }
-  #conn.down { color: #f3a; border-color: #5a1f33; }
-  main {
-    width: 100%;
-    max-width: 760px;
-    padding: 16px 24px 48px;
-  }
+  #conn.down { color: #ff5a8a; border-color: #5a1f33; }
+
+  main { padding: 26px 24px 40px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+
+  /* Silver bezel ----------------------------------------------------- */
   .reader {
-    background: linear-gradient(180deg, #151a24, #11151d);
-    border: 1px solid #232b39;
+    width: 300px;
+    padding: 12px;
+    border-radius: 26px;
+    background: linear-gradient(150deg, #f1f3f6 0%, #c5ccd6 38%, #9aa3b0 100%);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.7) inset,
+      0 -2px 6px rgba(0,0,0,.25) inset,
+      0 34px 70px rgba(0,0,0,.55);
+  }
+  /* Black touch face ------------------------------------------------- */
+  .face {
+    position: relative;
     border-radius: 16px;
-    padding: 28px;
-    box-shadow: 0 12px 40px rgba(0,0,0,.45);
+    padding: 26px 22px 20px;
+    background:
+      radial-gradient(120% 60% at 50% -10%, #20242b 0%, #0c0e12 55%),
+      #0a0c10;
+    box-shadow: 0 2px 8px rgba(0,0,0,.6) inset, 0 0 0 1px #000 inset;
   }
-  #leds {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 30px;
-    justify-content: center;
-  }
-  .led-card { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+
+  /* Top status LED strip (the live element) -------------------------- */
   .led {
-    width: 64px;
-    height: 64px;
-    border-radius: 50%;
-    background: var(--c, #1c2230);
-    border: 2px solid rgba(255,255,255,.08);
+    width: 46%;
+    height: 14px;
+    margin: 2px auto 22px;
+    border-radius: 8px;
+    background: #11151c;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.6) inset;
     transition: background .12s ease, box-shadow .12s ease;
   }
   .led.lit {
-    border-color: rgba(255,255,255,.22);
-    box-shadow: 0 0 26px 4px var(--c), inset 0 0 10px rgba(255,255,255,.35);
+    background: var(--c);
+    box-shadow:
+      0 0 16px 2px var(--c),
+      0 0 36px 6px color-mix(in srgb, var(--c) 60%, transparent),
+      0 0 0 1px rgba(255,255,255,.25) inset;
   }
-  .lbl  { font-size: 12px; color: #9aa3b2; }
-  .cname{ font-size: 12px; color: #cfd6e2; text-transform: capitalize; font-weight: 600; }
-  .empty { color: #6b7484; text-align: center; padding: 26px 0; }
-  footer { color: #4d5564; font-size: 12px; padding-bottom: 28px; }
+
+  /* Card-tap hint ---------------------------------------------------- */
+  .card { display: flex; flex-direction: column; align-items: center; gap: 4px; margin-bottom: 20px; color: rgba(220,226,236,.55); }
+  .card svg { width: 56px; height: 40px; }
+  .card span { font-size: 11px; letter-spacing: .5px; }
+
+  /* Keypad ----------------------------------------------------------- */
+  .keypad {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px 8px;
+    margin: 0 6px;
+  }
+  .key {
+    text-align: center;
+    font-size: 26px;
+    font-weight: 300;
+    color: rgba(226,230,238,.78);
+    text-shadow: 0 1px 1px rgba(0,0,0,.8);
+    user-select: none;
+  }
+  .bell { display: flex; justify-content: center; margin-top: 16px; color: rgba(220,226,236,.5); }
+  .bell svg { width: 26px; height: 26px; }
+
+  .caption { font-size: 13px; color: #9aa3b2; }
+  .caption b { color: #d8dde6; text-transform: capitalize; }
+  footer { color: #4d5564; font-size: 12px; padding-bottom: 26px; }
   code { color: #9aa3b2; }
 </style>
 </head>
@@ -89,18 +125,48 @@
     <span class="sub">live LED state</span>
     <span id="conn">connecting…</span>
   </header>
+
   <main>
     <div class="reader">
-      <div id="leds"><div class="empty">Waiting for an <code>osdp_LED</code> command…</div></div>
+      <div class="face">
+        <div id="led" class="led"></div>
+
+        <div class="card">
+          <svg viewBox="0 0 64 46" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect x="6" y="6" width="38" height="26" rx="3"/>
+            <line x1="6" y1="14" x2="44" y2="14"/>
+            <path d="M40 40 q6 -2 9 -8 M44 30 l4 4 l5 -3"/>
+          </svg>
+          <span>Card</span>
+        </div>
+
+        <div class="keypad">
+          <div class="key">1</div><div class="key">2</div><div class="key">3</div>
+          <div class="key">4</div><div class="key">5</div><div class="key">6</div>
+          <div class="key">7</div><div class="key">8</div><div class="key">9</div>
+          <div class="key">✱</div><div class="key">0</div><div class="key">#</div>
+        </div>
+
+        <div class="bell">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+            <path d="M10.3 21a2 2 0 0 0 3.4 0"/>
+          </svg>
+        </div>
+      </div>
     </div>
+
+    <div class="caption">status LED: <b id="state-name">—</b></div>
   </main>
+
   <footer>polling <code>/api/state</code> · served by osdp-mcp</footer>
 
 <script>
-  // OSDP colour codes (spec Table 18) → [css colour, label]. Index 0 is
-  // "off" and renders as an unlit circle.
+  // OSDP colour codes (spec Table 18) → [css colour, label]. 0 = off.
   const COLORS = {
-    0: ['#1c2230', 'off'],
+    0: ['#11151c', 'off'],
     1: ['#ff3b46', 'red'],
     2: ['#2fd27a', 'green'],
     3: ['#ffb02e', 'amber'],
@@ -110,7 +176,8 @@
     7: ['#eef1f6', 'white'],
   };
 
-  const ledsEl = document.getElementById('leds');
+  const ledEl = document.getElementById('led');
+  const nameEl = document.getElementById('state-name');
   const connEl = document.getElementById('conn');
 
   function setConn(ok) {
@@ -118,25 +185,27 @@
     connEl.className = ok ? 'ok' : 'down';
   }
 
+  // Pick the reader's status LED: reader 0 / LED 0 if present, else the
+  // first LED reported. "To start" the reader has a single status strip.
+  function pickLed(leds) {
+    if (!leds || leds.length === 0) return null;
+    return leds.find(function (l) { return l.reader_no === 0 && l.led_no === 0; }) || leds[0];
+  }
+
   function render(leds) {
-    if (!leds || leds.length === 0) {
-      ledsEl.innerHTML =
-        '<div class="empty">Waiting for an <code>osdp_LED</code> command…</div>';
+    const led = pickLed(leds);
+    if (!led || led.color === 0) {
+      ledEl.classList.remove('lit');
+      ledEl.style.removeProperty('--c');
+      nameEl.textContent = led ? 'off' : '—';
       return;
     }
-    ledsEl.innerHTML = leds.map(function (l) {
-      const known = COLORS[l.color];
-      const css = known ? known[0] : '#1c2230';
-      const name = l.color_name || (known ? known[1] : ('0x' + l.color.toString(16)));
-      const lit = l.color !== 0;
-      return (
-        '<div class="led-card">' +
-          '<div class="led' + (lit ? ' lit' : '') + '" style="--c:' + css + '"></div>' +
-          '<div class="lbl">reader ' + l.reader_no + ' · LED ' + l.led_no + '</div>' +
-          '<div class="cname">' + name + '</div>' +
-        '</div>'
-      );
-    }).join('');
+    const known = COLORS[led.color];
+    const css = known ? known[0] : '#888';
+    const name = led.color_name || (known ? known[1] : ('0x' + led.color.toString(16)));
+    ledEl.style.setProperty('--c', css);
+    ledEl.classList.add('lit');
+    nameEl.textContent = name;
   }
 
   async function poll() {
@@ -152,7 +221,7 @@
   }
 
   poll();
-  setInterval(poll, 300);
+  setInterval(poll, 250);
 </script>
 </body>
 </html>

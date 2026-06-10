@@ -33,6 +33,12 @@ use crate::reader_state::ReaderStateView;
 /// assets), embedded at build time so the binary needs no companion files.
 const INDEX_HTML: &str = include_str!("ui_index.html");
 
+/// The embedded reader-visual page (the same bytes served at `GET /`).
+/// Exposed so demos/tools can mount the page on their own router.
+pub fn index_html() -> &'static str {
+    INDEX_HTML
+}
+
 /// Build the UI router over a shared [`PdHandle`]. Split out from
 /// [`serve`] so tests can drive the routes without binding a socket.
 pub fn router(pd: Arc<PdHandle>) -> Router {
