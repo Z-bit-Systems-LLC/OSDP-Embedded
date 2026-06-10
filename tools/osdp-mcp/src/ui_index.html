@@ -220,8 +220,26 @@
     }
   }
 
+  // Prefer Server-Sent Events: instant push, one event per LED change, with
+  // a snapshot on connect. EventSource auto-reconnects if the stream drops.
+  function subscribe() {
+    if (typeof EventSource === 'undefined') return;
+    try {
+      const es = new EventSource('/api/events');
+      es.addEventListener('state', function (e) {
+        try { render(JSON.parse(e.data).leds); setConn(true); } catch (_) {}
+      });
+      es.onopen = function () { setConn(true); };
+      es.onerror = function () { setConn(false); /* browser retries */ };
+    } catch (_) { /* fall back to the poll backstop below */ }
+  }
+
+  subscribe();
+  // Backstop: prime immediately on load, then a slow poll so the page still
+  // refreshes if a proxy buffers the SSE stream. Far lighter than the old
+  // 250 ms poll; redundant (and harmless) when SSE is flowing.
   poll();
-  setInterval(poll, 250);
+  setInterval(poll, 10000);
 </script>
 </body>
 </html>

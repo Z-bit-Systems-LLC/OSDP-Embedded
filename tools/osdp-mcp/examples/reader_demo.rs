@@ -24,15 +24,18 @@
 //! ```
 
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
+use axum::response::sse::{Event, Sse};
 use axum::response::Html;
 use axum::routing::get;
 use axum::{Json, Router};
+use tokio_stream::Stream;
 
 use osdp_embedded::acu::Acu;
 use osdp_embedded::messages::{Led, LedRecord, OSDP_CMD_LED, OSDP_REPLY_ACK};
@@ -210,6 +213,18 @@ async fn api_state(State(rs): State<SharedReaderState>) -> Json<ReaderStateView>
     Json(view)
 }
 
+/// SSE stream, reusing the osdp-mcp builder so the demo page gets the same
+/// instant push as the real server.
+async fn api_events(
+    State(rs): State<SharedReaderState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (initial, rx) = {
+        let s = rs.lock().expect("reader state lock");
+        (s.snapshot(), s.subscribe())
+    };
+    osdp_mcp::ui::reader_sse(initial, rx)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let bind: SocketAddr = std::env::args()
@@ -228,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/state", get(api_state))
+        .route("/api/events", get(api_events))
         .with_state(reader_state);
 
     println!("reader demo: open http://{bind}/ in a browser (Ctrl-C to quit)");

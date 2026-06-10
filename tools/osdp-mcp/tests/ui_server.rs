@@ -61,3 +61,22 @@ async fn api_state_is_empty_for_fresh_pd() {
     // A PD that has never been driven shows no LEDs.
     assert_eq!(json, serde_json::json!({ "leds": [] }));
 }
+
+#[tokio::test]
+async fn api_events_is_an_sse_stream() {
+    let app = ui::router(spawn_pd());
+
+    let resp = app
+        .oneshot(Request::get("/api/events").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    // Headers are ready immediately (snapshot-on-connect streams in the
+    // body); assert the SSE content type without draining the live stream.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("text/event-stream"), "content-type was {ct:?}");
+}

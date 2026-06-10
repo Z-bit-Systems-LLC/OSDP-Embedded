@@ -316,9 +316,16 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   `tokio` task alongside either MCP transport and sharing the one
   `PdHandle`. Tested with `tower::oneshot` over the router
   (`tests/ui_server.rs`) and smoke-checked against a live binary.
-- ☐ **SSE push.** Via `tokio::sync::broadcast` + the existing `LogInner`
-  `Notify` hook point; `GET /api/events` streams snapshot-on-connect
-  then deltas; replaces polling.
+- ☑ **SSE push.** A `tokio::sync::broadcast` channel lives inside
+  `ReaderState`; every `set_led` / `clear` fans the new snapshot out to
+  subscribers. `GET /api/events` streams a snapshot on connect then one
+  `state` event per LED change (with keep-alive comments). The page uses
+  `EventSource` for instant updates, keeping a slow (10 s) polling
+  backstop so it degrades gracefully if a proxy buffers the stream. The
+  SSE builder is shared (`ui::reader_sse`) so the `reader_demo` example
+  serves the identical stream. (Built per-change-snapshot rather than the
+  originally-sketched `LogInner` deltas — simpler and the payload is
+  tiny.)
 - ☐ **Live wire-log panel** on the page, reusing the `code_name` labels.
 
 ### Deferred

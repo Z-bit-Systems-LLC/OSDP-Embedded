@@ -59,6 +59,9 @@ rmcp = { version = "1.7", features = ["transport-io", "transport-streamable-http
 # stop in-flight SSE streams cleanly on Ctrl-C.
 axum       = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
+# Adapts the reader-state broadcast channel into the `/api/events` SSE
+# stream (`wrappers::BroadcastStream`) and provides the stream combinators.
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # rmcp's macros expand to async fns and Tokio I/O; we need a multi-
 # thread runtime for the stdio server loop. The PD itself is !Send

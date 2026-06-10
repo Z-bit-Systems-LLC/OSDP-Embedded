@@ -19,23 +19,55 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use osdp_embedded::pd::{LedColor, LedHandler};
+use tokio::sync::broadcast;
 
-/// Latest displayed colour of each `(reader_no, led_no)` the PD has driven.
-#[derive(Default)]
+/// Capacity of the change-broadcast ring. Snapshots are tiny; a slow SSE
+/// subscriber that lags just resyncs to the next snapshot, never serving
+/// stale data, so a small buffer is plenty.
+const EVENT_CHANNEL_CAP: usize = 64;
+
+/// Latest displayed colour of each `(reader_no, led_no)` the PD has driven,
+/// plus a broadcast channel that fans each change out to live SSE clients.
 pub struct ReaderState {
     leds: BTreeMap<(u8, u8), LedColor>,
+    tx: broadcast::Sender<ReaderStateView>,
+}
+
+impl Default for ReaderState {
+    fn default() -> Self {
+        let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAP);
+        Self {
+            leds: BTreeMap::new(),
+            tx,
+        }
+    }
 }
 
 impl ReaderState {
-    /// Record the current colour of one LED.
+    /// Record the current colour of one LED and notify subscribers.
     pub fn set_led(&mut self, reader_no: u8, led_no: u8, color: LedColor) {
         self.leds.insert((reader_no, led_no), color);
+        self.notify();
     }
 
     /// Forget all tracked LEDs. Called when a PD is (re)opened so a fresh
     /// reader starts blank rather than showing the previous PD's colours.
     pub fn clear(&mut self) {
         self.leds.clear();
+        self.notify();
+    }
+
+    /// Subscribe to per-change snapshots — drives the `/api/events` SSE
+    /// stream. Each subscriber also receives an explicit snapshot-on-connect
+    /// from the endpoint, so a missed early event can't leave it blank.
+    pub fn subscribe(&self) -> broadcast::Receiver<ReaderStateView> {
+        self.tx.subscribe()
+    }
+
+    /// Push the current snapshot to any live subscribers. `send` errs only
+    /// when there are none, which we ignore.
+    fn notify(&self) {
+        let _ = self.tx.send(self.snapshot());
     }
 
     /// A serialisable snapshot for `pd_reader_state` / the UI.

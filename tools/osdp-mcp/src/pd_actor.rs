@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use osdp_embedded::messages::{Pdcap, Pdid};
 use osdp_embedded::pd::Pd;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
@@ -461,6 +461,17 @@ impl PdHandle {
             .lock()
             .map(|s| s.snapshot())
             .unwrap_or_else(|_| ReaderStateView { leds: Vec::new() })
+    }
+
+    /// Subscribe to reader-state changes — one snapshot per LED change —
+    /// for the `/api/events` SSE stream. The broadcast channel lives inside
+    /// the shared `ReaderState` and survives PD reconfigure, so a client
+    /// stays subscribed across `pd_stop` / `pd_configure`.
+    pub fn subscribe_reader(&self) -> broadcast::Receiver<ReaderStateView> {
+        match self.reader_state.lock() {
+            Ok(s) => s.subscribe(),
+            Err(poisoned) => poisoned.into_inner().subscribe(),
+        }
     }
 
     /// Drop every queued event. Subsequent POLLs go straight to
