@@ -30,6 +30,7 @@ osdp_add_test(test_commands)
 osdp_add_test(test_replies)
 osdp_add_test(test_stream)
 osdp_add_test(test_dispatch)
+osdp_add_test(test_led_state)
 
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)

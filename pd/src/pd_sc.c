@@ -270,6 +270,11 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
                                 plaintext, plaintext_len, &reply);
     }
 
+    /* Mirror reader-visible commands (osdp_LED) into the LED bank, same
+     * as the plaintext path — the application sees identical LED state
+     * whether the command arrived in the clear or under Secure Channel. */
+    osdp_pd_internal_observe_command(pd, cmd->code, plaintext, plaintext_len);
+
     /* Reply SCB type picks the reply-direction encrypted variant
      * (SCS_18). `osdp_sc_wrap_frame` enforces the project-wide
      * convention that the SCB type is dictated by payload presence,

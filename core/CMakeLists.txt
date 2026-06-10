@@ -8,6 +8,7 @@ add_library(osdp_core STATIC
     src/shared/checksum.c
     src/shared/frame.c
     src/shared/stream.c
+    src/shared/led_state.c
     src/sc/cbc.c
     src/sc/keys.c
     src/sc/mac.c

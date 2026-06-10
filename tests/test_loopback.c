@@ -18,6 +18,7 @@
 
 #include "osdp/osdp_acu.h"
 #include "osdp/osdp_commands.h"
+#include "osdp/osdp_led_state.h"
 #include "osdp/osdp_pd.h"
 #include "osdp/osdp_replies.h"
 #include "unity.h"
@@ -128,9 +129,46 @@ static osdp_status_t pd_app_handler(void *user,
         reply->payload     = kSamplePdid;
         reply->payload_len = sizeof(kSamplePdid);
         return OSDP_OK;
+    case OSDP_CMD_LED:
+        /* A real reader ACKs LED control; the PD tracks the resulting
+         * colour transparently in its LED bank regardless. */
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
     default:
         return OSDP_ERR_NOT_SUPPORTED;
     }
+}
+
+/* ---- LED-change captures ---------------------------------------------- */
+
+typedef struct {
+    unsigned int call_count;
+    uint8_t      last_reader;
+    uint8_t      last_led;
+    uint8_t      last_color;
+} led_capture_t;
+
+static void on_pd_led(void *user, uint8_t reader_no, uint8_t led_no,
+                      uint8_t color)
+{
+    led_capture_t *c = (led_capture_t *)user;
+    c->call_count++;
+    c->last_reader = reader_no;
+    c->last_led    = led_no;
+    c->last_color  = color;
+}
+
+static void on_acu_led(void *user, uint8_t pd_address, uint8_t reader_no,
+                       uint8_t led_no, uint8_t color)
+{
+    (void)pd_address;
+    led_capture_t *c = (led_capture_t *)user;
+    c->call_count++;
+    c->last_reader = reader_no;
+    c->last_led    = led_no;
+    c->last_color  = color;
 }
 
 /* ---- ACU-side captures ------------------------------------------------- */
@@ -176,6 +214,8 @@ typedef struct rig {
     osdp_acu_pd_slot_t  acu_slots[2];
     reply_capture_t     reply;
     timeout_capture_t   timeout;
+    led_capture_t       pd_led;
+    led_capture_t       acu_led;
 } rig_t;
 
 static void rig_init(rig_t *r, uint8_t pd_address)
@@ -194,12 +234,14 @@ static void rig_init(rig_t *r, uint8_t pd_address)
     osdp_pd_init(&r->pd, pd_address);
     osdp_pd_set_transport(&r->pd, &pd_t);
     osdp_pd_set_command_handler(&r->pd, pd_app_handler, NULL);
+    osdp_pd_set_led_handler(&r->pd, on_pd_led, &r->pd_led);
 
     osdp_acu_init(&r->acu, r->acu_slots,
                   sizeof(r->acu_slots) / sizeof(r->acu_slots[0]));
     osdp_acu_set_transport(&r->acu, &acu_t);
     osdp_acu_set_reply_handler  (&r->acu, on_reply,   &r->reply);
     osdp_acu_set_timeout_handler(&r->acu, on_timeout, &r->timeout);
+    osdp_acu_set_led_handler    (&r->acu, on_acu_led, &r->acu_led);
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_acu_register_pd(&r->acu, 0, pd_address));
 }
 
@@ -346,6 +388,111 @@ static void test_broadcast_command_reaches_pd(void)
     TEST_ASSERT_EQUAL_UINT(1, r.reply.call_count);
 }
 
+/* ---- Reader LED tracking ---------------------------------------------- */
+
+/* Build the payload of an osdp_LED command carrying a single record. */
+static size_t build_led_payload(const osdp_led_record_t *rec,
+                                uint8_t *buf, size_t cap)
+{
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_led_build(rec, 1, buf, cap, &written));
+    return written;
+}
+
+/* An osdp_LED command setting a steady permanent colour propagates ACU →
+ * PD, the PD ACKs it, and BOTH sides' LED banks (callback + colour query)
+ * resolve to that colour — the end-to-end "what is the reader showing?"
+ * path for the visual reader. */
+static void test_led_steady_colour_tracked_on_both_sides(void)
+{
+    rig_t r;
+    rig_init(&r, 0x10);
+
+    osdp_led_record_t rec = {0};
+    rec.reader_no         = 0;
+    rec.led_no            = 0;
+    rec.temp_control_code = OSDP_LED_TEMP_NOP;
+    rec.perm_control_code = OSDP_LED_PERM_SET;
+    rec.perm_on_color     = OSDP_LED_GREEN;
+    rec.perm_off_color    = OSDP_LED_GREEN;
+
+    uint8_t payload[64];
+    const size_t plen = build_led_payload(&rec, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&r.acu, 0x10, OSDP_CMD_LED,
+                                            payload, plen));
+    cycle(&r, 4);
+
+    /* PD ACK'd the LED command on the wire. */
+    TEST_ASSERT_EQUAL_UINT(1, r.reply.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_LED,   r.reply.last.cmd_code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, r.reply.last.reply_code);
+
+    /* PD-side bank: callback fired green, query agrees. */
+    TEST_ASSERT_EQUAL_UINT(1, r.pd_led.call_count);
+    TEST_ASSERT_EQUAL_HEX8(0, r.pd_led.last_reader);
+    TEST_ASSERT_EQUAL_HEX8(0, r.pd_led.last_led);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, r.pd_led.last_color);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, osdp_pd_led_color(&r.pd, 0, 0));
+
+    /* ACU-side mirror: callback fired green, query agrees. */
+    TEST_ASSERT_EQUAL_UINT(1, r.acu_led.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, r.acu_led.last_color);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN,
+                           osdp_acu_led_color(&r.acu, 0x10, 0, 0));
+
+    /* An untouched LED reads black. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_BLACK, osdp_pd_led_color(&r.pd, 0, 1));
+}
+
+/* A temporary override with a countdown timer shows its colour while the
+ * timer runs and reverts to the permanent colour once it expires — driven
+ * purely by the wire clock and detected inside tick(), so the change
+ * callback fires on both peers without any further command. */
+static void test_led_temporary_timer_expires_to_permanent(void)
+{
+    rig_t r;
+    rig_init(&r, 0x10);
+    r.wire.now_ms = 1000;
+
+    osdp_led_record_t rec = {0};
+    rec.reader_no         = 0;
+    rec.led_no            = 0;
+    rec.perm_control_code = OSDP_LED_PERM_SET;     /* steady red baseline */
+    rec.perm_on_color     = OSDP_LED_RED;
+    rec.perm_off_color    = OSDP_LED_RED;
+    rec.temp_control_code = OSDP_LED_TEMP_SET;     /* 1 s steady green    */
+    rec.temp_on_color     = OSDP_LED_GREEN;
+    rec.temp_off_color    = OSDP_LED_GREEN;
+    rec.temp_timer_100ms  = 10;                    /* 10 × 100 ms = 1 s   */
+
+    uint8_t payload[64];
+    const size_t plen = build_led_payload(&rec, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&r.acu, 0x10, OSDP_CMD_LED,
+                                            payload, plen));
+    cycle(&r, 4);
+
+    /* Timer running → green on both sides. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, r.pd_led.last_color);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, osdp_pd_led_color(&r.pd, 0, 0));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, r.acu_led.last_color);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN,
+                           osdp_acu_led_color(&r.acu, 0x10, 0, 0));
+
+    /* Advance past the 1 s timer; ticking re-resolves the bank → red. No
+     * new command is sent — the revert is entirely time-driven. */
+    r.wire.now_ms = 2500;
+    cycle(&r, 2);
+
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_RED, osdp_pd_led_color(&r.pd, 0, 0));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_RED, r.pd_led.last_color);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_RED,
+                           osdp_acu_led_color(&r.acu, 0x10, 0, 0));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_RED, r.acu_led.last_color);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -355,5 +502,7 @@ int main(void)
     RUN_TEST(test_polling_loop_progresses_sequence_numbers);
     RUN_TEST(test_no_reply_yields_acu_timeout);
     RUN_TEST(test_broadcast_command_reaches_pd);
+    RUN_TEST(test_led_steady_colour_tracked_on_both_sides);
+    RUN_TEST(test_led_temporary_timer_expires_to_permanent);
     return UNITY_END();
 }

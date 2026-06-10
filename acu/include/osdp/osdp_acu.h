@@ -5,6 +5,7 @@
 #define OSDP_ACU_H
 
 #include "osdp/osdp_frame.h"
+#include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
@@ -246,6 +247,41 @@ typedef void (*osdp_acu_sc_event_cb)(
     void                       *user,
     const osdp_acu_sc_event_t  *event);
 
+/* ---- Reader LED observation --------------------------------------------
+ *
+ * The ACU is the side that *drives* reader LEDs: every osdp_LED command it
+ * sends is folded into an internal bank of osdp_led_t resolvers, keyed by
+ * (pd_address, reader_no, led_no). This lets a controller application — or
+ * a visualiser — ask "what colour should PD X's reader LED be right now?"
+ * without re-parsing the commands it issued, and get a callback whenever
+ * that resolved colour changes (including temporary-timer expiry and flash
+ * transitions, which are evaluated inside osdp_acu_tick()). */
+
+/* Number of distinct (pd_address, reader_no, led_no) LEDs the ACU tracks.
+ * Sized for a small multi-PD bus; commands for LEDs beyond this are still
+ * sent on the wire but not mirrored locally. */
+#define OSDP_ACU_MAX_LEDS 16U
+
+/* Fired when a driven reader LED's resolved colour changes. `color` is an
+ * osdp_led_color_t value (0x00 black/off .. 0x07 white). The callback must
+ * not re-enter the ACU API. */
+typedef void (*osdp_acu_led_cb)(void   *user,
+                                uint8_t pd_address,
+                                uint8_t reader_no,
+                                uint8_t led_no,
+                                uint8_t color);
+
+/* One tracked physical LED on some PD, plus the last colour reported so
+ * the ACU fires the callback only on an actual change. */
+typedef struct osdp_acu_led_slot {
+    bool       used;
+    uint8_t    pd_address;
+    uint8_t    reader_no;
+    uint8_t    led_no;
+    uint8_t    last_color;   /* osdp_led_color_t last handed to led_cb */
+    osdp_led_t state;
+} osdp_acu_led_slot_t;
+
 /* ---- Context -----------------------------------------------------------*/
 
 typedef struct osdp_acu {
@@ -269,6 +305,12 @@ typedef struct osdp_acu {
     /* SC event callback — fires on handshake completion or failure. */
     osdp_acu_sc_event_cb        sc_event_cb;
     void                       *sc_event_user;
+
+    /* Reader LED bank (populated from outbound osdp_LED commands) plus the
+     * optional change callback. */
+    osdp_acu_led_slot_t         leds[OSDP_ACU_MAX_LEDS];
+    osdp_acu_led_cb             led_cb;
+    void                       *led_user;
 } osdp_acu_t;
 
 /* ---- API ---------------------------------------------------------------*/
@@ -333,6 +375,20 @@ void osdp_acu_tick(osdp_acu_t *acu);
 
 bool osdp_acu_is_pd_online(const osdp_acu_t *acu, uint8_t pd_address);
 bool osdp_acu_is_pd_busy  (const osdp_acu_t *acu, uint8_t pd_address);
+
+/* ---- Reader LED observation --------------------------------------------*/
+
+/* Bind the reader-LED change handler. `cb` fires whenever a driven LED's
+ * resolved colour changes (see osdp_acu_led_cb). Pass cb=NULL to detach. */
+void osdp_acu_set_led_handler(osdp_acu_t *acu, osdp_acu_led_cb cb, void *user);
+
+/* Current resolved colour of the given PD's reader LED as an
+ * osdp_led_color_t (0x00 black/off .. 0x07 white). Returns OSDP_LED_BLACK
+ * for an LED the ACU has never driven. Resolved against the transport's
+ * now_ms clock (or time 0 if none) so flashing LEDs return the current
+ * phase. */
+uint8_t osdp_acu_led_color(const osdp_acu_t *acu, uint8_t pd_address,
+                           uint8_t reader_no, uint8_t led_no);
 
 /* ---- Secure Channel API -------------------------------------------------
  *

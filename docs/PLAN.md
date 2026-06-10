@@ -260,16 +260,45 @@ via a `--ui-bind 127.0.0.1:8088` flag + `OSDP_MCP_UI_BIND` env var (off
 by default, loopback-only, mirroring the existing `--bind` /
 `OSDP_MCP_*` pattern), spawned in both stdio and http transports.
 
+**LED handler lives in the C core, not in Rust (revised 2026-06-10).**
+The reader-state logic that decodes LED commands and tracks "what colour
+is the reader showing right now" belongs in the freestanding C library so
+*both* a PD firmware app and an ACU controller app get it for free, not
+just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
+
 ### Deliverables (build order)
 
-- ☐ **Reader state model** (`reader_state.rs`). Decode LED/BUZ/TEXT/OUT
-  in `DefaultHandler::handle` into a shared `Arc<Mutex<ReaderState>>`
-  (LED color/on-off, buzzer, text lines, output relays + link status:
-  running/online/SC/address). Wire reply stays a plain ACK —
-  observe-only, zero interop impact. Reuse the existing `Led::decode` /
-  `BuzCmd::decode` / `Text::decode` / `Out::decode` from the messages
-  module. Unit-test the folding. (OSDP LED color codes: 0=off, 1=red,
-  2=green, 3=amber, 4=blue.)
+- ☑ **Core LED state resolver** (`core/src/shared/led_state.c`,
+  `osdp_led_state.h`). A pure, caller-owned `osdp_led_t` value type: fold
+  an `osdp_led_record_t` in with `osdp_led_apply(rec, now_ms)`, ask for
+  the displayed colour with `osdp_led_color(now_ms)`. Resolves the
+  temporary-vs-permanent split, the temporary countdown timer, and the
+  flash on/off phase — all from the timestamp passed at query time, so no
+  background timer / no OS tick. Steady when `on+off == 0`; a 0-length
+  temp timer expires immediately (never masks permanent). 8 unit tests in
+  `tests/test_led_state.c` (steady, flash phases, temp expiry, cancel,
+  perm-NOP, 32-bit clock wrap).
+- ☑ **Baked into `pd/` and `acu/` with a change callback.** Both state
+  machines transparently decode inbound (PD) / outbound (ACU) `osdp_LED`
+  commands into an internal LED bank keyed by `(reader_no, led_no)` —
+  plus `pd_address` on the ACU. A consumer registers
+  `osdp_pd_set_led_handler` / `osdp_acu_set_led_handler` and is called
+  back whenever a tracked LED's *resolved* colour changes — on a new
+  command, on temporary-timer expiry, and on each flash transition (the
+  time-driven ones detected inside `tick()`, so they need a `now_ms`
+  transport clock). Direct query via `osdp_pd_led_color` /
+  `osdp_acu_led_color`. The wire reply is unchanged (the app still
+  ACKs LED), so this is observe-only with zero interop impact. The PD
+  path covers Secure Channel too (folds the unwrapped plaintext). Two
+  PD↔ACU loopback tests in `tests/test_loopback.c` drive a real LED
+  command end to end (steady colour mirrored on both peers; temporary
+  timer expiring back to permanent purely from the wire clock).
+- ☐ **Rust + MCP wiring.** Expose the PD LED callback / colour query
+  through the `osdp-embedded` wrapper, then have osdp-mcp's
+  `DefaultHandler` register it into a shared `ReaderState` for the UI.
+  (Future deliverables below still cover BUZ/TEXT/OUT and link status,
+  which can follow the same C-core pattern or stay Rust-side as plain
+  decode-into-state.)
 - ☐ **UI server** (`ui.rs`). An axum server independent of the MCP
   transport: `GET /` serves a self-contained embedded HTML page
   (`include_str!`), `GET /api/state` returns a JSON snapshot; the page

@@ -30,6 +30,17 @@ osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
 size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
                                           const osdp_frame_t *cmd);
 
+/* Fold a (plaintext) inbound command into the reader-LED bank. A no-op
+ * for everything except osdp_LED; for that it decodes the records, applies
+ * each to its (reader_no, led_no) slot, and re-resolves displayed colours
+ * so any change fires the registered LED callback. Shared by the plaintext
+ * dispatch (pd.c) and the Secure Channel operational dispatch (pd_sc.c) so
+ * LED state tracks identically on either path. Defined in pd.c. */
+void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+                                      uint8_t        cmd_code,
+                                      const uint8_t *payload,
+                                      size_t         payload_len);
+
 /* Decode a KEYSET payload and, if it carries a valid 16-byte SCBK,
  * copy the new key into pd->sc.scbk (and set the `scbk_set` flag).
  * Called by both the plaintext and SC dispatch paths after the

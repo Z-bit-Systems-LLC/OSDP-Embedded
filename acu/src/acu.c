@@ -5,6 +5,7 @@
 
 #include "acu_internal.h"
 
+#include "osdp/osdp_commands.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
@@ -51,6 +52,83 @@ static uint32_t now_ms_or_zero(const osdp_acu_t *acu)
         return 0U;
     }
     return acu->transport.now_ms(acu->transport.user);
+}
+
+/* ---- Reader LED bank ---------------------------------------------------*/
+
+/* Find the bank slot tracking (pd_address, reader_no, led_no), claiming a
+ * free one on first sighting. Returns NULL only when every slot is in use. */
+static osdp_acu_led_slot_t *acu_led_slot(osdp_acu_t *acu, uint8_t pd_address,
+                                         uint8_t reader_no, uint8_t led_no)
+{
+    osdp_acu_led_slot_t *free_slot = NULL;
+    for (size_t i = 0; i < OSDP_ACU_MAX_LEDS; i++) {
+        osdp_acu_led_slot_t *s = &acu->leds[i];
+        if (s->used && s->pd_address == pd_address &&
+            s->reader_no == reader_no && s->led_no == led_no) {
+            return s;
+        }
+        if (!s->used && free_slot == NULL) {
+            free_slot = s;
+        }
+    }
+    if (free_slot != NULL) {
+        free_slot->used       = true;
+        free_slot->pd_address = pd_address;
+        free_slot->reader_no  = reader_no;
+        free_slot->led_no     = led_no;
+        free_slot->last_color = OSDP_LED_BLACK;
+        osdp_led_init(&free_slot->state);
+    }
+    return free_slot;
+}
+
+/* Recompute every tracked LED's resolved colour at `now` and fire the
+ * change callback for any that flipped since the last report. */
+static void acu_led_refresh(osdp_acu_t *acu, uint32_t now)
+{
+    if (acu->led_cb == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < OSDP_ACU_MAX_LEDS; i++) {
+        osdp_acu_led_slot_t *s = &acu->leds[i];
+        if (!s->used) {
+            continue;
+        }
+        const uint8_t color = osdp_led_color(&s->state, now);
+        if (color != s->last_color) {
+            s->last_color = color;
+            acu->led_cb(acu->led_user, s->pd_address, s->reader_no,
+                        s->led_no, color);
+        }
+    }
+}
+
+/* Fold an outbound osdp_LED command (the plaintext the application passed
+ * to osdp_acu_send_command) into the bank, then re-resolve so any colour
+ * change fires the callback. A no-op for any other command code. */
+static void acu_observe_led(osdp_acu_t *acu, uint8_t pd_address,
+                            uint8_t cmd_code,
+                            const uint8_t *payload, size_t payload_len)
+{
+    if (cmd_code != OSDP_CMD_LED) {
+        return;
+    }
+    osdp_led_record_t recs[OSDP_ACU_MAX_LEDS];
+    size_t n = 0;
+    if (osdp_led_decode(payload, payload_len, recs,
+                        OSDP_ACU_MAX_LEDS, &n) != OSDP_OK) {
+        return;
+    }
+    const uint32_t now = now_ms_or_zero(acu);
+    for (size_t i = 0; i < n; i++) {
+        osdp_acu_led_slot_t *s =
+            acu_led_slot(acu, pd_address, recs[i].reader_no, recs[i].led_no);
+        if (s != NULL) {
+            osdp_led_apply(&s->state, &recs[i], now);
+        }
+    }
+    acu_led_refresh(acu, now);
 }
 
 /* ---- Reply ingestion ---------------------------------------------------*/
@@ -322,6 +400,11 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
     slot->pending_seq    = frame.sequence;
     slot->pending_code   = cmd_code;
     slot->pending_sent_ms = now_ms_or_zero(acu);
+
+    /* The command is on the wire — mirror any osdp_LED into the local LED
+     * bank so the ACU's colour query / change callback reflect what it
+     * just told the reader to display. */
+    acu_observe_led(acu, pd_address, cmd_code, payload, payload_len);
     return OSDP_OK;
 }
 
@@ -396,6 +479,11 @@ void osdp_acu_tick(osdp_acu_t *acu)
         }
         process_reply(acu, &frame);
     }
+
+    /* Re-resolve the LED bank so time-driven changes (temporary-timer
+     * expiry, flash transitions) reach the change callback even on ticks
+     * with no outbound command. No-op without a now_ms clock. */
+    acu_led_refresh(acu, now_ms_or_zero(acu));
 }
 
 bool osdp_acu_is_pd_online(const osdp_acu_t *acu, uint8_t pd_address)
@@ -416,6 +504,34 @@ bool osdp_acu_is_pd_busy(const osdp_acu_t *acu, uint8_t pd_address)
     const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
                                                                 pd_address);
     return slot != NULL && slot->waiting;
+}
+
+/* ---- Reader LED observation --------------------------------------------*/
+
+void osdp_acu_set_led_handler(osdp_acu_t *acu, osdp_acu_led_cb cb, void *user)
+{
+    if (acu == NULL) {
+        return;
+    }
+    acu->led_cb   = cb;
+    acu->led_user = user;
+}
+
+uint8_t osdp_acu_led_color(const osdp_acu_t *acu, uint8_t pd_address,
+                           uint8_t reader_no, uint8_t led_no)
+{
+    if (acu == NULL) {
+        return OSDP_LED_BLACK;
+    }
+    const uint32_t now = now_ms_or_zero(acu);
+    for (size_t i = 0; i < OSDP_ACU_MAX_LEDS; i++) {
+        const osdp_acu_led_slot_t *s = &acu->leds[i];
+        if (s->used && s->pd_address == pd_address &&
+            s->reader_no == reader_no && s->led_no == led_no) {
+            return osdp_led_color(&s->state, now);
+        }
+    }
+    return OSDP_LED_BLACK;
 }
 
 /* ---- Secure Channel API -------------------------------------------------*/

@@ -4,6 +4,7 @@
 #ifndef OSDP_PD_H
 #define OSDP_PD_H
 
+#include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
@@ -138,7 +139,46 @@ typedef osdp_status_t (*osdp_pd_command_cb)(
     size_t          payload_len,
     osdp_pd_reply_t *reply);
 
+/* ---- Reader LED observation --------------------------------------------
+ *
+ * The PD transparently decodes inbound osdp_LED (0x69) commands and folds
+ * each record into an internal bank of osdp_led_t resolvers, so the
+ * application never has to parse the LED command itself: it just registers
+ * a callback and/or queries the current colour. This runs alongside the
+ * normal command handler — the LED command still flows to cmd_cb (which
+ * typically ACKs it) and the wire behaviour is unchanged. */
+
+/* Fired whenever a reader LED's *displayed* colour changes — on a new LED
+ * command, when a temporary override's timer expires, and on each flash
+ * on/off transition. `color` is an osdp_led_color_t value (0x00 black/off
+ * .. 0x07 white). Time-driven transitions (timer expiry, flashing) are
+ * detected inside osdp_pd_tick(), so they only fire if the transport
+ * supplies a now_ms clock; a command-driven change fires immediately
+ * regardless. The callback must not re-enter the PD API. */
+typedef void (*osdp_pd_led_cb)(void   *user,
+                               uint8_t reader_no,
+                               uint8_t led_no,
+                               uint8_t color);
+
 /* ---- Context ------------------------------------------------------------*/
+
+/* Reader LED bank capacity: the number of distinct (reader_no, led_no)
+ * LEDs the PD tracks. Records beyond this (after all slots are claimed by
+ * earlier addresses) are still ACK'd on the wire but not reflected in the
+ * bank. Sized for the common case (one or two LEDs on a handful of
+ * readers); bump if a deployment needs more. */
+#define OSDP_PD_MAX_LEDS 8U
+
+/* One tracked physical LED: its (reader_no, led_no) identity, the resolved
+ * timer/flash state, and the last colour reported through the callback (so
+ * the PD can fire only on an actual change). */
+typedef struct osdp_pd_led_slot {
+    bool       used;
+    uint8_t    reader_no;
+    uint8_t    led_no;
+    uint8_t    last_color;   /* osdp_led_color_t last handed to led_cb */
+    osdp_led_t state;
+} osdp_pd_led_slot_t;
 
 /* Outbound TX scratch sized for any baseline reply. Bumped in later
  * iterations if/when extended replies (file transfer chunks, biometric
@@ -213,6 +253,12 @@ typedef struct osdp_pd {
 
     /* Secure Channel state (optional; opt-in via the set_sc_* APIs). */
     osdp_pd_sc_t               sc;
+
+    /* Reader LED bank (populated transparently from inbound osdp_LED
+     * commands) plus the optional change callback. */
+    osdp_pd_led_slot_t         leds[OSDP_PD_MAX_LEDS];
+    osdp_pd_led_cb             led_cb;
+    void                      *led_user;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/
@@ -244,6 +290,22 @@ void osdp_pd_tick(osdp_pd_t *pd);
  * transport doesn't supply a now_ms callback, the timeout is disabled
  * and the PD remains online once it has sent a reply. */
 bool osdp_pd_is_online(const osdp_pd_t *pd);
+
+/* ---- Reader LED observation --------------------------------------------*/
+
+/* Bind the reader-LED change handler. `cb` fires whenever a tracked LED's
+ * displayed colour changes (see osdp_pd_led_cb). Pass cb=NULL to detach.
+ * Registering a handler does not retroactively replay current colours —
+ * it reports changes from this point on. */
+void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user);
+
+/* Current displayed colour of the given reader LED as an osdp_led_color_t
+ * (0x00 black/off .. 0x07 white). Returns OSDP_LED_BLACK for an LED that
+ * has never been addressed by an osdp_LED command. Resolved against the
+ * transport's now_ms clock (or time 0 if none), so flashing LEDs return
+ * whichever phase is current. */
+uint8_t osdp_pd_led_color(const osdp_pd_t *pd,
+                          uint8_t reader_no, uint8_t led_no);
 
 /* ---- Secure Channel configuration --------------------------------------
  *

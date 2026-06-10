@@ -182,6 +182,12 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
                                 &reply);
     }
 
+    /* Mirror reader-visible commands (osdp_LED) into the LED bank so the
+     * application's change callback / colour query stay current, whatever
+     * the handler chose to reply. */
+    osdp_pd_internal_observe_command(pd, cmd->code,
+                                     cmd->payload, cmd->payload_len);
+
     size_t built = 0;
     osdp_status_t br;
     if (app_status == OSDP_OK) {
@@ -323,6 +329,121 @@ bool osdp_pd_is_online(const osdp_pd_t *pd)
     return pd->online;
 }
 
+/* ---- Reader LED bank -----------------------------------------------------*/
+
+/* Monotonic clock helper. Falls back to time 0 when the transport doesn't
+ * supply now_ms — in which case temporary-timer expiry and flashing simply
+ * don't advance, but command-driven colour changes still resolve. */
+static uint32_t pd_now_ms(const osdp_pd_t *pd)
+{
+    if (pd->transport.now_ms != NULL) {
+        return pd->transport.now_ms(pd->transport.user);
+    }
+    return 0U;
+}
+
+/* Find the bank slot tracking (reader_no, led_no), claiming a free one on
+ * first sighting. Returns NULL only when every slot is already in use by
+ * other LEDs (oversized deployment — the extra LED is ACK'd but untracked). */
+static osdp_pd_led_slot_t *pd_led_slot(osdp_pd_t *pd,
+                                       uint8_t reader_no, uint8_t led_no)
+{
+    osdp_pd_led_slot_t *free_slot = NULL;
+    for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
+        osdp_pd_led_slot_t *s = &pd->leds[i];
+        if (s->used && s->reader_no == reader_no && s->led_no == led_no) {
+            return s;
+        }
+        if (!s->used && free_slot == NULL) {
+            free_slot = s;
+        }
+    }
+    if (free_slot != NULL) {
+        free_slot->used       = true;
+        free_slot->reader_no  = reader_no;
+        free_slot->led_no     = led_no;
+        free_slot->last_color = OSDP_LED_BLACK;
+        osdp_led_init(&free_slot->state);
+    }
+    return free_slot;
+}
+
+/* Recompute every tracked LED's displayed colour at `now` and fire the
+ * change callback for any that flipped since the last report. Cheap and
+ * idempotent; safe to call after every command and on every tick. */
+static void pd_led_refresh(osdp_pd_t *pd, uint32_t now)
+{
+    if (pd->led_cb == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
+        osdp_pd_led_slot_t *s = &pd->leds[i];
+        if (!s->used) {
+            continue;
+        }
+        const uint8_t color = osdp_led_color(&s->state, now);
+        if (color != s->last_color) {
+            s->last_color = color;
+            pd->led_cb(pd->led_user, s->reader_no, s->led_no, color);
+        }
+    }
+}
+
+/* Transparently fold an inbound command into the reader-LED bank. A no-op
+ * for everything except osdp_LED; for that it decodes the records and
+ * applies each to its slot, then re-resolves colours so any change fires
+ * the callback. Declared in pd_internal.h so both the plaintext (pd.c) and
+ * Secure Channel (pd_sc.c) dispatch paths can call it with plaintext bytes. */
+void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+                                      uint8_t        cmd_code,
+                                      const uint8_t *payload,
+                                      size_t         payload_len)
+{
+    if (pd == NULL || cmd_code != OSDP_CMD_LED) {
+        return;
+    }
+    osdp_led_record_t recs[OSDP_PD_MAX_LEDS];
+    size_t n = 0;
+    if (osdp_led_decode(payload, payload_len, recs,
+                        OSDP_PD_MAX_LEDS, &n) != OSDP_OK) {
+        return;  /* malformed LED payload — leave the bank untouched */
+    }
+    const uint32_t now = pd_now_ms(pd);
+    for (size_t i = 0; i < n; i++) {
+        osdp_pd_led_slot_t *s =
+            pd_led_slot(pd, recs[i].reader_no, recs[i].led_no);
+        if (s != NULL) {
+            osdp_led_apply(&s->state, &recs[i], now);
+        }
+    }
+    pd_led_refresh(pd, now);
+}
+
+void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->led_cb   = cb;
+    pd->led_user = user;
+}
+
+uint8_t osdp_pd_led_color(const osdp_pd_t *pd,
+                          uint8_t reader_no, uint8_t led_no)
+{
+    if (pd == NULL) {
+        return OSDP_LED_BLACK;
+    }
+    const uint32_t now = pd_now_ms(pd);
+    for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
+        const osdp_pd_led_slot_t *s = &pd->leds[i];
+        if (s->used && s->reader_no == reader_no && s->led_no == led_no) {
+            return osdp_led_color(&s->state, now);
+        }
+    }
+    return OSDP_LED_BLACK;
+}
+
 /* ---- Secure Channel configuration ---------------------------------------*/
 
 void osdp_pd_set_sc_crypto(osdp_pd_t              *pd,
@@ -421,4 +542,9 @@ void osdp_pd_tick(osdp_pd_t *pd)
 
         process_frame(pd, &cmd);
     }
+
+    /* Re-resolve the LED bank so time-driven changes (temporary-timer
+     * expiry, flash on/off transitions) reach the change callback even on
+     * ticks that processed no command. No-op without a now_ms clock. */
+    pd_led_refresh(pd, pd_now_ms(pd));
 }
