@@ -26,6 +26,7 @@ use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig, StartupConfig};
 use osdp_mcp::pdcap_spec;
+use osdp_mcp::reader_state::ReaderStateView;
 use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -682,6 +683,23 @@ impl OsdpMcp {
             .await
             .map(Json)
             .map_err(|e| format!("pd_status failed: {}", e))
+    }
+
+    /// Snapshot the virtual reader's current output state — today, the
+    /// colour of each LED the ACU has driven via `osdp_LED`. The PD
+    /// decodes LED commands transparently (temporary vs permanent, the
+    /// temporary countdown timer, and flash phase) and this is the
+    /// resolved "what is the reader showing right now" view, suitable for
+    /// a visual display polled alongside the MCP server.
+    #[tool(
+        title = "Get Reader State",
+        description = "Return the virtual reader's current output state: the resolved colour \
+                       of each LED the ACU has driven via osdp_LED (reader_no, led_no, color \
+                       code 0..7, and a colour name). Empty until the ACU sends an LED command. \
+                       Reflects temporary/permanent overrides, timers, and flashing."
+    )]
+    fn pd_reader_state(&self) -> Json<ReaderStateView> {
+        Json(self.pd.reader_state())
     }
 
     /// Read the PD identity reported in the `osdp_ID` reply (`osdp_PDID`,

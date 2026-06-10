@@ -293,9 +293,17 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   PD↔ACU loopback tests in `tests/test_loopback.c` drive a real LED
   command end to end (steady colour mirrored on both peers; temporary
   timer expiring back to permanent purely from the wire clock).
-- ☐ **Rust + MCP wiring.** Expose the PD LED callback / colour query
-  through the `osdp-embedded` wrapper, then have osdp-mcp's
-  `DefaultHandler` register it into a shared `ReaderState` for the UI.
+- ☑ **Rust + MCP wiring.** The `osdp-embedded` wrapper exposes the PD
+  LED API — a typed `LedColor`, an `LedHandler` trait,
+  `Pd::set_led_handler`, and `Pd::led_color` (`rust/osdp/src/pd.rs`),
+  over FFI bindings whose `osdp_pd_t` / `osdp_acu_t` struct mirrors were
+  grown to match the new C LED-bank fields. osdp-mcp's `pd_actor`
+  registers an `LedHandler` (`reader_state.rs::ReaderLedHandler`) on the
+  PD that folds colour changes into a shared `ReaderState`, exposed via
+  the new `pd_reader_state` MCP tool (and cleared when a PD is
+  (re)opened). Tested end to end: `rust/osdp/tests/led_tracking.rs`
+  (wrapper) and `tools/osdp-mcp/tests/actor_loopback.rs`
+  (`led_command_updates_reader_state`).
   (Future deliverables below still cover BUZ/TEXT/OUT and link status,
   which can follow the same C-core pattern or stay Rust-side as plain
   decode-into-state.)

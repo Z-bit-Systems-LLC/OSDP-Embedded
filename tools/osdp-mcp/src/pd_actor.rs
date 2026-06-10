@@ -29,6 +29,7 @@ use crate::events::{self, EventQueue};
 use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
+use crate::reader_state::{self, ReaderLedHandler, ReaderStateView, SharedReaderState};
 use crate::serial_transport::SerialTransport;
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
@@ -214,6 +215,11 @@ pub struct PdHandle {
     /// Created once at spawn, so edits persist across `configure` /
     /// `stop`.
     pdcap: SharedPdcap,
+    /// Observed reader output state (LED colours), updated on the actor
+    /// thread by the PD's LED change callback and read by the
+    /// `pd_reader_state` tool. Created once at spawn; cleared whenever a
+    /// PD is (re)opened so a fresh reader starts blank.
+    reader_state: SharedReaderState,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -238,6 +244,7 @@ impl PdHandle {
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
         let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
+        let reader_state = reader_state::new_shared();
         let log_for_thread = Arc::clone(&log);
         let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
@@ -245,6 +252,7 @@ impl PdHandle {
         let drop_for_thread = Arc::clone(&drop_remaining);
         let pdid_for_thread = Arc::clone(&pdid);
         let pdcap_for_thread = Arc::clone(&pdcap);
+        let reader_state_for_thread = Arc::clone(&reader_state);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -257,6 +265,7 @@ impl PdHandle {
                     drop_for_thread,
                     pdid_for_thread,
                     pdcap_for_thread,
+                    reader_state_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -271,6 +280,7 @@ impl PdHandle {
             drop_remaining,
             pdid,
             pdcap,
+            reader_state,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -443,6 +453,16 @@ impl PdHandle {
         events::len(&self.events)
     }
 
+    /// Snapshot the reader's observed output state (LED colours). Reads
+    /// the shared state directly — no actor round-trip. A poisoned lock
+    /// yields an empty snapshot rather than failing.
+    pub fn reader_state(&self) -> ReaderStateView {
+        self.reader_state
+            .lock()
+            .map(|s| s.snapshot())
+            .unwrap_or_else(|_| ReaderStateView { leds: Vec::new() })
+    }
+
     /// Drop every queued event. Subsequent POLLs go straight to
     /// override-or-ACK.
     pub fn clear_events(&self) {
@@ -570,6 +590,7 @@ fn actor_loop(
     drop_remaining: DropCounter,
     pdid: SharedPdid,
     pdcap: SharedPdcap,
+    reader_state: SharedReaderState,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
@@ -603,6 +624,7 @@ fn actor_loop(
                     &drop_remaining,
                     &pdid,
                     &pdcap,
+                    &reader_state,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -633,6 +655,7 @@ fn handle_cmd(
     drop_remaining: &DropCounter,
     pdid: &SharedPdid,
     pdcap: &SharedPdcap,
+    reader_state: &SharedReaderState,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -665,6 +688,7 @@ fn handle_cmd(
                 Arc::clone(drop_remaining),
                 Arc::clone(pdid),
                 Arc::clone(pdcap),
+                Arc::clone(reader_state),
                 sc,
                 crypto_factory,
             )
@@ -700,6 +724,7 @@ fn handle_cmd(
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
+                        Arc::clone(reader_state),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -734,6 +759,7 @@ fn handle_cmd(
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
+                        Arc::clone(reader_state),
                         old.sc.clone(),
                         crypto_factory,
                     );
@@ -808,6 +834,7 @@ fn open_pd(
     drop_remaining: DropCounter,
     pdid: SharedPdid,
     pdcap: SharedPdcap,
+    reader_state: SharedReaderState,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -843,6 +870,14 @@ fn open_pd(
         drop_remaining,
         address,
     ));
+
+    // A freshly-opened PD starts with no LED state; clear any colours the
+    // previous PD left in the snapshot, then bind the change callback so
+    // the PD's transparent osdp_LED decoding flows into the reader state.
+    if let Ok(mut rs) = reader_state.lock() {
+        rs.clear();
+    }
+    pd.set_led_handler(ReaderLedHandler::new(reader_state));
 
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is

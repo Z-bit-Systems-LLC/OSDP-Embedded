@@ -16,12 +16,14 @@ use std::sync::{Arc, Mutex};
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
 use osdp_embedded::messages::{
-    Keypad, Pdcap, Pdid, Raw, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK,
-    OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW,
+    Keypad, Led, LedRecord, Pdcap, Pdid, Raw, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_LED,
+    OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP,
+    OSDP_REPLY_PDID, OSDP_REPLY_RAW,
 };
-use osdp_embedded::pd::Pd;
+use osdp_embedded::pd::{LedColor, Pd};
 use osdp_embedded::Transport;
 use osdp_mcp::overrides::OverrideReply;
+use osdp_mcp::reader_state::{self, ReaderLedHandler};
 
 // Pull the handler + log + overrides + events from osdp-mcp's lib.
 use osdp_mcp::events;
@@ -451,4 +453,80 @@ fn default_handler_handles_baseline() {
     // separate handler-level unit test (handler::tests::drop_counter…).
     drop(cap);
     let _ = drops;
+}
+
+/// An `osdp_LED` command from the ACU is decoded transparently by the PD
+/// and folded into the shared `ReaderState` via the LED change callback —
+/// the mechanism behind the `pd_reader_state` tool and the visual reader.
+#[test]
+fn led_command_updates_reader_state() {
+    let wire = Rc::new(RefCell::new(Wire::default()));
+
+    let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(16));
+    let ovmap = overrides::new_map();
+    let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Shared reader state, owned here and by the LED handler — exactly how
+    // the actor wires it so `pd_reader_state` can read a live PD's LEDs.
+    let reader_state = reader_state::new_shared();
+
+    let mut pd = Pd::new(0x10);
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    // DefaultHandler ACKs LED; the PD tracks the colour regardless.
+    pd.set_command_handler(handler::DefaultHandler::new(
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
+        StdArc::clone(&drops),
+        0x10,
+    ));
+    pd.set_led_handler(ReaderLedHandler::new(Arc::clone(&reader_state)));
+
+    let captured = Rc::new(RefCell::new(Captured::default()));
+    let mut acu = Acu::new(1);
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.register_pd(0, 0x10).expect("register_pd");
+
+    // Reader starts blank.
+    assert!(reader_state.lock().unwrap().snapshot().leds.is_empty());
+
+    // ACU drives reader 0, LED 0 steady green.
+    let led = Led {
+        records: vec![LedRecord {
+            reader_no: 0,
+            led_no: 0,
+            perm_control_code: 1, // SET
+            perm_on_color: LedColor::Green.as_u8(),
+            perm_off_color: LedColor::Green.as_u8(),
+            ..Default::default()
+        }],
+    };
+    let mut buf = [0u8; 32];
+    let n = led.build(&mut buf).expect("LED build");
+    acu.send_command(0x10, OSDP_CMD_LED, &buf[..n])
+        .expect("send LED");
+    cycle(&mut pd, &mut acu, 4);
+
+    // PD ACK'd, and the reader state reflects green on (0, 0).
+    {
+        let cap = captured.borrow();
+        let (_, cmd, reply, _) = cap.log.last().expect("an LED reply");
+        assert_eq!((*cmd, *reply), (OSDP_CMD_LED, OSDP_REPLY_ACK));
+    }
+    let snap = reader_state.lock().unwrap().snapshot();
+    assert_eq!(snap.leds.len(), 1);
+    assert_eq!(snap.leds[0].reader_no, 0);
+    assert_eq!(snap.leds[0].led_no, 0);
+    assert_eq!(snap.leds[0].color, LedColor::Green.as_u8());
+    assert_eq!(snap.leds[0].color_name, "green");
 }

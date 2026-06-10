@@ -13,5 +13,6 @@ pub mod log;
 pub mod overrides;
 pub mod pd_actor;
 pub mod pdcap_spec;
+pub mod reader_state;
 pub mod serial_transport;
 pub mod wire;
