@@ -29,7 +29,9 @@ use crate::events::{self, EventQueue};
 use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
-use crate::reader_state::{self, ReaderLedHandler, ReaderStateView, SharedReaderState};
+use crate::reader_state::{
+    self, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
+};
 use crate::serial_transport::SerialTransport;
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
@@ -460,7 +462,7 @@ impl PdHandle {
         self.reader_state
             .lock()
             .map(|s| s.snapshot())
-            .unwrap_or_else(|_| ReaderStateView { leds: Vec::new() })
+            .unwrap_or_else(|_| ReaderStateView::default())
     }
 
     /// Subscribe to reader-state changes — one snapshot per LED change —
@@ -888,7 +890,8 @@ fn open_pd(
     if let Ok(mut rs) = reader_state.lock() {
         rs.clear();
     }
-    pd.set_led_handler(ReaderLedHandler::new(reader_state));
+    pd.set_led_handler(ReaderLedHandler::new(Arc::clone(&reader_state)));
+    pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
 
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is

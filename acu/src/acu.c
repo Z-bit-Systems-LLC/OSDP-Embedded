@@ -131,6 +131,74 @@ static void acu_observe_led(osdp_acu_t *acu, uint8_t pd_address,
     acu_led_refresh(acu, now);
 }
 
+/* Find the buzzer slot for (pd_address, reader_no), claiming a free one on
+ * first sighting. Returns NULL only when every slot is in use. */
+static osdp_acu_buz_slot_t *acu_buz_slot(osdp_acu_t *acu, uint8_t pd_address,
+                                         uint8_t reader_no)
+{
+    osdp_acu_buz_slot_t *free_slot = NULL;
+    for (size_t i = 0; i < OSDP_ACU_MAX_BUZZERS; i++) {
+        osdp_acu_buz_slot_t *s = &acu->buzzers[i];
+        if (s->used && s->pd_address == pd_address &&
+            s->reader_no == reader_no) {
+            return s;
+        }
+        if (!s->used && free_slot == NULL) {
+            free_slot = s;
+        }
+    }
+    if (free_slot != NULL) {
+        free_slot->used          = true;
+        free_slot->pd_address    = pd_address;
+        free_slot->reader_no     = reader_no;
+        free_slot->last_sounding = false;
+        osdp_buz_init(&free_slot->state);
+    }
+    return free_slot;
+}
+
+/* Recompute every tracked buzzer's sounding state at `now` and fire the
+ * change callback for any that flipped since the last report. */
+static void acu_buz_refresh(osdp_acu_t *acu, uint32_t now)
+{
+    if (acu->buzzer_cb == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < OSDP_ACU_MAX_BUZZERS; i++) {
+        osdp_acu_buz_slot_t *s = &acu->buzzers[i];
+        if (!s->used) {
+            continue;
+        }
+        const bool sounding = osdp_buz_sounding(&s->state, now);
+        if (sounding != s->last_sounding) {
+            s->last_sounding = sounding;
+            acu->buzzer_cb(acu->buzzer_user, s->pd_address, s->reader_no,
+                           sounding, s->state.tone);
+        }
+    }
+}
+
+/* Fold an outbound osdp_BUZ into the bank, then re-resolve so any sounding
+ * change fires the callback. A no-op for any other command code. */
+static void acu_observe_buzzer(osdp_acu_t *acu, uint8_t pd_address,
+                               uint8_t cmd_code,
+                               const uint8_t *payload, size_t payload_len)
+{
+    if (cmd_code != OSDP_CMD_BUZ) {
+        return;
+    }
+    osdp_buz_cmd_t buz;
+    if (osdp_buz_decode(payload, payload_len, &buz) != OSDP_OK) {
+        return;
+    }
+    const uint32_t now = now_ms_or_zero(acu);
+    osdp_acu_buz_slot_t *s = acu_buz_slot(acu, pd_address, buz.reader_no);
+    if (s != NULL) {
+        osdp_buz_apply(&s->state, &buz, now);
+    }
+    acu_buz_refresh(acu, now);
+}
+
 /* ---- Reply ingestion ---------------------------------------------------*/
 
 void osdp_acu_internal_deliver_reply(osdp_acu_t           *acu,
@@ -403,8 +471,10 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
 
     /* The command is on the wire — mirror any osdp_LED into the local LED
      * bank so the ACU's colour query / change callback reflect what it
-     * just told the reader to display. */
+     * just told the reader to display, and surface any osdp_BUZ as a beep
+     * event. */
     acu_observe_led(acu, pd_address, cmd_code, payload, payload_len);
+    acu_observe_buzzer(acu, pd_address, cmd_code, payload, payload_len);
     return OSDP_OK;
 }
 
@@ -480,10 +550,12 @@ void osdp_acu_tick(osdp_acu_t *acu)
         process_reply(acu, &frame);
     }
 
-    /* Re-resolve the LED bank so time-driven changes (temporary-timer
-     * expiry, flash transitions) reach the change callback even on ticks
-     * with no outbound command. No-op without a now_ms clock. */
-    acu_led_refresh(acu, now_ms_or_zero(acu));
+    /* Re-resolve the LED + buzzer banks so time-driven changes (LED timer
+     * expiry / flash, buzzer beep/silence edges) reach the change callbacks
+     * even on ticks with no outbound command. No-op without a now_ms clock. */
+    const uint32_t now = now_ms_or_zero(acu);
+    acu_led_refresh(acu, now);
+    acu_buz_refresh(acu, now);
 }
 
 bool osdp_acu_is_pd_online(const osdp_acu_t *acu, uint8_t pd_address)
@@ -515,6 +587,33 @@ void osdp_acu_set_led_handler(osdp_acu_t *acu, osdp_acu_led_cb cb, void *user)
     }
     acu->led_cb   = cb;
     acu->led_user = user;
+}
+
+void osdp_acu_set_buzzer_handler(osdp_acu_t *acu, osdp_acu_buzzer_cb cb,
+                                 void *user)
+{
+    if (acu == NULL) {
+        return;
+    }
+    acu->buzzer_cb   = cb;
+    acu->buzzer_user = user;
+}
+
+bool osdp_acu_buzzer_sounding(const osdp_acu_t *acu, uint8_t pd_address,
+                             uint8_t reader_no)
+{
+    if (acu == NULL) {
+        return false;
+    }
+    const uint32_t now = now_ms_or_zero(acu);
+    for (size_t i = 0; i < OSDP_ACU_MAX_BUZZERS; i++) {
+        const osdp_acu_buz_slot_t *s = &acu->buzzers[i];
+        if (s->used && s->pd_address == pd_address &&
+            s->reader_no == reader_no) {
+            return osdp_buz_sounding(&s->state, now);
+        }
+    }
+    return false;
 }
 
 uint8_t osdp_acu_led_color(const osdp_acu_t *acu, uint8_t pd_address,

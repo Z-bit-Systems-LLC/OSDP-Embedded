@@ -150,6 +150,18 @@ pub trait LedHandler: 'static {
     fn on_led_change(&mut self, reader_no: u8, led_no: u8, color: LedColor);
 }
 
+/// Reader-buzzer change handler. Called by [`Pd::tick`] (and immediately on
+/// an inbound `osdp_BUZ`) whenever a tracked buzzer's *sounding* state
+/// changes — when a command starts it, on each beep/silence edge of the
+/// on/off pattern, and once more when the pattern finishes. `sounding` is
+/// true while the buzzer is making sound; `tone` is the driving tone code
+/// (0x01 off, 0x02 default tone). Time-driven edges only surface if the
+/// [`Transport`] supplies a `now_ms` clock. The PD decodes the command
+/// internally; the handler never parses it.
+pub trait BuzzerHandler: 'static {
+    fn on_buzzer_change(&mut self, reader_no: u8, sounding: bool, tone: u8);
+}
+
 // ---- Internal storage ---------------------------------------------------
 //
 // Each trait object is wrapped in a `Box<dyn Trait>`. We need the
@@ -159,6 +171,7 @@ pub trait LedHandler: 'static {
 type TransportBox = Box<dyn Transport>;
 type CommandHandlerBox = Box<dyn CommandHandler>;
 type LedHandlerBox = Box<dyn LedHandler>;
+type BuzzerHandlerBox = Box<dyn BuzzerHandler>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -175,6 +188,8 @@ pub struct Pd {
     /// Held alive for the lifetime of `self`; the C side keeps a raw
     /// `*mut c_void` derived from this box's heap address as `led_user`.
     led_handler: Option<Box<LedHandlerBox>>,
+    /// Same arrangement for the buzzer change handler (`buzzer_user`).
+    buzzer_handler: Option<Box<BuzzerHandlerBox>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
@@ -193,6 +208,7 @@ impl Pd {
             transport: None,
             cmd_handler: None,
             led_handler: None,
+            buzzer_handler: None,
             sc_crypto: None,
         }
     }
@@ -272,6 +288,28 @@ impl Pd {
     /// none), so a flashing LED returns whichever phase is current.
     pub fn led_color(&self, reader_no: u8, led_no: u8) -> LedColor {
         LedColor::from_u8(unsafe { sys::osdp_pd_led_color(&*self.inner, reader_no, led_no) })
+    }
+
+    /// Bind the reader-buzzer change handler. The PD transparently decodes
+    /// inbound `osdp_BUZ` commands and calls `handler` whenever a tracked
+    /// buzzer's sounding state changes (see [`BuzzerHandler`]). Replaces any
+    /// previously-set handler (the old one is dropped).
+    pub fn set_buzzer_handler<H: BuzzerHandler>(&mut self, handler: H) {
+        let boxed: Box<BuzzerHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            sys::osdp_pd_set_buzzer_handler(&mut *self.inner, Some(buzzer_handler_thunk), user_ptr);
+        }
+
+        self.buzzer_handler = Some(unsafe { Box::from_raw(user_ptr as *mut BuzzerHandlerBox) });
+    }
+
+    /// Whether the given reader's buzzer is sounding right now. False for a
+    /// reader no `osdp_BUZ` command has addressed. Resolved against the
+    /// transport's `now_ms` clock (or time 0 if none).
+    pub fn buzzer_sounding(&self, reader_no: u8) -> bool {
+        unsafe { sys::osdp_pd_buzzer_sounding(&*self.inner, reader_no) }
     }
 
     // ---- Secure Channel configuration ---------------------------------
@@ -383,6 +421,16 @@ unsafe extern "C" fn led_handler_thunk(user: *mut c_void, reader_no: u8, led_no:
     storage.on_led_change(reader_no, led_no, LedColor::from_u8(color));
 }
 
+unsafe extern "C" fn buzzer_handler_thunk(
+    user: *mut c_void,
+    reader_no: u8,
+    sounding: bool,
+    tone: u8,
+) {
+    let storage = &mut *(user as *mut BuzzerHandlerBox);
+    storage.on_buzzer_change(reader_no, sounding, tone);
+}
+
 // ---- Drop impl ---------------------------------------------------------
 
 impl Drop for Pd {
@@ -396,6 +444,8 @@ impl Drop for Pd {
             sys::osdp_pd_set_command_handler(&mut *self.inner, None, ptr::null_mut());
             // Detach the LED change handler too, for the same reason.
             sys::osdp_pd_set_led_handler(&mut *self.inner, None, ptr::null_mut());
+            // And the buzzer change handler.
+            sys::osdp_pd_set_buzzer_handler(&mut *self.inner, None, ptr::null_mut());
             // Replace the transport with one whose callbacks are NULL
             // so future tick()s can't dereference our (about to be
             // dropped) trait objects. We still own the C struct; the

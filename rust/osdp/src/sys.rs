@@ -455,6 +455,34 @@ extern "C" {
 }
 
 // ====================================================================
+// osdp_buz_state.h
+// ====================================================================
+
+// osdp_BUZ tone_code values.
+pub const OSDP_BUZ_TONE_OFF: u8 = 0x01;
+pub const OSDP_BUZ_TONE_DEFAULT: u8 = 0x02;
+
+/// Mirror of C `osdp_buz_t` (single reader buzzer resolver, 12 bytes,
+/// align 4). Embedded by the PD/ACU buzzer-bank slots, so its layout must
+/// match the C struct exactly.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct osdp_buz_t {
+    pub tone: u8,
+    pub on_time_100ms: u8,
+    pub off_time_100ms: u8,
+    pub count: u8,
+    pub started_ms: u32,
+    pub active: bool,
+}
+
+extern "C" {
+    pub fn osdp_buz_init(buz: *mut osdp_buz_t);
+    pub fn osdp_buz_apply(buz: *mut osdp_buz_t, cmd: *const osdp_buz_cmd_t, now_ms: u32);
+    pub fn osdp_buz_sounding(buz: *const osdp_buz_t, now_ms: u32) -> bool;
+}
+
+// ====================================================================
 // osdp_replies.h
 // ====================================================================
 
@@ -816,6 +844,7 @@ mod pd_ffi {
     pub const OSDP_PD_TX_BUF_LEN: usize = 256;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
+    pub const OSDP_PD_MAX_BUZZERS: usize = 4;
 
     pub type osdp_pd_read_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
@@ -862,6 +891,19 @@ mod pd_ffi {
         pub state: osdp_led_t,
     }
 
+    pub type osdp_pd_buzzer_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, reader_no: u8, sounding: bool, tone: u8)>;
+
+    /// Mirror of C `osdp_pd_buz_slot_t` (16 bytes, align 4).
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct osdp_pd_buz_slot_t {
+        pub used: bool,
+        pub reader_no: u8,
+        pub last_sounding: bool,
+        pub state: osdp_buz_t,
+    }
+
     #[repr(C)]
     pub struct osdp_pd_sc_t {
         pub crypto: osdp_sc_crypto_t,
@@ -903,6 +945,10 @@ mod pd_ffi {
         pub leds: [osdp_pd_led_slot_t; OSDP_PD_MAX_LEDS],
         pub led_cb: osdp_pd_led_cb,
         pub led_user: *mut c_void,
+
+        pub buzzers: [osdp_pd_buz_slot_t; OSDP_PD_MAX_BUZZERS],
+        pub buzzer_cb: osdp_pd_buzzer_cb,
+        pub buzzer_user: *mut c_void,
     }
 
     extern "C" {
@@ -918,6 +964,13 @@ mod pd_ffi {
 
         pub fn osdp_pd_set_led_handler(pd: *mut osdp_pd_t, cb: osdp_pd_led_cb, user: *mut c_void);
         pub fn osdp_pd_led_color(pd: *const osdp_pd_t, reader_no: u8, led_no: u8) -> u8;
+
+        pub fn osdp_pd_set_buzzer_handler(
+            pd: *mut osdp_pd_t,
+            cb: osdp_pd_buzzer_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_pd_buzzer_sounding(pd: *const osdp_pd_t, reader_no: u8) -> bool;
 
         pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
         pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
@@ -942,6 +995,7 @@ mod acu_ffi {
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
     pub const OSDP_ACU_MAX_LEDS: usize = 16;
+    pub const OSDP_ACU_MAX_BUZZERS: usize = 8;
 
     // The transport callback shape is identical between PD and ACU; rather
     // than aliasing `osdp_pd_read_cb` (which would create a hard cross-
@@ -1061,6 +1115,27 @@ mod acu_ffi {
         pub state: osdp_led_t,
     }
 
+    pub type osdp_acu_buzzer_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            pd_address: u8,
+            reader_no: u8,
+            sounding: bool,
+            tone: u8,
+        ),
+    >;
+
+    /// Mirror of C `osdp_acu_buz_slot_t` (16 bytes, align 4).
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct osdp_acu_buz_slot_t {
+        pub used: bool,
+        pub pd_address: u8,
+        pub reader_no: u8,
+        pub last_sounding: bool,
+        pub state: osdp_buz_t,
+    }
+
     #[repr(C)]
     pub struct osdp_acu_t {
         pub transport: osdp_acu_transport_t,
@@ -1081,6 +1156,10 @@ mod acu_ffi {
         pub leds: [osdp_acu_led_slot_t; OSDP_ACU_MAX_LEDS],
         pub led_cb: osdp_acu_led_cb,
         pub led_user: *mut c_void,
+
+        pub buzzers: [osdp_acu_buz_slot_t; OSDP_ACU_MAX_BUZZERS],
+        pub buzzer_cb: osdp_acu_buzzer_cb,
+        pub buzzer_user: *mut c_void,
     }
 
     extern "C" {
@@ -1151,5 +1230,16 @@ mod acu_ffi {
             reader_no: u8,
             led_no: u8,
         ) -> u8;
+
+        pub fn osdp_acu_set_buzzer_handler(
+            acu: *mut osdp_acu_t,
+            cb: osdp_acu_buzzer_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_acu_buzzer_sounding(
+            acu: *const osdp_acu_t,
+            pd_address: u8,
+            reader_no: u8,
+        ) -> bool;
     }
 } // mod acu_ffi

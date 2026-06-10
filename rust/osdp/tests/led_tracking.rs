@@ -15,8 +15,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use osdp_embedded::acu::Acu;
-use osdp_embedded::messages::{Led, LedRecord, OSDP_CMD_LED, OSDP_REPLY_ACK};
-use osdp_embedded::pd::{CommandHandler, LedColor, LedHandler, Pd, Reply};
+use osdp_embedded::messages::{BuzCmd, Led, LedRecord, OSDP_CMD_BUZ, OSDP_CMD_LED, OSDP_REPLY_ACK};
+use osdp_embedded::pd::{BuzzerHandler, CommandHandler, LedColor, LedHandler, Pd, Reply};
 use osdp_embedded::Transport;
 
 #[derive(Default)]
@@ -84,6 +84,23 @@ impl LedHandler for LedCapture {
     }
 }
 
+/// Records every buzzer sounding-change the PD reports.
+#[derive(Default)]
+struct BuzLog {
+    events: Vec<(u8, bool, u8)>, // (reader_no, sounding, tone)
+}
+struct BuzCapture {
+    inner: Rc<RefCell<BuzLog>>,
+}
+impl BuzzerHandler for BuzCapture {
+    fn on_buzzer_change(&mut self, reader_no: u8, sounding: bool, tone: u8) {
+        self.inner
+            .borrow_mut()
+            .events
+            .push((reader_no, sounding, tone));
+    }
+}
+
 fn cycle(pd: &mut Pd, acu: &mut Acu, n: usize) {
     for _ in 0..n {
         pd.tick();
@@ -104,11 +121,13 @@ struct Rig {
     pd: Pd,
     acu: Acu,
     led_log: Rc<RefCell<LedLog>>,
+    buz_log: Rc<RefCell<BuzLog>>,
 }
 
 fn rig() -> Rig {
     let wire = Rc::new(RefCell::new(Wire::default()));
     let led_log = Rc::new(RefCell::new(LedLog::default()));
+    let buz_log = Rc::new(RefCell::new(BuzLog::default()));
 
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
@@ -117,6 +136,9 @@ fn rig() -> Rig {
     pd.set_command_handler(AckHandler);
     pd.set_led_handler(LedCapture {
         inner: Rc::clone(&led_log),
+    });
+    pd.set_buzzer_handler(BuzCapture {
+        inner: Rc::clone(&buz_log),
     });
 
     let mut acu = Acu::new(1);
@@ -130,6 +152,7 @@ fn rig() -> Rig {
         pd,
         acu,
         led_log,
+        buz_log,
     }
 }
 
@@ -202,5 +225,43 @@ fn temporary_led_timer_expires_to_permanent() {
     assert_eq!(
         r.led_log.borrow().events.last().copied(),
         Some((0u8, 0u8, LedColor::Red))
+    );
+}
+
+#[test]
+fn buzzer_command_drives_sounding_then_silence() {
+    let mut r = rig();
+    r.wire.borrow_mut().now_ms = 1000;
+
+    // One beep: 100 ms on, 100 ms off, count 1 (total 200 ms).
+    let buz = BuzCmd {
+        reader_no: 0,
+        tone_code: 0x02, // default tone
+        on_time_100ms: 1,
+        off_time_100ms: 1,
+        count: 1,
+    };
+    let mut buf = [0u8; 8];
+    let n = buz.build(&mut buf).expect("BUZ build");
+    r.acu
+        .send_command(0x10, OSDP_CMD_BUZ, &buf[..n])
+        .expect("send BUZ");
+    cycle(&mut r.pd, &mut r.acu, 4);
+
+    // Beep is sounding; callback reported sounding=true with the tone.
+    assert!(r.pd.buzzer_sounding(0));
+    assert_eq!(
+        r.buz_log.borrow().events.last().copied(),
+        Some((0u8, true, 0x02u8))
+    );
+
+    // Advance into the off gap — falls silent purely from the clock.
+    r.wire.borrow_mut().now_ms = 1150;
+    cycle(&mut r.pd, &mut r.acu, 2);
+
+    assert!(!r.pd.buzzer_sounding(0));
+    assert_eq!(
+        r.buz_log.borrow().events.last().copied(),
+        Some((0u8, false, 0x02u8))
     );
 }

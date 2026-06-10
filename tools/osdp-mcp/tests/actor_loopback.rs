@@ -16,14 +16,14 @@ use std::sync::{Arc, Mutex};
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
 use osdp_embedded::messages::{
-    Keypad, Led, LedRecord, Pdcap, Pdid, Raw, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_LED,
-    OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP,
-    OSDP_REPLY_PDID, OSDP_REPLY_RAW,
+    BuzCmd, Keypad, Led, LedRecord, Pdcap, Pdid, Raw, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID,
+    OSDP_CMD_LED, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR,
+    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW,
 };
 use osdp_embedded::pd::{LedColor, Pd};
 use osdp_embedded::Transport;
 use osdp_mcp::overrides::OverrideReply;
-use osdp_mcp::reader_state::{self, ReaderLedHandler};
+use osdp_mcp::reader_state::{self, ReaderBuzzerHandler, ReaderLedHandler};
 
 // Pull the handler + log + overrides + events from osdp-mcp's lib.
 use osdp_mcp::events;
@@ -529,4 +529,73 @@ fn led_command_updates_reader_state() {
     assert_eq!(snap.leds[0].led_no, 0);
     assert_eq!(snap.leds[0].color, LedColor::Green.as_u8());
     assert_eq!(snap.leds[0].color_name, "green");
+}
+
+/// An `osdp_BUZ` command from the ACU is decoded by the PD and its sounding
+/// state folded into the shared `ReaderState` via the buzzer change
+/// callback — the mechanism behind the buzzer row of `pd_reader_state` and
+/// the page's beep.
+#[test]
+fn buzzer_command_updates_reader_state() {
+    let wire = Rc::new(RefCell::new(Wire::default()));
+
+    let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(16));
+    let ovmap = overrides::new_map();
+    let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+    let reader_state = reader_state::new_shared();
+
+    let mut pd = Pd::new(0x10);
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    pd.set_command_handler(handler::DefaultHandler::new(
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
+        StdArc::clone(&drops),
+        0x10,
+    ));
+    pd.set_buzzer_handler(ReaderBuzzerHandler::new(Arc::clone(&reader_state)));
+
+    let captured = Rc::new(RefCell::new(Captured::default()));
+    let mut acu = Acu::new(1);
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.register_pd(0, 0x10).expect("register_pd");
+
+    assert!(reader_state.lock().unwrap().snapshot().buzzers.is_empty());
+
+    // A beep on reader 0 (default tone). With no now_ms clock the PD
+    // resolves it at time 0 — inside the first on phase — so the reader
+    // state shows it sounding.
+    let buz = BuzCmd {
+        reader_no: 0,
+        tone_code: 0x02,
+        on_time_100ms: 2,
+        off_time_100ms: 2,
+        count: 3,
+    };
+    let mut buf = [0u8; 8];
+    let n = buz.build(&mut buf).expect("BUZ build");
+    acu.send_command(0x10, OSDP_CMD_BUZ, &buf[..n])
+        .expect("send BUZ");
+    cycle(&mut pd, &mut acu, 4);
+
+    {
+        let cap = captured.borrow();
+        let (_, cmd, reply, _) = cap.log.last().expect("a BUZ reply");
+        assert_eq!((*cmd, *reply), (OSDP_CMD_BUZ, OSDP_REPLY_ACK));
+    }
+    let snap = reader_state.lock().unwrap().snapshot();
+    assert_eq!(snap.buzzers.len(), 1);
+    assert_eq!(snap.buzzers[0].reader_no, 0);
+    assert!(snap.buzzers[0].sounding);
+    assert_eq!(snap.buzzers[0].tone, 0x02);
 }

@@ -171,6 +171,23 @@ static void on_acu_led(void *user, uint8_t pd_address, uint8_t reader_no,
     c->last_color  = color;
 }
 
+typedef struct {
+    unsigned int call_count;
+    uint8_t      reader_no;
+    bool         sounding;
+    uint8_t      tone;
+} buz_capture_t;
+
+static void on_pd_buzzer(void *user, uint8_t reader_no, bool sounding,
+                         uint8_t tone)
+{
+    buz_capture_t *c = (buz_capture_t *)user;
+    c->call_count++;
+    c->reader_no = reader_no;
+    c->sounding  = sounding;
+    c->tone      = tone;
+}
+
 /* ---- ACU-side captures ------------------------------------------------- */
 
 typedef struct {
@@ -216,6 +233,7 @@ typedef struct rig {
     timeout_capture_t   timeout;
     led_capture_t       pd_led;
     led_capture_t       acu_led;
+    buz_capture_t       pd_buz;
 } rig_t;
 
 static void rig_init(rig_t *r, uint8_t pd_address)
@@ -235,6 +253,7 @@ static void rig_init(rig_t *r, uint8_t pd_address)
     osdp_pd_set_transport(&r->pd, &pd_t);
     osdp_pd_set_command_handler(&r->pd, pd_app_handler, NULL);
     osdp_pd_set_led_handler(&r->pd, on_pd_led, &r->pd_led);
+    osdp_pd_set_buzzer_handler(&r->pd, on_pd_buzzer, &r->pd_buz);
 
     osdp_acu_init(&r->acu, r->acu_slots,
                   sizeof(r->acu_slots) / sizeof(r->acu_slots[0]));
@@ -493,6 +512,56 @@ static void test_led_temporary_timer_expires_to_permanent(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_LED_RED, r.acu_led.last_color);
 }
 
+/* A buzzer command beeps then falls silent: the PD resolves the on/off
+ * pattern over the wire clock and fires the change callback on the start
+ * (sounding) and the end of the pattern (silent) — the state-update model.
+ */
+static void test_buzzer_beeps_then_falls_silent(void)
+{
+    rig_t r;
+    rig_init(&r, 0x10);
+    r.wire.now_ms = 1000;
+
+    /* One beep: 100 ms on, 100 ms off, count 1 → total 200 ms. Sounds at
+     * the start, silent once into the off gap. */
+    const osdp_buz_cmd_t buz = {
+        .reader_no      = 0,
+        .tone_code      = OSDP_BUZ_TONE_DEFAULT,
+        .on_time_100ms  = 1,
+        .off_time_100ms = 1,
+        .count          = 1,
+    };
+    uint8_t payload[OSDP_BUZ_PAYLOAD_BYTES];
+    size_t plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_buz_build(&buz, payload, sizeof(payload), &plen));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&r.acu, 0x10, OSDP_CMD_BUZ,
+                                            payload, plen));
+    cycle(&r, 4);
+
+    /* Beep is sounding at the start; callback fired sounding=true. */
+    TEST_ASSERT_TRUE(osdp_pd_buzzer_sounding(&r.pd, 0));
+    TEST_ASSERT_TRUE(r.pd_buz.sounding);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_BUZ_TONE_DEFAULT, r.pd_buz.tone);
+    const unsigned int after_start = r.pd_buz.call_count;
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT(1, after_start);
+
+    /* Advance into the off gap — the buzzer falls silent, callback fires
+     * sounding=false with no new command sent. */
+    r.wire.now_ms = 1150;
+    cycle(&r, 2);
+    TEST_ASSERT_FALSE(osdp_pd_buzzer_sounding(&r.pd, 0));
+    TEST_ASSERT_FALSE(r.pd_buz.sounding);
+    TEST_ASSERT_GREATER_THAN_UINT(after_start, r.pd_buz.call_count);
+
+    /* Past the whole pattern — stays silent. */
+    r.wire.now_ms = 1300;
+    cycle(&r, 2);
+    TEST_ASSERT_FALSE(osdp_pd_buzzer_sounding(&r.pd, 0));
+    TEST_ASSERT_FALSE(r.pd_buz.sounding);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -504,5 +573,6 @@ int main(void)
     RUN_TEST(test_broadcast_command_reaches_pd);
     RUN_TEST(test_led_steady_colour_tracked_on_both_sides);
     RUN_TEST(test_led_temporary_timer_expires_to_permanent);
+    RUN_TEST(test_buzzer_beeps_then_falls_silent);
     return UNITY_END();
 }

@@ -389,34 +389,100 @@ static void pd_led_refresh(osdp_pd_t *pd, uint32_t now)
     }
 }
 
-/* Transparently fold an inbound command into the reader-LED bank. A no-op
- * for everything except osdp_LED; for that it decodes the records and
- * applies each to its slot, then re-resolves colours so any change fires
- * the callback. Declared in pd_internal.h so both the plaintext (pd.c) and
- * Secure Channel (pd_sc.c) dispatch paths can call it with plaintext bytes. */
+/* ---- Reader buzzer bank --------------------------------------------------*/
+
+/* Find the buzzer slot for `reader_no`, claiming a free one on first
+ * sighting. Returns NULL only when every slot is in use by other readers. */
+static osdp_pd_buz_slot_t *pd_buz_slot(osdp_pd_t *pd, uint8_t reader_no)
+{
+    osdp_pd_buz_slot_t *free_slot = NULL;
+    for (size_t i = 0; i < OSDP_PD_MAX_BUZZERS; i++) {
+        osdp_pd_buz_slot_t *s = &pd->buzzers[i];
+        if (s->used && s->reader_no == reader_no) {
+            return s;
+        }
+        if (!s->used && free_slot == NULL) {
+            free_slot = s;
+        }
+    }
+    if (free_slot != NULL) {
+        free_slot->used          = true;
+        free_slot->reader_no     = reader_no;
+        free_slot->last_sounding = false;
+        osdp_buz_init(&free_slot->state);
+    }
+    return free_slot;
+}
+
+/* Recompute every tracked buzzer's sounding state at `now` and fire the
+ * change callback for any that flipped since the last report — the beep /
+ * silence edges of the pattern, including the final silence. */
+static void pd_buz_refresh(osdp_pd_t *pd, uint32_t now)
+{
+    if (pd->buzzer_cb == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < OSDP_PD_MAX_BUZZERS; i++) {
+        osdp_pd_buz_slot_t *s = &pd->buzzers[i];
+        if (!s->used) {
+            continue;
+        }
+        const bool sounding = osdp_buz_sounding(&s->state, now);
+        if (sounding != s->last_sounding) {
+            s->last_sounding = sounding;
+            pd->buzzer_cb(pd->buzzer_user, s->reader_no, sounding,
+                          s->state.tone);
+        }
+    }
+}
+
+/* Transparently fold an inbound command into the reader-LED / -buzzer banks.
+ * A no-op for everything except osdp_LED and osdp_BUZ; for those it decodes
+ * the command, applies it to the matching slot, then re-resolves state so
+ * any change fires the callback. Declared in pd_internal.h so both the
+ * plaintext (pd.c) and Secure Channel (pd_sc.c) dispatch paths can call it
+ * with plaintext bytes. */
 void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
                                       uint8_t        cmd_code,
                                       const uint8_t *payload,
                                       size_t         payload_len)
 {
-    if (pd == NULL || cmd_code != OSDP_CMD_LED) {
+    if (pd == NULL) {
         return;
     }
-    osdp_led_record_t recs[OSDP_PD_MAX_LEDS];
-    size_t n = 0;
-    if (osdp_led_decode(payload, payload_len, recs,
-                        OSDP_PD_MAX_LEDS, &n) != OSDP_OK) {
-        return;  /* malformed LED payload — leave the bank untouched */
-    }
-    const uint32_t now = pd_now_ms(pd);
-    for (size_t i = 0; i < n; i++) {
-        osdp_pd_led_slot_t *s =
-            pd_led_slot(pd, recs[i].reader_no, recs[i].led_no);
-        if (s != NULL) {
-            osdp_led_apply(&s->state, &recs[i], now);
+
+    if (cmd_code == OSDP_CMD_LED) {
+        osdp_led_record_t recs[OSDP_PD_MAX_LEDS];
+        size_t n = 0;
+        if (osdp_led_decode(payload, payload_len, recs,
+                            OSDP_PD_MAX_LEDS, &n) != OSDP_OK) {
+            return;  /* malformed LED payload — leave the bank untouched */
         }
+        const uint32_t now = pd_now_ms(pd);
+        for (size_t i = 0; i < n; i++) {
+            osdp_pd_led_slot_t *s =
+                pd_led_slot(pd, recs[i].reader_no, recs[i].led_no);
+            if (s != NULL) {
+                osdp_led_apply(&s->state, &recs[i], now);
+            }
+        }
+        pd_led_refresh(pd, now);
+        return;
     }
-    pd_led_refresh(pd, now);
+
+    if (cmd_code == OSDP_CMD_BUZ) {
+        osdp_buz_cmd_t buz;
+        if (osdp_buz_decode(payload, payload_len, &buz) != OSDP_OK) {
+            return;  /* malformed BUZ payload — ignore */
+        }
+        const uint32_t now = pd_now_ms(pd);
+        osdp_pd_buz_slot_t *s = pd_buz_slot(pd, buz.reader_no);
+        if (s != NULL) {
+            osdp_buz_apply(&s->state, &buz, now);
+        }
+        pd_buz_refresh(pd, now);
+        return;
+    }
 }
 
 void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user)
@@ -426,6 +492,30 @@ void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user)
     }
     pd->led_cb   = cb;
     pd->led_user = user;
+}
+
+void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->buzzer_cb   = cb;
+    pd->buzzer_user = user;
+}
+
+bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no)
+{
+    if (pd == NULL) {
+        return false;
+    }
+    const uint32_t now = pd_now_ms(pd);
+    for (size_t i = 0; i < OSDP_PD_MAX_BUZZERS; i++) {
+        const osdp_pd_buz_slot_t *s = &pd->buzzers[i];
+        if (s->used && s->reader_no == reader_no) {
+            return osdp_buz_sounding(&s->state, now);
+        }
+    }
+    return false;
 }
 
 uint8_t osdp_pd_led_color(const osdp_pd_t *pd,
@@ -543,8 +633,11 @@ void osdp_pd_tick(osdp_pd_t *pd)
         process_frame(pd, &cmd);
     }
 
-    /* Re-resolve the LED bank so time-driven changes (temporary-timer
-     * expiry, flash on/off transitions) reach the change callback even on
-     * ticks that processed no command. No-op without a now_ms clock. */
-    pd_led_refresh(pd, pd_now_ms(pd));
+    /* Re-resolve the LED and buzzer banks so time-driven changes (LED
+     * timer expiry / flash edges, buzzer beep/silence edges and end-of-
+     * pattern) reach the change callbacks even on ticks that processed no
+     * command. No-op without a now_ms clock. */
+    const uint32_t now = pd_now_ms(pd);
+    pd_led_refresh(pd, now);
+    pd_buz_refresh(pd, now);
 }

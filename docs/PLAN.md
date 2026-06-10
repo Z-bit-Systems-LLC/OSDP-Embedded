@@ -326,6 +326,23 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   serves the identical stream. (Built per-change-snapshot rather than the
   originally-sketched `LogInner` deltas — simpler and the payload is
   tiny.)
+- ☑ **Reader buzzer (beep) — full stack.** Same shape as the LED but the
+  buzzer is modelled as a *sounding state*, not a colour: a core resolver
+  (`osdp_buz_state`) folds an `osdp_BUZ` command's tone / on-time /
+  off-time / count into an on/off pattern, and the PD/ACU fire a
+  change callback (`osdp_pd_set_buzzer_handler` /
+  `osdp_acu_set_buzzer_handler`) on every beep↔silence edge — including
+  the final silence when the `count` cycles complete — resolved on
+  `tick()`. Query via `osdp_pd_buzzer_sounding`. Exposed through the Rust
+  `BuzzerHandler` trait + `Pd::set_buzzer_handler` / `buzzer_sounding`;
+  osdp-mcp folds it into `ReaderState.buzzers` (per-reader `sounding` +
+  `tone`) so `pd_reader_state` and the SSE stream carry it. The page
+  shows a speaker icon beside the LED bar that pulses while sounding and
+  plays the beep via the Web Audio API behind a one-click "enable sound"
+  gesture (browser autoplay policy). Tested at every layer:
+  `tests/test_loopback.c` (beep→silence over the wire clock),
+  `rust/osdp/tests/led_tracking.rs`, and
+  `tools/osdp-mcp/tests/actor_loopback.rs`.
 - ☐ **Live wire-log panel** on the page, reusing the `code_name` labels.
 
 ### Deferred

@@ -58,8 +58,8 @@ async fn api_state_is_empty_for_fresh_pd() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // A PD that has never been driven shows no LEDs.
-    assert_eq!(json, serde_json::json!({ "leds": [] }));
+    // A PD that has never been driven shows no LEDs and no buzzers.
+    assert_eq!(json, serde_json::json!({ "leds": [], "buzzers": [] }));
 }
 
 #[tokio::test]

@@ -72,11 +72,17 @@
     box-shadow: 0 2px 8px rgba(0,0,0,.6) inset, 0 0 0 1px #000 inset;
   }
 
-  /* Top status LED strip (the live element) -------------------------- */
+  /* Top row: centred status LED strip + buzzer indicator ------------ */
+  .top {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;   /* keeps the LED bar dead-centre */
+    margin: 2px 0 34px;
+  }
   .led {
-    width: 52%;
+    width: 50%;
     height: 14px;
-    margin: 2px auto 34px;
     border-radius: 8px;
     background: #11151c;
     box-shadow: 0 0 0 1px rgba(0,0,0,.6) inset;
@@ -89,6 +95,25 @@
       0 0 36px 6px color-mix(in srgb, var(--c) 60%, transparent),
       0 0 0 1px rgba(255,255,255,.25) inset;
   }
+  /* Buzzer indicator (a speaker that lights + pulses while sounding).
+   * Absolutely placed at the right edge so it never shifts the LED bar. */
+  .buzzer {
+    position: absolute;
+    right: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 28px;
+    height: 28px;
+    color: rgba(220,226,236,.3);
+    transition: color .08s ease, filter .08s ease;
+  }
+  .buzzer svg { width: 100%; height: 100%; }
+  .buzzer.sounding {
+    color: #ffd34d;
+    filter: drop-shadow(0 0 9px #ffd34d);
+    animation: buzz .16s steps(2, jump-none) infinite;
+  }
+  @keyframes buzz { 50% { opacity: .5; } }
 
   /* Keypad ----------------------------------------------------------- */
   .keypad {
@@ -108,6 +133,18 @@
 
   .caption { font-size: 13px; color: #9aa3b2; }
   .caption b { color: #d8dde6; text-transform: capitalize; }
+  .soundbtn {
+    font: inherit;
+    font-size: 12px;
+    color: #cfd6e2;
+    background: #161b24;
+    border: 1px solid #2a3140;
+    border-radius: 999px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  .soundbtn:hover { border-color: #3a4356; }
+  .soundbtn.on { color: #6ee7a8; border-color: #1f5138; }
   footer { color: #4d5564; font-size: 12px; padding-bottom: 26px; }
   code { color: #9aa3b2; }
 </style>
@@ -122,7 +159,18 @@
   <main>
     <div class="reader">
       <div class="face">
-        <div id="led" class="led"></div>
+        <div class="top">
+          <div id="led" class="led"></div>
+          <div id="buzzer" class="buzzer" title="buzzer">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M4 9v6h4l5 5V4L8 9H4z"/>
+              <path d="M16 8.5a4 4 0 0 1 0 7" fill="none" stroke="currentColor"
+                    stroke-width="1.8" stroke-linecap="round"/>
+              <path d="M18.5 6a7 7 0 0 1 0 12" fill="none" stroke="currentColor"
+                    stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </div>
+        </div>
 
         <div class="keypad">
           <div class="key">1</div><div class="key">2</div><div class="key">3</div>
@@ -134,6 +182,7 @@
     </div>
 
     <div class="caption">status LED: <b id="state-name">—</b></div>
+    <button id="sound" class="soundbtn" type="button">🔇 Enable sound</button>
   </main>
 
   <footer>live via <code>/api/events</code> · served by osdp-mcp</footer>
@@ -183,13 +232,69 @@
     nameEl.textContent = name;
   }
 
+  // ---- Buzzer: visual pulse + Web Audio beep ------------------------
+  const buzzerEl = document.getElementById('buzzer');
+  const soundBtn = document.getElementById('sound');
+  let audioCtx = null, osc = null, gain = null, soundOn = false;
+  let buzzing = false;
+
+  // Audio can't autoplay — build the graph on the user's click.
+  soundBtn.addEventListener('click', function () {
+    if (!soundOn) {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctx();
+        osc = audioCtx.createOscillator();
+        gain = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.value = 2300;     // buzzer-ish
+        gain.gain.value = 0;            // silent until sounding
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start();
+        soundOn = true;
+        soundBtn.textContent = '🔊 Sound on';
+        soundBtn.classList.add('on');
+        applyBuzz();                    // catch a beep already in progress
+      } catch (_) { /* leave sound off */ }
+    } else {
+      // Toggle back off (mute), keep the graph for a quick re-enable.
+      soundOn = false;
+      if (gain && audioCtx) gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.005);
+      soundBtn.textContent = '🔇 Enable sound';
+      soundBtn.classList.remove('on');
+    }
+  });
+
+  function applyBuzz() {
+    buzzerEl.classList.toggle('sounding', buzzing);
+    if (soundOn && gain && audioCtx) {
+      // Short ramp avoids clicks on each beep edge.
+      gain.gain.setTargetAtTime(buzzing ? 0.05 : 0, audioCtx.currentTime, 0.004);
+    }
+  }
+
+  function renderBuzzer(buzzers) {
+    // Reader 0's buzzer drives the indicator (single-reader devices).
+    let b = null;
+    if (buzzers && buzzers.length) {
+      b = buzzers.find(function (x) { return x.reader_no === 0; }) || buzzers[0];
+    }
+    const on = !!(b && b.sounding);
+    if (on !== buzzing) { buzzing = on; applyBuzz(); }
+  }
+
+  function applyState(state) {
+    render(state.leds);
+    renderBuzzer(state.buzzers);
+    setConn(true);
+  }
+
   async function poll() {
     try {
       const r = await fetch('/api/state', { cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const state = await r.json();
-      render(state.leds);
-      setConn(true);
+      applyState(state);
     } catch (e) {
       setConn(false);
     }
@@ -202,7 +307,7 @@
     try {
       const es = new EventSource('/api/events');
       es.addEventListener('state', function (e) {
-        try { render(JSON.parse(e.data).leds); setConn(true); } catch (_) {}
+        try { applyState(JSON.parse(e.data)); } catch (_) {}
       });
       es.onopen = function () { setConn(true); };
       es.onerror = function () { setConn(false); /* browser retries */ };

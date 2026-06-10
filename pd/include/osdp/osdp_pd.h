@@ -4,6 +4,7 @@
 #ifndef OSDP_PD_H
 #define OSDP_PD_H
 
+#include "osdp/osdp_buz_state.h"
 #include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc_crypto.h"
@@ -160,6 +161,29 @@ typedef void (*osdp_pd_led_cb)(void   *user,
                                uint8_t led_no,
                                uint8_t color);
 
+/* ---- Reader buzzer observation -----------------------------------------
+ *
+ * The PD decodes inbound osdp_BUZ (0x6A) commands and folds each into a
+ * resolver (osdp_buz_t) keyed by reader, so — exactly like the LED — the
+ * application just registers a change callback and/or queries the current
+ * state instead of parsing the command. The buzzer's `on_time`/`off_time`/
+ * `count` pattern is resolved over time: the callback fires when the buzzer
+ * starts sounding, on each beep/silence edge of the pattern, and once more
+ * when the pattern finishes (a final "silent"). */
+
+/* Fired whenever a reader buzzer's *sounding* state changes — when a
+ * command starts it, on each on/off edge of the pattern, and when the
+ * pattern (count cycles) completes. `sounding` is true while the buzzer is
+ * making sound, false in the gaps and once it's done. `tone` is the
+ * tone_code from the driving command (0x01 off / 0x02 default tone). The
+ * time-driven edges are detected inside osdp_pd_tick(), so they need the
+ * transport's now_ms clock; the initial start fires immediately. Must not
+ * re-enter the PD API. */
+typedef void (*osdp_pd_buzzer_cb)(void   *user,
+                                  uint8_t reader_no,
+                                  bool    sounding,
+                                  uint8_t tone);
+
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
@@ -179,6 +203,20 @@ typedef struct osdp_pd_led_slot {
     uint8_t    last_color;   /* osdp_led_color_t last handed to led_cb */
     osdp_led_t state;
 } osdp_pd_led_slot_t;
+
+/* Reader buzzer bank capacity: the number of distinct readers whose buzzer
+ * the PD tracks. One buzzer per reader. */
+#define OSDP_PD_MAX_BUZZERS 4U
+
+/* One tracked reader buzzer: its reader identity, the resolved on/off
+ * pattern state, and the last sounding flag reported (so the PD fires only
+ * on an actual change). */
+typedef struct osdp_pd_buz_slot {
+    bool       used;
+    uint8_t    reader_no;
+    bool       last_sounding;  /* last value handed to buzzer_cb */
+    osdp_buz_t state;
+} osdp_pd_buz_slot_t;
 
 /* Outbound TX scratch sized for any baseline reply. Bumped in later
  * iterations if/when extended replies (file transfer chunks, biometric
@@ -259,6 +297,12 @@ typedef struct osdp_pd {
     osdp_pd_led_slot_t         leds[OSDP_PD_MAX_LEDS];
     osdp_pd_led_cb             led_cb;
     void                      *led_user;
+
+    /* Reader buzzer bank (populated from inbound osdp_BUZ commands) plus
+     * the optional sounding-change callback. */
+    osdp_pd_buz_slot_t         buzzers[OSDP_PD_MAX_BUZZERS];
+    osdp_pd_buzzer_cb          buzzer_cb;
+    void                      *buzzer_user;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/
@@ -306,6 +350,16 @@ void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user);
  * whichever phase is current. */
 uint8_t osdp_pd_led_color(const osdp_pd_t *pd,
                           uint8_t reader_no, uint8_t led_no);
+
+/* Bind the reader-buzzer handler. `cb` fires whenever a tracked buzzer's
+ * sounding state changes (see osdp_pd_buzzer_cb). Pass cb=NULL to detach. */
+void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb,
+                                void *user);
+
+/* True iff the given reader's buzzer is sounding right now. Resolved
+ * against the transport's now_ms clock (or time 0 if none). Returns false
+ * for a reader no osdp_BUZ command has addressed. */
+bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no);
 
 /* ---- Secure Channel configuration --------------------------------------
  *

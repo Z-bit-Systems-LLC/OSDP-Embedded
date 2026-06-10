@@ -4,6 +4,7 @@
 #ifndef OSDP_ACU_H
 #define OSDP_ACU_H
 
+#include "osdp/osdp_buz_state.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
@@ -271,6 +272,17 @@ typedef void (*osdp_acu_led_cb)(void   *user,
                                 uint8_t led_no,
                                 uint8_t color);
 
+/* Fired when a driven reader buzzer's sounding state changes — the
+ * controller's view of "PD X's reader is beeping / fell silent". `sounding`
+ * true while making sound; `tone` is the driving tone_code. The on/off
+ * edges and end-of-pattern are resolved inside osdp_acu_tick(). Must not
+ * re-enter the ACU API. */
+typedef void (*osdp_acu_buzzer_cb)(void   *user,
+                                   uint8_t pd_address,
+                                   uint8_t reader_no,
+                                   bool    sounding,
+                                   uint8_t tone);
+
 /* One tracked physical LED on some PD, plus the last colour reported so
  * the ACU fires the callback only on an actual change. */
 typedef struct osdp_acu_led_slot {
@@ -281,6 +293,19 @@ typedef struct osdp_acu_led_slot {
     uint8_t    last_color;   /* osdp_led_color_t last handed to led_cb */
     osdp_led_t state;
 } osdp_acu_led_slot_t;
+
+/* Number of distinct (pd_address, reader_no) buzzers the ACU tracks. */
+#define OSDP_ACU_MAX_BUZZERS 8U
+
+/* One tracked reader buzzer on some PD, plus the last sounding flag
+ * reported so the ACU fires the callback only on an actual change. */
+typedef struct osdp_acu_buz_slot {
+    bool       used;
+    uint8_t    pd_address;
+    uint8_t    reader_no;
+    bool       last_sounding;
+    osdp_buz_t state;
+} osdp_acu_buz_slot_t;
 
 /* ---- Context -----------------------------------------------------------*/
 
@@ -311,6 +336,12 @@ typedef struct osdp_acu {
     osdp_acu_led_slot_t         leds[OSDP_ACU_MAX_LEDS];
     osdp_acu_led_cb             led_cb;
     void                       *led_user;
+
+    /* Reader buzzer bank (from outbound osdp_BUZ commands) plus the
+     * optional sounding-change callback. */
+    osdp_acu_buz_slot_t         buzzers[OSDP_ACU_MAX_BUZZERS];
+    osdp_acu_buzzer_cb          buzzer_cb;
+    void                       *buzzer_user;
 } osdp_acu_t;
 
 /* ---- API ---------------------------------------------------------------*/
@@ -389,6 +420,16 @@ void osdp_acu_set_led_handler(osdp_acu_t *acu, osdp_acu_led_cb cb, void *user);
  * phase. */
 uint8_t osdp_acu_led_color(const osdp_acu_t *acu, uint8_t pd_address,
                            uint8_t reader_no, uint8_t led_no);
+
+/* Bind the reader-buzzer handler. `cb` fires when a driven buzzer's
+ * sounding state changes (see osdp_acu_buzzer_cb). Pass cb=NULL to detach. */
+void osdp_acu_set_buzzer_handler(osdp_acu_t *acu, osdp_acu_buzzer_cb cb,
+                                 void *user);
+
+/* True iff the given PD reader's buzzer is sounding right now (per the ACU's
+ * model of what it commanded). False for an unaddressed buzzer. */
+bool osdp_acu_buzzer_sounding(const osdp_acu_t *acu, uint8_t pd_address,
+                             uint8_t reader_no);
 
 /* ---- Secure Channel API -------------------------------------------------
  *

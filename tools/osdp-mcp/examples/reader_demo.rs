@@ -37,11 +37,15 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio_stream::Stream;
 
+use std::collections::VecDeque;
+
 use osdp_embedded::acu::Acu;
-use osdp_embedded::messages::{Led, LedRecord, OSDP_CMD_LED, OSDP_REPLY_ACK};
+use osdp_embedded::messages::{BuzCmd, Led, LedRecord, OSDP_CMD_BUZ, OSDP_CMD_LED, OSDP_REPLY_ACK};
 use osdp_embedded::pd::{CommandHandler, LedColor, Pd, Reply};
 use osdp_embedded::Transport;
-use osdp_mcp::reader_state::{self, ReaderLedHandler, ReaderStateView, SharedReaderState};
+use osdp_mcp::reader_state::{
+    self, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
+};
 
 const PD_ADDR: u8 = 0x10;
 
@@ -97,6 +101,20 @@ fn led_payload(records: Vec<LedRecord>) -> Vec<u8> {
     let led = Led { records };
     let mut buf = [0u8; 128];
     let n = led.build(&mut buf).expect("LED build");
+    buf[..n].to_vec()
+}
+
+/// Encode an `osdp_BUZ` command payload (default tone).
+fn buz_payload(on_100ms: u8, off_100ms: u8, count: u8) -> Vec<u8> {
+    let buz = BuzCmd {
+        reader_no: 0,
+        tone_code: 0x02, // default tone
+        on_time_100ms: on_100ms,
+        off_time_100ms: off_100ms,
+        count,
+    };
+    let mut buf = [0u8; 8];
+    let n = buz.build(&mut buf).expect("BUZ build");
     buf[..n].to_vec()
 }
 
@@ -156,7 +174,8 @@ fn run_driver(reader_state: SharedReaderState) {
         start,
     });
     pd.set_command_handler(AckAll);
-    pd.set_led_handler(ReaderLedHandler::new(reader_state));
+    pd.set_led_handler(ReaderLedHandler::new(Arc::clone(&reader_state)));
+    pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
 
     let mut acu = Acu::new(1);
     acu.set_transport(WireAdapter::<false> {
@@ -174,25 +193,37 @@ fn run_driver(reader_state: SharedReaderState) {
 
     let mut last_event = Instant::now();
     let mut n: u32 = 0;
+    // The ACU allows one outstanding command at a time, so queue the
+    // grant's commands and drain one per free cycle.
+    let mut queue: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
 
     loop {
         pd.tick();
         acu.tick();
 
-        // The ACU allows one outstanding command at a time; only issue a
-        // new one once the previous reply has landed.
-        if !acu.is_pd_busy(PD_ADDR) && last_event.elapsed() >= Duration::from_secs(4) {
-            // Alternate between a clean "granted" (solid green, 1.8 s) and
-            // a "processing" (flashing green, ~2 s). Both ride on top of
-            // the steady-red idle and auto-revert when the timer expires.
-            let rec = if n % 2 == 0 {
-                temporary(0, LedColor::Red, LedColor::Green, 18, 0, 0)
-            } else {
-                temporary(0, LedColor::Red, LedColor::Green, 20, 3, 3)
-            };
-            let _ = acu.send_command(PD_ADDR, OSDP_CMD_LED, &led_payload(vec![rec]));
-            n += 1;
-            last_event = Instant::now();
+        if !acu.is_pd_busy(PD_ADDR) {
+            if let Some((code, payload)) = queue.pop_front() {
+                let _ = acu.send_command(PD_ADDR, code, &payload);
+            } else if last_event.elapsed() >= Duration::from_secs(4) {
+                // "Access granted": flash the LED green and beep. Alternate
+                // a clean grant (solid green + two short beeps) with a
+                // "processing" look (flashing green + one longer beep).
+                let (led, buz) = if n % 2 == 0 {
+                    (
+                        temporary(0, LedColor::Red, LedColor::Green, 18, 0, 0),
+                        buz_payload(1, 1, 2),
+                    )
+                } else {
+                    (
+                        temporary(0, LedColor::Red, LedColor::Green, 20, 3, 3),
+                        buz_payload(3, 2, 2),
+                    )
+                };
+                queue.push_back((OSDP_CMD_LED, led_payload(vec![led])));
+                queue.push_back((OSDP_CMD_BUZ, buz));
+                n += 1;
+                last_event = Instant::now();
+            }
         }
 
         std::thread::sleep(Duration::from_millis(8));
@@ -209,7 +240,7 @@ async fn api_state(State(rs): State<SharedReaderState>) -> Json<ReaderStateView>
     let view = rs
         .lock()
         .map(|s| s.snapshot())
-        .unwrap_or_else(|_| ReaderStateView { leds: Vec::new() });
+        .unwrap_or_else(|_| ReaderStateView::default());
     Json(view)
 }
 

@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use osdp_embedded::pd::{LedColor, LedHandler};
+use osdp_embedded::pd::{BuzzerHandler, LedColor, LedHandler};
 use tokio::sync::broadcast;
 
 /// Capacity of the change-broadcast ring. Snapshots are tiny; a slow SSE
@@ -30,6 +30,9 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// plus a broadcast channel that fans each change out to live SSE clients.
 pub struct ReaderState {
     leds: BTreeMap<(u8, u8), LedColor>,
+    /// Sounding state of each reader's buzzer, keyed by reader_no, with the
+    /// driving tone code.
+    buzzers: BTreeMap<u8, (bool, u8)>,
     tx: broadcast::Sender<ReaderStateView>,
 }
 
@@ -38,6 +41,7 @@ impl Default for ReaderState {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAP);
         Self {
             leds: BTreeMap::new(),
+            buzzers: BTreeMap::new(),
             tx,
         }
     }
@@ -50,10 +54,18 @@ impl ReaderState {
         self.notify();
     }
 
-    /// Forget all tracked LEDs. Called when a PD is (re)opened so a fresh
-    /// reader starts blank rather than showing the previous PD's colours.
+    /// Record a reader buzzer's sounding state (and tone) and notify.
+    pub fn set_buzzer(&mut self, reader_no: u8, sounding: bool, tone: u8) {
+        self.buzzers.insert(reader_no, (sounding, tone));
+        self.notify();
+    }
+
+    /// Forget all tracked LEDs and buzzers. Called when a PD is (re)opened so
+    /// a fresh reader starts blank rather than showing the previous PD's
+    /// state.
     pub fn clear(&mut self) {
         self.leds.clear();
+        self.buzzers.clear();
         self.notify();
     }
 
@@ -81,6 +93,15 @@ impl ReaderState {
                     led_no,
                     color: color.as_u8(),
                     color_name: color_name(color),
+                })
+                .collect(),
+            buzzers: self
+                .buzzers
+                .iter()
+                .map(|(&reader_no, &(sounding, tone))| BuzzerView {
+                    reader_no,
+                    sounding,
+                    tone,
                 })
                 .collect(),
         }
@@ -118,6 +139,26 @@ impl LedHandler for ReaderLedHandler {
     }
 }
 
+/// PD buzzer change handler that folds each sounding-state change into a
+/// [`SharedReaderState`]. Bind it with `Pd::set_buzzer_handler`.
+pub struct ReaderBuzzerHandler {
+    state: SharedReaderState,
+}
+
+impl ReaderBuzzerHandler {
+    pub fn new(state: SharedReaderState) -> Self {
+        Self { state }
+    }
+}
+
+impl BuzzerHandler for ReaderBuzzerHandler {
+    fn on_buzzer_change(&mut self, reader_no: u8, sounding: bool, tone: u8) {
+        if let Ok(mut s) = self.state.lock() {
+            s.set_buzzer(reader_no, sounding, tone);
+        }
+    }
+}
+
 /// One LED's current colour in the snapshot returned to the agent / UI.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct LedView {
@@ -132,12 +173,27 @@ pub struct LedView {
     pub color_name: String,
 }
 
-/// The reader's current output state, returned by `pd_reader_state`.
+/// One reader buzzer's current sounding state in the snapshot.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct BuzzerView {
+    /// Reader number on the PD.
+    pub reader_no: u8,
+    /// True while the buzzer is making sound right now (it toggles through
+    /// the command's on/off pattern).
+    pub sounding: bool,
+    /// Driving tone code (0x01 off, 0x02 default tone).
+    pub tone: u8,
+}
+
+/// The reader's current output state, returned by `pd_reader_state`.
+#[derive(Debug, Clone, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct ReaderStateView {
     /// Every LED the reader has been told to display, with its current
     /// colour. Empty until the ACU sends an `osdp_LED` command.
     pub leds: Vec<LedView>,
+    /// Each reader buzzer's current sounding state. Empty until the ACU
+    /// sends an `osdp_BUZ` command.
+    pub buzzers: Vec<BuzzerView>,
 }
 
 fn color_name(c: LedColor) -> String {
