@@ -77,6 +77,7 @@ fn main() {
         "core/src/shared/crc16.c",
         "core/src/shared/frame.c",
         "core/src/shared/stream.c",
+        "core/src/shared/led_state.c",
         // core: per-message command codecs
         "core/src/commands/cmd_buz.c",
         "core/src/commands/cmd_cap.c",

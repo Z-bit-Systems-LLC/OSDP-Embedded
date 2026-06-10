@@ -405,6 +405,56 @@ pub struct osdp_keyset_cmd_t {
 }
 
 // ====================================================================
+// osdp_led_state.h
+// ====================================================================
+
+// osdp_led_color_t values (spec Table 18).
+pub const OSDP_LED_BLACK: u8 = 0x00;
+pub const OSDP_LED_RED: u8 = 0x01;
+pub const OSDP_LED_GREEN: u8 = 0x02;
+pub const OSDP_LED_AMBER: u8 = 0x03;
+pub const OSDP_LED_BLUE: u8 = 0x04;
+pub const OSDP_LED_MAGENTA: u8 = 0x05;
+pub const OSDP_LED_CYAN: u8 = 0x06;
+pub const OSDP_LED_WHITE: u8 = 0x07;
+
+// Control codes (spec Tables 16/17).
+pub const OSDP_LED_TEMP_NOP: u8 = 0x00;
+pub const OSDP_LED_TEMP_CANCEL: u8 = 0x01;
+pub const OSDP_LED_TEMP_SET: u8 = 0x02;
+pub const OSDP_LED_PERM_NOP: u8 = 0x00;
+pub const OSDP_LED_PERM_SET: u8 = 0x01;
+
+/// Mirror of C `osdp_led_flash_t` (4 bytes, align 1).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct osdp_led_flash_t {
+    pub on_color: u8,
+    pub off_color: u8,
+    pub on_time_100ms: u8,
+    pub off_time_100ms: u8,
+}
+
+/// Mirror of C `osdp_led_t` (single physical LED resolver). Embedded by
+/// the PD and ACU LED-bank slots, so its layout must match the C struct
+/// exactly.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct osdp_led_t {
+    pub permanent: osdp_led_flash_t,
+    pub temporary: osdp_led_flash_t,
+    pub temp_active: bool,
+    pub temp_started_ms: u32,
+    pub temp_duration_ms: u32,
+}
+
+extern "C" {
+    pub fn osdp_led_init(led: *mut osdp_led_t);
+    pub fn osdp_led_apply(led: *mut osdp_led_t, rec: *const osdp_led_record_t, now_ms: u32);
+    pub fn osdp_led_color(led: *const osdp_led_t, now_ms: u32) -> u8;
+}
+
+// ====================================================================
 // osdp_replies.h
 // ====================================================================
 
@@ -765,6 +815,7 @@ mod pd_ffi {
 
     pub const OSDP_PD_TX_BUF_LEN: usize = 256;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
+    pub const OSDP_PD_MAX_LEDS: usize = 8;
 
     pub type osdp_pd_read_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
@@ -796,6 +847,21 @@ mod pd_ffi {
             reply: *mut osdp_pd_reply_t,
         ) -> osdp_status_t,
     >;
+
+    pub type osdp_pd_led_cb = Option<
+        unsafe extern "C" fn(user: *mut c_void, reader_no: u8, led_no: u8, color: u8),
+    >;
+
+    /// Mirror of C `osdp_pd_led_slot_t` (24 bytes, align 4).
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct osdp_pd_led_slot_t {
+        pub used: bool,
+        pub reader_no: u8,
+        pub led_no: u8,
+        pub last_color: u8,
+        pub state: osdp_led_t,
+    }
 
     #[repr(C)]
     pub struct osdp_pd_sc_t {
@@ -834,6 +900,10 @@ mod pd_ffi {
         pub last_comm_ms: u32,
 
         pub sc: osdp_pd_sc_t,
+
+        pub leds: [osdp_pd_led_slot_t; OSDP_PD_MAX_LEDS],
+        pub led_cb: osdp_pd_led_cb,
+        pub led_user: *mut c_void,
     }
 
     extern "C" {
@@ -846,6 +916,9 @@ mod pd_ffi {
         );
         pub fn osdp_pd_tick(pd: *mut osdp_pd_t);
         pub fn osdp_pd_is_online(pd: *const osdp_pd_t) -> bool;
+
+        pub fn osdp_pd_set_led_handler(pd: *mut osdp_pd_t, cb: osdp_pd_led_cb, user: *mut c_void);
+        pub fn osdp_pd_led_color(pd: *const osdp_pd_t, reader_no: u8, led_no: u8) -> u8;
 
         pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
         pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
@@ -869,6 +942,7 @@ mod acu_ffi {
     pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
+    pub const OSDP_ACU_MAX_LEDS: usize = 16;
 
     // The transport callback shape is identical between PD and ACU; rather
     // than aliasing `osdp_pd_read_cb` (which would create a hard cross-
@@ -965,6 +1039,29 @@ mod acu_ffi {
     pub type osdp_acu_sc_event_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, event: *const osdp_acu_sc_event_t)>;
 
+    pub type osdp_acu_led_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            pd_address: u8,
+            reader_no: u8,
+            led_no: u8,
+            color: u8,
+        ),
+    >;
+
+    /// Mirror of C `osdp_acu_led_slot_t` (28 bytes, align 4 — the
+    /// 5 leading bytes pad to the osdp_led_t alignment).
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct osdp_acu_led_slot_t {
+        pub used: bool,
+        pub pd_address: u8,
+        pub reader_no: u8,
+        pub led_no: u8,
+        pub last_color: u8,
+        pub state: osdp_led_t,
+    }
+
     #[repr(C)]
     pub struct osdp_acu_t {
         pub transport: osdp_acu_transport_t,
@@ -981,6 +1078,10 @@ mod acu_ffi {
         pub sc_crypto_set: bool,
         pub sc_event_cb: osdp_acu_sc_event_cb,
         pub sc_event_user: *mut c_void,
+
+        pub leds: [osdp_acu_led_slot_t; OSDP_ACU_MAX_LEDS],
+        pub led_cb: osdp_acu_led_cb,
+        pub led_user: *mut c_void,
     }
 
     extern "C" {
@@ -1039,5 +1140,17 @@ mod acu_ffi {
             use_default_key: bool,
         ) -> osdp_status_t;
         pub fn osdp_acu_is_pd_sc_established(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+
+        pub fn osdp_acu_set_led_handler(
+            acu: *mut osdp_acu_t,
+            cb: osdp_acu_led_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_acu_led_color(
+            acu: *const osdp_acu_t,
+            pd_address: u8,
+            reader_no: u8,
+            led_no: u8,
+        ) -> u8;
     }
 } // mod acu_ffi

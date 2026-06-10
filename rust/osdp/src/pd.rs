@@ -83,6 +83,73 @@ pub trait CommandHandler: 'static {
     fn handle<'a>(&'a mut self, cmd_code: u8, payload: &[u8]) -> Result<Reply<'a>>;
 }
 
+/// Resolved colour of a reader LED (`osdp_led_color_t`, spec Table 18).
+/// `Other` carries any non-standard value rather than silently mapping it
+/// to a named colour.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum LedColor {
+    /// 0x00 — off.
+    Black,
+    /// 0x01.
+    Red,
+    /// 0x02.
+    Green,
+    /// 0x03.
+    Amber,
+    /// 0x04.
+    Blue,
+    /// 0x05.
+    Magenta,
+    /// 0x06.
+    Cyan,
+    /// 0x07.
+    White,
+    /// Any other (reserved / vendor) colour code.
+    Other(u8),
+}
+
+impl LedColor {
+    /// Map a raw `osdp_led_color_t` byte to a [`LedColor`].
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            sys::OSDP_LED_BLACK => LedColor::Black,
+            sys::OSDP_LED_RED => LedColor::Red,
+            sys::OSDP_LED_GREEN => LedColor::Green,
+            sys::OSDP_LED_AMBER => LedColor::Amber,
+            sys::OSDP_LED_BLUE => LedColor::Blue,
+            sys::OSDP_LED_MAGENTA => LedColor::Magenta,
+            sys::OSDP_LED_CYAN => LedColor::Cyan,
+            sys::OSDP_LED_WHITE => LedColor::White,
+            other => LedColor::Other(other),
+        }
+    }
+
+    /// The raw `osdp_led_color_t` byte for this colour.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            LedColor::Black => sys::OSDP_LED_BLACK,
+            LedColor::Red => sys::OSDP_LED_RED,
+            LedColor::Green => sys::OSDP_LED_GREEN,
+            LedColor::Amber => sys::OSDP_LED_AMBER,
+            LedColor::Blue => sys::OSDP_LED_BLUE,
+            LedColor::Magenta => sys::OSDP_LED_MAGENTA,
+            LedColor::Cyan => sys::OSDP_LED_CYAN,
+            LedColor::White => sys::OSDP_LED_WHITE,
+            LedColor::Other(v) => v,
+        }
+    }
+}
+
+/// Reader-LED change handler. Called by [`Pd::tick`] (and immediately when
+/// an `osdp_LED` command arrives) whenever a tracked LED's *resolved*
+/// displayed colour changes — on a new command, on temporary-timer
+/// expiry, and on each flash on/off transition. Time-driven transitions
+/// only surface if the [`Transport`] supplies a `now_ms` clock. The PD
+/// decodes the LED command internally; the handler never parses it.
+pub trait LedHandler: 'static {
+    fn on_led_change(&mut self, reader_no: u8, led_no: u8, color: LedColor);
+}
+
 // ---- Internal storage ---------------------------------------------------
 //
 // Each trait object is wrapped in a `Box<dyn Trait>`. We need the
@@ -91,6 +158,7 @@ pub trait CommandHandler: 'static {
 
 type TransportBox = Box<dyn Transport>;
 type CommandHandlerBox = Box<dyn CommandHandler>;
+type LedHandlerBox = Box<dyn LedHandler>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -104,6 +172,9 @@ pub struct Pd {
     /// `*mut c_void` derived from this box's heap address.
     transport: Option<Box<TransportBox>>,
     cmd_handler: Option<Box<CommandHandlerBox>>,
+    /// Held alive for the lifetime of `self`; the C side keeps a raw
+    /// `*mut c_void` derived from this box's heap address as `led_user`.
+    led_handler: Option<Box<LedHandlerBox>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
@@ -121,6 +192,7 @@ impl Pd {
             inner,
             transport: None,
             cmd_handler: None,
+            led_handler: None,
             sc_crypto: None,
         }
     }
@@ -175,6 +247,31 @@ impl Pd {
     /// 8 seconds. Always false for a fresh `Pd` until a reply lands.
     pub fn is_online(&self) -> bool {
         unsafe { sys::osdp_pd_is_online(&*self.inner) }
+    }
+
+    // ---- Reader LED observation ---------------------------------------
+
+    /// Bind the reader-LED change handler. The PD transparently decodes
+    /// inbound `osdp_LED` commands and calls `handler` whenever a tracked
+    /// LED's resolved colour changes (see [`LedHandler`]). Replaces any
+    /// previously-set handler (the old one is dropped).
+    pub fn set_led_handler<H: LedHandler>(&mut self, handler: H) {
+        let boxed: Box<LedHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            sys::osdp_pd_set_led_handler(&mut *self.inner, Some(led_handler_thunk), user_ptr);
+        }
+
+        self.led_handler = Some(unsafe { Box::from_raw(user_ptr as *mut LedHandlerBox) });
+    }
+
+    /// Current displayed colour of the given reader LED. Returns
+    /// [`LedColor::Black`] for an LED no `osdp_LED` command has addressed.
+    /// Resolved against the transport's `now_ms` clock (or time 0 if
+    /// none), so a flashing LED returns whichever phase is current.
+    pub fn led_color(&self, reader_no: u8, led_no: u8) -> LedColor {
+        LedColor::from_u8(unsafe { sys::osdp_pd_led_color(&*self.inner, reader_no, led_no) })
     }
 
     // ---- Secure Channel configuration ---------------------------------
@@ -281,6 +378,11 @@ unsafe extern "C" fn command_handler_thunk(
     }
 }
 
+unsafe extern "C" fn led_handler_thunk(user: *mut c_void, reader_no: u8, led_no: u8, color: u8) {
+    let storage = &mut *(user as *mut LedHandlerBox);
+    storage.on_led_change(reader_no, led_no, LedColor::from_u8(color));
+}
+
 // ---- Drop impl ---------------------------------------------------------
 
 impl Drop for Pd {
@@ -292,6 +394,8 @@ impl Drop for Pd {
         unsafe {
             // Detach the command handler with NULL.
             sys::osdp_pd_set_command_handler(&mut *self.inner, None, ptr::null_mut());
+            // Detach the LED change handler too, for the same reason.
+            sys::osdp_pd_set_led_handler(&mut *self.inner, None, ptr::null_mut());
             // Replace the transport with one whose callbacks are NULL
             // so future tick()s can't dereference our (about to be
             // dropped) trait objects. We still own the C struct; the
