@@ -241,7 +241,52 @@ typed message structs. Foundation for both PD and ACU work later.
   manual `cargo publish` recipe.
 - ☐ **Publishing** to crates.io. Pending the first release tag.
 
-## Iteration 5+ — Optional extensions (not yet planned)
+## Iteration 5 — osdp-mcp virtual reader web UI (planned)
+
+**Goal:** a browser-based visual display of the virtual PD reader in
+`tools/osdp-mcp`, so a human can watch the reader's outputs (LEDs,
+buzzer, text, relays) update in real time while an agent drives the MCP
+server. Agreed 2026-06-06.
+
+**Why:** osdp-mcp is PD-side. LED/BUZ/TEXT/OUT commands from the ACU
+control the reader, but today `DefaultHandler` blind-ACKs them without
+decoding, so nothing captures "what the reader is showing." The `/mcp`
+HTTP endpoint is JSON-RPC/SSE (not browser-consumable) and stdio is the
+dominant transport, so the UI needs its own independent HTTP surface
+(plain REST + SSE) running alongside either MCP transport.
+
+**Decisions:** start view-only, add interactivity incrementally. Enable
+via a `--ui-bind 127.0.0.1:8088` flag + `OSDP_MCP_UI_BIND` env var (off
+by default, loopback-only, mirroring the existing `--bind` /
+`OSDP_MCP_*` pattern), spawned in both stdio and http transports.
+
+### Deliverables (build order)
+
+- ☐ **Reader state model** (`reader_state.rs`). Decode LED/BUZ/TEXT/OUT
+  in `DefaultHandler::handle` into a shared `Arc<Mutex<ReaderState>>`
+  (LED color/on-off, buzzer, text lines, output relays + link status:
+  running/online/SC/address). Wire reply stays a plain ACK —
+  observe-only, zero interop impact. Reuse the existing `Led::decode` /
+  `BuzCmd::decode` / `Text::decode` / `Out::decode` from the messages
+  module. Unit-test the folding. (OSDP LED color codes: 0=off, 1=red,
+  2=green, 3=amber, 4=blue.)
+- ☐ **UI server** (`ui.rs`). An axum server independent of the MCP
+  transport: `GET /` serves a self-contained embedded HTML page
+  (`include_str!`), `GET /api/state` returns a JSON snapshot; the page
+  polls first.
+- ☐ **SSE push.** Via `tokio::sync::broadcast` + the existing `LogInner`
+  `Notify` hook point; `GET /api/events` streams snapshot-on-connect
+  then deltas; replaces polling.
+- ☐ **Live wire-log panel** on the page, reusing the `code_name` labels.
+
+### Deferred
+
+- Interactive `POST /api/card` + `/api/keypad` buttons reusing
+  `enqueue_event`.
+- Multi-reader support beyond reader 0.
+- Temporary-LED / temporary-text timer accuracy.
+
+## Iteration 6+ — Optional extensions (not yet planned)
 
 - File transfer, biometric, keypad extensions, manufacturer-specific
   commands, multi-part messages, certifiable test harness.
