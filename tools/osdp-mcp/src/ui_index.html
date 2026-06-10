@@ -65,7 +65,7 @@
   .face {
     position: relative;
     border-radius: 16px;
-    padding: 26px 22px 20px;
+    padding: 30px 26px 30px;
     background:
       radial-gradient(120% 60% at 50% -10%, #20242b 0%, #0c0e12 55%),
       #0a0c10;
@@ -74,9 +74,9 @@
 
   /* Top status LED strip (the live element) -------------------------- */
   .led {
-    width: 46%;
+    width: 52%;
     height: 14px;
-    margin: 2px auto 22px;
+    margin: 2px auto 34px;
     border-radius: 8px;
     background: #11151c;
     box-shadow: 0 0 0 1px rgba(0,0,0,.6) inset;
@@ -90,17 +90,12 @@
       0 0 0 1px rgba(255,255,255,.25) inset;
   }
 
-  /* Card-tap hint ---------------------------------------------------- */
-  .card { display: flex; flex-direction: column; align-items: center; gap: 4px; margin-bottom: 20px; color: rgba(220,226,236,.55); }
-  .card svg { width: 56px; height: 40px; }
-  .card span { font-size: 11px; letter-spacing: .5px; }
-
   /* Keypad ----------------------------------------------------------- */
   .keypad {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 14px 8px;
-    margin: 0 6px;
+    gap: 18px 8px;
+    margin: 0 4px;
   }
   .key {
     text-align: center;
@@ -110,8 +105,6 @@
     text-shadow: 0 1px 1px rgba(0,0,0,.8);
     user-select: none;
   }
-  .bell { display: flex; justify-content: center; margin-top: 16px; color: rgba(220,226,236,.5); }
-  .bell svg { width: 26px; height: 26px; }
 
   .caption { font-size: 13px; color: #9aa3b2; }
   .caption b { color: #d8dde6; text-transform: capitalize; }
@@ -131,29 +124,11 @@
       <div class="face">
         <div id="led" class="led"></div>
 
-        <div class="card">
-          <svg viewBox="0 0 64 46" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <rect x="6" y="6" width="38" height="26" rx="3"/>
-            <line x1="6" y1="14" x2="44" y2="14"/>
-            <path d="M40 40 q6 -2 9 -8 M44 30 l4 4 l5 -3"/>
-          </svg>
-          <span>Card</span>
-        </div>
-
         <div class="keypad">
           <div class="key">1</div><div class="key">2</div><div class="key">3</div>
           <div class="key">4</div><div class="key">5</div><div class="key">6</div>
           <div class="key">7</div><div class="key">8</div><div class="key">9</div>
           <div class="key">✱</div><div class="key">0</div><div class="key">#</div>
-        </div>
-
-        <div class="bell">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
-               stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
-            <path d="M10.3 21a2 2 0 0 0 3.4 0"/>
-          </svg>
         </div>
       </div>
     </div>
@@ -161,7 +136,7 @@
     <div class="caption">status LED: <b id="state-name">—</b></div>
   </main>
 
-  <footer>polling <code>/api/state</code> · served by osdp-mcp</footer>
+  <footer>live via <code>/api/events</code> · served by osdp-mcp</footer>
 
 <script>
   // OSDP colour codes (spec Table 18) → [css colour, label]. 0 = off.
