@@ -123,12 +123,28 @@
     margin: 0 4px;
   }
   .key {
-    text-align: center;
+    appearance: none;
+    -webkit-appearance: none;
+    background: transparent;
+    border: 0;
+    border-radius: 12px;
+    padding: 6px 0;
+    font: inherit;
     font-size: 26px;
     font-weight: 300;
+    text-align: center;
     color: rgba(226,230,238,.78);
     text-shadow: 0 1px 1px rgba(0,0,0,.8);
+    cursor: pointer;
     user-select: none;
+    transition: background .08s ease, transform .05s ease, color .08s ease;
+  }
+  .key:hover { background: rgba(255,255,255,.05); }
+  .key:active,
+  .key.pressed {
+    background: rgba(110,231,168,.16);
+    color: #eef1f6;
+    transform: scale(.94);
   }
 
   .caption { font-size: 13px; color: #9aa3b2; }
@@ -173,10 +189,18 @@
         </div>
 
         <div class="keypad">
-          <div class="key">1</div><div class="key">2</div><div class="key">3</div>
-          <div class="key">4</div><div class="key">5</div><div class="key">6</div>
-          <div class="key">7</div><div class="key">8</div><div class="key">9</div>
-          <div class="key">✱</div><div class="key">0</div><div class="key">#</div>
+          <button class="key" type="button" data-key="1">1</button>
+          <button class="key" type="button" data-key="2">2</button>
+          <button class="key" type="button" data-key="3">3</button>
+          <button class="key" type="button" data-key="4">4</button>
+          <button class="key" type="button" data-key="5">5</button>
+          <button class="key" type="button" data-key="6">6</button>
+          <button class="key" type="button" data-key="7">7</button>
+          <button class="key" type="button" data-key="8">8</button>
+          <button class="key" type="button" data-key="9">9</button>
+          <button class="key" type="button" data-key="*">✱</button>
+          <button class="key" type="button" data-key="0">0</button>
+          <button class="key" type="button" data-key="#">#</button>
         </div>
       </div>
     </div>
@@ -313,6 +337,20 @@
       es.onerror = function () { setConn(false); /* browser retries */ };
     } catch (_) { /* fall back to the poll backstop below */ }
   }
+
+  // ---- Keypad: POST each press to the PD ----------------------------
+  document.querySelectorAll('.key').forEach(function (el) {
+    el.addEventListener('click', function () {
+      const key = el.getAttribute('data-key');
+      el.classList.add('pressed');
+      setTimeout(function () { el.classList.remove('pressed'); }, 130);
+      fetch('/api/keypad', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: key }),
+      }).catch(function () { /* press feedback already shown */ });
+    });
+  });
 
   subscribe();
   // Backstop: prime immediately on load, then a slow poll so the page still

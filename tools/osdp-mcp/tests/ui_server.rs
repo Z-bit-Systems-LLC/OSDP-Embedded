@@ -80,3 +80,37 @@ async fn api_events_is_an_sse_stream() {
         .unwrap_or("");
     assert!(ct.contains("text/event-stream"), "content-type was {ct:?}");
 }
+
+#[tokio::test]
+async fn keypad_press_enqueues_a_pd_event() {
+    let pd = spawn_pd();
+    let app = ui::router(Arc::clone(&pd));
+    assert_eq!(pd.event_queue_depth(), 0);
+
+    // A valid key enqueues one KEYPAD event for the PD's next POLL.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/keypad")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"5"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pd.event_queue_depth(), 1);
+
+    // A bad key is rejected and enqueues nothing.
+    let resp = app
+        .oneshot(
+            Request::post("/api/keypad")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"AB"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(pd.event_queue_depth(), 1);
+}

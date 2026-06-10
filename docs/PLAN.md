@@ -343,12 +343,21 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   `tests/test_loopback.c` (beep→silence over the wire clock),
   `rust/osdp/tests/led_tracking.rs`, and
   `tools/osdp-mcp/tests/actor_loopback.rs`.
+- ☑ **Interactive keypad.** The page's keypad digits (1-9, ✱, 0, #) are
+  buttons; tapping one POSTs `/api/keypad`, which enqueues a one-key
+  `osdp_KEYPAD` event on the PD (same `enqueue_event` path as the
+  `inject_keypad` MCP tool, ASCII key byte per spec Table 35). The ACU
+  under test receives the digit on its next POLL — the reader's keypad
+  driven from the browser. The only write the UI surface performs;
+  everything else stays read-only. The `reader_demo` example turns a
+  press into a confirmation beep. Tested:
+  `tools/osdp-mcp/tests/ui_server.rs::keypad_press_enqueues_a_pd_event`.
 - ☐ **Live wire-log panel** on the page, reusing the `code_name` labels.
 
 ### Deferred
 
-- Interactive `POST /api/card` + `/api/keypad` buttons reusing
-  `enqueue_event`.
+- Interactive `POST /api/card` button reusing `enqueue_event` (the
+  keypad equivalent is done; a card-read injector is the remaining one).
 - Multi-reader support beyond reader 0.
 - Temporary-LED / temporary-text timer accuracy.
 

@@ -31,10 +31,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use tokio::sync::mpsc;
 use tokio_stream::Stream;
 
 use std::collections::VecDeque;
@@ -163,8 +165,10 @@ fn temporary(
 }
 
 /// Drive the PD↔ACU loopback forever, feeding the shared reader state.
-/// Runs on its own std::thread because `Pd`/`Acu` are `!Send`.
-fn run_driver(reader_state: SharedReaderState) {
+/// Runs on its own std::thread because `Pd`/`Acu` are `!Send`. Keypresses
+/// arrive over `key_rx` (from the page) and trigger a short confirmation
+/// beep.
+fn run_driver(reader_state: SharedReaderState, mut key_rx: mpsc::UnboundedReceiver<()>) {
     let start = Instant::now();
     let wire = Rc::new(RefCell::new(Wire::default()));
 
@@ -201,6 +205,12 @@ fn run_driver(reader_state: SharedReaderState) {
         pd.tick();
         acu.tick();
 
+        // Each keypress from the page → a short confirmation beep, queued
+        // ahead of the idle grant loop.
+        while key_rx.try_recv().is_ok() {
+            queue.push_back((OSDP_CMD_BUZ, buz_payload(1, 0, 1)));
+        }
+
         if !acu.is_pd_busy(PD_ADDR) {
             if let Some((code, payload)) = queue.pop_front() {
                 let _ = acu.send_command(PD_ADDR, code, &payload);
@@ -232,12 +242,21 @@ fn run_driver(reader_state: SharedReaderState) {
 
 // ---- UI server (reuses the osdp-mcp embedded page) -------------------
 
+/// Shared axum state: the reader snapshot plus a channel that forwards
+/// keypresses to the driver thread.
+#[derive(Clone)]
+struct DemoState {
+    reader: SharedReaderState,
+    keypress: mpsc::UnboundedSender<()>,
+}
+
 async fn index() -> Html<&'static str> {
     Html(osdp_mcp::ui::index_html())
 }
 
-async fn api_state(State(rs): State<SharedReaderState>) -> Json<ReaderStateView> {
-    let view = rs
+async fn api_state(State(st): State<DemoState>) -> Json<ReaderStateView> {
+    let view = st
+        .reader
         .lock()
         .map(|s| s.snapshot())
         .unwrap_or_else(|_| ReaderStateView::default());
@@ -247,13 +266,29 @@ async fn api_state(State(rs): State<SharedReaderState>) -> Json<ReaderStateView>
 /// SSE stream, reusing the osdp-mcp builder so the demo page gets the same
 /// instant push as the real server.
 async fn api_events(
-    State(rs): State<SharedReaderState>,
+    State(st): State<DemoState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (initial, rx) = {
-        let s = rs.lock().expect("reader state lock");
+        let s = st.reader.lock().expect("reader state lock");
         (s.snapshot(), s.subscribe())
     };
     osdp_mcp::ui::reader_sse(initial, rx)
+}
+
+/// Keypad press from the page → a confirmation beep on the driver thread.
+/// (The real osdp-mcp instead injects an osdp_KEYPAD event for the ACU.)
+async fn api_keypad(State(st): State<DemoState>, Json(body): Json<KeypadPress>) -> StatusCode {
+    // Validate the key the same way the real server does.
+    if osdp_mcp::ui::keypad_event(&body.key).is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let _ = st.keypress.send(());
+    StatusCode::NO_CONTENT
+}
+
+#[derive(serde::Deserialize)]
+struct KeypadPress {
+    key: String,
 }
 
 #[tokio::main]
@@ -265,17 +300,22 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
 
     let reader_state = reader_state::new_shared();
+    let (keypress_tx, keypress_rx) = mpsc::unbounded_channel::<()>();
 
     // PD/ACU loopback driver on its own thread (the state machines are
-    // !Send); it feeds `reader_state` through the LED change callback.
+    // !Send); it feeds `reader_state` and turns keypresses into beeps.
     let driver_state = Arc::clone(&reader_state);
-    std::thread::spawn(move || run_driver(driver_state));
+    std::thread::spawn(move || run_driver(driver_state, keypress_rx));
 
     let app = Router::new()
         .route("/", get(index))
         .route("/api/state", get(api_state))
         .route("/api/events", get(api_events))
-        .with_state(reader_state);
+        .route("/api/keypad", post(api_keypad))
+        .with_state(DemoState {
+            reader: reader_state,
+            keypress: keypress_tx,
+        });
 
     println!("reader demo: open http://{bind}/ in a browser (Ctrl-C to quit)");
     let listener = tokio::net::TcpListener::bind(bind).await?;
