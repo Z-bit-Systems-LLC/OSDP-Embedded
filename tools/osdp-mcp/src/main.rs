@@ -27,6 +27,7 @@ use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::pd_actor::{PdHandle, PdStatus, ScConfig, StartupConfig};
 use osdp_mcp::pdcap_spec;
 use osdp_mcp::reader_state::ReaderStateView;
+use osdp_mcp::ui;
 use osdp_mcp::wire::{WirePage, DEFAULT_WIRE_CAPACITY};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -1224,6 +1225,10 @@ struct Cli {
     crypto: Selector,
     transport: TransportKind,
     bind: SocketAddr,
+    /// Address for the browser reader-visual server, if enabled. `None`
+    /// (the default) leaves the UI off entirely. Set via `--ui-bind` or
+    /// `OSDP_MCP_UI_BIND`; spawned regardless of which MCP transport runs.
+    ui_bind: Option<SocketAddr>,
 }
 
 /// Default bind address for `--transport http`. Loopback by design —
@@ -1237,6 +1242,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut crypto: Option<Selector> = None;
     let mut transport: Option<TransportKind> = None;
     let mut bind: Option<String> = None;
+    let mut ui_bind: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--crypto" => {
@@ -1265,6 +1271,12 @@ fn parse_cli() -> Result<Cli, String> {
                     .ok_or_else(|| "--bind requires a value".to_string())?;
                 bind = Some(v);
             }
+            "--ui-bind" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "--ui-bind requires a value".to_string())?;
+                ui_bind = Some(v);
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "osdp-mcp — MCP server exposing an osdp-embedded PD\n\n\
@@ -1275,6 +1287,10 @@ fn parse_cli() -> Result<Cli, String> {
                                          http: streamable-HTTP server mounted at /mcp.\n  \
                        --bind <addr>     Bind address for --transport http.\n                       \
                                          Default: {bind} (loopback).\n  \
+                       --ui-bind <addr>  Enable the browser reader-visual server on <addr>\n                       \
+                                         (e.g. 127.0.0.1:8088). Off by default; serves a\n                       \
+                                         live LED view at GET / and JSON at GET /api/state,\n                       \
+                                         alongside either MCP transport.\n  \
                        --crypto <name>   AES backend to use for Secure Channel.\n                       \
                                          Available in this build: {available}\n                       \
                                          Default: {default}\n  \
@@ -1285,7 +1301,9 @@ fn parse_cli() -> Result<Cli, String> {
                        OSDP_MCP_BAUD      Line rate (default 9600).\n  \
                        OSDP_MCP_ADDRESS   7-bit address, decimal or 0x-hex (default 0).\n  \
                        OSDP_MCP_SC_MODE   Secure Channel: none | install | scbk (default none).\n  \
-                       OSDP_MCP_SCBK_HEX  32-hex-char SCBK, required when SC_MODE=scbk.\n",
+                       OSDP_MCP_SCBK_HEX  32-hex-char SCBK, required when SC_MODE=scbk.\n  \
+                       OSDP_MCP_UI_BIND   Enable the reader-visual server on this address\n                       \
+                                         (same as --ui-bind; the flag wins if both are set).\n",
                     bind = DEFAULT_HTTP_BIND,
                     available = Selector::available()
                         .into_iter()
@@ -1311,10 +1329,25 @@ fn parse_cli() -> Result<Cli, String> {
     let bind: SocketAddr = bind_str
         .parse()
         .map_err(|e| format!("invalid --bind {bind_str:?}: {e}"))?;
+
+    // The reader UI is off unless an address is supplied. A `--ui-bind`
+    // flag wins; otherwise fall back to OSDP_MCP_UI_BIND so an operator
+    // can enable it from a unit file. Either way the value must parse as a
+    // socket address.
+    let ui_bind = ui_bind.or_else(|| env_nonempty("OSDP_MCP_UI_BIND"));
+    let ui_bind: Option<SocketAddr> = match ui_bind {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|e| format!("invalid reader UI bind {s:?}: {e}"))?,
+        ),
+        None => None,
+    };
+
     Ok(Cli {
         crypto,
         transport,
         bind,
+        ui_bind,
     })
 }
 
@@ -1461,6 +1494,20 @@ async fn main() -> Result<()> {
                 "auto-start from OSDP_MCP_* failed; PD not running — use pd_configure"
             ),
         }
+    }
+
+    // Spin up the browser reader-visual server if enabled. It's
+    // independent of the MCP transport — shares the one PdHandle, reads
+    // the live reader state — so it runs the same way under stdio or HTTP.
+    // A bind failure is logged but non-fatal: the MCP server still serves.
+    if let Some(ui_addr) = cli.ui_bind {
+        let ui_pd = Arc::clone(&handler.pd);
+        tracing::info!(%ui_addr, "reader UI enabled at http://{ui_addr}/");
+        tokio::spawn(async move {
+            if let Err(e) = ui::serve(ui_pd, ui_addr).await {
+                tracing::error!(%ui_addr, error = %e, "reader UI server stopped");
+            }
+        });
     }
 
     match cli.transport {

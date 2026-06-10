@@ -307,10 +307,15 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   (Future deliverables below still cover BUZ/TEXT/OUT and link status,
   which can follow the same C-core pattern or stay Rust-side as plain
   decode-into-state.)
-- ☐ **UI server** (`ui.rs`). An axum server independent of the MCP
+- ☑ **UI server** (`ui.rs`). An axum server independent of the MCP
   transport: `GET /` serves a self-contained embedded HTML page
-  (`include_str!`), `GET /api/state` returns a JSON snapshot; the page
-  polls first.
+  (`include_str!("ui_index.html")` — inline CSS/JS, renders each reader
+  LED as a glowing circle), `GET /api/state` returns the
+  `ReaderStateView` JSON snapshot; the page polls it ~3×/s. Enabled via
+  `--ui-bind <addr>` / `OSDP_MCP_UI_BIND` (off by default), spawned as a
+  `tokio` task alongside either MCP transport and sharing the one
+  `PdHandle`. Tested with `tower::oneshot` over the router
+  (`tests/ui_server.rs`) and smoke-checked against a live binary.
 - ☐ **SSE push.** Via `tokio::sync::broadcast` + the existing `LogInner`
   `Notify` hook point; `GET /api/events` streams snapshot-on-connect
   then deltas; replaces polling.

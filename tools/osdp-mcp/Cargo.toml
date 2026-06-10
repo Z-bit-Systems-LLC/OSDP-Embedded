@@ -105,6 +105,9 @@ rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 # rmcp::object! macro expands to serde_json::json!(...) so the caller
 # needs serde_json in scope.
 serde_json = "1"
+# `tower::ServiceExt::oneshot` drives the UI axum Router in-process for
+# the reader-visual test — no socket bind, no HTTP client needed.
+tower = { version = "0.5", features = ["util"] }
 # The actor-loopback test pairs our PD with an in-process Acu to
 # verify the default handler responds to POLL / ID / CAP correctly.
 # Adding `acu` here unifies with the [dependencies] feature set only

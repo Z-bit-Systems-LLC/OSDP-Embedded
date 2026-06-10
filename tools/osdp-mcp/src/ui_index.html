@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<!--
+  SPDX-License-Identifier: GPL-3.0-or-later
+  Copyright (C) 2026 Z-bit Systems, LLC
+
+  Self-contained reader-visual page served by osdp-mcp's UI server
+  (src/ui.rs) at GET /. No external assets: it polls GET /api/state and
+  renders each reader LED as a glowing circle. View-only for now.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OSDP Virtual Reader</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    color: #d8dde6;
+    background: radial-gradient(1200px 800px at 50% -10%, #1b2230, #0c0f15 60%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  header {
+    width: 100%;
+    max-width: 760px;
+    padding: 22px 24px 8px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  .sub { color: #6b7484; font-size: 13px; }
+  #conn {
+    margin-left: auto;
+    font-size: 12px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid #2a3140;
+    color: #8a93a4;
+  }
+  #conn.ok   { color: #6ee7a8; border-color: #1f5138; }
+  #conn.down { color: #f3a; border-color: #5a1f33; }
+  main {
+    width: 100%;
+    max-width: 760px;
+    padding: 16px 24px 48px;
+  }
+  .reader {
+    background: linear-gradient(180deg, #151a24, #11151d);
+    border: 1px solid #232b39;
+    border-radius: 16px;
+    padding: 28px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.45);
+  }
+  #leds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 30px;
+    justify-content: center;
+  }
+  .led-card { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .led {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: var(--c, #1c2230);
+    border: 2px solid rgba(255,255,255,.08);
+    transition: background .12s ease, box-shadow .12s ease;
+  }
+  .led.lit {
+    border-color: rgba(255,255,255,.22);
+    box-shadow: 0 0 26px 4px var(--c), inset 0 0 10px rgba(255,255,255,.35);
+  }
+  .lbl  { font-size: 12px; color: #9aa3b2; }
+  .cname{ font-size: 12px; color: #cfd6e2; text-transform: capitalize; font-weight: 600; }
+  .empty { color: #6b7484; text-align: center; padding: 26px 0; }
+  footer { color: #4d5564; font-size: 12px; padding-bottom: 28px; }
+  code { color: #9aa3b2; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>OSDP Virtual Reader</h1>
+    <span class="sub">live LED state</span>
+    <span id="conn">connecting…</span>
+  </header>
+  <main>
+    <div class="reader">
+      <div id="leds"><div class="empty">Waiting for an <code>osdp_LED</code> command…</div></div>
+    </div>
+  </main>
+  <footer>polling <code>/api/state</code> · served by osdp-mcp</footer>
+
+<script>
+  // OSDP colour codes (spec Table 18) → [css colour, label]. Index 0 is
+  // "off" and renders as an unlit circle.
+  const COLORS = {
+    0: ['#1c2230', 'off'],
+    1: ['#ff3b46', 'red'],
+    2: ['#2fd27a', 'green'],
+    3: ['#ffb02e', 'amber'],
+    4: ['#3a9bff', 'blue'],
+    5: ['#ef5bd6', 'magenta'],
+    6: ['#3ee0e0', 'cyan'],
+    7: ['#eef1f6', 'white'],
+  };
+
+  const ledsEl = document.getElementById('leds');
+  const connEl = document.getElementById('conn');
+
+  function setConn(ok) {
+    connEl.textContent = ok ? 'connected' : 'disconnected';
+    connEl.className = ok ? 'ok' : 'down';
+  }
+
+  function render(leds) {
+    if (!leds || leds.length === 0) {
+      ledsEl.innerHTML =
+        '<div class="empty">Waiting for an <code>osdp_LED</code> command…</div>';
+      return;
+    }
+    ledsEl.innerHTML = leds.map(function (l) {
+      const known = COLORS[l.color];
+      const css = known ? known[0] : '#1c2230';
+      const name = l.color_name || (known ? known[1] : ('0x' + l.color.toString(16)));
+      const lit = l.color !== 0;
+      return (
+        '<div class="led-card">' +
+          '<div class="led' + (lit ? ' lit' : '') + '" style="--c:' + css + '"></div>' +
+          '<div class="lbl">reader ' + l.reader_no + ' · LED ' + l.led_no + '</div>' +
+          '<div class="cname">' + name + '</div>' +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch('/api/state', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const state = await r.json();
+      render(state.leds);
+      setConn(true);
+    } catch (e) {
+      setConn(false);
+    }
+  }
+
+  poll();
+  setInterval(poll, 300);
+</script>
+</body>
+</html>
