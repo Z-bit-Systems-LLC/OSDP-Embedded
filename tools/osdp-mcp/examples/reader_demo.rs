@@ -7,12 +7,14 @@
 //! in-process loopback, has the ACU drive `osdp_LED` commands on a loop,
 //! and serves the *same* browser page the live `osdp-mcp --ui-bind` would.
 //! Open the printed URL and watch the reader's single status LED:
-//!   - idle steady red (locked),
-//!   - every ~4 s an "access granted" pulse — solid green for ~1.8 s, or
-//!     a flashing-green "processing" for ~2 s on alternate cycles —
-//!     then auto-revert to red via the temporary-timer path.
-//! The flashing edges are resolved by the PD from a single command, so
-//! they exercise the time-driven LED change callback.
+//!
+//! - Idle: steady red (locked).
+//! - Every ~4 s an "access granted" pulse — solid green for ~1.8 s, or a
+//!   flashing-green "processing" for ~2 s on alternate cycles — then
+//!   auto-reverts to red via the temporary-timer path.
+//!
+//! The flashing edges are resolved by the PD from a single command, so they
+//! exercise the time-driven LED change callback.
 //!
 //! Run with:
 //!
@@ -127,7 +129,11 @@ fn temporary(
         perm_off_color: perm.as_u8(),
         temp_control_code: 2, // SET (override)
         temp_on_color: temp.as_u8(),
-        temp_off_color: if solid { temp.as_u8() } else { LedColor::Black.as_u8() },
+        temp_off_color: if solid {
+            temp.as_u8()
+        } else {
+            LedColor::Black.as_u8()
+        },
         temp_on_time: on_100ms,
         temp_off_time: off_100ms,
         temp_timer_100ms: timer_100ms,

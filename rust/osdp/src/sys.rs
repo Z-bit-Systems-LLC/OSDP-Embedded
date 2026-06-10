@@ -848,9 +848,8 @@ mod pd_ffi {
         ) -> osdp_status_t,
     >;
 
-    pub type osdp_pd_led_cb = Option<
-        unsafe extern "C" fn(user: *mut c_void, reader_no: u8, led_no: u8, color: u8),
-    >;
+    pub type osdp_pd_led_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, reader_no: u8, led_no: u8, color: u8)>;
 
     /// Mirror of C `osdp_pd_led_slot_t` (24 bytes, align 4).
     #[repr(C)]

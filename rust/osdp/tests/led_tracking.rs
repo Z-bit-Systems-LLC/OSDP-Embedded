@@ -55,7 +55,11 @@ impl<const PD: bool> Transport for WireAdapter<PD> {
 /// tracks the resulting colour transparently regardless of the reply.
 struct AckHandler;
 impl CommandHandler for AckHandler {
-    fn handle<'a>(&'a mut self, _cmd_code: u8, _payload: &[u8]) -> osdp_embedded::Result<Reply<'a>> {
+    fn handle<'a>(
+        &'a mut self,
+        _cmd_code: u8,
+        _payload: &[u8],
+    ) -> osdp_embedded::Result<Reply<'a>> {
         Ok(Reply {
             code: OSDP_REPLY_ACK,
             payload: &[],
@@ -89,9 +93,7 @@ fn cycle(pd: &mut Pd, acu: &mut Acu, n: usize) {
 
 /// Build the payload of an `osdp_LED` command carrying one record.
 fn led_payload(rec: LedRecord) -> Vec<u8> {
-    let led = Led {
-        records: vec![rec],
-    };
+    let led = Led { records: vec![rec] };
     let mut buf = [0u8; 32];
     let n = led.build(&mut buf).expect("LED build");
     buf[..n].to_vec()
