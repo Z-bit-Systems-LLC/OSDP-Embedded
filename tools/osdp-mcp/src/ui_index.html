@@ -30,20 +30,23 @@
   header {
     width: 100%;
     max-width: 720px;
-    padding: 22px 24px 4px;
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
+    padding: 24px 24px 6px;
+    text-align: center;
   }
   h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: .3px; }
-  .sub { color: #6b7484; font-size: 13px; }
+  /* Connection badge: pinned to the top-right corner, out of the way of
+   * the centred title. */
   #conn {
-    margin-left: auto;
+    position: fixed;
+    top: 14px;
+    right: 16px;
     font-size: 12px;
-    padding: 3px 9px;
+    padding: 3px 10px;
     border-radius: 999px;
     border: 1px solid #2a3140;
     color: #8a93a4;
+    background: rgba(12,15,21,.65);
+    backdrop-filter: blur(4px);
   }
   #conn.ok   { color: #6ee7a8; border-color: #1f5138; }
   #conn.down { color: #ff5a8a; border-color: #5a1f33; }
@@ -190,10 +193,9 @@
 </style>
 </head>
 <body>
+  <span id="conn">connecting…</span>
   <header>
     <h1>OSDP Virtual Reader</h1>
-    <span class="sub">live LED state</span>
-    <span id="conn">connecting…</span>
   </header>
 
   <main>
