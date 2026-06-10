@@ -1289,8 +1289,11 @@ fn parse_cli() -> Result<Cli, String> {
                                          Default: {bind} (loopback).\n  \
                        --ui-bind <addr>  Enable the browser reader-visual server on <addr>\n                       \
                                          (e.g. 127.0.0.1:8088). Off by default; serves a\n                       \
-                                         live LED view at GET / and JSON at GET /api/state,\n                       \
-                                         alongside either MCP transport.\n  \
+                                         live LED view at GET / and JSON at GET /api/state.\n                       \
+                                         Set it EQUAL to --bind under --transport http to\n                       \
+                                         serve the page on the MCP port itself (one port,\n                       \
+                                         so a single ngrok/proxy tunnel covers /mcp and the\n                       \
+                                         page); any other address runs a separate listener.\n  \
                        --crypto <name>   AES backend to use for Secure Channel.\n                       \
                                          Available in this build: {available}\n                       \
                                          Default: {default}\n  \
@@ -1496,23 +1499,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spin up the browser reader-visual server if enabled. It's
-    // independent of the MCP transport — shares the one PdHandle, reads
-    // the live reader state — so it runs the same way under stdio or HTTP.
-    // A bind failure is logged but non-fatal: the MCP server still serves.
+    // The reader UI can either ride on the MCP HTTP port (when --ui-bind
+    // equals --bind under the http transport — one port, so a single
+    // ngrok/reverse-proxy tunnel serves both /mcp and the page) or run as
+    // its own independent listener (a different port, or under stdio).
+    let ui_on_http_port =
+        matches!(cli.transport, TransportKind::Http) && cli.ui_bind == Some(cli.bind);
+
+    // Spin up the standalone reader-visual server only when the UI is
+    // enabled on a *separate* address. It shares the one PdHandle and
+    // reads the live reader state. A bind failure is logged but non-fatal.
     if let Some(ui_addr) = cli.ui_bind {
-        let ui_pd = Arc::clone(&handler.pd);
-        tracing::info!(%ui_addr, "reader UI enabled at http://{ui_addr}/");
-        tokio::spawn(async move {
-            if let Err(e) = ui::serve(ui_pd, ui_addr).await {
-                tracing::error!(%ui_addr, error = %e, "reader UI server stopped");
-            }
-        });
+        if !ui_on_http_port {
+            let ui_pd = Arc::clone(&handler.pd);
+            tracing::info!(%ui_addr, "reader UI enabled at http://{ui_addr}/");
+            tokio::spawn(async move {
+                if let Err(e) = ui::serve(ui_pd, ui_addr).await {
+                    tracing::error!(%ui_addr, error = %e, "reader UI server stopped");
+                }
+            });
+        }
     }
 
     match cli.transport {
         TransportKind::Stdio => run_stdio(handler, cli.crypto).await,
-        TransportKind::Http => run_http(handler, cli.crypto, cli.bind).await,
+        TransportKind::Http => run_http(handler, cli.crypto, cli.bind, ui_on_http_port).await,
     }
 }
 
@@ -1532,12 +1543,24 @@ async fn run_stdio(handler: OsdpMcp, crypto: Selector) -> Result<()> {
     Ok(())
 }
 
-async fn run_http(handler: OsdpMcp, crypto: Selector, bind: SocketAddr) -> Result<()> {
+async fn run_http(
+    handler: OsdpMcp,
+    crypto: Selector,
+    bind: SocketAddr,
+    serve_ui: bool,
+) -> Result<()> {
     tracing::info!(
         crypto = crypto.name(),
         %bind,
+        ui = serve_ui,
         "osdp-mcp starting (streamable-HTTP transport at /mcp)"
     );
+
+    // When the reader UI shares this port (--ui-bind == --bind), grab a
+    // PdHandle clone before `handler` is moved into the session factory
+    // below; the UI routes are merged onto the same router so one port
+    // (and one tunnel) serves both /mcp and the reader page.
+    let ui_pd = serve_ui.then(|| Arc::clone(&handler.pd));
 
     // Cancellation token lets us cut in-flight SSE streams when the
     // process is asked to shut down (Ctrl-C). Without it, axum's
@@ -1563,7 +1586,14 @@ async fn run_http(handler: OsdpMcp, crypto: Selector, bind: SocketAddr) -> Resul
         svc_cfg,
     );
 
-    let router = axum::Router::new().nest_service("/mcp", svc);
+    let mut router = axum::Router::new().nest_service("/mcp", svc);
+    // Mount the read-only reader UI (`GET /`, `GET /api/state`) on the same
+    // router when it shares this port. `/mcp` and the UI paths don't
+    // overlap, so they coexist on one listener.
+    if let Some(pd) = ui_pd {
+        router = router.merge(ui::router(pd));
+        tracing::info!(%bind, "reader UI on the MCP port at http://{bind}/");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| anyhow::anyhow!("bind {bind} failed: {e}"))?;
