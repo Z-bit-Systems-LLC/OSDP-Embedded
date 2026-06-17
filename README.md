@@ -470,7 +470,11 @@ PD's `ScCrypto` provider.
 Event injection (RAW / KEYPAD / LSTATR) and fault injection
 (`drop_next_n_replies`, `force_session_loss`) are wired up.
 `pd_status` surfaces both `event_queue_depth` and `drop_remaining`
-so an agent can confirm its setup before driving the ACU.
+so an agent can confirm its setup before driving the ACU. A queued
+event is only deliverable for a short freshness window (~2 s): like a
+real reader it is reported on the next POLL or dropped, so a card-read
+injected while the ACU isn't polling can't be replayed minutes later
+when polling resumes.
 
 ## Reference material
 
