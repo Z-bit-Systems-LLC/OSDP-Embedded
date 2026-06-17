@@ -33,20 +33,17 @@
     padding: 24px 24px 6px;
     text-align: center;
   }
-  h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: .3px; }
-  /* Connection badge: pinned to the top-right corner, out of the way of
-   * the centred title. */
+  h1 { font-size: 26px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  /* Connection badge: centred just under the title. */
   #conn {
-    position: fixed;
-    top: 14px;
-    right: 16px;
+    display: inline-block;
+    margin-top: 8px;
     font-size: 12px;
     padding: 3px 10px;
     border-radius: 999px;
     border: 1px solid #2a3140;
     color: #8a93a4;
     background: rgba(12,15,21,.65);
-    backdrop-filter: blur(4px);
   }
   #conn.ok   { color: #6ee7a8; border-color: #1f5138; }
   #conn.down { color: #ff5a8a; border-color: #5a1f33; }
@@ -192,9 +189,9 @@
 </style>
 </head>
 <body>
-  <span id="conn">connecting…</span>
   <header>
     <h1>OSDP Virtual Reader</h1>
+    <span id="conn">connecting…</span>
   </header>
 
   <main>
