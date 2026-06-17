@@ -37,6 +37,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -221,12 +222,29 @@ async fn api_card(State(pd): State<Arc<PdHandle>>, Json(body): Json<CardTap>) ->
     }
 }
 
+/// How long a UI-injected tamper stays asserted before it auto-clears.
+/// LSTATR is reported only on a *change* of status, so leaving tamper
+/// latched at 1 would make the ACU treat a later tamper as "no change"
+/// and ignore it. Clearing back to 0 after this delay restores the 0→1
+/// edge so the next press registers again.
+const TAMPER_CLEAR_DELAY: Duration = Duration::from_secs(5);
+
 /// Inject a tamper condition. The page POSTs this when "Tamper" is
 /// pressed; the PD surfaces it as an `osdp_LSTATR` with the tamper bit
 /// set on its next POLL. As a status report it is never aged out, so the
 /// ACU learns of the tamper whenever it next polls — even after a gap.
+///
+/// Tamper is momentary in the UI: we report it active now, then schedule
+/// a clear ([`TAMPER_CLEAR_DELAY`] later) so the ACU sees tamper return
+/// to normal and a subsequent press is again a fresh change it registers
+/// (see [`TAMPER_CLEAR_DELAY`]).
 async fn api_tamper(State(pd): State<Arc<PdHandle>>) -> StatusCode {
-    pd.enqueue_event(local_status_event(1, 0));
+    pd.enqueue_event(local_status_event(1, 0)); // tamper active
+    let pd = Arc::clone(&pd);
+    tokio::spawn(async move {
+        tokio::time::sleep(TAMPER_CLEAR_DELAY).await;
+        pd.enqueue_event(local_status_event(0, 0)); // tamper clear
+    });
     StatusCode::NO_CONTENT
 }
 
