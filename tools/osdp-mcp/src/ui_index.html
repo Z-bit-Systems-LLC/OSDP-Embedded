@@ -164,7 +164,6 @@
   }
   .soundbtn:hover { border-color: #3a4356; }
   .soundbtn:active { transform: scale(.95); }
-  .soundbtn.on { color: #6ee7a8; border-color: #1f5138; }
   .soundbtn.flash {
     color: #6ee7a8;
     border-color: #1f5138;
@@ -236,7 +235,6 @@
       <input id="card" class="cardinput" type="text" inputmode="numeric"
              value="12345" maxlength="20" aria-label="card number" />
       <button id="tap" class="soundbtn" type="button">Tap card</button>
-      <button id="sound" class="soundbtn" type="button">🔇 Enable sound</button>
     </div>
   </main>
 
@@ -289,14 +287,17 @@
 
   // ---- Buzzer: visual pulse + Web Audio beep ------------------------
   const buzzerEl = document.getElementById('buzzer');
-  const soundBtn = document.getElementById('sound');
-  let audioCtx = null, osc = null, gain = null, soundOn = false;
+  let audioCtx = null, osc = null, gain = null;
   let buzzing = false;
 
-  // Audio can't autoplay — build the graph on the user's click.
-  soundBtn.addEventListener('click', function () {
-    if (!soundOn) {
-      try {
+  // Build the buzzer's audio graph on demand. Browsers won't let an
+  // AudioContext make noise until a user gesture, so the context starts
+  // suspended; the first keypress resumes it. (Muting is left to the
+  // browser's own per-tab audio control.) Returns true once the graph is
+  // live.
+  function ensureAudio() {
+    try {
+      if (!audioCtx) {
         const Ctx = window.AudioContext || window.webkitAudioContext;
         audioCtx = new Ctx();
         osc = audioCtx.createOscillator();
@@ -306,26 +307,39 @@
         gain.gain.value = 0;            // silent until sounding
         osc.connect(gain).connect(audioCtx.destination);
         osc.start();
-        soundOn = true;
-        soundBtn.textContent = '🔊 Sound on';
-        soundBtn.classList.add('on');
-        applyBuzz();                    // catch a beep already in progress
-      } catch (_) { /* leave sound off */ }
-    } else {
-      // Toggle back off (mute), keep the graph for a quick re-enable.
-      soundOn = false;
-      if (gain && audioCtx) gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.005);
-      soundBtn.textContent = '🔇 Enable sound';
-      soundBtn.classList.remove('on');
-    }
-  });
+      }
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return true;
+    } catch (_) { return false; }       // audio unavailable
+  }
 
   function applyBuzz() {
     buzzerEl.classList.toggle('sounding', buzzing);
-    if (soundOn && gain && audioCtx) {
+    if (buzzing) ensureAudio();
+    if (gain && audioCtx) {
       // Short ramp avoids clicks on each beep edge.
       gain.gain.setTargetAtTime(buzzing ? 0.05 : 0, audioCtx.currentTime, 0.004);
     }
+  }
+
+  // A short tone for each keypad press — same pitch as the osdp_BUZ buzzer
+  // (2300 Hz square), just briefer, so the reader feels like one device.
+  // The press is itself a user gesture, so bring the audio graph up here.
+  function playKeyBeep() {
+    if (!ensureAudio() || !audioCtx) return;
+    try {
+      const now = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'square';
+      o.frequency.value = 2300;
+      g.gain.setValueAtTime(0, now);
+      g.gain.linearRampToValueAtTime(0.06, now + 0.005);
+      g.gain.setTargetAtTime(0, now + 0.02, 0.02);
+      o.connect(g).connect(audioCtx.destination);
+      o.start(now);
+      o.stop(now + 0.12);
+    } catch (_) { /* a missed beep is harmless */ }
   }
 
   function renderBuzzer(buzzers) {
@@ -373,6 +387,7 @@
   document.querySelectorAll('.key').forEach(function (el) {
     el.addEventListener('click', function () {
       const key = el.getAttribute('data-key');
+      playKeyBeep();
       el.classList.add('pressed');
       setTimeout(function () { el.classList.remove('pressed'); }, 130);
       fetch('/api/keypad', {
