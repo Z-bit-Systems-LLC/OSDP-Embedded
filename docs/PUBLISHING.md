@@ -4,9 +4,18 @@ This documents how a Z-bit Systems maintainer ships a new release of the
 `osdp-embedded` Rust crate. The Azure Pipelines build produces an
 `osdp-embedded-X.Y.Z.crate` artifact plus the Windows tool binaries on
 every tagged build (see `ci/package.yml`); the actual publish to
-crates.io and the binary upload run in the downstream Azure DevOps
-**Release pipeline**, behind its approval gate — so a human reviews each
-release before it lands on a public registry.
+crates.io runs in the downstream Azure DevOps **Release pipeline**
+(Classic), behind its approval gate — so a human reviews each release
+before it lands on a public registry, and the run is recorded under the
+web admin's **Releases** section.
+
+The publish itself is a single script — [`scripts/Publish-Crate.ps1`](../scripts/Publish-Crate.ps1)
+— so the irreversible logic stays version-controlled here rather than
+pasted into the Release UI. The Release pipeline's only job is to gate it
+behind an approval and feed it the build's `.crate` artifact + the
+crates.io token. See
+[The Release pipeline (Classic)](#the-release-pipeline-classic) for the
+one-time UI setup.
 
 ## Cutting a release (scripted)
 
@@ -23,12 +32,73 @@ The normal path is one command:
 origin), resolves the new version, bumps it via `Set-Version.ps1`, runs
 the `Check-Code.ps1` verification gates so the tagged commit is
 known-green, then commits, tags `v<version>`, and pushes `main` + the
-tag. Pushing the tag triggers the pipeline; approving the Release
-pipeline does the irreversible `cargo publish` and uploads the binaries.
+tag. Pushing the tag triggers the build pipeline (which packages the
+`.crate`); approving the Release pipeline then does the irreversible
+publish of that artifact to crates.io.
 
 The manual recipe below is what that automation does under the hood —
 follow it directly only when you need to deviate (e.g. a local dry-run of
 `cargo package`, or publishing from a workstation outside CI).
+
+## The Release pipeline (Classic)
+
+The build pipeline (`ci/azure-pipelines.yml`) is intentionally kept
+*separate* from the publish: it builds, tests, and packages on every `v*`
+tag, but never touches crates.io. The publish is a **Classic Release
+pipeline**, configured in the Azure DevOps web UI, so the run is recorded
+under the **Releases** section and is human-approved each time. (YAML
+multi-stage pipelines never appear under Releases — that section is
+exclusive to Classic — which is why this half is Classic by design.)
+
+One-time setup in the AzDO UI:
+
+1. **Secret variable for the token.** Create a crates.io API token (see
+   [One-time setup](#one-time-setup) below) and store it as a *secret*
+   pipeline variable on the Release pipeline (or a shared variable group),
+   e.g. `CratesIoToken`. Mark it secret so it's masked in logs.
+2. **Artifact.** Add a single artifact source: the **build pipeline**. The
+   release is artifacts-only — it downloads the build's
+   `osdp-embedded-release` artifact and needs no source checkout. That
+   artifact carries both `crates/osdp-embedded-X.Y.Z.crate` and
+   `scripts/Publish-Crate.ps1` (staged by `ci/package.yml`), so the release
+   agent has the verified `.crate` *and* the publish script without a repo
+   checkout. The publish uploads that exact `.crate`, so the bytes that ship
+   are byte-for-byte the bytes CI built and verified.
+3. **Continuous-deployment trigger.** Enable the CD trigger on the build
+   artifact with a tag filter so only `v*` tagged builds create a release
+   (the build only runs `package.yml` on tags anyway, but the filter keeps
+   branch builds from creating empty releases).
+4. **Pre-deployment approval.** On the publish stage, add a
+   pre-deployment approval (the maintainer). This is the gate that makes
+   the irreversible publish deliberate.
+5. **The publish task.** A single PowerShell task running
+   `scripts/Publish-Crate.ps1`. Map the secret variable to the env var
+   cargo reads (secret vars are *not* auto-exposed to scripts):
+
+   | Task setting        | Value                                                                  |
+   | ------------------- | ---------------------------------------------------------------------- |
+   | Type                | PowerShell (`pwsh: true`)                                              |
+   | Script path         | `$(System.DefaultWorkingDirectory)/<alias>/osdp-embedded-release/scripts/Publish-Crate.ps1` |
+   | Arguments           | `-ExpectedVersion $(Build.SourceBranchName)`                          |
+   | Environment var     | `CARGO_REGISTRY_TOKEN = $(CratesIoToken)`                             |
+
+   Replace `<alias>` with the build artifact's source alias (shown on the
+   release's Artifacts tab). The script ships *inside* the downloaded
+   artifact (see step 2), so the path is under
+   `$(System.DefaultWorkingDirectory)`, not a repo path.
+   `-ExpectedVersion` is the release tag (`v0.1.21`); the script parses the
+   version from the `.crate` file name and aborts unless it matches, so a
+   misrouted or stale artifact can never publish the wrong number. With no
+   `-CratePath`, the script finds the single `osdp-embedded-*.crate` under
+   the agent's artifact root (`$(System.DefaultWorkingDirectory)`). The agent
+   needs `cargo` on PATH — the same self-hosted Linux agent the `build_rust`
+   job uses already qualifies — but no C toolchain (the upload uses
+   `--no-verify`; CI already verified).
+
+The script locates the `.crate`, extracts it, and runs
+`cargo publish --no-verify` from the extracted manifest, cleaning up the
+temp extraction afterward. To rehearse without uploading, run it (or the
+task) with `-DryRun`.
 
 ## One-time setup
 

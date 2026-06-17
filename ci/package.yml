@@ -123,6 +123,19 @@ steps:
       targetFolder: '$(Build.ArtifactStagingDirectory)/crates'
       flattenFolders: true
 
+  # Ship the publish script inside the artifact. The downstream Classic
+  # Release is artifacts-only (no source checkout), so this is how
+  # scripts/Publish-Crate.ps1 reaches the release agent — taken from the
+  # repo at the tagged commit, so it stays version-controlled. The script
+  # is self-contained (no other scripts/ dependencies); it extracts the
+  # .crate above and uploads it (see docs/PUBLISHING.md).
+  - task: CopyFiles@2
+    displayName: 'Stage publish script'
+    inputs:
+      sourceFolder: '$(Build.SourcesDirectory)/scripts'
+      contents: 'Publish-Crate.ps1'
+      targetFolder: '$(Build.ArtifactStagingDirectory)/scripts'
+
   # ---- Publish ---------------------------------------------------------
 
   - task: PublishPipelineArtifact@1
