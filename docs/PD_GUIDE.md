@@ -20,6 +20,7 @@ alongside this guide.
   - [`osdp_pd_init`](#osdp_pd_init--create-a-pd)
   - [`osdp_pd_set_transport`](#osdp_pd_set_transport--the-io-hal)
   - [`osdp_pd_set_command_handler`](#osdp_pd_set_command_handler--your-device-logic)
+  - [Reporting events on POLL](#reporting-events-on-poll--keep-queued-replies-fresh) — freshness of queued replies
   - [`osdp_pd_tick`](#osdp_pd_tick--pump-the-state-machine)
   - [`osdp_pd_is_online`](#osdp_pd_is_online--connection-state)
   - [LED observation](#led-observation--osdp_pd_set_led_handler--osdp_pd_led_color)
@@ -280,6 +281,65 @@ genuinely new command" — side effects won't double-fire on a retransmit.
 
 ---
 
+## Reporting events on POLL — keep queued replies fresh
+
+OSDP is strictly master-slave: a PD **never** transmits spontaneously. So
+anything the device wants to tell the ACU — a card was presented (`RAW`),
+a key was pressed (`KEYPAD`), tamper/power changed (`LSTATR`) — has to
+wait for the next `OSDP_CMD_POLL` and be returned *in place of* the usual
+`ACK`. The natural implementation is an application-side FIFO that your
+POLL handler drains one entry per poll:
+
+```c
+case OSDP_CMD_POLL: {
+    event_t ev;
+    if (event_queue_pop_fresh(&app->events, now_ms, &ev)) {
+        reply->code        = ev.code;       /* RAW / KEYPAD / LSTATR … */
+        reply->payload     = ev.payload;
+        reply->payload_len = ev.payload_len;
+    } else {
+        reply->code = OSDP_REPLY_ACK;       /* nothing pending */
+        reply->payload = NULL; reply->payload_len = 0;
+    }
+    return OSDP_OK;
+}
+```
+
+### Stale events must be discarded, not replayed
+
+A point-in-time report is only meaningful right after it happens. A real
+reader reports a card on the *very next* poll (sub-second) or the read is
+gone — it never buffers a credential for minutes. If your queue lets
+entries live forever, an ACU that stopped polling and reconnected later
+would receive a **stale** card-read and could grant access for a
+credential presented minutes ago — a replay risk.
+
+So stamp each event with the time it was enqueued and **drop it once it
+ages past a short freshness window** (the reference MCP PD uses a 2 s TTL,
+matching its "actively polling" definition). A queued read is delivered
+promptly while the link is actively polled, or discarded — reported on the
+next poll or not at all. Prune from the front of the FIFO on each POLL;
+with a uniform TTL, once you reach a fresh entry the rest are fresher
+still.
+
+### Exception: status reports reflect current state
+
+`osdp_LSTATR`, `osdp_OSTATR`, and `osdp_ISTATR` are **not** transient
+events and are exempt from the freshness rule. They answer the ACU's
+explicit status *queries* (`osdp_LSTAT` / `osdp_OSTAT` / `osdp_ISTAT`) with
+the device's *current* local, output, and input state — there is no such
+thing as a "stale" current state, so you always report live values rather
+than aging a queued snapshot.
+
+The one moment a status report is naturally "queued" is **power-up**: a
+power-cycle condition is surfaced through the local status report at
+initialization (the first poll after the PD comes up), then reflects
+steady state thereafter. Don't apply the credential-style TTL to it —
+losing the power-on indication to an expiry timer would hide a genuine
+device-state change.
+
+---
+
 ## `osdp_pd_tick` — pump the state machine
 
 ```c
@@ -476,7 +536,7 @@ bool sc_up = osdp_pd_sc_established(&pd);
 
 | Code             | Value | Expected reply            |
 | ---------------- | ----- | ------------------------- |
-| `OSDP_CMD_POLL`  | 0x60  | `ACK` (or a queued event) |
+| `OSDP_CMD_POLL`  | 0x60  | `ACK`, or a queued event (see [freshness](#reporting-events-on-poll--keep-queued-replies-fresh)) |
 | `OSDP_CMD_ID`    | 0x61  | `PDID`                    |
 | `OSDP_CMD_CAP`   | 0x62  | `PDCAP`                   |
 | `OSDP_CMD_LSTAT` | 0x64  | `LSTATR`                  |
