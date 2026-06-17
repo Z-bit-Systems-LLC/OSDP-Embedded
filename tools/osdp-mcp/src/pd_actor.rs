@@ -761,10 +761,20 @@ fn handle_cmd(
                         address = format!("0x{:02X}", old.address),
                         "force_session_loss: rebuilding PD"
                     );
+                    // Capture what we need to rebuild, then DROP the old PD
+                    // before reopening. serialport sets TIOCEXCL on Unix, so
+                    // the old handle holds the port exclusively — reopening
+                    // the same device while `old` is still alive fails with
+                    // EBUSY, leaving the PD torn down. Dropping `old` first
+                    // releases the fd (matching Cmd::Configure, which does
+                    // `*slot = None` before open_pd).
+                    let (port, baud, address, sc) =
+                        (old.port.clone(), old.baud, old.address, old.sc.clone());
+                    drop(old);
                     let r = open_pd(
-                        &old.port,
-                        old.baud,
-                        old.address,
+                        &port,
+                        baud,
+                        address,
                         Arc::clone(log),
                         Arc::clone(wire),
                         Arc::clone(overrides),
@@ -773,7 +783,7 @@ fn handle_cmd(
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
-                        old.sc.clone(),
+                        sc,
                         crypto_factory,
                     );
                     match r {
