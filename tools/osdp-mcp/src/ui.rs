@@ -22,9 +22,17 @@
 //!   from the browser).
 //! - `POST /api/card` → inject a card read; the PD surfaces it as an
 //!   `osdp_RAW` reply on its next POLL (a card tapped, from the browser).
+//! - `POST /api/tamper` → inject a tamper condition; the PD surfaces it
+//!   as an `osdp_LSTATR` (tamper bit set) on its next POLL. A status
+//!   report, so it never goes stale — delivered whenever the ACU next
+//!   polls.
+//! - `POST /api/power-cycle` → power-cycle the reader: rebuild the PD
+//!   (SQN reset, Secure Channel session dropped — the ACU must
+//!   re-handshake), which on re-init queues a non-stale power-up
+//!   `osdp_LSTATR` for the next POLL.
 //!
-//! The keypad and card POSTs are the only writes the UI performs;
-//! everything else is read-only.
+//! The keypad / card / tamper / power-cycle POSTs are the only writes
+//! the UI performs; everything else is read-only.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -36,7 +44,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW};
+use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
@@ -110,6 +118,18 @@ pub fn card_event(facility: u8, card: u16) -> Result<OverrideReply, &'static str
     })
 }
 
+/// Build a Local Status Report (`osdp_LSTATR`) event with the given
+/// tamper / power flags. Spec §7.6 / Table 50: a 2-byte payload, byte 0
+/// = tamper status (0 normal, 1 tamper), byte 1 = power status (0
+/// normal, 1 power failure). A status report, so `events::enqueue` keeps
+/// it non-staleable — it is reported on the next POLL however delayed.
+pub fn local_status_event(tamper: u8, power: u8) -> OverrideReply {
+    OverrideReply {
+        code: OSDP_REPLY_LSTATR,
+        payload: vec![tamper, power],
+    }
+}
+
 /// The reader visual page. Self-contained (inline CSS + JS, no external
 /// assets), embedded at build time so the binary needs no companion files.
 const INDEX_HTML: &str = include_str!("ui_index.html");
@@ -129,6 +149,8 @@ pub fn router(pd: Arc<PdHandle>) -> Router {
         .route("/api/events", get(api_events))
         .route("/api/keypad", post(api_keypad))
         .route("/api/card", post(api_card))
+        .route("/api/tamper", post(api_tamper))
+        .route("/api/power-cycle", post(api_power_cycle))
         .with_state(pd)
 }
 
@@ -196,6 +218,29 @@ async fn api_card(State(pd): State<Arc<PdHandle>>, Json(body): Json<CardTap>) ->
             StatusCode::NO_CONTENT
         }
         Err(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Inject a tamper condition. The page POSTs this when "Tamper" is
+/// pressed; the PD surfaces it as an `osdp_LSTATR` with the tamper bit
+/// set on its next POLL. As a status report it is never aged out, so the
+/// ACU learns of the tamper whenever it next polls — even after a gap.
+async fn api_tamper(State(pd): State<Arc<PdHandle>>) -> StatusCode {
+    pd.enqueue_event(local_status_event(1, 0));
+    StatusCode::NO_CONTENT
+}
+
+/// Power-cycle the reader. The page POSTs this when "Power Cycle" is
+/// pressed; the PD is torn down and rebuilt with the same parameters —
+/// resetting its sequence number and dropping any Secure Channel session
+/// (the ACU must re-handshake), exactly as a real reboot would. The
+/// rebuild queues a non-stale power-up `osdp_LSTATR` (see
+/// `pd_actor::open_pd`) for the next POLL. Returns 503 if no PD is
+/// configured to cycle.
+async fn api_power_cycle(State(pd): State<Arc<PdHandle>>) -> StatusCode {
+    match pd.force_session_loss().await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 

@@ -170,6 +170,11 @@ enum DemoEvent {
     Keypress,
     /// A card was tapped → "access granted": green LED + a beep.
     CardTap,
+    /// The Tamper button → a red flashing-LED alarm + a beep pattern.
+    Tamper,
+    /// The Power Cycle button → the LED goes dark briefly then returns
+    /// (a reboot "blink"). The real osdp-mcp instead rebuilds the PD.
+    PowerCycle,
 }
 
 /// Drive the PD↔ACU loopback forever, feeding the shared reader state.
@@ -223,6 +228,19 @@ fn run_driver(reader_state: SharedReaderState, mut event_rx: mpsc::UnboundedRece
                     let led = temporary(0, LedColor::Red, LedColor::Green, 18, 0, 0);
                     queue.push_back((OSDP_CMD_LED, led_payload(vec![led])));
                     queue.push_back((OSDP_CMD_BUZ, buz_payload(1, 1, 2)));
+                }
+                DemoEvent::Tamper => {
+                    // Alarm: ~2 s of fast-flashing red over the steady red,
+                    // plus a repeating beep pattern.
+                    let led = temporary(0, LedColor::Red, LedColor::Red, 20, 2, 2);
+                    queue.push_back((OSDP_CMD_LED, led_payload(vec![led])));
+                    queue.push_back((OSDP_CMD_BUZ, buz_payload(2, 2, 3)));
+                }
+                DemoEvent::PowerCycle => {
+                    // Reboot look: drive the LED dark (black) for ~1.2 s,
+                    // then it reverts to the steady red permanent colour.
+                    let led = temporary(0, LedColor::Red, LedColor::Black, 12, 0, 0);
+                    queue.push_back((OSDP_CMD_LED, led_payload(vec![led])));
                 }
             }
         }
@@ -316,6 +334,20 @@ async fn api_card(State(st): State<DemoState>, Json(body): Json<CardTap>) -> Sta
     StatusCode::NO_CONTENT
 }
 
+/// Tamper button → a red alarm flash + beep on the driver thread. (The
+/// real osdp-mcp instead injects a non-stale osdp_LSTATR for the ACU.)
+async fn api_tamper(State(st): State<DemoState>) -> StatusCode {
+    let _ = st.events.send(DemoEvent::Tamper);
+    StatusCode::NO_CONTENT
+}
+
+/// Power Cycle button → a reboot "blink" (LED dark, then back). (The real
+/// osdp-mcp instead rebuilds the PD and queues a power-up osdp_LSTATR.)
+async fn api_power_cycle(State(st): State<DemoState>) -> StatusCode {
+    let _ = st.events.send(DemoEvent::PowerCycle);
+    StatusCode::NO_CONTENT
+}
+
 #[derive(serde::Deserialize)]
 struct KeypadPress {
     key: String,
@@ -350,6 +382,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/keypad", post(api_keypad))
         .route("/api/card", post(api_card))
+        .route("/api/tamper", post(api_tamper))
+        .route("/api/power-cycle", post(api_power_cycle))
         .with_state(DemoState {
             reader: reader_state,
             events: event_tx,

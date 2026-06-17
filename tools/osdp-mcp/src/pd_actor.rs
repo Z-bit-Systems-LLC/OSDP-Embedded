@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use osdp_embedded::messages::{Pdcap, Pdid};
+use osdp_embedded::messages::{Pdcap, Pdid, OSDP_REPLY_LSTATR};
 use osdp_embedded::pd::Pd;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -879,7 +879,7 @@ fn open_pd(
         Arc::clone(&stats),
         log,
         overrides,
-        events,
+        Arc::clone(&events),
         drop_remaining,
         address,
     ));
@@ -915,6 +915,22 @@ fn open_pd(
             }
         }
     }
+
+    // A freshly-powered reader announces itself: queue a power-up Local
+    // Status Report (osdp_LSTATR) so the ACU sees an LSTATR — power bit
+    // set — on its first POLL after the PD (re)initialises. This fires on
+    // every open_pd: the first pd_configure/pd_start, and the rebuild
+    // behind force_session_loss / the UI "Power Cycle" trigger (a real
+    // power cycle goes through this same path). It is a status report, so
+    // events::enqueue marks it non-staleable — it waits for the next POLL
+    // however long that takes, rather than expiring like a card-read.
+    events::enqueue(
+        &events,
+        OverrideReply {
+            code: OSDP_REPLY_LSTATR,
+            payload: vec![0, 1], // tamper=0 (normal), power=1 (power event)
+        },
+    );
 
     tracing::info!(
         port,

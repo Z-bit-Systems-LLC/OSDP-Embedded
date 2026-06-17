@@ -236,6 +236,10 @@
              value="12345" maxlength="20" aria-label="card number" />
       <button id="tap" class="soundbtn" type="button">Tap card</button>
     </div>
+    <div class="controls">
+      <button id="tamper" class="soundbtn" type="button">⚠ Tamper</button>
+      <button id="power-cycle" class="soundbtn" type="button">⏻ Power cycle</button>
+    </div>
   </main>
 
   <footer>live via <code>/api/events</code> · served by osdp-mcp</footer>
@@ -421,6 +425,37 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: value }),
     }).catch(function () {});
+  });
+
+  // ---- Status triggers: tamper + power cycle ------------------------
+  // Both POST a PD status report (LSTATR). Brief on-button confirmation,
+  // since neither changes the reader's LED/buzzer face — the effect is on
+  // the wire to the ACU.
+  function flashButton(btn, msg, ms) {
+    const label = btn.dataset.label || btn.textContent;
+    btn.dataset.label = label;
+    btn.classList.add('flash');
+    btn.textContent = msg;
+    setTimeout(function () {
+      btn.classList.remove('flash');
+      btn.textContent = label;
+    }, ms || 600);
+  }
+
+  const tamperBtn = document.getElementById('tamper');
+  tamperBtn.addEventListener('click', function () {
+    flashButton(tamperBtn, 'Tamper sent ✓');
+    fetch('/api/tamper', { method: 'POST' }).catch(function () {});
+  });
+
+  const powerBtn = document.getElementById('power-cycle');
+  powerBtn.addEventListener('click', function () {
+    flashButton(powerBtn, 'Cycling…', 900);
+    fetch('/api/power-cycle', { method: 'POST' })
+      .then(function (r) {
+        if (!r.ok) flashButton(powerBtn, 'No PD', 900);
+      })
+      .catch(function () {});
   });
 
   subscribe();

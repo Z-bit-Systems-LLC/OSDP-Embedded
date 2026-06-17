@@ -116,6 +116,39 @@ async fn keypad_press_enqueues_a_pd_event() {
 }
 
 #[tokio::test]
+async fn tamper_enqueues_a_pd_event() {
+    let pd = spawn_pd();
+    let app = ui::router(Arc::clone(&pd));
+    assert_eq!(pd.event_queue_depth(), 0);
+
+    // The Tamper button enqueues one LSTATR for the PD's next POLL.
+    let resp = app
+        .oneshot(Request::post("/api/tamper").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pd.event_queue_depth(), 1);
+}
+
+#[tokio::test]
+async fn power_cycle_without_a_pd_reports_unavailable() {
+    let pd = spawn_pd();
+    let app = ui::router(Arc::clone(&pd));
+
+    // No PD is configured on this freshly spawned actor, so there's
+    // nothing to power-cycle — the route reports it rather than 500ing.
+    let resp = app
+        .oneshot(
+            Request::post("/api/power-cycle")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn card_tap_enqueues_a_pd_event() {
     let pd = spawn_pd();
     let app = ui::router(Arc::clone(&pd));
