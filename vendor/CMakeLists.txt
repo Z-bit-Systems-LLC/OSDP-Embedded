@@ -41,8 +41,44 @@ target_include_directories(tiny_aes256
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-aes
 )
 
-target_compile_definitions(tiny_aes256 PUBLIC AES256=1)
+# AES256=1 selects the 256-bit key schedule. The AES_* → AES256_* renames
+# are PUBLIC so every translation unit that links tiny_aes256 both selects
+# AES-256 AND references the renamed symbols — letting a single binary
+# link BOTH tiny_aes (AES-128, for SC1) and tiny_aes256 (for SC2) without
+# a duplicate-symbol clash. Source keeps calling AES_init_ctx / etc.; the
+# preprocessor rewrites the names consistently in declarations and defs.
+target_compile_definitions(tiny_aes256 PUBLIC
+    AES256=1
+    AES_init_ctx=AES256_init_ctx
+    AES_init_ctx_iv=AES256_init_ctx_iv
+    AES_ctx_set_iv=AES256_ctx_set_iv
+    AES_ECB_encrypt=AES256_ECB_encrypt
+    AES_ECB_decrypt=AES256_ECB_decrypt
+    AES_CBC_encrypt_buffer=AES256_CBC_encrypt_buffer
+    AES_CBC_decrypt_buffer=AES256_CBC_decrypt_buffer
+    AES_CTR_xcrypt_buffer=AES256_CTR_xcrypt_buffer
+)
 
 if(NOT MSVC)
     target_compile_options(tiny_aes256 PRIVATE -w)
 endif()
+
+# tiny_kmac — self-contained Keccak-f[1600] + cSHAKE256 + KMAC256, for
+# OSDP-SC2 session-key derivation in tests and tools. Never in core.
+add_library(tiny_kmac STATIC
+    tiny-kmac/kmac.c
+)
+target_include_directories(tiny_kmac
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-kmac
+)
+
+# tiny_gcm — AES-256-GCM (CTR + GHASH) over tiny_aes256, for OSDP-SC2
+# message protection in tests and tools. Links tiny_aes256 PUBLIC so its
+# AES256 rename/config propagates. Never in core.
+add_library(tiny_gcm STATIC
+    tiny-gcm/gcm.c
+)
+target_include_directories(tiny_gcm
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-gcm
+)
+target_link_libraries(tiny_gcm PUBLIC tiny_aes256)

@@ -228,11 +228,13 @@ osdp_status_t osdp_comset_build(const osdp_comset_cmd_t *in,
 
 #define OSDP_KEYSET_HEADER_BYTES 2U
 
-/* Key-type values per spec Annex A.1. SCBK is the only meaningful
- * value in the v2.2 baseline; the enum is here so callers can write
- * `OSDP_KEYSET_KEY_TYPE_SCBK` rather than a magic 0x01. */
+/* Key-type values per spec Annex A.1. SCBK (0x01) is the AES-128 SC1
+ * base key; SCBK_AES256 (0x02) is the 32-byte AES-256 base key used by
+ * OSDP-SC2. The enum is here so callers can write the names rather than
+ * magic byte values. */
 typedef enum osdp_keyset_key_type {
-    OSDP_KEYSET_KEY_TYPE_SCBK = 0x01U
+    OSDP_KEYSET_KEY_TYPE_SCBK        = 0x01U,
+    OSDP_KEYSET_KEY_TYPE_SCBK_AES256 = 0x02U
 } osdp_keyset_key_type_t;
 
 typedef struct osdp_keyset_cmd {

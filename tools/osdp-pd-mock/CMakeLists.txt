@@ -13,6 +13,7 @@
 add_executable(osdp-pd-mock
     main.c
     aes_adapter.c
+    sc2_adapter.c
 )
 
 if(WIN32)
@@ -28,6 +29,8 @@ target_link_libraries(osdp-pd-mock PRIVATE
     osdp_messages
     osdp_pd
     tiny_aes
+    tiny_gcm
+    tiny_kmac
 )
 
 target_include_directories(osdp-pd-mock PRIVATE

@@ -106,6 +106,11 @@ fn main() {
         "core/src/sc/payload.c",
         "core/src/sc/session.c",
         "core/src/sc/wrap.c",
+        // core: secure-channel 2 primitives (AES-256-GCM / KMAC256)
+        "core/src/sc2/keys.c",
+        "core/src/sc2/crypto.c",
+        "core/src/sc2/session.c",
+        "core/src/sc2/wrap.c",
     ];
 
     // Cargo sets `CARGO_FEATURE_<NAME>` for every active feature.
@@ -117,6 +122,7 @@ fn main() {
     if pd_enabled {
         sources.push("pd/src/pd.c");
         sources.push("pd/src/pd_sc.c");
+        sources.push("pd/src/pd_sc2.c");
     }
     if acu_enabled {
         sources.push("acu/src/acu.c");

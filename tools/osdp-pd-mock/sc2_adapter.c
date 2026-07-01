@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
-#include "sc2_test_crypto.h"
+#include "sc2_adapter.h"
 
 #include "aes.h"    /* vendor/tiny-aes/aes.h, AES256 + renamed via tiny_aes256 */
 #include "gcm.h"    /* vendor/tiny-gcm */
 #include "kmac.h"   /* vendor/tiny-kmac */
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
-
-/* ---- AES-256 single block (ECB) ----------------------------------------*/
+#include <time.h>
 
 static osdp_status_t adapter_ecb(
     void *user, const uint8_t key[32], const uint8_t in[16], uint8_t out[16])
@@ -23,8 +24,6 @@ static osdp_status_t adapter_ecb(
     AES_ECB_encrypt(&ctx, out);
     return OSDP_OK;
 }
-
-/* ---- AES-256-GCM (shared vendor/tiny-gcm) ------------------------------*/
 
 static osdp_status_t adapter_gcm_encrypt(
     void *user, const uint8_t key[32], const uint8_t nonce[12],
@@ -51,8 +50,6 @@ static osdp_status_t adapter_gcm_decrypt(
     return OSDP_OK;
 }
 
-/* ---- KMAC256 -----------------------------------------------------------*/
-
 static osdp_status_t adapter_kmac(
     void *user,
     const uint8_t *key,  size_t key_len,
@@ -64,40 +61,37 @@ static osdp_status_t adapter_kmac(
     return OSDP_OK;
 }
 
-/* ---- RNG ---------------------------------------------------------------*/
+static int g_seeded = 0;
 
-static uint32_t g_prng_state = 0xCAFEBABEu;
-static const uint8_t *g_fixed_rand     = NULL;
-static size_t         g_fixed_rand_len = 0;
+static void seed_once_lazily(void)
+{
+    if (!g_seeded) {
+        srand((unsigned int)time(NULL));
+        g_seeded = 1;
+    }
+}
 
 static osdp_status_t adapter_rand(void *user, uint8_t *out, size_t len)
 {
     (void)user;
-    if (g_fixed_rand != NULL && g_fixed_rand_len > 0) {
-        for (size_t i = 0; i < len; i++) {
-            out[i] = g_fixed_rand[i % g_fixed_rand_len];
-        }
-        return OSDP_OK;
-    }
+    seed_once_lazily();
     for (size_t i = 0; i < len; i++) {
-        g_prng_state = g_prng_state * 1103515245u + 12345u;
-        out[i] = (uint8_t)(g_prng_state >> 16);
+        out[i] = (uint8_t)(rand() & 0xFF);
     }
     return OSDP_OK;
 }
 
-void sc2_test_crypto_seed_prng(uint32_t seed)
+void pd_mock_sc2_seed_rand(uint32_t seed)
 {
-    g_prng_state = seed;
+    if (seed == 0U) {
+        srand((unsigned int)time(NULL));
+    } else {
+        srand((unsigned int)seed);
+    }
+    g_seeded = 1;
 }
 
-void sc2_test_crypto_set_fixed_rand(const uint8_t *buf, size_t len)
-{
-    g_fixed_rand     = (len > 0) ? buf : NULL;
-    g_fixed_rand_len = (buf != NULL) ? len : 0;
-}
-
-static const osdp_sc2_crypto_t k_sc2_vtable = {
+static const osdp_sc2_crypto_t k_vtable = {
     .kmac256            = adapter_kmac,
     .aes256_gcm_encrypt = adapter_gcm_encrypt,
     .aes256_gcm_decrypt = adapter_gcm_decrypt,
@@ -106,7 +100,7 @@ static const osdp_sc2_crypto_t k_sc2_vtable = {
     .user               = NULL,
 };
 
-const osdp_sc2_crypto_t *sc2_test_crypto(void)
+const osdp_sc2_crypto_t *pd_mock_sc2_crypto(void)
 {
-    return &k_sc2_vtable;
+    return &k_vtable;
 }

@@ -7,6 +7,8 @@
 #include "osdp/osdp_buz_state.h"
 #include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
+#include "osdp/osdp_sc2_crypto.h"
 #include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
 #include "osdp/osdp_types.h"
@@ -257,6 +259,31 @@ typedef struct osdp_pd_sc {
     uint8_t                key_selector; /* 0 = SCBK-D, 1 = SCBK */
 } osdp_pd_sc_t;
 
+/* ---- Secure Channel 2 state (embedded in osdp_pd_t) --------------------
+ *
+ * Parallel to osdp_pd_sc_t but for OSDP-SC2 (AES-256-GCM / KMAC256).
+ * SC2 is device-specific-key only — there is no SCBK-D install mode —
+ * so the PD needs just the 32-byte SCBK, the cUID, and a crypto vtable.
+ * Left zeroed, the PD refuses SC2 SCB frames (SCS_21..28) with NAK 0x05
+ * exactly as before. Opt in via the osdp_pd_set_sc2_* setters. */
+typedef struct osdp_pd_sc2 {
+    osdp_sc2_crypto_t      crypto;
+    bool                   crypto_set;
+
+    uint8_t                scbk[OSDP_SC2_KEY_LEN];
+    bool                   scbk_set;
+    uint8_t                cuid[OSDP_SC2_CUID_LEN];
+    bool                   cuid_set;
+
+    osdp_sc2_session_t     session;
+
+    /* Mid-handshake state: RND.A from SCS_21 (CHLNG), RND.B generated
+     * for SCS_22 (CCRYPT), consumed by SCS_23 (SCRYPT). */
+    bool                   got_chlng;
+    uint8_t                rnd_a[OSDP_SC2_RND_LEN];
+    uint8_t                rnd_b[OSDP_SC2_RND_LEN];
+} osdp_pd_sc2_t;
+
 typedef struct osdp_pd {
     uint8_t                    address;     /* this PD's 7-bit addr  */
     osdp_stream_t              rx;          /* inbound byte buffer   */
@@ -291,6 +318,9 @@ typedef struct osdp_pd {
 
     /* Secure Channel state (optional; opt-in via the set_sc_* APIs). */
     osdp_pd_sc_t               sc;
+
+    /* Secure Channel 2 state (optional; opt-in via the set_sc2_* APIs). */
+    osdp_pd_sc2_t              sc2;
 
     /* Reader LED bank (populated transparently from inbound osdp_LED
      * commands) plus the optional change callback. */
@@ -389,6 +419,28 @@ void osdp_pd_set_sc_cuid(osdp_pd_t     *pd,
 /* True iff the SCS_11..14 handshake has completed successfully and
  * the PD is ready to handle SCS_15..18 operational traffic. */
 bool osdp_pd_sc_established(const osdp_pd_t *pd);
+
+/* ---- Secure Channel 2 configuration ------------------------------------
+ *
+ * Opt-in, independent of the SC1 setters. The PD accepts SC2 SCB frames
+ * (SCS_21..28) once the SC2 crypto vtable is bound AND the 32-byte SCBK
+ * is set AND the cUID is known. SC2 has no install-key mode. */
+
+/* Bind the SC2 crypto HAL (KMAC256 + AES-256-GCM + AES-256 block + RNG). */
+void osdp_pd_set_sc2_crypto(osdp_pd_t               *pd,
+                            const osdp_sc2_crypto_t *crypto);
+
+/* Set the per-PD 32-byte AES-256 Secure Channel Base Key. */
+void osdp_pd_set_sc2_scbk(osdp_pd_t     *pd,
+                          const uint8_t  scbk[OSDP_SC2_KEY_LEN]);
+
+/* Set the PD's 8-byte cUID (part of every SC2 message nonce). */
+void osdp_pd_set_sc2_cuid(osdp_pd_t     *pd,
+                          const uint8_t  cuid[OSDP_SC2_CUID_LEN]);
+
+/* True iff the SCS_21..24 handshake has completed and the PD is ready
+ * to handle SCS_25..28 operational traffic. */
+bool osdp_pd_sc2_established(const osdp_pd_t *pd);
 
 #ifdef __cplusplus
 }

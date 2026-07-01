@@ -831,6 +831,95 @@ extern "C" {
 }
 
 // ====================================================================
+// osdp_sc2_crypto.h / osdp_sc2.h  (Secure Channel 2)
+// ====================================================================
+
+pub const OSDP_AES256_KEY_LEN: usize = 32;
+pub const OSDP_SC2_KEY_LEN: usize = 32;
+pub const OSDP_SC2_RND_LEN: usize = 16;
+pub const OSDP_SC2_CUID_LEN: usize = 8;
+pub const OSDP_SC2_CRYPTOGRAM_LEN: usize = 32;
+pub const OSDP_SC2_NONCE_LEN: usize = 12;
+pub const OSDP_SC2_TAG_LEN: usize = 16;
+
+pub type osdp_sc2_kmac_cb = Option<
+    unsafe extern "C" fn(
+        user: *mut c_void,
+        key: *const u8,
+        key_len: usize,
+        data: *const u8,
+        data_len: usize,
+        out: *mut u8,
+        out_len: usize,
+    ) -> osdp_status_t,
+>;
+
+pub type osdp_sc2_gcm_encrypt_cb = Option<
+    unsafe extern "C" fn(
+        user: *mut c_void,
+        key: *const u8,
+        nonce: *const u8,
+        aad: *const u8,
+        aad_len: usize,
+        pt: *const u8,
+        pt_len: usize,
+        ct: *mut u8,
+        tag: *mut u8,
+    ) -> osdp_status_t,
+>;
+
+pub type osdp_sc2_gcm_decrypt_cb = Option<
+    unsafe extern "C" fn(
+        user: *mut c_void,
+        key: *const u8,
+        nonce: *const u8,
+        aad: *const u8,
+        aad_len: usize,
+        ct: *const u8,
+        ct_len: usize,
+        tag: *const u8,
+        pt: *mut u8,
+    ) -> osdp_status_t,
+>;
+
+pub type osdp_sc2_ecb_cb = Option<
+    unsafe extern "C" fn(
+        user: *mut c_void,
+        key: *const u8,
+        in_: *const u8,
+        out: *mut u8,
+    ) -> osdp_status_t,
+>;
+
+#[repr(C)]
+pub struct osdp_sc2_crypto_t {
+    pub kmac256: osdp_sc2_kmac_cb,
+    pub aes256_gcm_encrypt: osdp_sc2_gcm_encrypt_cb,
+    pub aes256_gcm_decrypt: osdp_sc2_gcm_decrypt_cb,
+    pub aes256_ecb_encrypt: osdp_sc2_ecb_cb,
+    pub rand_bytes: osdp_sc_rand_cb,
+    pub user: *mut c_void,
+}
+
+#[repr(C)]
+pub struct osdp_sc2_session_keys_t {
+    pub s_enc: [u8; OSDP_SC2_KEY_LEN],
+    pub s_nonce: [u8; OSDP_SC2_KEY_LEN],
+}
+
+#[repr(C)]
+pub struct osdp_sc2_session_t {
+    pub keys: osdp_sc2_session_keys_t,
+    pub cuid: [u8; OSDP_SC2_CUID_LEN],
+    pub counter: u32,
+    pub established: bool,
+}
+
+extern "C" {
+    pub fn osdp_sc2_session_init(session: *mut osdp_sc2_session_t);
+}
+
+// ====================================================================
 // osdp_pd.h - feature-gated to `pd`
 // ====================================================================
 
@@ -922,6 +1011,20 @@ mod pd_ffi {
     }
 
     #[repr(C)]
+    pub struct osdp_pd_sc2_t {
+        pub crypto: osdp_sc2_crypto_t,
+        pub crypto_set: bool,
+        pub scbk: [u8; OSDP_SC2_KEY_LEN],
+        pub scbk_set: bool,
+        pub cuid: [u8; OSDP_SC2_CUID_LEN],
+        pub cuid_set: bool,
+        pub session: osdp_sc2_session_t,
+        pub got_chlng: bool,
+        pub rnd_a: [u8; OSDP_SC2_RND_LEN],
+        pub rnd_b: [u8; OSDP_SC2_RND_LEN],
+    }
+
+    #[repr(C)]
     pub struct osdp_pd_t {
         pub address: u8,
         pub rx: osdp_stream_t,
@@ -941,6 +1044,8 @@ mod pd_ffi {
         pub last_comm_ms: u32,
 
         pub sc: osdp_pd_sc_t,
+
+        pub sc2: osdp_pd_sc2_t,
 
         pub leds: [osdp_pd_led_slot_t; OSDP_PD_MAX_LEDS],
         pub led_cb: osdp_pd_led_cb,
@@ -977,6 +1082,11 @@ mod pd_ffi {
         pub fn osdp_pd_set_sc_scbk_d(pd: *mut osdp_pd_t, scbk_d: *const u8);
         pub fn osdp_pd_set_sc_cuid(pd: *mut osdp_pd_t, cuid: *const u8);
         pub fn osdp_pd_sc_established(pd: *const osdp_pd_t) -> bool;
+
+        pub fn osdp_pd_set_sc2_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc2_crypto_t);
+        pub fn osdp_pd_set_sc2_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
+        pub fn osdp_pd_set_sc2_cuid(pd: *mut osdp_pd_t, cuid: *const u8);
+        pub fn osdp_pd_sc2_established(pd: *const osdp_pd_t) -> bool;
     }
 } // mod pd_ffi
 

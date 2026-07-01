@@ -153,15 +153,32 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * rather than the PD tearing down the session off the back of the
      * KEYSET itself. A *secure* (SCB-bearing) frame at sequence 0 is part
      * of an in-progress handshake and must NOT reset anything. */
-    if (!cmd->has_scb && cmd->sequence == 0 && pd->sc.session.established) {
-        osdp_sc_session_init(&pd->sc.session);
-        pd->sc.got_chlng = false;
+    if (!cmd->has_scb && cmd->sequence == 0) {
+        if (pd->sc.session.established) {
+            osdp_sc_session_init(&pd->sc.session);
+            pd->sc.got_chlng = false;
+        }
+        if (pd->sc2.session.established) {
+            osdp_sc2_session_init(&pd->sc2.session);
+            pd->sc2.got_chlng = false;
+        }
     }
 
     /* Secure Channel: dispatch to the SC handler if the application
      * has supplied enough configuration; otherwise fall back to the
-     * historical "NAK 0x05" behaviour. */
+     * historical "NAK 0x05" behaviour. SC2 SCB types (0x21..0x28) route
+     * to the SC2 state machine; the SC1 types (0x11..0x18) to SC1. */
     if (cmd->has_scb) {
+        if (cmd->scb_type >= OSDP_SCS_21 && cmd->scb_type <= OSDP_SCS_28) {
+            if (osdp_pd_internal_sc2_configured(pd)) {
+                return osdp_pd_internal_handle_sc2_into_tx(pd, cmd);
+            }
+            size_t n = 0;
+            if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) != OSDP_OK) {
+                return 0;
+            }
+            return n;
+        }
         if (osdp_pd_internal_sc_configured(pd)) {
             return osdp_pd_internal_handle_sc_into_tx(pd, cmd);
         }
@@ -587,6 +604,48 @@ bool osdp_pd_sc_established(const osdp_pd_t *pd)
         return false;
     }
     return pd->sc.session.established;
+}
+
+/* ---- Secure Channel 2 configuration -------------------------------------*/
+
+void osdp_pd_set_sc2_crypto(osdp_pd_t               *pd,
+                            const osdp_sc2_crypto_t *crypto)
+{
+    if (pd == NULL || crypto == NULL) {
+        return;
+    }
+    pd->sc2.crypto     = *crypto;
+    pd->sc2.crypto_set = true;
+    osdp_sc2_session_init(&pd->sc2.session);
+    pd->sc2.got_chlng  = false;
+}
+
+void osdp_pd_set_sc2_scbk(osdp_pd_t     *pd,
+                          const uint8_t  scbk[OSDP_SC2_KEY_LEN])
+{
+    if (pd == NULL || scbk == NULL) {
+        return;
+    }
+    (void)memcpy(pd->sc2.scbk, scbk, OSDP_SC2_KEY_LEN);
+    pd->sc2.scbk_set = true;
+}
+
+void osdp_pd_set_sc2_cuid(osdp_pd_t     *pd,
+                          const uint8_t  cuid[OSDP_SC2_CUID_LEN])
+{
+    if (pd == NULL || cuid == NULL) {
+        return;
+    }
+    (void)memcpy(pd->sc2.cuid, cuid, OSDP_SC2_CUID_LEN);
+    pd->sc2.cuid_set = true;
+}
+
+bool osdp_pd_sc2_established(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return false;
+    }
+    return pd->sc2.session.established;
 }
 
 void osdp_pd_tick(osdp_pd_t *pd)

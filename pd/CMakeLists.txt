@@ -8,6 +8,7 @@
 add_library(osdp_pd STATIC
     src/pd.c
     src/pd_sc.c
+    src/pd_sc2.c
 )
 
 target_include_directories(osdp_pd

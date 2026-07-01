@@ -14,6 +14,18 @@
  * attempt the handshake. */
 bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd);
 
+/* Whether the PD has enough Secure Channel 2 configuration (crypto
+ * vtable + 32-byte SCBK + cUID) to attempt the SC2 handshake. */
+bool osdp_pd_internal_sc2_configured(const osdp_pd_t *pd);
+
+/* Process an SC2 SCB-bearing inbound frame (SCS_21..28): handshake
+ * messages produce inline replies into pd->tx_buf; operational
+ * SCS_25/27 traffic unwraps, dispatches to the application handler
+ * with plaintext, and wraps the reply as SCS_28. Returns the byte
+ * count written into pd->tx_buf, or 0 if no reply should be sent. */
+size_t osdp_pd_internal_handle_sc2_into_tx(osdp_pd_t          *pd,
+                                           const osdp_frame_t *cmd);
+
 /* Build a NAK reply into pd->tx_buf for `cmd` carrying `error_code`,
  * writing the frame length to *out_len. Defined in pd.c (wrapping the
  * static build_nak helper) and shared with the SC handlers in pd_sc.c. */

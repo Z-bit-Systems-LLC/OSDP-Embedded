@@ -80,27 +80,18 @@ osdp_add_sc_test(test_sc_wrap)
 
 # ---- Secure Channel 2 tests ------------------------------------------------
 # SC2 needs AES-256 + AES-256-GCM + KMAC256, none of which the AES-128
-# tiny_aes lib provides. tiny_kmac is a self-contained Keccak/KMAC256
-# (test-only); sc2_test_crypto wires it together with the AES-256 build
-# of tiny-AES (tiny_aes256) and a small GCM into an osdp_sc2_crypto_t.
-# SC2 test executables link this backend, NOT sc_test_aes, so the
-# AES-128 and AES-256 tiny-AES builds never share a translation unit.
-add_library(tiny_kmac STATIC
-    vendor/tiny-kmac/kmac.c
-)
-target_include_directories(tiny_kmac
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/tiny-kmac
-)
-
+# tiny_aes lib provides. The crypto backends live under the shared
+# vendor/ tree (tiny_gcm = AES-256-GCM over tiny_aes256; tiny_kmac =
+# Keccak/KMAC256) so tests and the SC2 interop tools use identical code.
+# sc2_test_crypto wires them into an osdp_sc2_crypto_t. The AES256 symbol
+# renames on tiny_aes256 let a binary link both AES-128 and AES-256 builds.
 add_library(sc2_test_crypto STATIC
     sc2_test_crypto.c
 )
 target_include_directories(sc2_test_crypto
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 )
-# tiny_aes256 is PUBLIC so sc2_test_crypto.c compiles with AES256=1 and
-# sees the matching struct AES_ctx layout.
-target_link_libraries(sc2_test_crypto PUBLIC osdp_core tiny_aes256 tiny_kmac)
+target_link_libraries(sc2_test_crypto PUBLIC osdp_core tiny_gcm tiny_kmac)
 
 function(osdp_add_sc2_test test_name)
     add_executable(${test_name} ${test_name}.c)
@@ -111,6 +102,13 @@ endfunction()
 
 osdp_add_sc2_test(test_sc2_primitives)
 osdp_add_sc2_test(test_sc2_wrap)
+
+# PD-side SC2 handshake + operational test needs osdp_pd and the SC2
+# crypto backend.
+add_executable(test_pd_sc2 test_pd_sc2.c)
+target_link_libraries(test_pd_sc2 PRIVATE
+    osdp_core osdp_messages osdp_pd sc2_test_crypto unity)
+add_test(NAME test_pd_sc2 COMMAND test_pd_sc2)
 
 # PD-side SC handshake test needs both osdp_pd and the SC test
 # crypto adapter.

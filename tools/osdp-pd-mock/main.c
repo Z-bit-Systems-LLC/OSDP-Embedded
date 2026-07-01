@@ -27,7 +27,9 @@
 #include "osdp/osdp_pd.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
 #include "osdp/osdp_sc_crypto.h"
+#include "sc2_adapter.h"
 #include "serial.h"
 
 #include <signal.h>
@@ -342,9 +344,11 @@ typedef struct cli {
     enum {
         SC_NONE,
         SC_SCBKD,
-        SC_SCBK_CUSTOM
+        SC_SCBK_CUSTOM,
+        SC_SCBK2          /* OSDP-SC2: 32-byte AES-256 SCBK */
     }            sc_mode;
     uint8_t      sc_custom_key[OSDP_SC_KEY_LEN];
+    uint8_t      sc2_key[OSDP_SC2_KEY_LEN];
     int          verbose;
 } cli_t;
 
@@ -358,17 +362,18 @@ static void usage(const char *prog)
         "  --address N        7-bit PD address (0x00..0x7E, default 0x00)\n"
         "  --baud N           baud rate (default 9600)\n"
         "  --sc=MODE          Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
-        "                                     'scbk:HEX32' (custom 16-byte key)\n"
+        "                                     'scbk:HEX32' (SC1 custom 16-byte key),\n"
+        "                                     'scbk2:HEX64' (SC2 AES-256 32-byte key)\n"
         "  -v / -vv           print decoded commands (-v) or every byte (-vv)\n"
         "  -h, --help         this help\n",
         prog);
 }
 
-/* Parse 32 hex chars into a 16-byte key. Returns true on success. */
-static bool parse_hex_key(const char *s, uint8_t out[OSDP_SC_KEY_LEN])
+/* Parse `n*2` hex chars into an n-byte key. Returns true on success. */
+static bool parse_hex_keyn(const char *s, uint8_t *out, size_t n)
 {
-    if (s == NULL || strlen(s) != OSDP_SC_KEY_LEN * 2U) return false;
-    for (size_t i = 0; i < OSDP_SC_KEY_LEN; i++) {
+    if (s == NULL || strlen(s) != n * 2U) return false;
+    for (size_t i = 0; i < n; i++) {
         unsigned int b;
         if (sscanf(s + i * 2, "%2x", &b) != 1) return false;
         out[i] = (uint8_t)b;
@@ -411,8 +416,17 @@ static bool parse_args(int argc, char **argv, cli_t *out)
                 out->sc_mode = SC_NONE;
             } else if (strcmp(mode, "scbkd") == 0) {
                 out->sc_mode = SC_SCBKD;
+            } else if (strncmp(mode, "scbk2:", 6) == 0) {
+                if (!parse_hex_keyn(mode + 6, out->sc2_key,
+                                    OSDP_SC2_KEY_LEN)) {
+                    fprintf(stderr,
+                            "--sc=scbk2:HEX requires 64 hex chars (32 bytes)\n");
+                    return false;
+                }
+                out->sc_mode = SC_SCBK2;
             } else if (strncmp(mode, "scbk:", 5) == 0) {
-                if (!parse_hex_key(mode + 5, out->sc_custom_key)) {
+                if (!parse_hex_keyn(mode + 5, out->sc_custom_key,
+                                    OSDP_SC_KEY_LEN)) {
                     fprintf(stderr,
                             "--sc=scbk:HEX requires 32 hex chars (16 bytes)\n");
                     return false;
@@ -494,7 +508,14 @@ int main(int argc, char **argv)
     /* Optionally configure Secure Channel. The crypto vtable, the cUID
      * (derived from our PDID), and the requested key all need to be
      * set before the first inbound CHLNG / SCRYPT. */
-    if (cli.sc_mode != SC_NONE) {
+    if (cli.sc_mode == SC_SCBK2) {
+        /* OSDP-SC2: AES-256-GCM / KMAC256, 32-byte SCBK, 8-byte cUID. */
+        uint8_t cuid[OSDP_SC2_CUID_LEN];
+        cuid_from_pdid(&app.pdid, cuid);
+        osdp_pd_set_sc2_crypto(&pd, pd_mock_sc2_crypto());
+        osdp_pd_set_sc2_cuid  (&pd, cuid);
+        osdp_pd_set_sc2_scbk  (&pd, cli.sc2_key);
+    } else if (cli.sc_mode != SC_NONE) {
         uint8_t cuid[OSDP_SC_CUID_LEN];
         cuid_from_pdid(&app.pdid, cuid);
         osdp_pd_set_sc_crypto(&pd, pd_mock_aes_crypto());
@@ -510,9 +531,10 @@ int main(int argc, char **argv)
             "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x,"
             " SC=%s (Ctrl-C to exit)\n",
             cli.port, cli.baud, cli.address,
-            cli.sc_mode == SC_NONE   ? "off"
-          : cli.sc_mode == SC_SCBKD  ? "SCBK-D"
-                                     : "SCBK (custom)");
+            cli.sc_mode == SC_NONE        ? "off"
+          : cli.sc_mode == SC_SCBKD       ? "SCBK-D"
+          : cli.sc_mode == SC_SCBK2       ? "SC2 (AES-256)"
+                                          : "SCBK (custom)");
 
     /* Catch Ctrl-C for orderly shutdown. */
     signal(SIGINT, on_signal);
@@ -525,9 +547,12 @@ int main(int argc, char **argv)
         osdp_pd_tick(&pd);
 
         if (cli.sc_mode != SC_NONE) {
-            const bool sc_now = osdp_pd_sc_established(&pd);
+            const bool sc_now = (cli.sc_mode == SC_SCBK2)
+                                    ? osdp_pd_sc2_established(&pd)
+                                    : osdp_pd_sc_established(&pd);
             if (sc_now != sc_was_up) {
-                fprintf(stderr, "=== Secure Channel %s ===\n",
+                fprintf(stderr, "=== Secure Channel%s %s ===\n",
+                        cli.sc_mode == SC_SCBK2 ? " 2" : "",
                         sc_now ? "ESTABLISHED" : "torn down");
                 sc_was_up = sc_now;
             }
