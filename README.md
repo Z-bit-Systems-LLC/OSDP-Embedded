@@ -10,28 +10,38 @@ actually need** — no malloc, no globals, no OS dependencies in the core.
 
 ## Project status
 
-**Iterations 1–3 done.** The library now covers:
+The library covers the OSDP v2.2 baseline plus **both** Secure Channel
+variants — SC1 (AES-128) and SC2 (the quantum-resistant AES-256-GCM
+channel):
 
 - **Layer 1 framing** — encode and decode every OSDP frame variant
-  (plain, with-SCB, MAC-bearing, encrypted-payload). Round-trips a
-  592-frame `libosdp-conformance` Secure Channel capture byte-for-byte.
+  (plain, with-SCB, MAC-bearing, encrypted-payload for SC1 SCS_15..18
+  and SC2 SCS_25..28). Round-trips a 592-frame `libosdp-conformance`
+  Secure Channel capture byte-for-byte.
 - **Per-message codecs** for the v2.2 baseline command/reply set
   (POLL, ID, CAP, LED, BUZ, OUT, TEXT, COMSET on the ACU side; ACK,
   NAK, PDID, PDCAP, RAW, KEYPAD, COM on the PD side), plus the SC
   handshake messages (CHLNG, SCRYPT, CCRYPT, RMAC_I).
 - **PD-side state machine** (`osdp::pd`): address filtering,
   sequence-number policing with byte-identical retransmit detection,
-  online/offline tracking, optional Secure Channel handshake +
-  operational SCS_15..18.
+  online/offline tracking, and an optional Secure Channel handshake +
+  operational traffic — SC1 (SCS_11..18) and SC2 (SCS_21..28).
 - **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
-  per-PD SQN, reply/timeout callbacks, optional Secure Channel
-  handshake (fire-and-forget) and operational SCS_15..18 with
-  automatic session-loss detection per spec D.1.4 / 5.7 / 5.9.
+  per-PD SQN, reply/timeout callbacks, optional SC1 or SC2 handshake
+  (fire-and-forget) and operational traffic with automatic session-loss
+  detection per spec D.1.4 / 5.7 / 5.9.
+- **Secure Channel 2** — the quantum-resistant channel from the SIA
+  OSDP-SC2 annex: AES-256-GCM message protection with KMAC256-derived
+  session keys, built as a parallel implementation to SC1 in the
+  SCS_21..28 range. The core supplies the primitives; the consumer
+  supplies AES-256-GCM + KMAC256 + AES-256 block via a HAL, exactly as
+  SC1 does for AES-128.
 - **Live interop verified** against both
   [libosdp-conformance](https://github.com/Security-Industry-Association/libosdp-conformance)
   (via byte-level capture replay in tests) and Z-bit Systems'
-  [OSDP.Net](https://github.com/Z-bit-Systems-LLC/OSDP.Net) `ACUConsole`
-  (over a com0com null-modem pair, exercising POLL/ID/CAP plus SC).
+  [OSDP.Net](https://github.com/Z-bit-Systems-LLC/OSDP.Net) — our PD
+  against `ACUConsole` and our ACU against `PDConsole` over a com0com
+  null-modem pair, exercising POLL/ID/CAP under **both** SC1 and SC2.
 
 See [docs/PLAN.md](docs/PLAN.md) for the phased roadmap and what's still
 in progress.
@@ -44,9 +54,10 @@ summary per frame. Drop captures into `tests/captures/` to register
 them as integration tests automatically.
 
 The included `osdp-pd-mock` CLI runs an `osdp::pd` instance on a real
-or virtual serial port (Win32 or POSIX), with optional Secure Channel
-(`--sc=scbkd` or `--sc=scbk:HEX32`). Useful for live interop validation
-against a hardware ACU, OSDP.Net's `ACUConsole`, etc.
+or virtual serial port (Win32 or POSIX), with optional Secure Channel —
+SC1 (`--sc=scbkd` or `--sc=scbk:HEX32`) or SC2 (`--sc=scbk2:HEX64`).
+Useful for live interop validation against a hardware ACU, OSDP.Net's
+`ACUConsole`, etc.
 
 The companion `osdp-acu-mock` CLI runs an `osdp::acu` instance on a
 serial port, driving an external PD (OSDP.Net's `PDConsole`, a
@@ -70,11 +81,11 @@ The core library is split by **message direction**, not by role:
 
 | Target           | Contents                                                           | Linked by         |
 | ---------------- | ------------------------------------------------------------------ | ----------------- |
-| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API, Secure Channel primitives (key derivation, cryptograms, custom CBC-MAC, AES-CBC payload encrypt/decrypt, frame wrap/unwrap) | everything |
+| `osdp::core`     | CRC-16, checksum, frame decode/build, streaming push API, Secure Channel primitives — SC1 (key derivation, cryptograms, custom CBC-MAC, AES-CBC payload encrypt/decrypt) and SC2 (KMAC256 key derivation, AES-256-CBC cryptograms, nonce/counter, AES-256-GCM frame wrap/unwrap) | everything |
 | `osdp::messages` | One TU per command and per reply, each containing model + decoder + builder | PD, ACU, Monitor |
 | `osdp::dispatch` | Optional switch-router from frame → typed message; pulls all codecs | Monitor only      |
-| `osdp::pd`       | PD-side state machine: address filtering, command handler dispatch, sequence-number policing (byte-identical retransmit detection), online/offline tracking, optional Secure Channel handshake + operational SCS_15..18 | PD applications |
-| `osdp::acu`      | ACU-side state machine: multi-PD registration, command issuance, reply/timeout callbacks, sequence-number progression, optional Secure Channel handshake (fire-and-forget) + operational SCS_15..18 with session-loss detection | ACU applications |
+| `osdp::pd`       | PD-side state machine: address filtering, command handler dispatch, sequence-number policing (byte-identical retransmit detection), online/offline tracking, optional SC1 (SCS_11..18) or SC2 (SCS_21..28) handshake + operational traffic | PD applications |
+| `osdp::acu`      | ACU-side state machine: multi-PD registration, command issuance, reply/timeout callbacks, sequence-number progression, optional SC1 or SC2 handshake (fire-and-forget) + operational traffic with session-loss detection | ACU applications |
 
 A PD or ACU application calls per-message codec functions directly
 (`osdp_led_decode`, `osdp_pdid_build`, etc.) and lets the linker garbage-collect
@@ -82,14 +93,27 @@ everything it doesn't reference. A Monitor links `osdp::dispatch` to decode
 arbitrary traffic without writing its own switch.
 
 Secure Channel is opt-in: a PD or ACU application that doesn't bind a
-crypto vtable + key material via the `osdp_*_set_sc_*` API behaves
-exactly like the iteration-2 (insecure) build, and the AES + RNG code
-isn't pulled into the link. When SC is enabled, the consumer supplies
-the AES-128 ECB primitive and the RNG via callbacks (`osdp_sc_crypto_t`)
-— the core never vendors a crypto implementation. Tests use a vendored
-copy of [tiny-AES-c](https://github.com/kokke/tiny-AES-c) (Unlicense /
-public domain) at `vendor/tiny-aes/`; production builds typically bind
-mbedTLS, hardware AES, or `BCryptGenRandom` / `/dev/urandom`.
+crypto vtable + key material via the `osdp_*_set_sc_*` (SC1) or
+`osdp_*_set_sc2_*` (SC2) API behaves exactly like the insecure build,
+and the crypto code isn't pulled into the link. The core never vendors
+a crypto implementation — the consumer supplies the primitives via
+callbacks:
+
+- **SC1** (`osdp_sc_crypto_t`): AES-128 ECB encrypt/decrypt + RNG.
+- **SC2** (`osdp_sc2_crypto_t`): AES-256-GCM encrypt/decrypt + KMAC256 +
+  a raw AES-256 block + RNG. SC2 is device-specific-key only (no
+  install-mode SCBK-D); the ACU picks SC1 vs SC2 by which CHLNG it
+  sends, so there is no negotiation on the wire.
+
+Tests and the interop tools use vendored, test/tool-only crypto:
+[tiny-AES-c](https://github.com/kokke/tiny-AES-c) (Unlicense) at
+`vendor/tiny-aes/` for AES, plus `vendor/tiny-gcm/` (AES-256-GCM) and
+`vendor/tiny-kmac/` (Keccak/KMAC256) for SC2. Production builds
+typically bind a full crypto library —
+[wolfSSL / wolfCrypt](https://www.wolfssl.com/) (AES, AES-GCM, and
+KMAC/SHA-3 all in one FIPS-capable library, a good fit on embedded
+targets), mbedTLS, BearSSL, or a hardware AES-GCM engine — with RNG
+from `BCryptGenRandom` / `/dev/urandom` or an on-chip TRNG.
 
 See [CLAUDE.md](CLAUDE.md) for the full set of architectural constraints and
 coding rules.
@@ -103,7 +127,9 @@ core/                         # C11 portable library, framing + codecs
 │   ├── shared/               # framing, integrity, stream — always linked
 │   ├── commands/             # ACU→PD message codecs (one TU per command)
 │   ├── replies/              # PD→ACU message codecs (one TU per reply)
-│   └── dispatch/             # optional bulk dispatch helpers
+│   ├── dispatch/             # optional bulk dispatch helpers
+│   ├── sc/                   # Secure Channel 1 primitives (AES-128)
+│   └── sc2/                  # Secure Channel 2 primitives (AES-256-GCM/KMAC256)
 └── CMakeLists.txt
 pd/                           # PD-side state machine + transport HAL
 └── ...                       # exports osdp::pd
@@ -123,8 +149,10 @@ tests/
 ├── captures/                 # drop *.osdpcap files here for integration tests
 └── test_*.c                  # Unity-based unit tests, run on host
 vendor/                       # 3rd-party code shared between tools and tests
-└── tiny-aes/                 # tiny-AES-c (Unlicense / public domain) —
-                              # AES-128 ECB primitive for tests + osdp-pd-mock
+├── tiny-aes/                 # tiny-AES-c (Unlicense) — AES-128 (SC1) and,
+│                             # compiled -DAES256, AES-256 (SC2) block cipher
+├── tiny-gcm/                 # AES-256-GCM (CTR+GHASH) over tiny-aes256 (SC2)
+└── tiny-kmac/                # Keccak-f[1600] + KMAC256 (SC2 key derivation)
 rust/                         # Rust workspace
 └── osdp/                     #   `osdp-embedded` crate: typed Pd / Acu /
                               #   frame / messages / sc + private FFI seam
@@ -238,16 +266,22 @@ Default features: `["std", "pd", "acu"]`.
 Public API: `osdp_embedded::{Error, Result, Transport, frame, messages, sc}`,
 `osdp_embedded::pd::{Pd, CommandHandler, Reply}` (under `pd`),
 `osdp_embedded::acu::{Acu, ReplyHandler, TimeoutHandler, …}` (under
-`acu`), and the `osdp_embedded::sc::ScCrypto` trait for application-
-supplied AES + RNG.
+`acu`), and the crypto traits for application-supplied primitives:
+`osdp_embedded::sc::ScCrypto` (SC1 — AES-128 + RNG) and
+`osdp_embedded::sc::ScCrypto2` (SC2 — AES-256-GCM + KMAC256 + AES-256
+block + RNG). PD/ACU expose matching `set_sc_*` / `set_sc2_*` setters
+and `start_sc_handshake` / `start_sc2_handshake`.
 
-Build / test / run the loopback examples:
+Build / test / run the loopback examples (`loopback_sc` drives SC1;
+`loopback_sc2` drives SC2 against RustCrypto's `aes-gcm` + `tiny-keccak`
+KMAC256):
 
 ```sh
 cargo build  --manifest-path rust/Cargo.toml
 cargo test   --manifest-path rust/Cargo.toml
 cargo run    --manifest-path rust/Cargo.toml --example loopback
 cargo run    --manifest-path rust/Cargo.toml --example loopback_sc
+cargo run    --manifest-path rust/Cargo.toml --example loopback_sc2
 ```
 
 To cut a release, run `./scripts/New-Release.ps1` (patch bump by default;
@@ -269,8 +303,8 @@ Before pushing, run every gate the CI `build` job enforces in one shot:
 It mirrors [ci/build.yml](ci/build.yml) — CMake configure/build/`ctest`
 (Release preset) for the C library, then `cargo fmt --check`, `cargo
 clippy -D warnings`, `cargo build`/`test --workspace --release`, and the
-two loopback examples for the Rust workspace. A clean run means the
-pipeline should pass. Every gate runs even if an earlier one fails, so a
+three loopback examples (`loopback`, `loopback_sc`, `loopback_sc2`) for
+the Rust workspace. A clean run means the pipeline should pass. Every gate runs even if an earlier one fails, so a
 single invocation surfaces all problems; the script exits non-zero if any
 gate failed, so it drops straight into a git `pre-push` hook.
 
@@ -322,25 +356,30 @@ build/tools/osdp-pd-mock/osdp-pd-mock --address 0 -v
 The mock answers POLL with ACK, ID with a placeholder PDID, CAP with a
 small default capability set, and ACKs LED / BUZ / OUT / TEXT /
 COMSET / KEYSET. Run with `--help` for the full flag set. Secure
-Channel mode (`--sc=scbkd`) is pending an AES-vendoring decision in
-this build of the tool.
+Channel is enabled with `--sc=scbkd` (install key), `--sc=scbk:HEX32`
+(SC1 operational key), or `--sc=scbk2:HEX64` (SC2 / AES-256-GCM key).
+Validated live against OSDP.Net's `ACUConsole` under both SC1 and SC2.
 
 `osdp-acu-mock` is the companion tool that runs an `osdp::acu` on a
 serial port and drives an external PD. It auto-sends ID once, CAP
-once, then POLL on a configurable interval (default 500 ms) and
-prints decoded replies / SC events / timeouts to stderr. SC mode is
-identical to the PD tool (`--sc=scbkd` or `--sc=scbk:HEX32`); on
-session loss it auto-restarts the handshake so a PD reboot doesn't
-require restarting the ACU process.
+once, then POLL on a configurable interval (default 200 ms; real ACUs
+often poll every 20–50 ms, and smaller values are fine — the scheduler
+won't outrun PD replies) and prints decoded replies / SC events /
+timeouts to stderr. SC mode matches the PD tool (`--sc=scbkd`,
+`--sc=scbk:HEX32`, or `--sc=scbk2:HEX64` for SC2); the handshake
+auto-retries and re-runs on session loss, so PD start ordering or a PD
+reboot doesn't require restarting the ACU process. Validated live
+against OSDP.Net's `PDConsole` under both SC1 and SC2.
 
 ```sh
 # Drive a PD at address 0 on COM3 with the default install key:
 $env:OSDP_INTEROP_ACU_PORT = "COM3"
 build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 --sc=scbkd -v
 
-# Plaintext mode (no SC), faster polling:
+# SC2 (AES-256-GCM) with a 32-byte SCBK, polling every 50 ms:
 build\tools\osdp-acu-mock\Debug\osdp-acu-mock.exe --address 0 \
-    --poll-interval 200 -v
+    --sc=scbk2:404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F \
+    --poll-interval 50 -v
 ```
 
 ### Agent-driven testing (MCP server)
@@ -371,13 +410,15 @@ binary. At runtime, `--crypto <name>` picks among them.
 
 | Feature             | Default | AES source                       |
 | ------------------- | ------- | -------------------------------- |
-| `crypto-rustcrypto` | yes     | pure-Rust [`aes`](https://crates.io/crates/aes) crate (constant-time) |
-| `crypto-tiny-aes`   | no      | vendored tiny-AES-c, compiled via `build.rs` from `vendor/tiny-aes/` |
+| `crypto-rustcrypto` | yes     | pure-Rust [`aes`](https://crates.io/crates/aes) crate (constant-time); also carries **SC2** via [`aes-gcm`](https://crates.io/crates/aes-gcm) + [`tiny-keccak`](https://crates.io/crates/tiny-keccak) KMAC256 |
+| `crypto-tiny-aes`   | no      | vendored tiny-AES-c, compiled via `build.rs` from `vendor/tiny-aes/` (SC1 / AES-128 only) |
 
 Both backends source random bytes from `getrandom` (the OS CSPRNG —
-`BCryptGenRandom` / `/dev/urandom` / `getentropy`). Adding a third
-backend (wolfCrypt, mbedTLS, hardware AES) is a single file behind
-a new `crypto-*` feature.
+`BCryptGenRandom` / `/dev/urandom` / `getentropy`). SC2 requires the
+`crypto-rustcrypto` backend, since it needs AES-256-GCM and KMAC256
+(tiny-AES-c has neither). Adding a further backend (wolfCrypt / wolfSSL,
+mbedTLS, hardware AES-GCM) is a single file behind a new `crypto-*`
+feature.
 
 The binary lands at `rust/target/debug/osdp-mcp` (or `…/release/`
 with `--release`). Two transports are supported, selected at
@@ -455,17 +496,22 @@ identically to the CLI tool. The agent overrides specific cmd
 codes from there.
 
 Secure Channel is enabled per-PD by passing `sc_mode` to
-`pd_configure`. Two modes:
+`pd_configure`:
 
   - `"scbkd"` — bind the well-known install-time SCBK-D from the
     spec. Convenient for development against an ACU that supports
     handshake with the default key.
-  - `"scbk"` + `scbk_hex` — bind a per-installation SCBK (32 hex
+  - `"scbk"` + `scbk_hex` — bind a per-installation SC1 SCBK (32 hex
     chars = 16 bytes). The ACU side must hold the matching key.
+  - `"scbk2"` + `scbk_hex` — bind a per-installation **SC2** SCBK
+    (64 hex chars = 32 bytes) and drive the quantum-resistant
+    AES-256-GCM channel. Requires the `crypto-rustcrypto` backend.
+    The reader UI badge shows a "Secure SC2" posture once the
+    handshake completes.
 
-Either mode also derives the cUID from the configured PDID per
-spec D.4.3 and binds the chosen AES backend (`--crypto`) as the
-PD's `ScCrypto` provider.
+Every mode derives the cUID from the configured PDID per spec D.4.3
+and binds the chosen crypto backend as the PD's `ScCrypto` (SC1) or
+`ScCrypto2` (SC2) provider.
 
 Event injection (RAW / KEYPAD / LSTATR) and fault injection
 (`drop_next_n_replies`, `force_session_loss`) are wired up.

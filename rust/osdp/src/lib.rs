@@ -34,7 +34,10 @@
 //!   reply in the OSDP v2.2.2 baseline set.
 //! - [`Transport`] - shared read/write/now_ms callback trait used by
 //!   both PD and ACU when bound via `set_transport`.
-//! - [`sc::ScCrypto`] for application-supplied AES + RNG.
+//! - [`sc::ScCrypto`] for application-supplied AES-128 + RNG (Secure
+//!   Channel 1), and [`sc::ScCrypto2`] for AES-256-GCM + KMAC256 +
+//!   AES-256 block + RNG (Secure Channel 2). PD/ACU expose matching
+//!   `set_sc_*` / `set_sc2_*` setters.
 //! - [`pd::Pd`] (feature `pd`) - PD-side state machine, with
 //!   [`pd::CommandHandler`].
 //! - [`acu::Acu`] (feature `acu`) - ACU-side state machine, with
