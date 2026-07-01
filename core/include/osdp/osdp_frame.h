@@ -60,23 +60,63 @@ extern "C" {
 #define OSDP_SCS_17  0x17U   /* ACU→PD: encrypted data + MAC      */
 #define OSDP_SCS_18  0x18U   /* PD→ACU: encrypted data + MAC      */
 
+/* Secure Channel 2 (OSDP-SC2) Security Block types, occupying the 0x2X
+ * range parallel to SC1's 0x1X. SC2 is a quantum-resistant channel
+ * built on AES-256-GCM + KMAC256 key derivation; SEC_BLK_DATA[0] = 0x02
+ * selects it during the handshake. The crypto lives in osdp::core's
+ * SC2 code (core/src/sc2/); the framing layer only needs the byte
+ * values and the size of the trailing GCM tag. */
+#define OSDP_SCS_21  0x21U   /* ACU→PD: SC2 initiation challenge   */
+#define OSDP_SCS_22  0x22U   /* PD→ACU: SC2 client cryptogram      */
+#define OSDP_SCS_23  0x23U   /* ACU→PD: SC2 server cryptogram      */
+#define OSDP_SCS_24  0x24U   /* PD→ACU: SC2 handshake status       */
+#define OSDP_SCS_25  0x25U   /* ACU→PD: SC2 plain data + tag       */
+#define OSDP_SCS_26  0x26U   /* PD→ACU: SC2 plain data + tag       */
+#define OSDP_SCS_27  0x27U   /* ACU→PD: SC2 encrypted data + tag   */
+#define OSDP_SCS_28  0x28U   /* PD→ACU: SC2 encrypted data + tag   */
+
 /* Truncated MAC byte count appended to SCS_15..18 frames before the
  * trailing CRC/checksum (spec D.5.1 step 1). */
 #define OSDP_FRAME_MAC_LEN  4U
 
-/* SCB type carries a 4-byte truncated MAC at the end of the data
- * area. True for SCS_15 .. SCS_18. */
-static inline bool osdp_scb_has_mac(uint8_t scb_type)
+/* Full AES-256-GCM authentication tag appended to SCS_25..28 frames
+ * before the trailing CRC/checksum. Unlike SC1's truncated MAC, the
+ * SC2 tag is sent in full (16 bytes) and is the sole authenticator. */
+#define OSDP_FRAME_MAC_LEN_SC2  16U
+
+/* Size, in bytes, of the trailing MAC / authentication tag that a
+ * given SCB type carries at the end of its data area: 4 for the SC1
+ * types (SCS_15..18), 16 for the SC2 types (SCS_25..28), 0 for
+ * handshake or non-SC frames. This is the single source of truth the
+ * framing layer uses to split (decode) or reserve (build) the tail. */
+static inline size_t osdp_scb_mac_len(uint8_t scb_type)
 {
-    return scb_type >= OSDP_SCS_15 && scb_type <= OSDP_SCS_18;
+    if (scb_type >= OSDP_SCS_15 && scb_type <= OSDP_SCS_18) {
+        return OSDP_FRAME_MAC_LEN;
+    }
+    if (scb_type >= OSDP_SCS_25 && scb_type <= OSDP_SCS_28) {
+        return OSDP_FRAME_MAC_LEN_SC2;
+    }
+    return 0U;
 }
 
-/* SCB type indicates the data block is encrypted (S-ENC, CBC, IV =
- * complement of the last MAC in the opposite direction). True for
- * SCS_17 and SCS_18. */
+/* SCB type carries a trailing MAC / GCM tag at the end of the data
+ * area. True for SCS_15..18 (4-byte MAC) and SCS_25..28 (16-byte tag). */
+static inline bool osdp_scb_has_mac(uint8_t scb_type)
+{
+    return osdp_scb_mac_len(scb_type) != 0U;
+}
+
+/* SCB type indicates the data block is encrypted. For SC1 (SCS_17/18)
+ * the data is AES-128-CBC encrypted; for SC2 (SCS_27/28) it is
+ * AES-256-GCM encrypted, and note the command/reply CODE byte is part
+ * of the ciphertext (so a decoded frame's `code` field is the first
+ * ciphertext byte, not a meaningful command code, until the SC2 layer
+ * decrypts it). */
 static inline bool osdp_scb_is_encrypted(uint8_t scb_type)
 {
-    return scb_type == OSDP_SCS_17 || scb_type == OSDP_SCS_18;
+    return scb_type == OSDP_SCS_17 || scb_type == OSDP_SCS_18 ||
+           scb_type == OSDP_SCS_27 || scb_type == OSDP_SCS_28;
 }
 
 /* ---- Frame model --------------------------------------------------------*/
@@ -119,10 +159,12 @@ typedef struct osdp_frame {
     const uint8_t    *payload;       /* may be NULL when payload_len == 0     */
     size_t            payload_len;
 
-    /* Truncated MAC for SCS_15..18 frames. mac_len is OSDP_FRAME_MAC_LEN
-     * (4) for those SCB types and 0 otherwise. The build path requires
-     * a non-NULL `mac` whenever the SCB type implies a MAC; the decode
-     * path always populates it for those SCB types. */
+    /* Trailing MAC / authentication tag for MAC-bearing SCB types.
+     * mac_len is OSDP_FRAME_MAC_LEN (4) for SC1 SCS_15..18,
+     * OSDP_FRAME_MAC_LEN_SC2 (16) for SC2 SCS_25..28, and 0 otherwise
+     * (see osdp_scb_mac_len). The build path requires a non-NULL `mac`
+     * of the matching length whenever the SCB type implies a MAC; the
+     * decode path always populates it for those SCB types. */
     const uint8_t    *mac;
     size_t            mac_len;
 

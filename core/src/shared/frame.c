@@ -100,15 +100,19 @@ osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
 
     const uint8_t *mac = NULL;
     size_t         mac_len = 0;
-    if (has_scb && osdp_scb_has_mac(scb_type)) {
-        if (payload_len < OSDP_FRAME_MAC_LEN) {
-            /* SCS_15..18 require at least a 4-byte MAC after the
-             * code byte. Anything shorter is a malformed frame. */
-            return OSDP_ERR_BAD_PAYLOAD;
+    if (has_scb) {
+        const size_t tag = osdp_scb_mac_len(scb_type);
+        if (tag > 0) {
+            if (payload_len < tag) {
+                /* A MAC-bearing SCB type requires at least `tag` bytes
+                 * (4 for SC1 SCS_15..18, 16 for SC2 SCS_25..28) after
+                 * the code byte. Anything shorter is a malformed frame. */
+                return OSDP_ERR_BAD_PAYLOAD;
+            }
+            payload_len -= tag;
+            mac     = &buf[payload_end - tag];
+            mac_len = tag;
         }
-        payload_len -= OSDP_FRAME_MAC_LEN;
-        mac     = &buf[payload_end - OSDP_FRAME_MAC_LEN];
-        mac_len = OSDP_FRAME_MAC_LEN;
     }
     const uint8_t *payload = (payload_len > 0) ? &buf[payload_start] : NULL;
 
@@ -193,17 +197,20 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         return OSDP_ERR_INVALID_ARG;
     }
 
-    /* Validate MAC presence vs SCB type. SCS_15..18 require a MAC;
-     * other SCB types (or no SCB at all) must not carry one. */
-    const bool need_mac = in->has_scb && osdp_scb_has_mac(in->scb_type);
-    if (need_mac) {
-        if (in->mac_len != OSDP_FRAME_MAC_LEN || in->mac == NULL) {
+    /* Validate MAC presence vs SCB type. MAC-bearing SCB types
+     * (SC1 SCS_15..18 → 4 bytes, SC2 SCS_25..28 → 16 bytes) require a
+     * MAC of the matching length; other SCB types (or no SCB at all)
+     * must not carry one. */
+    const size_t mac_needed =
+        in->has_scb ? osdp_scb_mac_len(in->scb_type) : 0u;
+    if (mac_needed > 0) {
+        if (in->mac_len != mac_needed || in->mac == NULL) {
             return OSDP_ERR_INVALID_ARG;
         }
     } else if (in->mac_len != 0) {
         return OSDP_ERR_INVALID_ARG;
     }
-    const size_t mac_total = need_mac ? OSDP_FRAME_MAC_LEN : 0u;
+    const size_t mac_total = mac_needed;
 
     const size_t integrity_size =
         (in->integrity == OSDP_INTEGRITY_CRC) ? 2u : 1u;
@@ -265,7 +272,8 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         off += in->payload_len;
     }
 
-    /* Truncated MAC for SCS_15..18, before integrity bytes. */
+    /* Trailing MAC / GCM tag (SC1 SCS_15..18 or SC2 SCS_25..28),
+     * before integrity bytes. */
     if (mac_total > 0) {
         (void)memcpy(&f[off], in->mac, mac_total);
         off += mac_total;

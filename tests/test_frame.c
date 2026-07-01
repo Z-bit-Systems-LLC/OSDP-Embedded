@@ -683,6 +683,153 @@ static void test_scs_helpers_classify_correctly(void)
     TEST_ASSERT_TRUE (osdp_scb_is_encrypted(OSDP_SCS_18));
 }
 
+/* ---- SCS_21..28 (Secure Channel 2) framing -----------------------------*/
+
+static void test_scs2_helpers_classify_correctly(void)
+{
+    /* Handshake SC2 types carry no MAC. */
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(OSDP_SCS_21));
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(OSDP_SCS_24));
+    /* Operational SC2 types carry a 16-byte GCM tag. */
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_25));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_26));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_27));
+    TEST_ASSERT_TRUE (osdp_scb_has_mac(OSDP_SCS_28));
+    TEST_ASSERT_FALSE(osdp_scb_has_mac(0x29));   /* unallocated */
+
+    /* Tag length is SC-version specific. */
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN,     osdp_scb_mac_len(OSDP_SCS_15));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN_SC2, osdp_scb_mac_len(OSDP_SCS_25));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN_SC2, osdp_scb_mac_len(OSDP_SCS_28));
+    TEST_ASSERT_EQUAL_size_t(0,                      osdp_scb_mac_len(OSDP_SCS_21));
+
+    /* Only SCS_27/28 are encrypted among the SC2 set. */
+    TEST_ASSERT_FALSE(osdp_scb_is_encrypted(OSDP_SCS_25));
+    TEST_ASSERT_FALSE(osdp_scb_is_encrypted(OSDP_SCS_26));
+    TEST_ASSERT_TRUE (osdp_scb_is_encrypted(OSDP_SCS_27));
+    TEST_ASSERT_TRUE (osdp_scb_is_encrypted(OSDP_SCS_28));
+}
+
+static void test_decode_splits_16byte_tag_for_scs_27_frame(void)
+{
+    /* An SCS_27 (ACU→PD encrypted+tag) frame: the 16 trailing bytes
+     * before CRC must come back via `mac` / `mac_len`, and NOT be part
+     * of `payload`. Here `code` is the first ciphertext byte — the SC2
+     * layer decrypts code||payload as a unit; the framing layer just
+     * splits the tag off the tail. */
+    static const uint8_t tag[OSDP_FRAME_MAC_LEN_SC2] = {
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
+    };
+    static const uint8_t ct_tail[3] = { 0xAA, 0xBB, 0xCC };
+
+    osdp_frame_t built = {0};
+    built.address      = 0x05;
+    built.integrity    = OSDP_INTEGRITY_CRC;
+    built.has_scb      = true;
+    /* SC2 operational SCB is length 2 (no selector data byte). */
+    built.scb_length   = OSDP_SCB_MIN_LEN;
+    built.scb_type     = OSDP_SCS_27;
+    built.code         = 0x80;   /* first ciphertext byte */
+    built.payload      = ct_tail;
+    built.payload_len  = sizeof(ct_tail);
+    built.mac          = tag;
+    built.mac_len      = OSDP_FRAME_MAC_LEN_SC2;
+
+    uint8_t buf[64];
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
+
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_built(buf, n, &got));
+    TEST_ASSERT_TRUE(got.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_27, got.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(0x80, got.code);
+    TEST_ASSERT_EQUAL_size_t(sizeof(ct_tail), got.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(ct_tail, got.payload, sizeof(ct_tail));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN_SC2, got.mac_len);
+    TEST_ASSERT_EQUAL_MEMORY(tag, got.mac, OSDP_FRAME_MAC_LEN_SC2);
+}
+
+static void test_decode_scs_28_minimal_ciphertext(void)
+{
+    /* Smallest SC2 encrypted frame: a single ciphertext byte (an
+     * encrypted 1-byte plaintext such as an ACK code) plus a 16-byte
+     * tag. After splitting the tag, the inner payload is empty and the
+     * lone ciphertext byte lands in `code`. Mirrors the annex Ack
+     * example shape. */
+    static const uint8_t tag[OSDP_FRAME_MAC_LEN_SC2] = {
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F
+    };
+    osdp_frame_t built = {0};
+    built.address      = 0x00;
+    built.integrity    = OSDP_INTEGRITY_CRC;
+    built.reply        = true;
+    built.has_scb      = true;
+    built.scb_length   = OSDP_SCB_MIN_LEN;
+    built.scb_type     = OSDP_SCS_28;
+    built.code         = 0x77;   /* the single ciphertext byte */
+    built.mac          = tag;
+    built.mac_len      = OSDP_FRAME_MAC_LEN_SC2;
+
+    uint8_t buf[64];
+    size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&built, buf, sizeof(buf), &n));
+
+    osdp_frame_t got = {0};
+    TEST_ASSERT_EQUAL(OSDP_OK, decode_built(buf, n, &got));
+    TEST_ASSERT_EQUAL_HEX8(0x77, got.code);
+    TEST_ASSERT_EQUAL_size_t(0, got.payload_len);
+    TEST_ASSERT_NULL(got.payload);
+    TEST_ASSERT_EQUAL_size_t(OSDP_FRAME_MAC_LEN_SC2, got.mac_len);
+    TEST_ASSERT_EQUAL_MEMORY(tag, got.mac, OSDP_FRAME_MAC_LEN_SC2);
+}
+
+static void test_decode_rejects_scs_27_shorter_than_tag(void)
+{
+    /* Post-code area is 8 bytes — shorter than the 16-byte SC2 tag
+     * (once the code byte is consumed). Must be rejected. */
+    uint8_t buf[32];
+    const uint16_t total = 17;   /* hdr5 + scb2 + code1 + 7 + crc2 */
+    buf[0] = OSDP_SOM;
+    buf[1] = 0x05;
+    buf[2] = (uint8_t)(total & 0xFF);
+    buf[3] = (uint8_t)(total >> 8);
+    buf[4] = (uint8_t)(OSDP_CTRL_USE_CRC | OSDP_CTRL_SCB);
+    buf[5] = OSDP_SCB_MIN_LEN;
+    buf[6] = OSDP_SCS_27;
+    buf[7] = 0x80;                       /* code / first ciphertext byte */
+    for (unsigned i = 8; i < total - 2u; i++) {
+        buf[i] = (uint8_t)i;             /* 7 trailing bytes, < 16 */
+    }
+    const uint16_t crc = osdp_crc16(buf, total - 2);
+    buf[total - 2] = (uint8_t)(crc & 0xFF);
+    buf[total - 1] = (uint8_t)((crc >> 8) & 0xFF);
+
+    osdp_frame_t f;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_frame_decode(buf, total, &f));
+}
+
+static void test_build_rejects_wrong_tag_len_for_scs_27(void)
+{
+    /* SCS_27 needs a 16-byte tag; a 4-byte one (SC1-sized) is invalid. */
+    static const uint8_t mac_bytes[OSDP_FRAME_MAC_LEN] = {1, 2, 3, 4};
+    osdp_frame_t f = {0};
+    f.address    = 0x05;
+    f.integrity  = OSDP_INTEGRITY_CRC;
+    f.has_scb    = true;
+    f.scb_length = OSDP_SCB_MIN_LEN;
+    f.scb_type   = OSDP_SCS_27;
+    f.code       = 0x80;
+    f.mac        = mac_bytes;
+    f.mac_len    = OSDP_FRAME_MAC_LEN;   /* wrong: SC2 wants 16 */
+    uint8_t buf[32]; size_t n = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_build(&f, buf, sizeof(buf), &n));
+}
+
 /* ---- Symmetry: build → decode → build is byte-identical -----------------*/
 
 static void test_build_decode_build_is_symmetric(void)
@@ -768,6 +915,12 @@ int main(void)
     RUN_TEST(test_build_rejects_unexpected_mac_for_scs_11);
     RUN_TEST(test_build_rejects_mac_when_scb_absent);
     RUN_TEST(test_scs_helpers_classify_correctly);
+    /* SCS_21..28 (Secure Channel 2) framing. */
+    RUN_TEST(test_scs2_helpers_classify_correctly);
+    RUN_TEST(test_decode_splits_16byte_tag_for_scs_27_frame);
+    RUN_TEST(test_decode_scs_28_minimal_ciphertext);
+    RUN_TEST(test_decode_rejects_scs_27_shorter_than_tag);
+    RUN_TEST(test_build_rejects_wrong_tag_len_for_scs_27);
     /* Symmetry. */
     RUN_TEST(test_build_decode_build_is_symmetric);
     return UNITY_END();

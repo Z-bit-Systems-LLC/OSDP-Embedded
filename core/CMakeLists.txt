@@ -16,6 +16,10 @@ add_library(osdp_core STATIC
     src/sc/payload.c
     src/sc/session.c
     src/sc/wrap.c
+    src/sc2/keys.c
+    src/sc2/crypto.c
+    src/sc2/session.c
+    src/sc2/wrap.c
 )
 
 target_include_directories(osdp_core

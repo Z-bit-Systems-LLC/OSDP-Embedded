@@ -24,3 +24,25 @@ target_include_directories(tiny_aes
 if(NOT MSVC)
     target_compile_options(tiny_aes PRIVATE -w)
 endif()
+
+# AES-256 build of the same vendored source, for OSDP-SC2 (which uses
+# AES-256-GCM and a raw AES-256 block). tiny-AES selects the key length
+# by the AES256 macro at compile time, and struct AES_ctx's size depends
+# on it — so AES256=1 is PUBLIC: every target that links tiny_aes256 (the
+# SC2 test/tool crypto backend) compiles its own aes.h include with the
+# matching 240-byte key schedule. Kept separate from tiny_aes (AES-128)
+# so the two never collide in one translation unit; a given executable
+# links one or the other, never both.
+add_library(tiny_aes256 STATIC
+    tiny-aes/aes.c
+)
+
+target_include_directories(tiny_aes256
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-aes
+)
+
+target_compile_definitions(tiny_aes256 PUBLIC AES256=1)
+
+if(NOT MSVC)
+    target_compile_options(tiny_aes256 PRIVATE -w)
+endif()
