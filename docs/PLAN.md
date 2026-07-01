@@ -413,10 +413,15 @@ negotiation (the ACU picks via the CHLNG SCB type).
   POLL/ID/CAP under SCS_27/28, keep the shared counter in lockstep
   across 8 commands, and the ACU tears down on a tampered tag and on
   offline timeout — the validated PD exercising the ACU end to end.
-- ☐ **Phase 6: Rust + MCP + docs.** FFI mirrors (`sys.rs`) and the C
-  source list (`build.rs`) grown for SC2 (required — a stale mirror is
-  heap corruption). Safe Rust SC2 API and osdp-mcp `scbk2` mode still
-  to come.
+- ☑ **Phase 6: Rust + MCP + docs.** FFI mirrors (`sys.rs`) + C source
+  list (`build.rs`) grown for SC2. Safe Rust `ScCrypto2` trait +
+  `Pd::set_sc2_*` / `Acu::set_sc2_*` / `start_sc2_handshake`;
+  `examples/loopback_sc2.rs` validates it against RustCrypto backends
+  (aes-gcm + tiny-keccak KMAC256). osdp-mcp `pd_configure` gains
+  `sc_mode="scbk2"` (64-hex SCBK) driving an AES-256-GCM virtual PD, with
+  the reader badge showing the SC2 posture. Both interop tools
+  (`osdp-pd-mock`, `osdp-acu-mock`) speak `--sc=scbk2:HEX64`. Docs:
+  PLAN.md + CLAUDE.md.
 
 ## Iteration 6+ — Optional extensions (not yet planned)
 

@@ -36,7 +36,11 @@ publish     = false
 # their RNG bytes from `getrandom`.
 [features]
 default           = ["crypto-rustcrypto"]
-crypto-rustcrypto = ["dep:aes", "dep:getrandom"]
+# The rustcrypto backend also carries OSDP-SC2 (AES-256-GCM + KMAC256) —
+# aes-gcm and tiny-keccak provide the AEAD and KMAC the SC2 ScCrypto2
+# provider needs. tiny-AES-c has no GCM/KMAC, so SC2 requires this
+# backend.
+crypto-rustcrypto = ["dep:aes", "dep:aes-gcm", "dep:tiny-keccak", "dep:getrandom"]
 crypto-tiny-aes   = ["dep:getrandom"]
 
 [dependencies]
@@ -44,8 +48,10 @@ osdp-embedded = { path = "../../rust/osdp", default-features = false, features =
 
 # Optional crypto backend deps — compiled in only when the matching
 # feature is active.
-aes       = { version = "0.8", optional = true }
-getrandom = { version = "0.2", optional = true }
+aes         = { version = "0.8", optional = true }
+aes-gcm     = { version = "0.10", optional = true }
+tiny-keccak = { version = "2", optional = true, features = ["kmac"] }
+getrandom   = { version = "0.2", optional = true }
 
 # rmcp is the official Rust MCP SDK. Default features (base64, macros,
 # server) plus transport-io for stdio and transport-streamable-http-

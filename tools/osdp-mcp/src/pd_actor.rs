@@ -59,6 +59,9 @@ pub enum ScMode {
     Install,
     /// Operational mode: the PD uses a per-installation 16-byte SCBK.
     Scbk,
+    /// OSDP-SC2: the PD uses a per-installation 32-byte AES-256 SCBK
+    /// (AES-256-GCM / KMAC256 channel).
+    Scbk2,
 }
 
 impl ScMode {
@@ -67,6 +70,7 @@ impl ScMode {
             None => ScMode::None,
             Some(ScConfig::Scbkd) => ScMode::Install,
             Some(ScConfig::Scbk(_)) => ScMode::Scbk,
+            Some(ScConfig::Scbk2(_)) => ScMode::Scbk2,
         }
     }
 }
@@ -151,6 +155,10 @@ pub enum ScConfig {
     /// Use a per-installation SCBK (custom 16-byte key). PD will
     /// accept handshakes with the SCBK selector.
     Scbk([u8; 16]),
+    /// OSDP-SC2: per-installation 32-byte AES-256 SCBK. The PD accepts
+    /// SCS_21..28 (AES-256-GCM) handshakes. Requires the
+    /// `crypto-rustcrypto` backend (SC2 needs GCM + KMAC).
+    Scbk2([u8; 32]),
 }
 
 /// Messages the MCP side sends to the actor. Every variant carries a
@@ -847,7 +855,7 @@ fn handle_cmd(
                         is_online: s.pd.is_online(),
                         actively_polling,
                         sc_mode: ScMode::from_cfg(&s.sc),
-                        sc_established: s.pd.sc_established(),
+                        sc_established: s.pd.sc_established() || s.pd.sc2_established(),
                         last_command_at_ms: stats.last_command_at_ms,
                         last_reply_at_ms: stats.last_reply_at_ms,
                         last_cmd_code: stats.last_cmd_code,
@@ -941,18 +949,37 @@ fn open_pd(
     // stream: vendor[3] + model + version + serial[0..2]).
     let mut sc_mode_label = "none";
     if let Some(cfg) = sc.as_ref() {
-        let crypto = crypto_factory();
-        pd.set_sc_crypto(BoxedSc(crypto));
         let cuid = derive_cuid_from_pdid(&pdid_snapshot);
-        pd.set_sc_cuid(&cuid);
         match cfg {
             ScConfig::Scbkd => {
+                pd.set_sc_crypto(BoxedSc(crypto_factory()));
+                pd.set_sc_cuid(&cuid);
                 pd.set_sc_scbk_d(osdp_embedded::sc::scbk_default());
                 sc_mode_label = "scbkd";
             }
             ScConfig::Scbk(key) => {
+                pd.set_sc_crypto(BoxedSc(crypto_factory()));
+                pd.set_sc_cuid(&cuid);
                 pd.set_sc_scbk(key);
                 sc_mode_label = "scbk";
+            }
+            // OSDP-SC2: AES-256-GCM / KMAC256. Only the rustcrypto
+            // backend carries the GCM + KMAC primitives, so gate on it.
+            ScConfig::Scbk2(_key) => {
+                #[cfg(feature = "crypto-rustcrypto")]
+                {
+                    pd.set_sc2_crypto(crate::crypto::rustcrypto::RustCrypto2Backend::new());
+                    pd.set_sc2_cuid(&cuid);
+                    pd.set_sc2_scbk(_key);
+                    sc_mode_label = "scbk2";
+                }
+                #[cfg(not(feature = "crypto-rustcrypto"))]
+                {
+                    anyhow::bail!(
+                        "sc_mode=scbk2 (OSDP-SC2) requires the crypto-rustcrypto \
+                         backend; rebuild with `--features crypto-rustcrypto`"
+                    );
+                }
             }
         }
     }
@@ -1000,6 +1027,10 @@ fn open_pd(
 /// what the reader badge shows, and it's why a KEYSET flips install→secure
 /// the moment the ACU re-handshakes with the rotated key.
 fn effective_sc_mode(pd: &Pd) -> ScMode {
+    // SC2 runs on its own session; if it's up, the wire is SC2 keyed.
+    if pd.sc2_established() {
+        return ScMode::Scbk2;
+    }
     match pd.sc_operational() {
         None => ScMode::None,
         Some(false) => ScMode::Install,

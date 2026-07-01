@@ -88,10 +88,13 @@ struct PdConfigureArgs {
     ///   - "scbk" (alias: "operational"): PD uses a per-installation
     ///     16-byte SCBK — pair with `scbk_hex`. This is the steady-
     ///     state mode after a KEYSET has rotated the install key.
+    ///   - "scbk2" (alias: "sc2"): OSDP-SC2 — the quantum-resistant
+    ///     AES-256-GCM channel — with a per-installation 32-byte SCBK.
+    ///     Pair with a 64-hex-char `scbk_hex`.
     #[serde(default)]
     sc_mode: Option<String>,
-    /// 32-hex-char SCBK (16 bytes) — required when `sc_mode` is
-    /// "scbk" / "operational", ignored otherwise.
+    /// SCBK hex — 32 chars (16 bytes) for `sc_mode` "scbk", or 64 chars
+    /// (32 bytes) for "scbk2". Ignored for other modes.
     #[serde(default)]
     scbk_hex: Option<String>,
 }
@@ -131,9 +134,24 @@ fn parse_sc_config(
             key.copy_from_slice(&bytes);
             Ok(Some(ScConfig::Scbk(key)))
         }
+        // OSDP-SC2: AES-256-GCM channel, 32-byte SCBK.
+        Some("scbk2") | Some("sc2") => {
+            let hex = scbk_hex.unwrap_or("");
+            let bytes = hex_decode(hex)?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "sc_mode='scbk2' requires a 64-hex-char key (32 bytes); got {} byte(s)",
+                    bytes.len()
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Ok(Some(ScConfig::Scbk2(key)))
+        }
         Some(other) => Err(format!(
             "unknown sc_mode {other:?}; expected one of: \
-             none, install (= scbkd / default), scbk (= operational, with scbk_hex)"
+             none, install (= scbkd / default), scbk (= operational SC1, with scbk_hex), \
+             scbk2 (= operational SC2 / AES-256-GCM, with 64-hex scbk_hex)"
         )),
     }
 }
@@ -145,6 +163,7 @@ fn sc_label(sc: &Option<ScConfig>) -> &'static str {
         None => "off",
         Some(ScConfig::Scbkd) => "install (SCBK-D)",
         Some(ScConfig::Scbk(_)) => "operational (SCBK)",
+        Some(ScConfig::Scbk2(_)) => "operational SC2 (AES-256 SCBK)",
     }
 }
 
@@ -533,7 +552,8 @@ you don't have to re-supply the SCBK (which `pd_status` never exposes). \
   - sc_mode (default \"none\"): Secure Channel mode —
       \"none\"    : SC disabled.
       \"install\" : accept handshakes with the spec's well-known SCBK-D key (first-time keying / dev).
-      \"scbk\"    : operational per-installation key — also pass scbk_hex (32 hex chars / 16 bytes).
+      \"scbk\"    : operational per-installation SC1 key — also pass scbk_hex (32 hex chars / 16 bytes).
+      \"scbk2\"   : operational OSDP-SC2 (AES-256-GCM) key — also pass scbk_hex (64 hex chars / 32 bytes).
 
 Identity & capabilities: `pd_get_pdid` / `pd_set_pdid` read and edit the device \
 identity reported in the osdp_ID reply; `pd_get_pdcap` / `pd_set_capability` / \
@@ -674,9 +694,9 @@ impl OsdpMcp {
     #[tool(
         title = "Get PD Status",
         description = "Return a JSON snapshot of the PD's state: running, \
-                       online, actively_polling, sc_mode (none/install/scbk = \
-                       clear text / SCBK-D / operational), sc_established, and \
-                       the last cmd/reply."
+                       online, actively_polling, sc_mode (none/install/scbk/scbk2 = \
+                       clear text / SCBK-D / operational SC1 / operational SC2), \
+                       sc_established, and the last cmd/reply."
     )]
     async fn pd_status(&self) -> Result<Json<PdStatus>, String> {
         self.pd

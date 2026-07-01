@@ -36,7 +36,8 @@
   h1 { font-size: 26px; font-weight: 600; margin: 0; letter-spacing: .3px; }
   /* Single status badge (sits under the reader). Fuses stream health with
      the live OSDP link posture: disconnected / no reader / clear text /
-     install (SCBK-D) / secure (operational SCBK). */
+     install (SCBK-D) / secure (operational SCBK, SC1) / secure SC2
+     (operational AES-256-GCM SCBK). */
   .statusbadge {
     display: inline-block;
     font-size: 13px;
@@ -299,6 +300,7 @@
   // Secure Channel mode → [label, css class]. Shared by the operational
   // badge and the configured sub-label.
   const MODE = {
+    scbk2:   ['🛡️ Secure SC2', 'secure'],
     scbk:    ['🔒 Secure',     'secure'],
     install: ['🔑 Install',    'install'],
     none:    ['🔓 Clear Text', 'clear'],
