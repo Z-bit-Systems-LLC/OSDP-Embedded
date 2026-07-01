@@ -79,6 +79,86 @@ function Test-Tool {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# When cmake isn't already on PATH (i.e. we're not running from a
+# "Developer PowerShell for VS"), try to locate a Visual Studio install
+# and import its build environment so the CMake/Ninja/MSVC stack can run
+# instead of being skipped. cmake, ninja, cl and rc all ship *inside*
+# Visual Studio and are absent from a plain shell's PATH. Returns $true
+# if cmake is invokable afterwards, $false if no toolchain was found.
+function Initialize-VsToolchain {
+    if (Test-Tool 'cmake') { return $true }
+
+    # Locate the VS install. vswhere is the canonical locator; fall back
+    # to scanning the standard install roots if it's missing.
+    $vsRoot = $null
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vsRoot = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null | Select-Object -First 1
+    }
+    if (-not $vsRoot) {
+        foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not $pf) { continue }
+            $base = Join-Path $pf 'Microsoft Visual Studio'
+            if (-not (Test-Path $base)) { continue }
+            $hit = Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
+                Where-Object { Test-Path (Join-Path $_.FullName 'VC\Auxiliary\Build\vcvars64.bat') } |
+                Select-Object -First 1
+            if ($hit) { $vsRoot = $hit.FullName; break }
+        }
+    }
+    if (-not $vsRoot) { return $false }
+
+    $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+    if (-not (Test-Path $vcvars)) { return $false }
+
+    # Import the environment vcvars64 produces (PATH, INCLUDE, LIB, ...)
+    # into this process — the standard "source vcvars into PowerShell"
+    # trick: run it in cmd, dump `set`, and copy each variable across.
+    cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>$null | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+        }
+    }
+
+    # Belt and suspenders: this machine's vcvars has been seen to set
+    # INCLUDE/LIB but leave cmake/ninja/cl/rc off PATH. Prepend the
+    # bundled cmake + ninja and the newest MSVC toolset / Windows SDK
+    # tool dirs so the executables resolve regardless. Newest dir wins so
+    # a VS update (which changes the toolset version) needs no edit here.
+    $extra = @()
+    $cmakeBin = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'
+    $ninjaBin = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+    foreach ($b in @($cmakeBin, $ninjaBin)) { if (Test-Path $b) { $extra += $b } }
+
+    $msvcRoot = Join-Path $vsRoot 'VC\Tools\MSVC'
+    if (Test-Path $msvcRoot) {
+        $ts = Get-ChildItem $msvcRoot -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | Select-Object -First 1
+        if ($ts) {
+            $b = Join-Path $ts.FullName 'bin\Hostx64\x64'
+            if (Test-Path $b) { $extra += $b }
+        }
+    }
+
+    foreach ($pf in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        if (-not $pf) { continue }
+        $sdkRoot = Join-Path $pf 'Windows Kits\10\bin'
+        if (-not (Test-Path $sdkRoot)) { continue }
+        $sdk = Get-ChildItem $sdkRoot -Directory -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -match '^\d+\.' -and (Test-Path (Join-Path $_.FullName 'x64\rc.exe')) } |
+               Sort-Object Name -Descending | Select-Object -First 1
+        if ($sdk) { $extra += (Join-Path $sdk.FullName 'x64'); break }
+    }
+
+    if ($extra.Count) { $env:Path = ($extra -join ';') + ';' + $env:Path }
+
+    return [bool](Test-Tool 'cmake')
+}
+
 # Results accumulator. Each entry: @{ Name; Status } where Status is
 # one of 'pass', 'fail', 'skip'.
 $results = [System.Collections.Generic.List[object]]::new()
@@ -137,8 +217,8 @@ try {
     if ($SkipC) {
         Skip-Gate 'CMake stack' '-SkipC was passed'
     }
-    elseif (-not (Test-Tool 'cmake')) {
-        Skip-Gate 'CMake stack' 'cmake not on PATH — run from a Developer PowerShell for VS (cl/rc/cmake), or pass -SkipC'
+    elseif (-not (Initialize-VsToolchain)) {
+        Skip-Gate 'CMake stack' 'cmake / Visual Studio toolchain not found — run from a Developer PowerShell for VS, install VS with the C++ workload, or pass -SkipC'
     }
     else {
         $configured = Invoke-Gate 'CMake configure (release preset)' {
