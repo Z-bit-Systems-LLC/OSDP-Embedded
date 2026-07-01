@@ -30,7 +30,7 @@ use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPd
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::reader_state::{
-    self, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
+    self, ConnectionView, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
 };
 use crate::serial_transport::SerialTransport;
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
@@ -47,11 +47,12 @@ const POLLING_WINDOW_MS: u32 = 2_000;
 /// Reflects how the PD was configured (which key it will handshake
 /// with), independent of whether a handshake has actually completed
 /// yet (that's [`PdStatus::sc_established`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScMode {
     /// No Secure Channel — the link is clear text. The PD NAKs any
     /// SCB-bearing frame.
+    #[default]
     None,
     /// Install mode: the PD accepts handshakes with the spec's
     /// well-known default key (SCBK-D, D.4). First-time keying / dev.
@@ -585,6 +586,11 @@ struct Slot {
     /// `ForceSessionLoss` so the rebuilt PD comes up with the same
     /// SC posture as the original.
     sc: Option<ScConfig>,
+    /// Last connection view published to the reader UI, so the tick loop
+    /// pushes an update only on a real change — SC establish/drop/re-key or
+    /// the ACU starting/stopping polling (the C library exposes no callback
+    /// for these, so we poll each tick).
+    last_conn: ConnectionView,
     stats: Arc<Mutex<PdStats>>,
     /// PD-local clock zero. Shares the same wall-clock basis as the
     /// handler's `last_command_at_ms` stamps (both anchored at
@@ -650,6 +656,17 @@ fn actor_loop(
 
         if let Some(s) = slot.as_mut() {
             s.pd.tick();
+            // Refresh the reader UI's connection view (configured +
+            // operational posture, polling) and publish only on a change.
+            // The C library has no callback for SC establish/drop or the
+            // ACU's poll cadence, so we recompute each tick and diff.
+            let view = connection_view(s);
+            if view != s.last_conn {
+                s.last_conn = view;
+                if let Ok(mut rs) = reader_state.lock() {
+                    rs.set_connection(view);
+                }
+            }
         }
 
         thread::sleep(tick_period);
@@ -714,6 +731,10 @@ fn handle_cmd(
             // Drop the running PD but keep `last_config` so `Start` can
             // bring it back.
             *slot = None;
+            // No PD is running now — clear the reader's connection badge.
+            if let Ok(mut rs) = reader_state.lock() {
+                rs.set_connection(ConnectionView::default());
+            }
             let _ = reply.send(());
         }
         Cmd::Start { reply } => {
@@ -897,8 +918,18 @@ fn open_pd(
     // A freshly-opened PD starts with no LED state; clear any colours the
     // previous PD left in the snapshot, then bind the change callback so
     // the PD's transparent osdp_LED decoding flows into the reader state.
+    // Publish the initial connection view: configured mode is known now,
+    // but a just-opened PD has no SC session (operational = clear text) and
+    // hasn't seen a poll yet. The tick loop upgrades both as they change.
+    let initial_conn = ConnectionView {
+        running: true,
+        configured: ScMode::from_cfg(&sc),
+        operational: ScMode::None,
+        polling: false,
+    };
     if let Ok(mut rs) = reader_state.lock() {
         rs.clear();
+        rs.set_connection(initial_conn);
     }
     pd.set_led_handler(ReaderLedHandler::new(Arc::clone(&reader_state)));
     pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
@@ -955,9 +986,45 @@ fn open_pd(
         baud,
         address,
         sc,
+        last_conn: initial_conn,
         stats,
         epoch,
     })
+}
+
+/// The Secure Channel posture actually in force on the wire, derived from
+/// the live session rather than the configuration: with no established
+/// session the link is clear text (`None`) even when the PD is configured
+/// for install or operational SC; an established session reports the key it
+/// handshaked with (SCBK-D → install, operational SCBK → secure). This is
+/// what the reader badge shows, and it's why a KEYSET flips install→secure
+/// the moment the ACU re-handshakes with the rotated key.
+fn effective_sc_mode(pd: &Pd) -> ScMode {
+    match pd.sc_operational() {
+        None => ScMode::None,
+        Some(false) => ScMode::Install,
+        Some(true) => ScMode::Scbk,
+    }
+}
+
+/// Build the reader UI's connection view from a live slot: the configured
+/// posture, the operational (live-on-the-wire) posture, and whether the ACU
+/// is actively polling (a command within [`POLLING_WINDOW_MS`], same test
+/// as `pd_status`). Cheap enough to call every tick.
+fn connection_view(s: &Slot) -> ConnectionView {
+    let now_ms = s.epoch.elapsed().as_millis() as u32;
+    let polling = s
+        .stats
+        .lock()
+        .ok()
+        .and_then(|g| g.last_command_at_ms)
+        .is_some_and(|t| now_ms.wrapping_sub(t) <= POLLING_WINDOW_MS);
+    ConnectionView {
+        running: true,
+        configured: ScMode::from_cfg(&s.sc),
+        operational: effective_sc_mode(&s.pd),
+        polling,
+    }
 }
 
 /// Build the 8-byte cUID from a PDID. Spec D.4.3:

@@ -58,8 +58,21 @@ async fn api_state_is_empty_for_fresh_pd() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // A PD that has never been driven shows no LEDs and no buzzers.
-    assert_eq!(json, serde_json::json!({ "leds": [], "buzzers": [] }));
+    // A PD that has never been driven shows no LEDs, no buzzers, and no
+    // running link (the connection badge stays hidden until a PD starts).
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "leds": [],
+            "buzzers": [],
+            "connection": {
+                "running": false,
+                "configured": "none",
+                "operational": "none",
+                "polling": false
+            }
+        })
+    );
 }
 
 #[tokio::test]

@@ -34,10 +34,30 @@
     text-align: center;
   }
   h1 { font-size: 26px; font-weight: 600; margin: 0; letter-spacing: .3px; }
-  /* Connection badge: centred just under the title. */
-  #conn {
+  /* Single status badge (sits under the reader). Fuses stream health with
+     the live OSDP link posture: disconnected / no reader / clear text /
+     install (SCBK-D) / secure (operational SCBK). */
+  .statusbadge {
     display: inline-block;
-    margin-top: 8px;
+    font-size: 13px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    border: 1px solid #2a3140;
+    color: #8a93a4;
+    background: rgba(12,15,21,.65);
+    letter-spacing: .2px;
+  }
+  .statusbadge.down    { color: #ff5a8a; border-color: #5a1f33; }
+  .statusbadge.idle    { color: #8a93a4; border-color: #2a3140; }
+  .statusbadge.clear   { color: #9aa3b4; border-color: #2a3140; }
+  .statusbadge.install { color: #ffb02e; border-color: #5a4a1f; }
+  .statusbadge.secure  { color: #6ee7a8; border-color: #1f5138; }
+  .statusline { display: flex; gap: 8px; align-items: center; justify-content: center; }
+  /* ACU polling indicator: a dot + label; pulses green while actively polled. */
+  .poll {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     font-size: 12px;
     padding: 3px 10px;
     border-radius: 999px;
@@ -45,8 +65,24 @@
     color: #8a93a4;
     background: rgba(12,15,21,.65);
   }
-  #conn.ok   { color: #6ee7a8; border-color: #1f5138; }
-  #conn.down { color: #ff5a8a; border-color: #5a1f33; }
+  .poll[hidden] { display: none; }
+  .poll::before {
+    content: '';
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #4d5564;
+  }
+  .poll.active { color: #6ee7a8; border-color: #1f5138; }
+  .poll.active::before {
+    background: #2fd27a;
+    box-shadow: 0 0 8px #2fd27a;
+    animation: pollpulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pollpulse { 50% { opacity: .3; } }
+  /* "configured" posture — a small muted sub-label under the main
+     (operational) badge. Collapses when there's nothing to show. */
+  .subcaption { font-size: 12px; color: #6b7688; min-height: 1em; }
+  .subcaption:empty { display: none; }
 
   main { padding: 26px 24px 40px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
 
@@ -147,8 +183,6 @@
     transform: scale(.94);
   }
 
-  .caption { font-size: 13px; color: #9aa3b2; }
-  .caption b { color: #d8dde6; text-transform: capitalize; }
   .soundbtn {
     font: inherit;
     font-size: 12px;
@@ -191,7 +225,6 @@
 <body>
   <header>
     <h1>OSDP Virtual Reader</h1>
-    <span id="conn">connecting…</span>
   </header>
 
   <main>
@@ -227,7 +260,11 @@
       </div>
     </div>
 
-    <div class="caption">status LED: <b id="state-name">—</b></div>
+    <div class="statusline">
+      <span id="status" class="statusbadge">connecting…</span>
+      <span id="polling" class="poll" hidden></span>
+    </div>
+    <div id="configured" class="subcaption"></div>
     <div class="controls">
       <input id="card" class="cardinput" type="text" inputmode="numeric"
              value="12345" maxlength="20" aria-label="card number" />
@@ -255,12 +292,49 @@
   };
 
   const ledEl = document.getElementById('led');
-  const nameEl = document.getElementById('state-name');
-  const connEl = document.getElementById('conn');
+  const statusEl = document.getElementById('status');
+  const pollEl = document.getElementById('polling');
+  const configuredEl = document.getElementById('configured');
 
-  function setConn(ok) {
-    connEl.textContent = ok ? 'connected' : 'disconnected';
-    connEl.className = ok ? 'ok' : 'down';
+  // Secure Channel mode → [label, css class]. Shared by the operational
+  // badge and the configured sub-label.
+  const MODE = {
+    scbk:    ['🔒 Secure',     'secure'],
+    install: ['🔑 Install',    'install'],
+    none:    ['🔓 Clear Text', 'clear'],
+  };
+
+  // Stream down → we can't trust anything; show "disconnected" and clear
+  // the rest.
+  function setStatusDown() {
+    statusEl.textContent = 'disconnected';
+    statusEl.className = 'statusbadge down';
+    pollEl.hidden = true;
+    configuredEl.textContent = '';
+  }
+
+  // Two statuses plus a polling indicator, all from state.connection:
+  //  - #status     = OPERATIONAL posture (live on the wire): the main badge.
+  //  - #configured = CONFIGURED posture (what the PD is set up for).
+  //  - #polling    = whether the ACU is actively polling.
+  function setStatus(conn) {
+    if (!conn || !conn.running) {
+      statusEl.textContent = 'no reader';
+      statusEl.className = 'statusbadge idle';
+      pollEl.hidden = true;
+      configuredEl.textContent = '';
+      return;
+    }
+    const op = MODE[conn.operational] || MODE.none;
+    statusEl.textContent = op[0];
+    statusEl.className = 'statusbadge ' + op[1];
+
+    const cfg = MODE[conn.configured] || MODE.none;
+    configuredEl.textContent = 'configured: ' + cfg[0];
+
+    pollEl.hidden = false;
+    pollEl.textContent = conn.polling ? 'polling' : 'idle';
+    pollEl.className = conn.polling ? 'poll active' : 'poll';
   }
 
   // Pick the reader's status LED: reader 0 / LED 0 if present, else the
@@ -275,15 +349,12 @@
     if (!led || led.color === 0) {
       ledEl.classList.remove('lit');
       ledEl.style.removeProperty('--c');
-      nameEl.textContent = led ? 'off' : '—';
       return;
     }
     const known = COLORS[led.color];
     const css = known ? known[0] : '#888';
-    const name = led.color_name || (known ? known[1] : ('0x' + led.color.toString(16)));
     ledEl.style.setProperty('--c', css);
     ledEl.classList.add('lit');
-    nameEl.textContent = name;
   }
 
   // ---- Buzzer: visual pulse + Web Audio beep ------------------------
@@ -356,7 +427,7 @@
   function applyState(state) {
     render(state.leds);
     renderBuzzer(state.buzzers);
-    setConn(true);
+    setStatus(state.connection);
   }
 
   async function poll() {
@@ -366,7 +437,7 @@
       const state = await r.json();
       applyState(state);
     } catch (e) {
-      setConn(false);
+      setStatusDown();
     }
   }
 
@@ -379,8 +450,9 @@
       es.addEventListener('state', function (e) {
         try { applyState(JSON.parse(e.data)); } catch (_) {}
       });
-      es.onopen = function () { setConn(true); };
-      es.onerror = function () { setConn(false); /* browser retries */ };
+      // No onopen handler: the snapshot-on-connect `state` event fires
+      // immediately and drives the badge through applyState.
+      es.onerror = function () { setStatusDown(); /* browser retries */ };
     } catch (_) { /* fall back to the poll backstop below */ }
   }
 

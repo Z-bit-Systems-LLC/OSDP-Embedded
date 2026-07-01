@@ -359,6 +359,22 @@ impl Pd {
     pub fn sc_established(&self) -> bool {
         unsafe { sys::osdp_pd_sc_established(&*self.inner) }
     }
+
+    /// Which Secure Channel key the **current session** is running under,
+    /// or `None` when no session is established — in which case traffic on
+    /// the wire is clear text right now, whatever keys happen to be
+    /// configured. `Some(false)` = the default install key (SCBK-D);
+    /// `Some(true)` = an operational per-installation SCBK. A KEYSET shows
+    /// up here: once the ACU re-handshakes with the rotated operational key
+    /// this flips from `Some(false)` to `Some(true)`.
+    pub fn sc_operational(&self) -> Option<bool> {
+        if !self.sc_established() {
+            return None;
+        }
+        // `key_selector` is a plain u8 the C library sets during the
+        // handshake (0 = SCBK-D, 1 = SCBK); reading it is a pure field load.
+        Some(self.inner.sc.key_selector == 1)
+    }
 }
 
 // `osdp::pd` is single-threaded by design (no internal locks). Don't

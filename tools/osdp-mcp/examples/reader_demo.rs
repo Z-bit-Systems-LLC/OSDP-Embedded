@@ -191,6 +191,17 @@ fn run_driver(reader_state: SharedReaderState, mut event_rx: mpsc::UnboundedRece
     });
     pd.set_command_handler(AckAll);
     pd.set_led_handler(ReaderLedHandler::new(Arc::clone(&reader_state)));
+    // The loopback link is clear text (no Secure Channel) and the ACU
+    // drives it continuously, so present a running, clear-text, actively
+    // polling reader for the life of the demo.
+    if let Ok(mut s) = reader_state.lock() {
+        s.set_connection(reader_state::ConnectionView {
+            running: true,
+            configured: osdp_mcp::pd_actor::ScMode::None,
+            operational: osdp_mcp::pd_actor::ScMode::None,
+            polling: true,
+        });
+    }
     pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
 
     let mut acu = Acu::new(1);
