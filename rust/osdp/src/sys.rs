@@ -1160,6 +1160,15 @@ mod acu_ffi {
         pub sc_cuid: [u8; OSDP_SC_CUID_LEN],
 
         pub sc_session: osdp_sc_session_t,
+
+        // Secure Channel 2 slot state (mirror of the C additions).
+        pub sc2_scbk_set: bool,
+        pub sc2_scbk: [u8; OSDP_SC2_KEY_LEN],
+        pub sc2_phase: osdp_acu_sc_phase_t,
+        pub sc2_rnd_a: [u8; OSDP_SC2_RND_LEN],
+        pub sc2_rnd_b: [u8; OSDP_SC2_RND_LEN],
+        pub sc2_cuid: [u8; OSDP_SC2_CUID_LEN],
+        pub sc2_session: osdp_sc2_session_t,
     }
 
     #[repr(C)]
@@ -1260,6 +1269,8 @@ mod acu_ffi {
         pub integrity: osdp_integrity_t,
         pub sc_crypto: osdp_sc_crypto_t,
         pub sc_crypto_set: bool,
+        pub sc2_crypto: osdp_sc2_crypto_t,
+        pub sc2_crypto_set: bool,
         pub sc_event_cb: osdp_acu_sc_event_cb,
         pub sc_event_user: *mut c_void,
 
@@ -1328,6 +1339,15 @@ mod acu_ffi {
             use_default_key: bool,
         ) -> osdp_status_t;
         pub fn osdp_acu_is_pd_sc_established(acu: *const osdp_acu_t, pd_address: u8) -> bool;
+
+        pub fn osdp_acu_set_sc2_crypto(acu: *mut osdp_acu_t, crypto: *const osdp_sc2_crypto_t);
+        pub fn osdp_acu_set_pd_sc2_scbk(
+            acu: *mut osdp_acu_t,
+            pd_address: u8,
+            scbk: *const u8,
+        ) -> osdp_status_t;
+        pub fn osdp_acu_start_sc2_handshake(acu: *mut osdp_acu_t, pd_address: u8) -> osdp_status_t;
+        pub fn osdp_acu_is_pd_sc2_established(acu: *const osdp_acu_t, pd_address: u8) -> bool;
 
         pub fn osdp_acu_set_led_handler(
             acu: *mut osdp_acu_t,

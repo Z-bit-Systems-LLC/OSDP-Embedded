@@ -8,6 +8,7 @@
 add_library(osdp_acu STATIC
     src/acu.c
     src/acu_sc.c
+    src/acu_sc2.c
 )
 
 target_include_directories(osdp_acu

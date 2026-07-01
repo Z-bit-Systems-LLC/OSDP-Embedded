@@ -71,4 +71,42 @@ void osdp_acu_internal_deliver_reply(osdp_acu_t          *acu,
                                      const uint8_t       *payload,
                                      size_t               payload_len);
 
+/* ---- Secure Channel 2 (parallel to the SC1 helpers above) ------------- */
+
+/* Whether the ACU + slot have the SC2 config needed to start a
+ * handshake (SC2 crypto vtable with the required callbacks + a per-PD
+ * 32-byte SCBK). */
+bool osdp_acu_internal_sc2_configured(const osdp_acu_t          *acu,
+                                      const osdp_acu_pd_slot_t  *slot);
+
+/* Build CHLNG (SCS_21) into acu->tx_buf and send it, advancing the
+ * slot to AWAITING_CCRYPT. */
+osdp_status_t osdp_acu_internal_send_chlng2(osdp_acu_t          *acu,
+                                            osdp_acu_pd_slot_t  *slot);
+
+/* Consume CCRYPT (SCS_22): validate the Client Cryptogram, derive
+ * keys, send SCRYPT (SCS_23). On failure fires HANDSHAKE_FAILED. */
+void osdp_acu_internal_handle_ccrypt2(osdp_acu_t          *acu,
+                                      osdp_acu_pd_slot_t  *slot,
+                                      const osdp_frame_t  *frame);
+
+/* Consume RMAC_I (SCS_24): check the status byte (0x02 ok / 0xFF fail),
+ * seed the session (counter 0, cUID), transition to ESTABLISHED, and
+ * fire ESTABLISHED or HANDSHAKE_FAILED. */
+void osdp_acu_internal_handle_rmac_i2(osdp_acu_t          *acu,
+                                      osdp_acu_pd_slot_t  *slot,
+                                      const osdp_frame_t  *frame);
+
+/* Tear down an SC2 session (or abort a handshake), fire the matching
+ * event, and reset the slot's SC2 fields to IDLE. */
+void osdp_acu_internal_terminate_sc2(osdp_acu_t          *acu,
+                                     osdp_acu_pd_slot_t  *slot);
+
+/* Handle an inbound SCS_26 / SCS_28 reply on an ESTABLISHED SC2 slot:
+ * GCM-verify + decrypt, deliver the plaintext via reply_cb. On auth
+ * failure, terminates the session. */
+void osdp_acu_internal_handle_sc2_reply(osdp_acu_t          *acu,
+                                        osdp_acu_pd_slot_t  *slot,
+                                        const osdp_frame_t  *frame);
+
 #endif /* OSDP_ACU_INTERNAL_H */

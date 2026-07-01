@@ -127,6 +127,7 @@ fn main() {
     if acu_enabled {
         sources.push("acu/src/acu.c");
         sources.push("acu/src/acu_sc.c");
+        sources.push("acu/src/acu_sc2.c");
     }
 
     let mut build = cc::Build::new();

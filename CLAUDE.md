@@ -36,12 +36,15 @@ seems to need a change, raise it explicitly with the user first.
    `src/dispatch/` and are linked only when the consumer wants bulk
    routing (e.g. a Monitor).
 7. **Build system: CMake.** Test framework: **Unity** (vendored).
-8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel.**
-   Currently implemented: Layer 1 framing, the baseline command/reply
-   set, PD-side state machine (with SC), ACU-side state machine (with
-   SC). Still deferred: file transfer, biometric, manufacturer-specific
-   commands, multi-part messages. See [docs/PLAN.md](docs/PLAN.md) for
-   what's done and what's next.
+8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel
+   (SC1) and Secure Channel 2 (SC2).** Currently implemented: Layer 1
+   framing, the baseline command/reply set, PD-side state machine (with
+   SC1 + SC2), ACU-side state machine (with SC1 + SC2). SC2 is the
+   quantum-resistant channel (AES-256-GCM + KMAC256) built as a parallel
+   implementation in the SCS_21..28 range; both sides are live-validated
+   against OSDP.Net's `feature/osdp-sc2`. Still deferred: file transfer,
+   biometric, manufacturer-specific commands, multi-part messages. See
+   [docs/PLAN.md](docs/PLAN.md) for what's done and what's next.
 
 ## Module layout
 
@@ -56,6 +59,9 @@ core/include/osdp/
   osdp_sc_crypto.h    # AES-128 ECB + RNG HAL (consumer-supplied)
   osdp_sc.h           # Secure Channel primitives: keys, cryptograms,
                       # MAC, CBC, payload, frame wrap/unwrap
+  osdp_sc2_crypto.h   # SC2 HAL: KMAC256 + AES-256-GCM + AES-256 + RNG
+  osdp_sc2.h          # SC2 primitives: keys, cryptograms, nonce,
+                      # frame wrap/unwrap (AES-256-GCM)
 
 core/src/
   shared/             # crc16.c, checksum.c, frame.c, stream.c — always linked
@@ -63,19 +69,23 @@ core/src/
   replies/            # reply_<name>.c — model + decode + build per reply
   dispatch/           # opt-in bulk routing; references every codec
   sc/                 # keys.c, mac.c, cbc.c, payload.c, session.c,
-                      # wrap.c — Secure Channel primitives
+                      # wrap.c — Secure Channel (SC1) primitives
+  sc2/                # keys.c, crypto.c, session.c, wrap.c — SC2
+                      # (AES-256-GCM / KMAC256) primitives
 
 pd/                   # role-specific state machine for the PD side
   include/osdp/osdp_pd.h
   src/pd.c            # baseline state machine (address, SQN, online)
-  src/pd_sc.c         # SC handshake (SCS_11..14) + operational SCS_15..18
+  src/pd_sc.c         # SC1 handshake (SCS_11..14) + operational SCS_15..18
+  src/pd_sc2.c        # SC2 handshake (SCS_21..24) + operational SCS_25..28
   src/pd_internal.h
   CMakeLists.txt      # exports osdp::pd
 
 acu/                  # role-specific state machine for the ACU side
   include/osdp/osdp_acu.h
   src/acu.c           # baseline state machine (slots, SQN, timeouts)
-  src/acu_sc.c        # SC handshake + operational SC + session-loss
+  src/acu_sc.c        # SC1 handshake + operational SC + session-loss
+  src/acu_sc2.c       # SC2 handshake + operational SC2 + session-loss
   src/acu_internal.h
   CMakeLists.txt      # exports osdp::acu
 
@@ -233,6 +243,52 @@ that aren't explicit in the spec:
   - During the handshake itself: bad Client Cryptogram in CCRYPT, or
     `sec_blk_data[0] == 0xFF` in RMAC_I, or the offline timeout fires
     while still in `AWAITING_*`.
+
+## Secure Channel 2 conventions
+
+SC2 (the quantum-resistant channel: AES-256-GCM message protection +
+KMAC256-derived session keys) is a **parallel** implementation to SC1 in
+the SCS_21..28 range, in `core/src/sc2/`, `pd/src/pd_sc2.c`, and
+`acu/src/acu_sc2.c`. It uses its own HAL (`osdp_sc2_crypto_t`: KMAC256 +
+AES-256-GCM encrypt/decrypt + AES-256 block + RNG) and its own session
+type (`osdp_sc2_session_t`) — the SC1 vtable/session are untouched. Both
+sides are live-validated against OSDP.Net's `feature/osdp-sc2`. Rules
+that differ from SC1:
+
+- **Device-specific key only.** No SCBK-D install mode. `SEC_BLK_DATA[0]
+  = 0x02` selects SC2 during the SCS_21..24 handshake. There is no
+  SC1/SC2 negotiation — the ACU chooses by which CHLNG it sends; a PD
+  that doesn't support the requested version NAKs 0x05.
+- **The code byte is encrypted.** For SCS_27/28 the GCM plaintext is
+  `code || data`, so a decoded frame's `code` is a ciphertext byte until
+  `osdp_sc2_unwrap_frame` decrypts it (it returns the real code
+  separately). SCS_25/26 (auth-only, dev/test) send code+data in the
+  clear and fold them into the GCM AAD.
+- **AAD = the 7-byte header incl. the security block**
+  (`SOM|ADDR|LEN|CTRL|SEC_BLK_LEN|SEC_BLK_TYPE`). The GCM tag is the full
+  16 bytes (no truncation) and is the sole authenticator; there is no
+  rolling MAC chain.
+- **One shared message counter**, seeded to 0 at establish and
+  incremented on **every** wrap AND unwrap, keeps both peers in lockstep
+  and feeds the per-message nonce (`cUID || counter(LE) || 0x80 00 00 00`
+  encrypted with S-NONCE, first 12 bytes). No SC2 traffic is valid until
+  `session.established`.
+- **RMAC_I (SCS_24) carries no payload** — success/fail is the SCB status
+  byte (0x02 ok / 0xFF fail). CCRYPT (SCS_22) is 56 bytes
+  (`cUID[8] || RND.B[16] || ClientCryptogram[32]`); the cryptograms are
+  AES-256-CBC (zero IV, genuinely chained across the two blocks — NOT
+  ECB), 32 bytes.
+- **KEYSET KeyType 0x02** rotates the 32-byte AES-256 SCBK in place
+  (`pd->sc2.scbk`), same "next handshake" semantics as SC1; malformed
+  records NAK 0x09.
+- **Test/tool crypto lives in `vendor/`** (`tiny-gcm` = AES-256-GCM over
+  `tiny-aes256`; `tiny-kmac` = Keccak/KMAC256), never in `core/`. The
+  AES-256 build renames its symbols (`AES_*`→`AES256_*`) so one binary
+  can link both the AES-128 (SC1) and AES-256 (SC2) tiny-AES builds.
+- **The Rust FFI mirror is hand-maintained.** Growing a C struct
+  (`osdp_pd_t` / `osdp_acu_t`) REQUIRES updating both `rust/osdp/src/sys.rs`
+  (the `#[repr(C)]` mirror — a stale one is silent heap corruption at
+  runtime) and the C source list in `rust/osdp/build.rs`.
 
 ## Out of scope (do not introduce without explicit user approval)
 

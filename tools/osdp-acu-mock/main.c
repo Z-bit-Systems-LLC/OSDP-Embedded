@@ -36,7 +36,9 @@
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
 #include "osdp/osdp_sc_crypto.h"
+#include "sc2_adapter.h"
 #include "serial.h"
 
 #include <signal.h>
@@ -55,7 +57,12 @@ static void on_signal(int sig) { (void)sig; g_should_exit = 1; }
 
 #define DEFAULT_BAUD          9600U
 #define DEFAULT_PD_ADDRESS    0x00U
-#define DEFAULT_POLL_INTERVAL 500U   /* ms between commands              */
+/* Target cadence between commands in steady state. This is a ceiling,
+ * not a floor: the send scheduler only issues the next command when the
+ * slot is idle (osdp_acu_is_pd_busy gates it), so a smaller value just
+ * means "poll as soon as the previous reply lands" and can't flood the
+ * bus. Override with --poll-interval; faster (smaller) values are fine. */
+#define DEFAULT_POLL_INTERVAL 200U
 #define MAIN_LOOP_TICK_MS     2U     /* ~2× a 9600-baud byte             */
 
 /* ---- Pretty-printers ------------------------------------------------ */
@@ -128,6 +135,7 @@ typedef struct app {
     unsigned int         poll_interval_ms;
     bool                 sc_enabled;
     bool                 sc_use_default_key;
+    bool                 sc_is_v2;   /* true = OSDP-SC2 (AES-256-GCM) */
 } app_t;
 
 /* ---- Callbacks ----------------------------------------------------- */
@@ -187,8 +195,10 @@ static void on_sc_event(void *user, const osdp_acu_sc_event_t *e)
          * re-handshake so the user doesn't have to restart the run. */
         fprintf(stderr, "  (auto-restarting handshake)\n");
         app->phase = SEND_PHASE_PENDING_SC;
-        const osdp_status_t r = osdp_acu_start_sc_handshake(
-            app->acu, app->pd_address, app->sc_use_default_key);
+        const osdp_status_t r = app->sc_is_v2
+            ? osdp_acu_start_sc2_handshake(app->acu, app->pd_address)
+            : osdp_acu_start_sc_handshake(app->acu, app->pd_address,
+                                          app->sc_use_default_key);
         if (r != OSDP_OK) {
             fprintf(stderr,
                     "  warning: re-handshake start failed (%d); will retry "
@@ -208,8 +218,10 @@ typedef struct cli {
         SC_NONE,
         SC_SCBKD,
         SC_SCBK_CUSTOM,
+        SC_SCBK2,          /* OSDP-SC2: 32-byte AES-256 SCBK */
     }            sc_mode;
     uint8_t      sc_custom_key[OSDP_SC_KEY_LEN];
+    uint8_t      sc2_key[OSDP_SC2_KEY_LEN];
     unsigned int poll_interval_ms;
     int          verbose;
 } cli_t;
@@ -223,9 +235,12 @@ static void usage(const char *prog)
         "                          POSIX examples: /dev/ttyUSB0, /dev/cu.usbserial-XXX\n"
         "  --address N           PD address to drive (0x00..0x7E, default 0x00)\n"
         "  --baud N              baud rate (default 9600)\n"
-        "  --poll-interval N     ms between commands (default 500)\n"
+        "  --poll-interval N     ms between commands (default 200; real ACUs\n"
+        "                          often poll every 20-50ms — smaller is fine,\n"
+        "                          the send scheduler won't outrun PD replies)\n"
         "  --sc=MODE             Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
-        "                                        'scbk:HEX32' (custom 16-byte key)\n"
+        "                                        'scbk:HEX32' (SC1 custom 16-byte key),\n"
+        "                                        'scbk2:HEX64' (SC2 AES-256 32-byte key)\n"
         "  -v / -vv              verbose: -v prints sent commands, -vv adds idle ticks\n"
         "  -h, --help            this help\n"
         "\n"
@@ -235,10 +250,10 @@ static void usage(const char *prog)
         prog);
 }
 
-static bool parse_hex_key(const char *s, uint8_t out[OSDP_SC_KEY_LEN])
+static bool parse_hex_keyn(const char *s, uint8_t *out, size_t n)
 {
-    if (s == NULL || strlen(s) != OSDP_SC_KEY_LEN * 2U) return false;
-    for (size_t i = 0; i < OSDP_SC_KEY_LEN; i++) {
+    if (s == NULL || strlen(s) != n * 2U) return false;
+    for (size_t i = 0; i < n; i++) {
         unsigned int b;
         if (sscanf(s + i * 2, "%2x", &b) != 1) return false;
         out[i] = (uint8_t)b;
@@ -284,8 +299,17 @@ static bool parse_args(int argc, char **argv, cli_t *out)
                 out->sc_mode = SC_NONE;
             } else if (strcmp(mode, "scbkd") == 0) {
                 out->sc_mode = SC_SCBKD;
+            } else if (strncmp(mode, "scbk2:", 6) == 0) {
+                if (!parse_hex_keyn(mode + 6, out->sc2_key,
+                                    OSDP_SC2_KEY_LEN)) {
+                    fprintf(stderr,
+                            "--sc=scbk2:HEX requires 64 hex chars (32 bytes)\n");
+                    return false;
+                }
+                out->sc_mode = SC_SCBK2;
             } else if (strncmp(mode, "scbk:", 5) == 0) {
-                if (!parse_hex_key(mode + 5, out->sc_custom_key)) {
+                if (!parse_hex_keyn(mode + 5, out->sc_custom_key,
+                                    OSDP_SC_KEY_LEN)) {
                     fprintf(stderr,
                             "--sc=scbk:HEX requires 32 hex chars (16 bytes)\n");
                     return false;
@@ -317,12 +341,24 @@ static bool parse_args(int argc, char **argv, cli_t *out)
  * `last_send_ms`). Skipped silently while a SC handshake is pending. */
 static bool maybe_send_next(app_t *app)
 {
-    /* Don't send anything while waiting for handshake completion. */
-    if (app->phase == SEND_PHASE_PENDING_SC) {
-        return false;
-    }
     if (osdp_acu_is_pd_busy(app->acu, app->pd_address)) {
         return false;
+    }
+
+    /* While a handshake is pending, (re)issue CHLNG on the send cadence.
+     * A single CHLNG that times out (e.g. the PD started after us) would
+     * otherwise leave the tool stuck; retrying makes start ordering not
+     * matter for a live interop test. */
+    if (app->phase == SEND_PHASE_PENDING_SC) {
+        const osdp_status_t r = app->sc_is_v2
+            ? osdp_acu_start_sc2_handshake(app->acu, app->pd_address)
+            : osdp_acu_start_sc_handshake(app->acu, app->pd_address,
+                                          app->sc_use_default_key);
+        if (r == OSDP_OK && app->verbose >= 1) {
+            fprintf(stderr, "--> send   PD 0x%02X  CHLNG (handshake)\n",
+                    app->pd_address);
+        }
+        return r == OSDP_OK;
     }
 
     uint8_t       cmd     = OSDP_CMD_POLL;
@@ -407,6 +443,7 @@ int main(int argc, char **argv)
     app.poll_interval_ms = cli.poll_interval_ms;
     app.sc_enabled       = (cli.sc_mode != SC_NONE);
     app.sc_use_default_key = (cli.sc_mode == SC_SCBKD);
+    app.sc_is_v2         = (cli.sc_mode == SC_SCBK2);
     app.phase            = app.sc_enabled
                               ? SEND_PHASE_PENDING_SC
                               : SEND_PHASE_INIT;
@@ -429,7 +466,19 @@ int main(int argc, char **argv)
 
     /* Optionally configure Secure Channel. The crypto vtable + per-PD
      * key both need to be in place before start_sc_handshake. */
-    if (app.sc_enabled) {
+    if (app.sc_is_v2) {
+        osdp_acu_set_sc2_crypto(&acu, acu_mock_sc2_crypto());
+        (void)osdp_acu_set_pd_sc2_scbk(&acu, cli.pd_address, cli.sc2_key);
+        const osdp_status_t r =
+            osdp_acu_start_sc2_handshake(&acu, cli.pd_address);
+        if (r != OSDP_OK) {
+            fprintf(stderr,
+                    "osdp-acu-mock: start_sc2_handshake failed: %d\n",
+                    (int)r);
+            serial_close(serial);
+            return 1;
+        }
+    } else if (app.sc_enabled) {
         osdp_acu_set_sc_crypto(&acu, acu_mock_aes_crypto());
         if (cli.sc_mode == SC_SCBKD) {
             osdp_acu_set_pd_scbk_d(&acu, cli.pd_address,
@@ -453,9 +502,10 @@ int main(int argc, char **argv)
             "osdp-acu-mock: ACU on %s @ %u baud, driving PD 0x%02X,"
             " SC=%s, poll-interval=%ums (Ctrl-C to exit)\n",
             cli.port, cli.baud, cli.pd_address,
-            cli.sc_mode == SC_NONE   ? "off"
-          : cli.sc_mode == SC_SCBKD  ? "SCBK-D"
-                                     : "SCBK (custom)",
+            cli.sc_mode == SC_NONE        ? "off"
+          : cli.sc_mode == SC_SCBKD       ? "SCBK-D"
+          : cli.sc_mode == SC_SCBK2       ? "SC2 (AES-256)"
+                                          : "SCBK (custom)",
             cli.poll_interval_ms);
 
     signal(SIGINT, on_signal);

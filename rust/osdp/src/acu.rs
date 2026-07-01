@@ -47,7 +47,7 @@ use core::slice;
 use crate::sys;
 
 use crate::error::{Error, Result};
-use crate::sc::{self, ScCrypto, ScEventHandler, SC_KEY_LEN};
+use crate::sc::{self, ScCrypto, ScCrypto2, ScEventHandler, SC2_KEY_LEN, SC_KEY_LEN};
 
 // ---- Public traits ------------------------------------------------------
 
@@ -100,6 +100,7 @@ pub struct Acu {
     reply_h: Option<Box<ReplyBox>>,
     timeout_h: Option<Box<TimeoutBox>>,
     sc_crypto: Option<Box<sc::ScCryptoBox>>,
+    sc2_crypto: Option<Box<sc::ScCrypto2Box>>,
     sc_event_h: Option<Box<sc::ScEventBox>>,
 }
 
@@ -124,6 +125,7 @@ impl Acu {
             reply_h: None,
             timeout_h: None,
             sc_crypto: None,
+            sc2_crypto: None,
             sc_event_h: None,
         }
     }
@@ -280,6 +282,43 @@ impl Acu {
     /// Channel session (SCS_15..18 traffic permitted).
     pub fn is_pd_sc_established(&self, pd_address: u8) -> bool {
         unsafe { sys::osdp_acu_is_pd_sc_established(&*self.inner, pd_address) }
+    }
+
+    // ---- Secure Channel 2 configuration -------------------------------
+    //
+    // Parallel to the SC1 setters. SC2 is device-key only (no SCBK-D).
+    // The shared SC event handler (set via `set_sc_event_handler`)
+    // reports SC2 outcomes too.
+
+    /// Bind the SC2 crypto provider (KMAC256 + AES-256-GCM + AES-256
+    /// block + RNG) used across every SC2 session the ACU negotiates.
+    pub fn set_sc2_crypto<C: ScCrypto2>(&mut self, crypto: C) {
+        let boxed: sc::ScCrypto2Box = Box::new(crypto);
+        let (vtable, user) = sc::build_vtable2(boxed);
+        unsafe { sys::osdp_acu_set_sc2_crypto(&mut *self.inner, &vtable) };
+        self.sc2_crypto = Some(unsafe { Box::from_raw(user as *mut sc::ScCrypto2Box) });
+    }
+
+    /// Set the 32-byte AES-256 SC2 base key (SCBK) for the registered
+    /// PD at `pd_address`.
+    pub fn set_pd_sc2_scbk(&mut self, pd_address: u8, scbk: &[u8; SC2_KEY_LEN]) -> Result<()> {
+        let s =
+            unsafe { sys::osdp_acu_set_pd_sc2_scbk(&mut *self.inner, pd_address, scbk.as_ptr()) };
+        Error::from_status(s)
+    }
+
+    /// Initiate an OSDP-SC2 handshake with `pd_address`. Sends CHLNG
+    /// (SCS_21) immediately; the outcome is delivered via the SC event
+    /// handler. Same error contract as [`Self::start_sc_handshake`].
+    pub fn start_sc2_handshake(&mut self, pd_address: u8) -> Result<()> {
+        let s = unsafe { sys::osdp_acu_start_sc2_handshake(&mut *self.inner, pd_address) };
+        Error::from_status(s)
+    }
+
+    /// True iff `pd_address`'s slot has a fully-established SC2 session
+    /// (SCS_25..28 traffic permitted).
+    pub fn is_pd_sc2_established(&self, pd_address: u8) -> bool {
+        unsafe { sys::osdp_acu_is_pd_sc2_established(&*self.inner, pd_address) }
     }
 }
 

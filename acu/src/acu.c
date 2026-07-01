@@ -9,6 +9,7 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
 
 #include <string.h>
 
@@ -240,21 +241,32 @@ static void process_reply(osdp_acu_t *acu, const osdp_frame_t *frame)
      * gate on ESTABLISHED so the handshake's own SQN=0 echo (CHLNG
      * → CCRYPT, both at SQN=0 on a fresh slot) doesn't loop back as
      * a reset. */
-    if (frame->sequence == 0U &&
-        slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
-        osdp_acu_internal_terminate_sc(acu, slot);
-        return;
+    if (frame->sequence == 0U) {
+        if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+            osdp_acu_internal_terminate_sc(acu, slot);
+            return;
+        }
+        if (slot->sc2_phase == OSDP_ACU_SC_ESTABLISHED) {
+            osdp_acu_internal_terminate_sc2(acu, slot);
+            return;
+        }
     }
 
     /* Spec D.1.4: once the secure channel is established, a non-BUSY
      * plaintext reply terminates the session. The PD is misbehaving
      * (or the session got out of sync); reset and let the application
      * re-handshake. BUSY (0x79) is exempted by the spec because the
-     * PD signals "I can't reply right now" without exiting SC. */
-    if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED &&
-        frame->code != OSDP_REPLY_BUSY) {
-        osdp_acu_internal_terminate_sc(acu, slot);
-        return;
+     * PD signals "I can't reply right now" without exiting SC. The
+     * same rule applies to an established SC2 slot. */
+    if (frame->code != OSDP_REPLY_BUSY) {
+        if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+            osdp_acu_internal_terminate_sc(acu, slot);
+            return;
+        }
+        if (slot->sc2_phase == OSDP_ACU_SC_ESTABLISHED) {
+            osdp_acu_internal_terminate_sc2(acu, slot);
+            return;
+        }
     }
 
     /* If we are not waiting for a reply from this PD, the reply is
@@ -323,6 +335,9 @@ static void scan_timeouts_and_offline(osdp_acu_t *acu)
                 slot->online = false;
                 if (slot->sc_phase != OSDP_ACU_SC_IDLE) {
                     osdp_acu_internal_terminate_sc(acu, slot);
+                }
+                if (slot->sc2_phase != OSDP_ACU_SC_IDLE) {
+                    osdp_acu_internal_terminate_sc2(acu, slot);
                 }
             }
         }
@@ -444,7 +459,16 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
      * coerces to SCS_15 for empty payloads (project convention from
      * spec D.1.4) and would coerce the other way too if a caller
      * passed SCS_15 with data. */
-    if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
+    if (slot->sc2_phase == OSDP_ACU_SC_ESTABLISHED) {
+        /* SC2: always the encrypted command variant (SCS_27); the
+         * command/reply code is encrypted with the data. */
+        frame.has_scb    = true;
+        frame.scb_length = OSDP_SCB_MIN_LEN;
+        frame.scb_type   = OSDP_SCS_27;
+        br = osdp_sc2_wrap_frame(&acu->sc2_crypto, &slot->sc2_session,
+                                 &frame, acu->tx_buf, sizeof(acu->tx_buf),
+                                 &written);
+    } else if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
         frame.has_scb     = true;
         frame.scb_length  = OSDP_SCB_MIN_LEN;
         frame.scb_type    = OSDP_SCS_17;
@@ -540,6 +564,23 @@ void osdp_acu_tick(osdp_acu_t *acu)
             case OSDP_SCS_18:
                 if (slot->sc_phase == OSDP_ACU_SC_ESTABLISHED) {
                     osdp_acu_internal_handle_sc_reply(acu, slot, &frame);
+                }
+                break;
+            /* SC2 (SCS_22..28), routed by sc2_phase. */
+            case OSDP_SCS_22:
+                if (slot->sc2_phase == OSDP_ACU_SC_AWAITING_CCRYPT) {
+                    osdp_acu_internal_handle_ccrypt2(acu, slot, &frame);
+                }
+                break;
+            case OSDP_SCS_24:
+                if (slot->sc2_phase == OSDP_ACU_SC_AWAITING_RMAC_I) {
+                    osdp_acu_internal_handle_rmac_i2(acu, slot, &frame);
+                }
+                break;
+            case OSDP_SCS_26:
+            case OSDP_SCS_28:
+                if (slot->sc2_phase == OSDP_ACU_SC_ESTABLISHED) {
+                    osdp_acu_internal_handle_sc2_reply(acu, slot, &frame);
                 }
                 break;
             default:
@@ -706,4 +747,56 @@ bool osdp_acu_is_pd_sc_established(const osdp_acu_t *acu,
     const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
                                                                 pd_address);
     return slot != NULL && slot->sc_phase == OSDP_ACU_SC_ESTABLISHED;
+}
+
+/* ---- Secure Channel 2 API ----------------------------------------------*/
+
+void osdp_acu_set_sc2_crypto(osdp_acu_t               *acu,
+                             const osdp_sc2_crypto_t  *crypto)
+{
+    if (acu == NULL || crypto == NULL) {
+        return;
+    }
+    acu->sc2_crypto     = *crypto;
+    acu->sc2_crypto_set = true;
+}
+
+osdp_status_t osdp_acu_set_pd_sc2_scbk(osdp_acu_t   *acu,
+                                       uint8_t       pd_address,
+                                       const uint8_t scbk[OSDP_SC2_KEY_LEN])
+{
+    if (acu == NULL || scbk == NULL) return OSDP_ERR_INVALID_ARG;
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) return OSDP_ERR_INVALID_ARG;
+    (void)memcpy(slot->sc2_scbk, scbk, OSDP_SC2_KEY_LEN);
+    slot->sc2_scbk_set = true;
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_acu_start_sc2_handshake(osdp_acu_t *acu,
+                                           uint8_t     pd_address)
+{
+    if (acu == NULL) return OSDP_ERR_INVALID_ARG;
+    osdp_acu_pd_slot_t *slot = find_slot_by_address(acu, pd_address);
+    if (slot == NULL) return OSDP_ERR_INVALID_ARG;
+    if (acu->transport.write == NULL) return OSDP_ERR_INVALID_ARG;
+    if (!osdp_acu_internal_sc2_configured(acu, slot)) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (slot->waiting) {
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+    osdp_sc2_session_init(&slot->sc2_session);
+    slot->sc2_phase = OSDP_ACU_SC_IDLE;
+
+    return osdp_acu_internal_send_chlng2(acu, slot);
+}
+
+bool osdp_acu_is_pd_sc2_established(const osdp_acu_t *acu,
+                                   uint8_t           pd_address)
+{
+    if (acu == NULL) return false;
+    const osdp_acu_pd_slot_t *slot = find_slot_by_address_const(acu,
+                                                                pd_address);
+    return slot != NULL && slot->sc2_phase == OSDP_ACU_SC_ESTABLISHED;
 }

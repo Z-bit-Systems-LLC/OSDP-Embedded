@@ -202,6 +202,239 @@ unsafe extern "C" fn rand_thunk(user: *mut c_void, out: *mut u8, len: usize) -> 
     }
 }
 
+// ========================================================================
+// Secure Channel 2 (AES-256-GCM + KMAC256)
+// ========================================================================
+
+/// Length of an SC2 base key (SCBK) in bytes (AES-256).
+pub const SC2_KEY_LEN: usize = sys::OSDP_SC2_KEY_LEN;
+/// Length of the SC2 cUID in bytes.
+pub const SC2_CUID_LEN: usize = sys::OSDP_SC2_CUID_LEN;
+/// AES-256-GCM nonce length in bytes.
+pub const SC2_NONCE_LEN: usize = sys::OSDP_SC2_NONCE_LEN;
+/// AES-256-GCM tag length in bytes.
+pub const SC2_TAG_LEN: usize = sys::OSDP_SC2_TAG_LEN;
+
+/// Application-supplied crypto provider for OSDP-SC2. One instance per
+/// peer. Unlike [`ScCrypto`] (SC1, AES-128 + custom MAC), SC2 needs an
+/// AEAD (AES-256-GCM), a KMAC256, and a raw AES-256 block. Implementers
+/// on hosted targets typically wrap the [`aes-gcm`](https://crates.io/crates/aes-gcm),
+/// [`aes`](https://crates.io/crates/aes), and a SHA-3/KMAC crate; on
+/// bare metal, a hardware AES-GCM peripheral plus a compact Keccak.
+pub trait ScCrypto2: 'static {
+    /// KMAC256 (empty customization) over `data` keyed by `key`, writing
+    /// `out.len()` bytes (SC2 always requests 32).
+    fn kmac256(&mut self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<()>;
+
+    /// AES-256-GCM encrypt: `ct` receives `pt.len()` bytes, `tag` the
+    /// 16-byte authentication tag, over additional data `aad`.
+    fn aes256_gcm_encrypt(
+        &mut self,
+        key: &[u8; SC2_KEY_LEN],
+        nonce: &[u8; SC2_NONCE_LEN],
+        aad: &[u8],
+        pt: &[u8],
+        ct: &mut [u8],
+        tag: &mut [u8; SC2_TAG_LEN],
+    ) -> Result<()>;
+
+    /// AES-256-GCM decrypt + verify. Returns `Err(BadCrc)` on tag
+    /// mismatch; on success `pt` receives `ct.len()` bytes.
+    fn aes256_gcm_decrypt(
+        &mut self,
+        key: &[u8; SC2_KEY_LEN],
+        nonce: &[u8; SC2_NONCE_LEN],
+        aad: &[u8],
+        ct: &[u8],
+        tag: &[u8; SC2_TAG_LEN],
+        pt: &mut [u8],
+    ) -> Result<()>;
+
+    /// Encrypt one 16-byte block with a 256-bit key (raw AES-256 ECB),
+    /// used for nonce derivation and the CBC-chained cryptograms.
+    fn aes256_ecb_encrypt(
+        &mut self,
+        key: &[u8; SC2_KEY_LEN],
+        in_: &[u8; 16],
+        out: &mut [u8; 16],
+    ) -> Result<()>;
+
+    /// Fill `out` with cryptographically-random bytes (16-byte RND.A on
+    /// the ACU, RND.B on the PD). Default impl returns `Err(NotSupported)`.
+    fn rand_bytes(&mut self, _out: &mut [u8]) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+pub(crate) type ScCrypto2Box = Box<dyn ScCrypto2>;
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+/// Build a C `osdp_sc2_crypto_t` routing into the supplied trait object.
+/// Returns the raw user pointer the caller must reclaim (via
+/// `Box::from_raw`) and stash inside the owning struct.
+pub(crate) fn build_vtable2(crypto: ScCrypto2Box) -> (sys::osdp_sc2_crypto_t, *mut c_void) {
+    let boxed: Box<ScCrypto2Box> = Box::new(crypto);
+    let user = Box::into_raw(boxed) as *mut c_void;
+    let v = sys::osdp_sc2_crypto_t {
+        kmac256: Some(kmac_thunk),
+        aes256_gcm_encrypt: Some(gcm_encrypt_thunk),
+        aes256_gcm_decrypt: Some(gcm_decrypt_thunk),
+        aes256_ecb_encrypt: Some(ecb2_thunk),
+        rand_bytes: Some(rand2_thunk),
+        user,
+    };
+    (v, user)
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn kmac_thunk(
+    user: *mut c_void,
+    key: *const u8,
+    key_len: usize,
+    data: *const u8,
+    data_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut ScCrypto2Box);
+    let key = core::slice::from_raw_parts(key, key_len);
+    let data = core::slice::from_raw_parts(data, data_len);
+    let out = core::slice::from_raw_parts_mut(out, out_len);
+    match storage.kmac256(key, data, out) {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn gcm_encrypt_thunk(
+    user: *mut c_void,
+    key: *const u8,
+    nonce: *const u8,
+    aad: *const u8,
+    aad_len: usize,
+    pt: *const u8,
+    pt_len: usize,
+    ct: *mut u8,
+    tag: *mut u8,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut ScCrypto2Box);
+    let mut key_arr = [0u8; SC2_KEY_LEN];
+    let mut nonce_arr = [0u8; SC2_NONCE_LEN];
+    ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), SC2_KEY_LEN);
+    ptr::copy_nonoverlapping(nonce, nonce_arr.as_mut_ptr(), SC2_NONCE_LEN);
+    let aad = if aad_len > 0 {
+        core::slice::from_raw_parts(aad, aad_len)
+    } else {
+        &[]
+    };
+    // Copy plaintext to an owned buffer so `ct` may alias `pt`.
+    let mut pt_buf = alloc::vec![0u8; pt_len];
+    if pt_len > 0 {
+        ptr::copy_nonoverlapping(pt, pt_buf.as_mut_ptr(), pt_len);
+    }
+    let mut ct_buf = alloc::vec![0u8; pt_len];
+    let mut tag_arr = [0u8; SC2_TAG_LEN];
+    let r = storage.aes256_gcm_encrypt(
+        &key_arr,
+        &nonce_arr,
+        aad,
+        &pt_buf,
+        &mut ct_buf,
+        &mut tag_arr,
+    );
+    if r.is_ok() {
+        if pt_len > 0 {
+            ptr::copy_nonoverlapping(ct_buf.as_ptr(), ct, pt_len);
+        }
+        ptr::copy_nonoverlapping(tag_arr.as_ptr(), tag, SC2_TAG_LEN);
+    }
+    match r {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn gcm_decrypt_thunk(
+    user: *mut c_void,
+    key: *const u8,
+    nonce: *const u8,
+    aad: *const u8,
+    aad_len: usize,
+    ct: *const u8,
+    ct_len: usize,
+    tag: *const u8,
+    pt: *mut u8,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut ScCrypto2Box);
+    let mut key_arr = [0u8; SC2_KEY_LEN];
+    let mut nonce_arr = [0u8; SC2_NONCE_LEN];
+    let mut tag_arr = [0u8; SC2_TAG_LEN];
+    ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), SC2_KEY_LEN);
+    ptr::copy_nonoverlapping(nonce, nonce_arr.as_mut_ptr(), SC2_NONCE_LEN);
+    ptr::copy_nonoverlapping(tag, tag_arr.as_mut_ptr(), SC2_TAG_LEN);
+    let aad = if aad_len > 0 {
+        core::slice::from_raw_parts(aad, aad_len)
+    } else {
+        &[]
+    };
+    let mut ct_buf = alloc::vec![0u8; ct_len];
+    if ct_len > 0 {
+        ptr::copy_nonoverlapping(ct, ct_buf.as_mut_ptr(), ct_len);
+    }
+    let mut pt_buf = alloc::vec![0u8; ct_len];
+    let r = storage.aes256_gcm_decrypt(&key_arr, &nonce_arr, aad, &ct_buf, &tag_arr, &mut pt_buf);
+    if r.is_ok() && ct_len > 0 {
+        ptr::copy_nonoverlapping(pt_buf.as_ptr(), pt, ct_len);
+    }
+    match r {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+unsafe extern "C" fn ecb2_thunk(
+    user: *mut c_void,
+    key: *const u8,
+    in_: *const u8,
+    out: *mut u8,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut ScCrypto2Box);
+    let mut key_arr = [0u8; SC2_KEY_LEN];
+    let mut in_arr = [0u8; 16];
+    ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), SC2_KEY_LEN);
+    ptr::copy_nonoverlapping(in_, in_arr.as_mut_ptr(), 16);
+    let mut out_arr = [0u8; 16];
+    let r = storage.aes256_ecb_encrypt(&key_arr, &in_arr, &mut out_arr);
+    if r.is_ok() {
+        ptr::copy_nonoverlapping(out_arr.as_ptr(), out, 16);
+    }
+    match r {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
+#[cfg(any(feature = "pd", feature = "acu"))]
+unsafe extern "C" fn rand2_thunk(
+    user: *mut c_void,
+    out: *mut u8,
+    len: usize,
+) -> sys::osdp_status_t {
+    let storage = &mut *(user as *mut ScCrypto2Box);
+    let slice = core::slice::from_raw_parts_mut(out, len);
+    match storage.rand_bytes(slice) {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
 // ---- ACU-side SC events ------------------------------------------------
 //
 // SC handshake outcomes are reported by the ACU only - the PD's

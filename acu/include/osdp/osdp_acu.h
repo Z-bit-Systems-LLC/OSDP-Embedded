@@ -8,6 +8,8 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
+#include "osdp/osdp_sc2_crypto.h"
 #include "osdp/osdp_sc_crypto.h"
 #include "osdp/osdp_stream.h"
 #include "osdp/osdp_types.h"
@@ -178,6 +180,19 @@ typedef struct osdp_acu_pd_slot {
     /* Operational session. Populated when sc_phase becomes ESTABLISHED;
      * keys + rolling MAC chain live in here. Phase 5b will use it. */
     osdp_sc_session_t     sc_session;
+
+    /* ---- Secure Channel 2 state (opt-in via osdp_acu_set_pd_sc2_scbk).
+     * Parallel to the SC1 fields above but for OSDP-SC2 (AES-256-GCM /
+     * KMAC256). SC2 is device-key only — no SCBK-D. A slot uses either
+     * SC1 or SC2, never both at once; sc2_phase reuses the SC1 phase
+     * enum (IDLE → AWAITING_CCRYPT → AWAITING_RMAC_I → ESTABLISHED). */
+    bool                  sc2_scbk_set;
+    uint8_t               sc2_scbk[OSDP_SC2_KEY_LEN];
+    osdp_acu_sc_phase_t   sc2_phase;
+    uint8_t               sc2_rnd_a[OSDP_SC2_RND_LEN];
+    uint8_t               sc2_rnd_b[OSDP_SC2_RND_LEN];
+    uint8_t               sc2_cuid [OSDP_SC2_CUID_LEN];
+    osdp_sc2_session_t    sc2_session;
 } osdp_acu_pd_slot_t;
 
 /* ---- Reply / timeout events --------------------------------------------*/
@@ -327,7 +342,13 @@ typedef struct osdp_acu {
     osdp_sc_crypto_t            sc_crypto;
     bool                        sc_crypto_set;
 
-    /* SC event callback — fires on handshake completion or failure. */
+    /* Secure Channel 2 HAL — one shared SC2 crypto vtable across slots. */
+    osdp_sc2_crypto_t           sc2_crypto;
+    bool                        sc2_crypto_set;
+
+    /* SC event callback — fires on handshake completion or failure.
+     * Shared by SC1 and SC2 (the event carries only the PD address and
+     * kind, not which channel version). */
     osdp_acu_sc_event_cb        sc_event_cb;
     void                       *sc_event_user;
 
@@ -486,6 +507,34 @@ osdp_status_t osdp_acu_start_sc_handshake(osdp_acu_t *acu,
 /* True iff the PD slot's SC session has reached the ESTABLISHED
  * phase (both peers have valid keys and a matching Initial R-MAC). */
 bool osdp_acu_is_pd_sc_established(const osdp_acu_t *acu,
+                                   uint8_t           pd_address);
+
+/* ---- Secure Channel 2 configuration ------------------------------------
+ *
+ * Parallel to the SC1 setters, independent and opt-in. SC2 is
+ * device-key only (no SCBK-D). Bind the SC2 crypto vtable + a per-PD
+ * 32-byte SCBK, then call osdp_acu_start_sc2_handshake. The shared
+ * sc_event handler reports the result. */
+
+/* Bind the SC2 crypto HAL (KMAC256 + AES-256-GCM + AES-256 block +
+ * RNG) used for every SC2 operation across every PD. Copied. */
+void osdp_acu_set_sc2_crypto(osdp_acu_t               *acu,
+                             const osdp_sc2_crypto_t  *crypto);
+
+/* Set the per-PD 32-byte AES-256 SCBK for SC2. */
+osdp_status_t osdp_acu_set_pd_sc2_scbk(osdp_acu_t   *acu,
+                                       uint8_t       pd_address,
+                                       const uint8_t scbk[OSDP_SC2_KEY_LEN]);
+
+/* Initiate an OSDP-SC2 handshake with the given PD: sends CHLNG
+ * (SCS_21) immediately; subsequent ticks drive CCRYPT → SCRYPT →
+ * RMAC_I and fire the sc_event handler. Same return contract as
+ * osdp_acu_start_sc_handshake. */
+osdp_status_t osdp_acu_start_sc2_handshake(osdp_acu_t *acu,
+                                           uint8_t     pd_address);
+
+/* True iff the PD slot's SC2 session has reached ESTABLISHED. */
+bool osdp_acu_is_pd_sc2_established(const osdp_acu_t *acu,
                                    uint8_t           pd_address);
 
 #ifdef __cplusplus

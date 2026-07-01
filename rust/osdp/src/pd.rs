@@ -54,7 +54,7 @@ use core::slice;
 use crate::sys;
 
 use crate::error::{Error, Result};
-use crate::sc::{self, ScCrypto, SC_CUID_LEN, SC_KEY_LEN};
+use crate::sc::{self, ScCrypto, ScCrypto2, SC2_CUID_LEN, SC2_KEY_LEN, SC_CUID_LEN, SC_KEY_LEN};
 // Hoisted at the crate root - same trait shape worked for both Pd and
 // Acu, no reason to keep duplicates. Re-exported here so consumers can
 // still write `osdp_embedded::pd::Transport` if they prefer the
@@ -195,6 +195,9 @@ pub struct Pd {
     /// keep the trait-object box alive so the user pointer in that
     /// copy stays valid.
     sc_crypto: Option<Box<sc::ScCryptoBox>>,
+    /// Same arrangement for the SC2 crypto vtable
+    /// (`osdp_pd_t.sc2.crypto`).
+    sc2_crypto: Option<Box<sc::ScCrypto2Box>>,
 }
 
 impl Pd {
@@ -210,6 +213,7 @@ impl Pd {
             led_handler: None,
             buzzer_handler: None,
             sc_crypto: None,
+            sc2_crypto: None,
         }
     }
 
@@ -358,6 +362,40 @@ impl Pd {
     /// the PD is ready to handle SCS_15..18 operational traffic.
     pub fn sc_established(&self) -> bool {
         unsafe { sys::osdp_pd_sc_established(&*self.inner) }
+    }
+
+    // ---- Secure Channel 2 configuration -------------------------------
+    //
+    // Parallel to the SC1 setters. SC2 is device-key only (no SCBK-D);
+    // the PD accepts SCS_21..28 frames once the SC2 crypto vtable, the
+    // 32-byte SCBK, and the cUID are all set.
+
+    /// Bind the SC2 crypto provider (KMAC256 + AES-256-GCM + AES-256
+    /// block + RNG). Replaces any previously-bound SC2 provider.
+    pub fn set_sc2_crypto<C: ScCrypto2>(&mut self, crypto: C) {
+        let boxed: sc::ScCrypto2Box = Box::new(crypto);
+        let (vtable, user) = sc::build_vtable2(boxed);
+        unsafe {
+            sys::osdp_pd_set_sc2_crypto(&mut *self.inner, &vtable);
+        }
+        self.sc2_crypto = Some(unsafe { Box::from_raw(user as *mut sc::ScCrypto2Box) });
+    }
+
+    /// Set the per-PD 32-byte AES-256 SC2 base key (SCBK).
+    pub fn set_sc2_scbk(&mut self, scbk: &[u8; SC2_KEY_LEN]) {
+        unsafe { sys::osdp_pd_set_sc2_scbk(&mut *self.inner, scbk.as_ptr()) };
+    }
+
+    /// Set the SC2 cUID — the PD's 8-byte client UID (part of every
+    /// SC2 message nonce).
+    pub fn set_sc2_cuid(&mut self, cuid: &[u8; SC2_CUID_LEN]) {
+        unsafe { sys::osdp_pd_set_sc2_cuid(&mut *self.inner, cuid.as_ptr()) };
+    }
+
+    /// True iff the SCS_21..24 handshake completed and the PD is ready
+    /// to handle SCS_25..28 operational traffic.
+    pub fn sc2_established(&self) -> bool {
+        unsafe { sys::osdp_pd_sc2_established(&*self.inner) }
     }
 
     /// Which Secure Channel key the **current session** is running under,

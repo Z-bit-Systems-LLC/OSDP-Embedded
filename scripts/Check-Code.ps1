@@ -22,6 +22,7 @@
         7. cargo test   --release     (workspace)
         8. cargo run    --example loopback
         9. cargo run    --example loopback_sc
+       10. cargo run    --example loopback_sc2
 
     Every gate runs even if an earlier one fails (dependent steps are
     skipped, not silently passed), so a single invocation surfaces all
@@ -284,11 +285,16 @@ try {
             Invoke-Gate 'cargo run --example loopback_sc' {
                 cargo run --manifest-path $rustToml --release --example loopback_sc
             } | Out-Null
+
+            Invoke-Gate 'cargo run --example loopback_sc2' {
+                cargo run --manifest-path $rustToml --release --example loopback_sc2
+            } | Out-Null
         }
         else {
             Skip-Gate 'cargo test --workspace --release' 'build failed'
-            Skip-Gate 'cargo run --example loopback'     'build failed'
-            Skip-Gate 'cargo run --example loopback_sc'  'build failed'
+            Skip-Gate 'cargo run --example loopback'      'build failed'
+            Skip-Gate 'cargo run --example loopback_sc'   'build failed'
+            Skip-Gate 'cargo run --example loopback_sc2'  'build failed'
         }
     }
 }

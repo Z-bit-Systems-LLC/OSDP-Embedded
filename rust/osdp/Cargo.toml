@@ -79,6 +79,10 @@ acu = []
 # library proper.
 [dev-dependencies]
 aes = "0.8"
+# SC2 loopback example only: AES-256-GCM (RustCrypto) and KMAC256
+# (tiny-keccak) to back the ScCrypto2 trait. Never in the library.
+aes-gcm = "0.10"
+tiny-keccak = { version = "2", features = ["kmac"] }
 
 [build-dependencies]
 cc = "1.0"
@@ -97,4 +101,8 @@ required-features = ["pd", "acu"]
 
 [[example]]
 name              = "loopback_sc"
+required-features = ["pd", "acu"]
+
+[[example]]
+name              = "loopback_sc2"
 required-features = ["pd", "acu"]

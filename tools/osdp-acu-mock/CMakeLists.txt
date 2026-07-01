@@ -15,6 +15,7 @@
 add_executable(osdp-acu-mock
     main.c
     aes_adapter.c
+    sc2_adapter.c
 )
 
 if(WIN32)
@@ -30,6 +31,8 @@ target_link_libraries(osdp-acu-mock PRIVATE
     osdp_messages
     osdp_acu
     tiny_aes
+    tiny_gcm
+    tiny_kmac
 )
 
 target_include_directories(osdp-acu-mock PRIVATE

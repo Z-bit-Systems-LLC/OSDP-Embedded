@@ -110,6 +110,13 @@ target_link_libraries(test_pd_sc2 PRIVATE
     osdp_core osdp_messages osdp_pd sc2_test_crypto unity)
 add_test(NAME test_pd_sc2 COMMAND test_pd_sc2)
 
+# PD↔ACU SC2 loopback: both real state machines through a shared wire,
+# full handshake + operational SCS_25..28 + session-loss.
+add_executable(test_loopback_sc2 test_loopback_sc2.c)
+target_link_libraries(test_loopback_sc2 PRIVATE
+    osdp_core osdp_messages osdp_pd osdp_acu sc2_test_crypto unity)
+add_test(NAME test_loopback_sc2 COMMAND test_loopback_sc2)
+
 # PD-side SC handshake test needs both osdp_pd and the SC test
 # crypto adapter.
 add_executable(test_pd_sc test_pd_sc.c)

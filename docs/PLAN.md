@@ -368,6 +368,56 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
 - Card-read format/parity options (today the value is sent MSB-aligned as
   Wiegand without computed parity, matching the `inject_raw` tool).
 
+## Iteration 7 — Secure Channel 2 (in progress)
+
+**Goal:** OSDP-SC2, the quantum-resistant secure channel (AES-256-GCM
+message protection + KMAC256-derived session keys), as a **parallel**
+implementation to SC1 in the SCS_21..28 security-block range. Agreed
+2026-07-01. Verified against the OSDP.Net `feature/osdp-sc2` reference
+and the OSDP-SC2 annex sample-session vectors.
+
+Locked decisions: AES-256-GCM is a **HAL callback** (the core never
+implements GHASH); KMAC256 + AES-256 block are HAL callbacks too;
+**separate `osdp_sc2_*` types** (not extensions of the SC1 vtable/
+session); device-specific-key only (no SCBK-D install mode); no SC1/SC2
+negotiation (the ACU picks via the CHLNG SCB type).
+
+- ☑ **Phase 0: Frame layer.** `OSDP_SCS_21..28`; `osdp_scb_mac_len()`
+  returns the trailing-tag size per SCB type (4 B SC1 / 16 B SC2 GCM
+  tag); `osdp_scb_is_encrypted` covers SCS_27/28. For SCS_27/28 the
+  command/reply CODE byte is inside the ciphertext.
+- ☑ **Phase 1: Crypto HAL + primitives.** `osdp_sc2_crypto.h`
+  (kmac256 / aes256_gcm_encrypt+decrypt / aes256_ecb_encrypt / rand),
+  `osdp_sc2.h`, `core/src/sc2/{keys,crypto,session}.c`: KMAC256 session
+  keys, AES-256-CBC (chained) client/server cryptograms, nonce from
+  cUID + shared counter. Test/tool backend: vendored `vendor/tiny-kmac`
+  (Keccak-f1600 + cSHAKE256 + KMAC256), `vendor/tiny-gcm` (AES-256-GCM
+  over `tiny_aes256`; the AES-256 build renames its symbols so one
+  binary can link both AES sizes). Known-answer tests match the annex
+  (S-ENC, S-NONCE, both cryptograms, nonce@0).
+- ☑ **Phase 2: GCM wrap/unwrap + session.** `core/src/sc2/wrap.c`:
+  AAD = the 7-byte header incl. security block; shared message counter
+  advances on both wrap and unwrap. Reproduces both annex operational
+  frames (POLL@0, ACK@1) byte-for-byte incl. GCM tag and CRC.
+- ☑ **Phase 3: PD side.** `pd/src/pd_sc2.c` (SCS_21..24 handshake +
+  SCS_25..28 operational), `osdp_pd_set_sc2_*` API, KEYSET KeyType 0x02
+  (32-byte SCBK). **Live-validated against OSDP.Net's SC2 ACU** over a
+  serial pair via `osdp-pd-mock --sc=scbk2:HEX64`.
+- ☑ **Phase 4: ACU side.** `acu/src/acu_sc2.c`,
+  `osdp_acu_start_sc2_handshake`, transparent SCS_27 wrap of every
+  command once ESTABLISHED, SC2 session-loss (GCM auth fail / plaintext
+  during established / SQN=0 reset / offline timeout). `osdp-acu-mock
+  --sc=scbk2:HEX64` for live interop against OSDP.Net PDConsole.
+- ☑ **Phase 5: PD↔ACU SC2 loopback.** `tests/test_loopback_sc2.c`:
+  both real state machines complete the handshake, round-trip
+  POLL/ID/CAP under SCS_27/28, keep the shared counter in lockstep
+  across 8 commands, and the ACU tears down on a tampered tag and on
+  offline timeout — the validated PD exercising the ACU end to end.
+- ☐ **Phase 6: Rust + MCP + docs.** FFI mirrors (`sys.rs`) and the C
+  source list (`build.rs`) grown for SC2 (required — a stale mirror is
+  heap corruption). Safe Rust SC2 API and osdp-mcp `scbk2` mode still
+  to come.
+
 ## Iteration 6+ — Optional extensions (not yet planned)
 
 - File transfer, biometric, keypad extensions, manufacturer-specific
@@ -375,3 +425,5 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
 - Full-capture replay: extend `test_capture_replay` from the handshake
   alone (SCS_11..14) to all 592 frames in `sc-monitor-current.osdpcap`,
   including SCS_15..18 operational traffic.
+- SC2: SCS_25/26 (authenticated-only, dev/test) interop validation
+  against OSDP.Net; SC2 session-expiry counter-rollover handling.
