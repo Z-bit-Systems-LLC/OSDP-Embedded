@@ -1138,6 +1138,71 @@ static void test_keyset_with_malformed_payload_naks_and_preserves_scbk(void)
     TEST_ASSERT_EQUAL_MEMORY(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
 }
 
+/* A KEYSET whose envelope is well-formed (key_length matches the trailing
+ * bytes) but whose key_type is not SCBK is a *recognized* command with an
+ * invalid record — spec Table 47 error 0x09 "Unable to process command
+ * record", NOT 0x03 "Unknown Command Code" (KEYSET is implemented). The
+ * PD must NAK 0x09 and leave the stored SCBK untouched. */
+static void test_keyset_unsupported_key_type_naks_0x09(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, keyset_friendly_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    uint8_t scbk_before[OSDP_SC_KEY_LEN];
+    (void)memcpy(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
+
+    /* key_type 0x02 (not SCBK), key_length 16, 16 bytes of key material.
+     * The envelope is internally consistent, so the decoder accepts it;
+     * apply_keyset rejects the unsupported key_type. */
+    uint8_t bad_type_payload[OSDP_KEYSET_HEADER_BYTES + OSDP_SC_KEY_LEN];
+    bad_type_payload[0] = 0x02;
+    bad_type_payload[1] = OSDP_SC_KEY_LEN;
+    for (size_t i = 0; i < OSDP_SC_KEY_LEN; ++i) {
+        bad_type_payload[OSDP_KEYSET_HEADER_BYTES + i] = (uint8_t)(0xA0 + i);
+    }
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_KEYSET;
+    cmd_template.payload     = bad_type_payload;
+    cmd_template.payload_len = sizeof(bad_type_payload);
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, plain_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, plain[0]);
+
+    /* Stored SCBK must NOT have changed. */
+    TEST_ASSERT_EQUAL_MEMORY(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
+}
+
 /* ---- Regression: clear-text SQN 0 drops a stale SC session -------------
  *
  * Mirrors OSDP.Net commit 02e478476. A clear-text command at sequence 0
@@ -1262,6 +1327,7 @@ int main(void)
     /* KEYSET runtime rotation. */
     RUN_TEST(test_keyset_under_sc_rotates_scbk_without_restart);
     RUN_TEST(test_keyset_with_malformed_payload_naks_and_preserves_scbk);
+    RUN_TEST(test_keyset_unsupported_key_type_naks_0x09);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_drops_established_session);
     RUN_TEST(test_cleartext_nonzero_sqn_keeps_session);

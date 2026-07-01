@@ -307,9 +307,9 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
             const osdp_status_t ks = osdp_pd_internal_apply_keyset(
                 pd, plaintext, plaintext_len);
             if (ks != OSDP_OK) {
-                nak_byte = (ks == OSDP_ERR_NOT_SUPPORTED)
-                               ? OSDP_NAK_UNKNOWN_CMD
-                               : OSDP_NAK_RECORD_INVALID;
+                /* Any malformed-but-recognized KEYSET is spec Table 47
+                 * error 0x09 "Unable to process command record". */
+                nak_byte = OSDP_NAK_RECORD_INVALID;
                 reply_template.code        = OSDP_REPLY_NAK;
                 reply_template.payload     = &nak_byte;
                 reply_template.payload_len = 1;

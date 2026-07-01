@@ -26,6 +26,7 @@ alongside this guide.
   - [LED observation](#led-observation--osdp_pd_set_led_handler--osdp_pd_led_color)
   - [Buzzer observation](#buzzer-observation--osdp_pd_set_buzzer_handler--osdp_pd_buzzer_sounding)
   - [Secure Channel](#secure-channel--osdp_pd_set_sc_)
+  - [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
 - [Reference tables](#reference-tables)
 - [Try it without hardware](#try-it-without-hardware)
 
@@ -261,13 +262,11 @@ you still just ACK them, and the PD does the right thing on the wire:
 - **`osdp_LED` / `osdp_BUZ`** — the PD transparently decodes these into
   its internal reader-state banks (see the LED/buzzer sections)
   *regardless* of what your handler replies. ACK them.
-- **`osdp_KEYSET`** — if your handler ACKs a well-formed KEYSET
-  (`key_type` = SCBK, length 16), the PD rotates the stored SCBK in place
-  *before* sending the ACK; the new key takes effect on the next
-  handshake while the current SC session keeps running. A malformed
-  KEYSET payload is automatically downgraded from ACK to `NAK 0x09`
-  (`OSDP_NAK_RECORD_INVALID`) and the stored key is left untouched. Your
-  handler doesn't need to know any of this.
+- **`osdp_KEYSET`** — ACK it and the PD rotates the stored Secure Channel
+  Base Key for you; NAK it (or leave it unhandled) and nothing rotates.
+  The rotation happens in RAM only — persisting the new key across a reboot
+  is your job. See [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
+  for the full contract, the exact NAK codes, and the persistence pattern.
 
 ### Sequencing & retransmits are automatic
 
@@ -527,6 +526,104 @@ bool sc_up = osdp_pd_sc_established(&pd);
 > A clear-text command at sequence 0 signals the ACU is (re)starting the
 > connection and drops any stale SC session automatically; the ACU then
 > re-discovers the PD and re-handshakes. You don't manage any of this.
+
+---
+
+## Key rotation with `osdp_KEYSET`
+
+The ACU rotates a PD's Secure Channel Base Key (SCBK) by sending
+`osdp_KEYSET` (0x75) — almost always **inside** an established Secure
+Channel, so the new key never crosses the wire in the clear. The library
+performs the rotation for you, but two things are yours to own: **ACKing
+the command** and **persisting the key**.
+
+### What the library does
+
+When your command handler returns `OSDP_OK` for an `osdp_KEYSET`, the PD —
+*before* it transmits the ACK — decodes the payload and, if it is a
+well-formed 16-byte SCBK (`key_type` = `OSDP_KEYSET_KEY_TYPE_SCBK`,
+`key_length` = 16), overwrites the stored key in `pd.sc.scbk`. The **live
+SC session keeps running untouched**: the session keys, SQN counters, and
+`established` flag are all left alone. The rotated key matters only for the
+*next* handshake, which the ACU initiates whenever it chooses — typically
+right away: it drops the session and re-runs SCS_11..14 requesting the SCBK
+key selector.
+
+> **Observed on the wire.** A KEYSET arrives as an encrypted **SCS_17**
+> frame; the PD answers **ACK under SCS_16** (MAC-only — an empty reply is
+> never encrypted, per spec D.1.4); the ACU then immediately re-handshakes
+> with **key selector 1 (SCBK)** and the session re-establishes on the new
+> key. The re-handshake only succeeds because the PD actually stored the
+> key the KEYSET carried — which is the proof the rotation took effect.
+
+If your handler does **not** ACK the KEYSET (it returns
+`OSDP_ERR_NOT_SUPPORTED`, or no handler is bound), the PD NAKs and
+**nothing rotates**. A PD that wants to support re-keying must therefore
+handle `OSDP_CMD_KEYSET` and return `OSDP_OK`.
+
+### Rejections leave the stored key intact
+
+If the handler ACKs but the payload can't be applied, the PD automatically
+demotes the wire reply from ACK to **`NAK 0x09`
+(`OSDP_NAK_RECORD_INVALID`)** and the stored SCBK is **never overwritten**.
+Every malformed-but-recognized KEYSET maps to 0x09 — the spec's "Unable to
+process command record" (Table 47) — because the PD *does* implement
+KEYSET; 0x03 "Unknown Command Code" is reserved for command codes the PD
+doesn't implement at all. The cases that reject:
+
+| Payload problem                                                                       |
+| ------------------------------------------------------------------------------------- |
+| Envelope malformed — truncated, or the `key_length` field disagrees with the trailing bytes |
+| `key_type` is not SCBK (`0x01`)                                                        |
+| The key is not exactly 16 bytes                                                        |
+
+### Persisting the new key is your job
+
+The library keeps its "no I/O of its own" contract: it rotates the key in
+RAM and never writes it anywhere. On its own, a rotated key is therefore
+lost on the next power cycle, and the PD falls back to whatever key you set
+at boot. To make the rotation survive a reboot, **persist it yourself.**
+
+There is no rotation callback or accessor — the supported hook is the
+command handler, which sees the KEYSET payload *before* the library applies
+it. Decode and store it there, then reload it at boot with
+`osdp_pd_set_sc_scbk`:
+
+```c
+case OSDP_CMD_KEYSET: {
+    osdp_keyset_cmd_t ks;
+    if (osdp_keyset_decode(payload, len, &ks) == OSDP_OK &&
+        ks.key_type   == OSDP_KEYSET_KEY_TYPE_SCBK &&
+        ks.key_length == OSDP_SC_KEY_LEN) {
+        secure_store_scbk(ks.key_data);   /* 16 bytes → your key store */
+    }
+    reply->code = OSDP_REPLY_ACK;         /* library rotates pd.sc.scbk after this returns OK */
+    reply->payload = NULL; reply->payload_len = 0;
+    return OSDP_OK;
+}
+```
+
+Gate your store on the same checks the library uses (SCBK type, 16 bytes)
+so you never persist a key the library then rejects. At startup, load the
+persisted key back *before* the first `CHLNG`:
+
+```c
+uint8_t scbk[OSDP_SC_KEY_LEN];
+if (secure_load_scbk(scbk))                          /* a key was rotated before */
+    osdp_pd_set_sc_scbk(&pd, scbk);
+else
+    osdp_pd_set_sc_scbk_d(&pd, OSDP_SCBK_DEFAULT);   /* still on the install key */
+```
+
+> **Store the key in a secure element, not plaintext flash.** The SCBK is
+> the root of the Secure Channel's confidentiality and authenticity — an
+> attacker who reads it can impersonate the ACU or decrypt traffic. Best
+> practice is to hold it in a secure element / secure key store (ATECC608,
+> SE050, an MCU's protected key slots, a TPM) where the key can be written
+> and used for AES **without ever being read back** into general-purpose
+> memory. If you have no secure element, at minimum use a read-protected /
+> OTP region and lock the debug interface — and never log the key or place
+> it in a world-readable filesystem.
 
 ---
 

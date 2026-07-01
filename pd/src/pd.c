@@ -69,12 +69,16 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
         return s;  /* malformed envelope → caller NAK's */
     }
     if (parsed.key_type != OSDP_KEYSET_KEY_TYPE_SCBK) {
-        /* v2.2 baseline defines only SCBK; reserved key types are
-         * NACK'd so the ACU sees an explicit "I won't apply this". */
-        return OSDP_ERR_NOT_SUPPORTED;
+        /* v2.2 baseline defines only SCBK. A recognized command carrying
+         * an unusable record parameter is spec Table 47 error 0x09
+         * "Unable to process command record" — NOT 0x03, which the spec
+         * reserves for command codes the PD does not implement (and
+         * KEYSET *is* implemented). The caller maps this onto NAK 0x09. */
+        return OSDP_ERR_BAD_PAYLOAD;
     }
     if (parsed.key_length != OSDP_SC_KEY_LEN || parsed.key_data == NULL) {
-        return OSDP_ERR_NOT_SUPPORTED;
+        /* Wrong key size is likewise an invalid record → NAK 0x09. */
+        return OSDP_ERR_BAD_PAYLOAD;
     }
 
     /* Overwrite the stored SCBK and mark it set. The crypto vtable,
@@ -200,10 +204,9 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
             const osdp_status_t ks = osdp_pd_internal_apply_keyset(
                 pd, cmd->payload, cmd->payload_len);
             if (ks != OSDP_OK) {
-                const uint8_t nak_code =
-                    (ks == OSDP_ERR_NOT_SUPPORTED) ? OSDP_NAK_UNKNOWN_CMD
-                                                   : OSDP_NAK_RECORD_INVALID;
-                br = build_nak(pd, cmd, nak_code, &built);
+                /* Any malformed-but-recognized KEYSET is spec Table 47
+                 * error 0x09 "Unable to process command record". */
+                br = build_nak(pd, cmd, OSDP_NAK_RECORD_INVALID, &built);
                 return (br == OSDP_OK) ? built : 0;
             }
         }
