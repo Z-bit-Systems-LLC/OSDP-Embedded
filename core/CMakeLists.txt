@@ -79,6 +79,7 @@ add_library(osdp::messages ALIAS osdp_messages)
 add_library(osdp_pair STATIC
     src/pair/fragment.c
     src/pair/multipart.c
+    src/pair/cbor.c
 )
 
 target_include_directories(osdp_pair
