@@ -482,8 +482,13 @@ Locked decisions (2026-07-05):
   reject, and **fixed-seed ML-DSA-44 demo-CA + ML-KEM-768 public-key hashes
   that match OSDP.Net's published constants byte-for-byte** (PQClean ↔
   BouncyCastle crypto interop confirmed). Whole C suite green.
-- ☐ **Phase 2: Key schedule.** `keyschedule.c`; assert K_m2/3/4 + SCBK vs
-  the fixed vectors; HKDF RFC-5869 sanity vector.
+- ☑ **Phase 2: Key schedule.** `core/src/pair/keyschedule.c`:
+  `osdp_pair_derive_confirm_keys` (K_m2/3/4 from ss + TH2) +
+  `osdp_pair_derive_scbk` (SCBK from ss + TH4), HKDF-SHA256 over the HAL.
+  KAT asserts all four against OSDP.Net's fixed vectors byte-for-byte
+  (`8EAF7FD9..` SCBK). Transcript-hash (TH1..TH4) computation deferred to
+  Phase 3, where the message layer owns the byte spans and it becomes a
+  contiguous one-shot (avoids a big scratch on the one-shot SHA HAL).
 - ☐ **Phase 3: Message codecs.** `messages.c` Msg1/2/3/Result CBOR
   encode/parse; TH1..TH4 span extraction; tampered/negative cases.
 - ☐ **Phase 4: PD side.** PD-responder state machine + `pd/src/pd_pair.c`

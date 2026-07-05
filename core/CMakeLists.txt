@@ -81,6 +81,7 @@ add_library(osdp_pair STATIC
     src/pair/multipart.c
     src/pair/cbor.c
     src/pair/cert.c
+    src/pair/keyschedule.c
 )
 
 target_include_directories(osdp_pair

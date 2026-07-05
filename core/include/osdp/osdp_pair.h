@@ -239,6 +239,55 @@ osdp_status_t osdp_c509_verify(const osdp_pair_crypto_t *crypto,
                                const osdp_c509_cert_t *cert,
                                const uint8_t issuer_pubkey[OSDP_MLDSA44_PK_LEN]);
 
+/* ---- Key schedule -------------------------------------------------------
+ *
+ * The pairing key schedule turns the ML-KEM shared secret `ss` and the
+ * transcript hashes into the three key-confirmation keys and the final SC2
+ * SCBK (HKDF-SHA256, RFC 5869):
+ *
+ *   PRK  = HKDF-Extract(salt = TH2, ikm = ss)
+ *   K_m2 = HKDF-Expand(PRK, "osdp-pair confirm2", 32)
+ *   K_m3 = HKDF-Expand(PRK, "osdp-pair confirm3", 32)
+ *   K_m4 = HKDF-Expand(PRK, "osdp-pair confirm4", 32)
+ *   SCBK = HKDF-Expand(HKDF-Extract(salt = TH4, ikm = ss),
+ *                      "osdp-pair scbk", 32)
+ *
+ * TH2 binds both nonces + both certs; TH4 additionally binds both
+ * signatures and both confirmation MACs, so the SCBK is unique to this
+ * exact pairing. (The transcript hashes themselves are produced by the
+ * message layer, which owns the byte spans they cover.) */
+
+#define OSDP_PAIR_SS_LEN   OSDP_MLKEM_SS_LEN  /* 32 — ML-KEM shared secret */
+#define OSDP_PAIR_SCBK_LEN OSDP_PAIR_HASH_LEN /* 32 — derived SC2 SCBK     */
+
+/* HKDF info labels and the message-signature domain separators. */
+#define OSDP_PAIR_INFO_CONFIRM2   "osdp-pair confirm2"
+#define OSDP_PAIR_INFO_CONFIRM3   "osdp-pair confirm3"
+#define OSDP_PAIR_INFO_CONFIRM4   "osdp-pair confirm4"
+#define OSDP_PAIR_INFO_SCBK       "osdp-pair scbk"
+#define OSDP_PAIR_SIG_DOMAIN_MSG2 "OSDP-PAIR-v1-msg2"
+#define OSDP_PAIR_SIG_DOMAIN_MSG3 "OSDP-PAIR-v1-msg3"
+
+typedef struct osdp_pair_confirm_keys {
+    uint8_t km2[OSDP_PAIR_HASH_LEN];
+    uint8_t km3[OSDP_PAIR_HASH_LEN];
+    uint8_t km4[OSDP_PAIR_HASH_LEN];
+} osdp_pair_confirm_keys_t;
+
+/* Derive the three key-confirmation keys from `ss` and TH2. */
+osdp_status_t osdp_pair_derive_confirm_keys(
+    const osdp_pair_crypto_t *crypto,
+    const uint8_t             ss [OSDP_PAIR_SS_LEN],
+    const uint8_t             th2[OSDP_PAIR_HASH_LEN],
+    osdp_pair_confirm_keys_t *out);
+
+/* Derive the final SC2 SCBK from `ss` and TH4. */
+osdp_status_t osdp_pair_derive_scbk(
+    const osdp_pair_crypto_t *crypto,
+    const uint8_t             ss [OSDP_PAIR_SS_LEN],
+    const uint8_t             th4[OSDP_PAIR_HASH_LEN],
+    uint8_t                   out_scbk[OSDP_PAIR_SCBK_LEN]);
+
 #ifdef __cplusplus
 }
 #endif

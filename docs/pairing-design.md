@@ -429,8 +429,10 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
   KATs: SHA-256 + HKDF RFC-5869 vectors, KEM round trip, C509 thumbprint +
   self-signed verify + tamper-reject, and the fixed-seed ML-DSA-44 /
   ML-KEM-768 pubkey hashes matching OSDP.Net byte-for-byte (§9).
-- **Phase 2 — key schedule.** `keyschedule.c`; assert K_m2/3/4 + SCBK
-  against the fixed vectors (§9). HKDF RFC-5869 sanity vector.
+- **Phase 2 ☑ — key schedule.** `core/src/pair/keyschedule.c`
+  (`osdp_pair_derive_confirm_keys` + `osdp_pair_derive_scbk`, HKDF-SHA256).
+  KAT asserts K_m2/3/4 + SCBK against the fixed vectors (§9) byte-for-byte.
+  TH1..TH4 computation deferred to Phase 3 (message layer owns the spans).
 - **Phase 3 — message codecs.** `messages.c` Msg1/2/3/Result CBOR
   encode/parse; TH1..TH4 span extraction; negative/tampered cases.
 - **Phase 4 — PD side.** `session.c` PD responder + `pd/src/pd_pair.c`
