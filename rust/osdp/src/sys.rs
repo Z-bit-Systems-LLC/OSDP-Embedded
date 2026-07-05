@@ -1054,6 +1054,13 @@ mod pd_ffi {
         pub buzzers: [osdp_pd_buz_slot_t; OSDP_PD_MAX_BUZZERS],
         pub buzzer_cb: osdp_pd_buzzer_cb,
         pub buzzer_user: *mut c_void,
+
+        // Opt-in SC2 asymmetric-pairing driver (osdp::pd_pair). Opaque here;
+        // Rust does not expose pairing yet (that is a later phase), so this is
+        // always null in Rust-driven PDs. Mirrors the trailing `void *pair`
+        // field added to osdp_pd_t — required so the struct size matches the C
+        // side even though the pairing API is not bound.
+        pub pair: *mut c_void,
     }
 
     extern "C" {

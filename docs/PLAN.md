@@ -497,16 +497,22 @@ Locked decisions (2026-07-05):
   round-trip/negative tests (`test_pair_messages.c`) + TH self-consistency
   vs direct concat+SHA256 (`test_pair_crypto.c`). Wire layout + TH spans
   confirmed against OSDP.Net `f0f102bd1` PairingMessages/KeySchedule.cs.
-- ◑ **Phase 4: PD side.** ☑ **Session** — PD-responder state machine in
+- ☑ **Phase 4: PD side.** ☑ **Session** — PD-responder state machine in
   `core/src/pair/session.c` (`osdp_pair_pd_init` / `_process_msg1` /
   `_process_msg3` / `_build_result`): Idle→AwaitMsg3→AwaitPersist→Complete,
   ML-KEM encaps, TH2 sign + Km2 MAC, ACU auth via CA/pinned trust, Msg3
   verify, SCBK derive, mac_R Result; rejection Results on bad cert/protocol.
-  ☐ **Driver** — `pd/src/pd_pair.c` wiring into `osdp::pd` (osdp_PAIR
-  reassembly, 30 s timeout, `on_scbk_established` surfacing the peer
-  identity, opt-in NAK gate) + the §5.1 handoff (Result **inline**, then
-  apply SCBK + require SC2 strictly after it is sent) + Rust FFI struct
-  growth.
+  ☑ **Driver** — `pd/src/pd_pair.c` (new opt-in `osdp::pd_pair` target)
+  wired into `osdp::pd` through a hook pointer on `osdp_pd_t` (so a
+  non-pairing PD links none of it): osdp_PAIR fragment reassembly, Msg2
+  delivered as osdp_PAIRR over successive POLLs, Result inline on the
+  Msg3-completing PAIR, 30 s timeout, opt-in NAK gate, `established`
+  callback surfacing the peer identity, and the §5.1 handoff (SCBK applied
+  to `pd->sc2` in place strictly **after** the Result is transmitted). Rust
+  FFI `sys.rs` grown by the one trailing `pair` pointer (loopback example +
+  suite green). Integration test `tests/test_pd_pair.c`: a real `osdp_pd`
+  completes pairing against a simulated ACU over an in-memory wire and
+  applies the SCBK; a bare PD NAKs osdp_PAIR.
 - ◑ **Phase 5: ACU side.** ☑ **Session** — ACU-initiator state machine in
   `core/src/pair/session.c` (`osdp_pair_acu_init` / `_create_msg1` /
   `_process_msg2` / `_process_result`): Created→AwaitMsg2→AwaitResult→

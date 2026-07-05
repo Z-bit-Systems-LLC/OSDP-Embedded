@@ -34,6 +34,14 @@ osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
                                          uint8_t             error_code,
                                          size_t             *out_len);
 
+/* Build an arbitrary reply (code + payload) into pd->tx_buf, mirroring the
+ * inbound frame's address/sequence/integrity. Shared with the pairing driver
+ * in pd_pair.c (osdp::pd_pair) so it can emit ACK / osdp_PAIRR frames. */
+osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
+                                           const osdp_frame_t    *cmd,
+                                           const osdp_pd_reply_t *reply,
+                                           size_t                *out_len);
+
 /* Process a SCB-bearing inbound frame: handshake messages produce
  * inline replies (built into pd->tx_buf), operational SCS_15..18
  * traffic dispatches into the existing application handler with

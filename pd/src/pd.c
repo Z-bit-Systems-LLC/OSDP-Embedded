@@ -100,6 +100,15 @@ osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
     return build_nak(pd, cmd, error_code, out_len);
 }
 
+/* Exposed for the pairing driver (pd_pair.c) to emit ACK / osdp_PAIRR. */
+osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
+                                           const osdp_frame_t    *cmd,
+                                           const osdp_pd_reply_t *reply,
+                                           size_t                *out_len)
+{
+    return build_reply(pd, cmd, reply, out_len);
+}
+
 /* Send `len` bytes from `buf` via the bound transport. Short writes
  * are dropped on the floor for now; future iterations may queue or
  * report a transmission error.
@@ -161,6 +170,18 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         if (pd->sc2.session.established) {
             osdp_sc2_session_init(&pd->sc2.session);
             pd->sc2.got_chlng = false;
+        }
+    }
+
+    /* SC2 asymmetric pairing (opt-in). A cleartext osdp_PAIR — or a POLL
+     * while a multi-fragment Message 2 is mid-delivery — is handled by the
+     * attached pairing driver through its hook, entirely ahead of the SC and
+     * application paths. Dispatched through the pointer so pd.c carries no
+     * pairing dependency. */
+    if (pd->pair != NULL) {
+        const osdp_pd_pair_hook_t *h = (const osdp_pd_pair_hook_t *)pd->pair;
+        if (h->wants(pd, cmd)) {
+            return h->handle(pd, cmd);
         }
     }
 
@@ -307,6 +328,14 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     cache_reply(pd, cmd, built);
     if (built > 0) {
         send_bytes(pd, pd->tx_buf, built);
+    }
+
+    /* Deterministic cleartext->SC2 handoff: the pairing driver applies a
+     * freshly-derived SCBK to the SC2 channel strictly AFTER its Result reply
+     * has been transmitted (above). Idempotent; a no-op unless a Result was
+     * just sent. */
+    if (pd->pair != NULL) {
+        ((const osdp_pd_pair_hook_t *)pd->pair)->post_send(pd);
     }
 }
 

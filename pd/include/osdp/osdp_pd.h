@@ -5,6 +5,7 @@
 #define OSDP_PD_H
 
 #include "osdp/osdp_buz_state.h"
+#include "osdp/osdp_frame.h"
 #include "osdp/osdp_led_state.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc2.h"
@@ -16,6 +17,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Opt-in extension hook for SC2 asymmetric pairing (osdp::pd_pair). When a
+ * pairing driver is attached (`pd->pair != NULL`, via osdp_pd_attach_pair),
+ * the PD routes cleartext osdp_PAIR — and POLL while a multi-fragment Msg2
+ * is being delivered — through this vtable, which is the first member of the
+ * caller-owned pairing state. pd.c dispatches through the pointer and never
+ * names a pairing symbol, so the pairing driver and its PQC-adjacent
+ * dependencies are linked only into a PD that actually attaches one. */
+struct osdp_pd;
+typedef struct osdp_pd_pair_hook {
+    /* True if the pairing driver should handle this command. */
+    bool   (*wants)(struct osdp_pd *pd, const osdp_frame_t *cmd);
+    /* Build the reply into pd->tx_buf; return its length (0 = no reply). */
+    size_t (*handle)(struct osdp_pd *pd, const osdp_frame_t *cmd);
+    /* Invoked right after the reply is transmitted, for the deterministic
+     * post-Result cleartext->SC2 handoff (apply SCBK strictly after send). */
+    void   (*post_send)(struct osdp_pd *pd);
+} osdp_pd_pair_hook_t;
 
 /* osdp_pd — Peripheral Device-side state machine and reply pipeline.
  *
@@ -333,6 +352,12 @@ typedef struct osdp_pd {
     osdp_pd_buz_slot_t         buzzers[OSDP_PD_MAX_BUZZERS];
     osdp_pd_buzzer_cb          buzzer_cb;
     void                      *buzzer_user;
+
+    /* Optional SC2 asymmetric-pairing driver (osdp::pd_pair). NULL unless a
+     * caller-owned osdp_pd_pair_t is attached via osdp_pd_attach_pair; its
+     * first member is an osdp_pd_pair_hook_t through which pd.c dispatches.
+     * Kept last so growing the pairing state never shifts existing fields. */
+    void                      *pair;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/

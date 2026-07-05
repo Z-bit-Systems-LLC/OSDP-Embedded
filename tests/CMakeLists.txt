@@ -75,6 +75,13 @@ add_executable(test_pair_session test_pair_session.c)
 target_link_libraries(test_pair_session PRIVATE pair_test_crypto unity)
 add_test(NAME test_pair_session COMMAND test_pair_session)
 
+# SC2 asymmetric pairing — PD driver integration: a real osdp_pd + pairing
+# driver on an in-memory wire, ACU simulated with the pure session.
+add_executable(test_pd_pair test_pd_pair.c)
+target_link_libraries(test_pd_pair PRIVATE
+    osdp_core osdp_messages osdp_pd osdp_pd_pair pair_test_crypto unity)
+add_test(NAME test_pd_pair COMMAND test_pd_pair)
+
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)
 target_link_libraries(test_pd PRIVATE
