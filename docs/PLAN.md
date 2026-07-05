@@ -489,8 +489,14 @@ Locked decisions (2026-07-05):
   (`8EAF7FD9..` SCBK). Transcript-hash (TH1..TH4) computation deferred to
   Phase 3, where the message layer owns the byte spans and it becomes a
   contiguous one-shot (avoids a big scratch on the one-shot SHA HAL).
-- ☐ **Phase 3: Message codecs.** `messages.c` Msg1/2/3/Result CBOR
-  encode/parse; TH1..TH4 span extraction; tampered/negative cases.
+- ☑ **Phase 3: Message codecs.** `core/src/pair/messages.c`: byte-exact
+  CBOR encode/parse for Msg1/2/3/Result (matching PairingMessages.cs —
+  `[tag]||CBOR`, Msg2 core nested as a bstr, credentials as bstr) with
+  zero-copy decode + strict field-size validation; TH1..TH4 helpers
+  (SHA-256 over bounded stack scratch, no incremental-hash HAL). 9 codec
+  round-trip/negative tests (`test_pair_messages.c`) + TH self-consistency
+  vs direct concat+SHA256 (`test_pair_crypto.c`). Wire layout + TH spans
+  confirmed against OSDP.Net `f0f102bd1` PairingMessages/KeySchedule.cs.
 - ☐ **Phase 4: PD side.** PD-responder state machine + `pd/src/pd_pair.c`
   driver (reassembly, 30 s timeout, `on_scbk_established` surfacing the
   authenticated peer identity); opt-in gate / NAK-when-unconfigured.

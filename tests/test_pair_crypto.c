@@ -274,6 +274,63 @@ static void test_key_schedule_vectors(void)
     TEST_ASSERT_EQUAL_MEMORY(exp_scbk, scbk, 32);
 }
 
+/* ---- Transcript hashes: match a direct concat+SHA256 ------------------- */
+
+static void test_transcript_hashes(void)
+{
+    uint8_t th1[32], th2[32], th3[32], th4[32], expect[32];
+
+    /* TH1 = SHA256(msg1_wire). */
+    static uint8_t wire[128];
+    fill_iota(wire, sizeof(wire), 0x01);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_th1(&s_crypto, wire, sizeof(wire), th1));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        s_crypto.sha256(s_crypto.user, wire, sizeof(wire), expect));
+    TEST_ASSERT_EQUAL_MEMORY(expect, th1, 32);
+
+    /* TH2 = SHA256(TH1 || core). */
+    static uint8_t core[256];
+    fill_iota(core, sizeof(core), 0x40);
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_th2(&s_crypto, th1, core, sizeof(core), th2));
+    {
+        static uint8_t cat[32 + sizeof(core)];
+        (void)memcpy(cat, th1, 32);
+        (void)memcpy(&cat[32], core, sizeof(core));
+        TEST_ASSERT_EQUAL(OSDP_OK,
+            s_crypto.sha256(s_crypto.user, cat, sizeof(cat), expect));
+        TEST_ASSERT_EQUAL_MEMORY(expect, th2, 32);
+    }
+
+    /* TH3 = SHA256(TH2 || sig_p || mac_p). */
+    static uint8_t sig[OSDP_PAIR_SIG_LEN];
+    static uint8_t mac[OSDP_PAIR_MAC_LEN];
+    fill_iota(sig, sizeof(sig), 0x11);
+    fill_iota(mac, sizeof(mac), 0x22);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_th3(&s_crypto, th2, sig, mac, th3));
+    {
+        static uint8_t cat[32 + OSDP_PAIR_SIG_LEN + OSDP_PAIR_MAC_LEN];
+        (void)memcpy(cat, th2, 32);
+        (void)memcpy(&cat[32], sig, OSDP_PAIR_SIG_LEN);
+        (void)memcpy(&cat[32 + OSDP_PAIR_SIG_LEN], mac, OSDP_PAIR_MAC_LEN);
+        TEST_ASSERT_EQUAL(OSDP_OK,
+            s_crypto.sha256(s_crypto.user, cat, sizeof(cat), expect));
+        TEST_ASSERT_EQUAL_MEMORY(expect, th3, 32);
+    }
+
+    /* TH4 = SHA256(TH3 || sig_a || mac_a) — reuse sig/mac as stand-ins. */
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_th4(&s_crypto, th3, sig, mac, th4));
+    {
+        static uint8_t cat[32 + OSDP_PAIR_SIG_LEN + OSDP_PAIR_MAC_LEN];
+        (void)memcpy(cat, th3, 32);
+        (void)memcpy(&cat[32], sig, OSDP_PAIR_SIG_LEN);
+        (void)memcpy(&cat[32 + OSDP_PAIR_SIG_LEN], mac, OSDP_PAIR_MAC_LEN);
+        TEST_ASSERT_EQUAL(OSDP_OK,
+            s_crypto.sha256(s_crypto.user, cat, sizeof(cat), expect));
+        TEST_ASSERT_EQUAL_MEMORY(expect, th4, 32);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -286,5 +343,6 @@ int main(void)
     RUN_TEST(test_cert_verify_self_signed);
     RUN_TEST(test_cert_verify_rejects_tamper);
     RUN_TEST(test_key_schedule_vectors);
+    RUN_TEST(test_transcript_hashes);
     return UNITY_END();
 }

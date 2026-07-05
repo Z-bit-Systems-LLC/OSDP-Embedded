@@ -433,8 +433,10 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
   (`osdp_pair_derive_confirm_keys` + `osdp_pair_derive_scbk`, HKDF-SHA256).
   KAT asserts K_m2/3/4 + SCBK against the fixed vectors (§9) byte-for-byte.
   TH1..TH4 computation deferred to Phase 3 (message layer owns the spans).
-- **Phase 3 — message codecs.** `messages.c` Msg1/2/3/Result CBOR
-  encode/parse; TH1..TH4 span extraction; negative/tampered cases.
+- **Phase 3 ☑ — message codecs.** `core/src/pair/messages.c`: byte-exact
+  CBOR encode/parse for Msg1/2/3/Result + TH1..TH4 helpers (bounded stack
+  scratch over the one-shot SHA HAL). Layout + TH spans confirmed against
+  OSDP.Net `f0f102bd1`. 9 codec tests + TH self-consistency.
 - **Phase 4 — PD side.** `session.c` PD responder + `pd/src/pd_pair.c`
   driver (reassembly, 30 s timeout, `on_scbk_established` surfacing the peer
   identity). Opt-in gate / NAK-when-unconfigured. **Deterministic handoff

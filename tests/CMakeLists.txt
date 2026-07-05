@@ -49,6 +49,12 @@ add_executable(test_pair_cert test_pair_cert.c)
 target_link_libraries(test_pair_cert PRIVATE osdp_pair unity)
 add_test(NAME test_pair_cert COMMAND test_pair_cert)
 
+# SC2 asymmetric pairing — Phase 3 message codecs (Msg1/2/3/Result CBOR
+# encode/parse). No crypto.
+add_executable(test_pair_messages test_pair_messages.c)
+target_link_libraries(test_pair_messages PRIVATE osdp_pair unity)
+add_test(NAME test_pair_messages COMMAND test_pair_messages)
+
 # Pairing crypto test backend: osdp_pair_crypto_t over vendored PQClean
 # (ML-KEM-768 + ML-DSA-44 + SHA-256) with HMAC/HKDF on top. Host-only, never
 # in a production core. Mirrors sc2_test_crypto.

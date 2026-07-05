@@ -82,6 +82,7 @@ add_library(osdp_pair STATIC
     src/pair/cbor.c
     src/pair/cert.c
     src/pair/keyschedule.c
+    src/pair/messages.c
 )
 
 target_include_directories(osdp_pair

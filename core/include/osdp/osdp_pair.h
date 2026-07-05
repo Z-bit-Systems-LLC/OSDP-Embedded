@@ -288,6 +288,129 @@ osdp_status_t osdp_pair_derive_scbk(
     const uint8_t             th4[OSDP_PAIR_HASH_LEN],
     uint8_t                   out_scbk[OSDP_PAIR_SCBK_LEN]);
 
+/* ---- Pairing messages ---------------------------------------------------
+ *
+ * Each of the four messages is a 1-byte type tag followed by a canonical
+ * CBOR body (see PairingMessages.cs). Decoders are zero-copy: pointer
+ * fields alias the input `wire` buffer, which must outlive the model.
+ *
+ *   Msg1 (ACU->PD)  tag 0x01  array(6): uint ver, uint suite, bstr nonce_a,
+ *                             bstr ek, uint cred_type, bstr cred
+ *   Msg2 (PD->ACU)  tag 0x02  array(3): bstr core, bstr sig_p, bstr mac_p
+ *                   core      array(4): bstr nonce_p, bstr ct, uint cred_type,
+ *                             bstr cred   (nested as a byte string)
+ *   Msg3 (ACU->PD)  tag 0x03  array(2): bstr sig_a, bstr mac_a
+ *   Result (PD->ACU) tag 0x04 array(2): uint status, bstr mac (may be empty) */
+
+#define OSDP_PAIR_NONCE_LEN  16U    /* RND.A / RND.B                        */
+#define OSDP_PAIR_CT_LEN     OSDP_MLKEM768_CT_LEN
+#define OSDP_PAIR_SIG_LEN    OSDP_MLDSA44_SIG_LEN
+#define OSDP_PAIR_MAC_LEN    OSDP_PAIR_HASH_LEN
+
+/* Fixed Message-1 header values and the credential-type selector. */
+#define OSDP_PAIR_PROTOCOL_VERSION 1U
+#define OSDP_PAIR_CIPHER_SUITE     1U
+#define OSDP_PAIR_CRED_CERT        0U
+#define OSDP_PAIR_CRED_THUMBPRINT  1U
+
+/* Upper bound on the encoded Message-2 core (drives the TH2 scratch). The
+ * core is nonce_p(16) + ct(1088) + cred_type + a credential that is either a
+ * 32-byte thumbprint or a full C509 cert (~3.9 KB), plus CBOR headers. */
+#define OSDP_PAIR_CORE_MAX   6144U
+
+typedef struct osdp_pair_msg1 {
+    uint64_t       version;
+    uint64_t       suite;
+    const uint8_t *nonce_a;   size_t nonce_a_len;   /* 16                   */
+    const uint8_t *ek;        size_t ek_len;        /* 1184                 */
+    uint64_t       cred_type;                       /* 0 cert / 1 thumbprint*/
+    const uint8_t *cred;      size_t cred_len;
+    const uint8_t *wire;      size_t wire_len;      /* full wire, for TH1    */
+} osdp_pair_msg1_t;
+
+typedef struct osdp_pair_msg2 {
+    const uint8_t *core;      size_t core_len;      /* encoded array(4), TH2 */
+    const uint8_t *nonce_p;   size_t nonce_p_len;   /* 16                   */
+    const uint8_t *ct;        size_t ct_len;        /* 1088                 */
+    uint64_t       cred_type;
+    const uint8_t *cred;      size_t cred_len;
+    const uint8_t *sig_p;     size_t sig_p_len;     /* 2420                 */
+    const uint8_t *mac_p;     size_t mac_p_len;     /* 32                   */
+} osdp_pair_msg2_t;
+
+typedef struct osdp_pair_msg3 {
+    const uint8_t *sig_a;     size_t sig_a_len;     /* 2420                 */
+    const uint8_t *mac_a;     size_t mac_a_len;     /* 32                   */
+} osdp_pair_msg3_t;
+
+typedef struct osdp_pair_result {
+    uint64_t       status;                          /* PairingStatus wire   */
+    const uint8_t *mac;       size_t mac_len;       /* 32 on success, else 0*/
+} osdp_pair_result_t;
+
+/* Message 1. */
+osdp_status_t osdp_pair_msg1_encode(const uint8_t *nonce_a, size_t nonce_a_len,
+                                    const uint8_t *ek, size_t ek_len,
+                                    uint64_t cred_type,
+                                    const uint8_t *cred, size_t cred_len,
+                                    uint8_t *buf, size_t buf_cap, size_t *written);
+osdp_status_t osdp_pair_msg1_decode(const uint8_t *wire, size_t len,
+                                    osdp_pair_msg1_t *out);
+
+/* Message 2: encode the core (array(4)) first, then the outer message. */
+osdp_status_t osdp_pair_msg2_core_encode(const uint8_t *nonce_p, size_t nonce_p_len,
+                                         const uint8_t *ct, size_t ct_len,
+                                         uint64_t cred_type,
+                                         const uint8_t *cred, size_t cred_len,
+                                         uint8_t *buf, size_t buf_cap, size_t *written);
+osdp_status_t osdp_pair_msg2_encode(const uint8_t *core, size_t core_len,
+                                    const uint8_t *sig_p, size_t sig_p_len,
+                                    const uint8_t *mac_p, size_t mac_p_len,
+                                    uint8_t *buf, size_t buf_cap, size_t *written);
+osdp_status_t osdp_pair_msg2_decode(const uint8_t *wire, size_t len,
+                                    osdp_pair_msg2_t *out);
+
+/* Message 3. */
+osdp_status_t osdp_pair_msg3_encode(const uint8_t *sig_a, size_t sig_a_len,
+                                    const uint8_t *mac_a, size_t mac_a_len,
+                                    uint8_t *buf, size_t buf_cap, size_t *written);
+osdp_status_t osdp_pair_msg3_decode(const uint8_t *wire, size_t len,
+                                    osdp_pair_msg3_t *out);
+
+/* Result. Pass mac_len 0 for a non-success status. */
+osdp_status_t osdp_pair_result_encode(uint64_t status,
+                                      const uint8_t *mac, size_t mac_len,
+                                      uint8_t *buf, size_t buf_cap, size_t *written);
+osdp_status_t osdp_pair_result_decode(const uint8_t *wire, size_t len,
+                                      osdp_pair_result_t *out);
+
+/* ---- Transcript hashes --------------------------------------------------
+ *
+ *   TH1 = SHA256(message1_wire)                 (includes the type tag)
+ *   TH2 = SHA256(TH1 || core)                   (core = encoded array(4))
+ *   TH3 = SHA256(TH2 || sig_p || mac_p)
+ *   TH4 = SHA256(TH3 || sig_a || mac_a)
+ *
+ * TH2..TH4 concatenate onto a bounded stack scratch and hash once via the
+ * one-shot HAL SHA-256 (no incremental-hash HAL surface). */
+osdp_status_t osdp_pair_th1(const osdp_pair_crypto_t *crypto,
+                            const uint8_t *msg1_wire, size_t len,
+                            uint8_t out_th1[OSDP_PAIR_HASH_LEN]);
+osdp_status_t osdp_pair_th2(const osdp_pair_crypto_t *crypto,
+                            const uint8_t th1[OSDP_PAIR_HASH_LEN],
+                            const uint8_t *core, size_t core_len,
+                            uint8_t out_th2[OSDP_PAIR_HASH_LEN]);
+osdp_status_t osdp_pair_th3(const osdp_pair_crypto_t *crypto,
+                            const uint8_t th2[OSDP_PAIR_HASH_LEN],
+                            const uint8_t sig_p[OSDP_PAIR_SIG_LEN],
+                            const uint8_t mac_p[OSDP_PAIR_MAC_LEN],
+                            uint8_t out_th3[OSDP_PAIR_HASH_LEN]);
+osdp_status_t osdp_pair_th4(const osdp_pair_crypto_t *crypto,
+                            const uint8_t th3[OSDP_PAIR_HASH_LEN],
+                            const uint8_t sig_a[OSDP_PAIR_SIG_LEN],
+                            const uint8_t mac_a[OSDP_PAIR_MAC_LEN],
+                            uint8_t out_th4[OSDP_PAIR_HASH_LEN]);
+
 #ifdef __cplusplus
 }
 #endif
