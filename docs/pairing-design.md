@@ -1,7 +1,8 @@
 # OSDP-SC2 Asymmetric Device Pairing — Design & Plan
 
 Status: **proposed** (research complete, awaiting implementation sign-off).
-Oracle: OSDP.Net `feature/osdp-sc2`, HEAD `f51dac39…`, `src/OSDP.Net/Pairing/`
+Oracle: OSDP.Net `feature/osdp-sc2`, HEAD `f0f102bd1` (incl. the "Pairing
+live bring-up" fixes from 38400-baud RS-485 testing), `src/OSDP.Net/Pairing/`
 and `docs/pairing-overview.md`.
 
 This document is the cold-start reference for adding **certificate-based
@@ -322,6 +323,51 @@ Status enum (wire): `0x00 ok / 0x01 auth-fail / 0x02 persist-fail /
 0x03 policy / 0x04 protocol`; local-only: cert-rejected, key-confirm-fail,
 not-supported, timeout, unknown-cred-ref.
 
+### 5.1 Deterministic cleartext→SC2 handoff (from live RS-485 testing)
+
+The OSDP.Net "Pairing live bring-up" commit (`f0f102bd1`, 38400-baud serial)
+pinned the exact handoff sequencing. These are **driver** rules (Phases
+4–6); they do not affect the wire format of the transport, CBOR, C509, or
+crypto layers. The whole flow — cleartext pairing, then SC2 — happens over
+**one connection** with no reconnect, no sleep, and no timing delay:
+
+- **Message 2 is delivered by polling; the Result is delivered inline.**
+  The multi-fragment Message 2 (PD→ACU) is queued and sent over subsequent
+  polls. The **single-fragment Result is returned directly as the PAIRR
+  reply to the PAIR command that carried Message 3's final fragment** — not
+  queued — precisely so it reaches the ACU *before* the PD's channel goes
+  secure. Failure/rejection Results are likewise delivered inline (with no
+  key applied).
+- **PD ordering: send the Result, THEN activate the key.** On Message 3
+  success the PD derives the SCBK, runs the persistence callback, **sends
+  the cleartext Result**, and only *after that byte is on the wire* applies
+  the SCBK to its running SC2 session in place and switches to
+  require-security (OSDP.Net: `ActivatePairedKey` → set key, reset SC2
+  context, `SecurityMode=FullSecurity`, `RequireSecurity=true`). This
+  strict "reply-before-activate" order guarantees the PD is ready before the
+  ACU's first `CHLNG`. In our C model this is the existing KEYSET-style
+  in-place SCBK write into `pd->sc2.scbk`, staged until the Result frame is
+  emitted, plus flipping the PD to "SC2 now required."
+- **During pairing the PD is an unsecured but SC2-capable device.** It runs
+  an SC2 channel with a placeholder key (`RequireSecurity=false`,
+  `SecureChannelVersion=V2`); pairing swaps in the real SCBK. Our
+  `osdp_sc2_session_t` already separates the stored SCBK from the
+  established session, so this is just "write SCBK, mark SC2 required."
+- **ACU: challenge immediately on the same connection.** After
+  `ProcessResult` the ACU re-adds the device as SC2 with the derived key and
+  issues the SC2 handshake straight away — our existing
+  `osdp_acu_start_sc2_handshake`. The protocol round-trip (PD activates →
+  Result → ACU receives → ACU challenges) is what enforces ordering, so no
+  delay is needed.
+- **The PD-side result callback surfaces the authenticated peer**, not just
+  the key: OSDP.Net changed `OnScbkEstablished` to receive the full
+  `PairingResult` (SCBK **+ peer identity/cert**). Our Phase-4 PD callback
+  should carry an `osdp_pair_result_t { scbk, peer identity, cert
+  thumbprint }` and return a persisted-ok bool.
+- **Progress reporting is UX-only** (`IProgress<PairingProgress>`, ACU-side,
+  weighted 0.45/0.30/0.15/0.10 across the four messages). Optional to mirror
+  as an ACU driver phase/progress hook; not wire-affecting.
+
 ## 6. Provisional constants (centralized)
 
 Because the format is not SIA-assigned, keep every provisional value in one
@@ -373,9 +419,10 @@ to confirm in Phase 0:
 Mirrors the SC1/SC2 phase style. Deterministic parts are validated against
 fixed vectors (§9) even though the full E2E SCBK is randomized.
 
-- **Phase 0 — transport.** `cmd_pair.c` / `reply_pairr.c` (0xB0/0x8A) +
-  `shared/multipart.c` (2-byte reassembly, pairing-scoped). Buffer-sizing
-  constants + bounds checks. Round-trip + truncated/oversized negatives.
+- **Phase 0 ☑ — transport.** `core/src/pair/fragment.c` (0xB0/0x8A carrier)
+  + `core/src/pair/multipart.c` (2-byte reassembler + fragment iterator) in
+  `osdp::pair`; buffer-sizing constants. 18 tests: round trip + short-header
+  / size-mismatch / overrun / gap / bad-total / retransmit / restart.
 - **Phase 1 ☑ — crypto HAL + CBOR + C509.** `osdp_pair_crypto.h`,
   `osdp_cbor.h`/`cbor.c` (12 tests), `cert.c` (9 structural tests). Vendored
   PQClean backend (`vendor/pqclean/`, `tests/pair_test_crypto.c`) drives 8
@@ -387,16 +434,20 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
 - **Phase 3 — message codecs.** `messages.c` Msg1/2/3/Result CBOR
   encode/parse; TH1..TH4 span extraction; negative/tampered cases.
 - **Phase 4 — PD side.** `session.c` PD responder + `pd/src/pd_pair.c`
-  driver (reassembly, 30 s timeout, `on_scbk_established`). Opt-in gate /
-  NAK-when-unconfigured.
+  driver (reassembly, 30 s timeout, `on_scbk_established` surfacing the peer
+  identity). Opt-in gate / NAK-when-unconfigured. **Deterministic handoff
+  (§5.1): deliver the Result inline, then apply the SCBK in place and flip
+  to SC2-required strictly after the Result is sent.**
 - **Phase 5 — ACU side.** `session.c` ACU initiator + `acu/src/acu_pair.c`
   driver (fragment send, multipart receive, per-message timeout, rejection
   surfacing).
 - **Phase 6 — loopback.** `tests/test_loopback_pair.c`: both real state
-  machines complete the exchange and derive an **identical SCBK**; feed that
-  SCBK into the existing SC2 handshake + a POLL/ACK under SCS_27 — full
-  provisioning-through-operation path in-process. Untrusted-CA, tampered
-  Msg2/Msg3, and persist-fail negatives.
+  machines complete the exchange and derive an **identical SCBK**; then the
+  **in-place cleartext→SC2 handoff on the same wire** (§5.1: inline Result →
+  PD applies SCBK after sending → ACU challenges immediately) drives the
+  existing SC2 handshake + a POLL/ACK under SCS_27 — full provisioning-
+  through-operation path in-process. Untrusted-CA, tampered Msg2/Msg3, and
+  persist-fail negatives.
 - **Phase 7 — WolfSSL backend + live interop.** WolfSSL `osdp_pair_crypto_t`
   binding (wolfCrypt ML-KEM-768 + ML-DSA-44 + SHA-256/HMAC/HKDF) in
   `tools/` + `tests/`; tools gain a pairing mode; live-validate vs OSDP.Net

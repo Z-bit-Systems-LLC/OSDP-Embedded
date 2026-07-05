@@ -487,15 +487,22 @@ Locked decisions (2026-07-05):
 - ☐ **Phase 3: Message codecs.** `messages.c` Msg1/2/3/Result CBOR
   encode/parse; TH1..TH4 span extraction; tampered/negative cases.
 - ☐ **Phase 4: PD side.** PD-responder state machine + `pd/src/pd_pair.c`
-  driver (reassembly, 30 s timeout, `on_scbk_established` persistence);
-  opt-in gate / NAK-when-unconfigured.
+  driver (reassembly, 30 s timeout, `on_scbk_established` surfacing the
+  authenticated peer identity); opt-in gate / NAK-when-unconfigured.
+  Deterministic cleartext→SC2 handoff (pairing-design.md §5.1, from
+  OSDP.Net's live 38400-baud RS-485 bring-up): deliver the single-fragment
+  Result **inline** (not polled), then apply the SCBK in place and require
+  SC2 **strictly after** the Result is on the wire — so the ACU's next CHLNG
+  establishes with no reconnect or sleep.
 - ☐ **Phase 5: ACU side.** ACU-initiator state machine + `acu/src/acu_pair.c`
   driver (fragment send, multipart receive, per-message timeout, rejection
-  surfacing).
+  surfacing); on success, start the SC2 handshake immediately on the same
+  connection with the derived SCBK.
 - ☐ **Phase 6: PD↔ACU loopback.** `tests/test_loopback_pair.c`: both real
-  state machines derive an identical SCBK, which then feeds the existing SC2
-  handshake + a POLL/ACK under SCS_27 — full provisioning-through-operation
-  in-process; untrusted-CA / tampered-Msg2/3 / persist-fail negatives.
+  state machines derive an identical SCBK, then the **in-place cleartext→SC2
+  handoff on the same wire** feeds the existing SC2 handshake + a POLL/ACK
+  under SCS_27 — full provisioning-through-operation in-process; untrusted-CA
+  / tampered-Msg2/3 / persist-fail negatives.
 - ☐ **Phase 7: Live interop (WolfSSL).** WolfSSL `osdp_pair_crypto_t`
   binding for the interop tools; tools gain a pairing mode; live-validate vs
   OSDP.Net `feature/osdp-sc2` over a serial pair. (Hermetic KATs already run
