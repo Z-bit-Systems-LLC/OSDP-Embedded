@@ -80,6 +80,7 @@ add_library(osdp_pair STATIC
     src/pair/fragment.c
     src/pair/multipart.c
     src/pair/cbor.c
+    src/pair/cert.c
 )
 
 target_include_directories(osdp_pair

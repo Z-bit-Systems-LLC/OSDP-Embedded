@@ -43,6 +43,12 @@ add_executable(test_pair_cbor test_pair_cbor.c)
 target_link_libraries(test_pair_cbor PRIVATE osdp_pair unity)
 add_test(NAME test_pair_cbor COMMAND test_pair_cbor)
 
+# SC2 asymmetric pairing — Phase 1 C509 cert encode/decode (structure only,
+# no crypto). Thumbprint/verify KATs land with the crypto backend.
+add_executable(test_pair_cert test_pair_cert.c)
+target_link_libraries(test_pair_cert PRIVATE osdp_pair unity)
+add_test(NAME test_pair_cert COMMAND test_pair_cert)
+
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)
 target_link_libraries(test_pd PRIVATE
