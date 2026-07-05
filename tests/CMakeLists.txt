@@ -69,6 +69,12 @@ add_executable(test_pair_crypto test_pair_crypto.c)
 target_link_libraries(test_pair_crypto PRIVATE pair_test_crypto unity)
 add_test(NAME test_pair_crypto COMMAND test_pair_crypto)
 
+# SC2 asymmetric pairing — Phase 4/5 pure session loopback (both real
+# handshake state machines derive an identical SCBK), over PQClean.
+add_executable(test_pair_session test_pair_session.c)
+target_link_libraries(test_pair_session PRIVATE pair_test_crypto unity)
+add_test(NAME test_pair_session COMMAND test_pair_session)
+
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)
 target_link_libraries(test_pd PRIVATE

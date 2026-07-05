@@ -497,18 +497,27 @@ Locked decisions (2026-07-05):
   round-trip/negative tests (`test_pair_messages.c`) + TH self-consistency
   vs direct concat+SHA256 (`test_pair_crypto.c`). Wire layout + TH spans
   confirmed against OSDP.Net `f0f102bd1` PairingMessages/KeySchedule.cs.
-- ☐ **Phase 4: PD side.** PD-responder state machine + `pd/src/pd_pair.c`
-  driver (reassembly, 30 s timeout, `on_scbk_established` surfacing the
-  authenticated peer identity); opt-in gate / NAK-when-unconfigured.
-  Deterministic cleartext→SC2 handoff (pairing-design.md §5.1, from
-  OSDP.Net's live 38400-baud RS-485 bring-up): deliver the single-fragment
-  Result **inline** (not polled), then apply the SCBK in place and require
-  SC2 **strictly after** the Result is on the wire — so the ACU's next CHLNG
-  establishes with no reconnect or sleep.
-- ☐ **Phase 5: ACU side.** ACU-initiator state machine + `acu/src/acu_pair.c`
-  driver (fragment send, multipart receive, per-message timeout, rejection
-  surfacing); on success, start the SC2 handshake immediately on the same
-  connection with the derived SCBK.
+- ◑ **Phase 4: PD side.** ☑ **Session** — PD-responder state machine in
+  `core/src/pair/session.c` (`osdp_pair_pd_init` / `_process_msg1` /
+  `_process_msg3` / `_build_result`): Idle→AwaitMsg3→AwaitPersist→Complete,
+  ML-KEM encaps, TH2 sign + Km2 MAC, ACU auth via CA/pinned trust, Msg3
+  verify, SCBK derive, mac_R Result; rejection Results on bad cert/protocol.
+  ☐ **Driver** — `pd/src/pd_pair.c` wiring into `osdp::pd` (osdp_PAIR
+  reassembly, 30 s timeout, `on_scbk_established` surfacing the peer
+  identity, opt-in NAK gate) + the §5.1 handoff (Result **inline**, then
+  apply SCBK + require SC2 strictly after it is sent) + Rust FFI struct
+  growth.
+- ◑ **Phase 5: ACU side.** ☑ **Session** — ACU-initiator state machine in
+  `core/src/pair/session.c` (`osdp_pair_acu_init` / `_create_msg1` /
+  `_process_msg2` / `_process_result`): Created→AwaitMsg2→AwaitResult→
+  Complete, ML-KEM keygen/decaps, PD auth, sig_P + mac_P verify (KEM-mismatch
+  catch), Msg3 sign, SCBK derive, mac_R verify. ☐ **Driver** —
+  `acu/src/acu_pair.c` (fragment send, multipart receive, per-message
+  timeout, rejection surfacing) + start the SC2 handshake immediately on the
+  same connection.
+  Both sessions validated by `tests/test_pair_session.c`: full loopback
+  derives an **identical SCBK** end-to-end over PQClean, plus untrusted-CA,
+  tampered-Msg3, and bad-Result-MAC negatives.
 - ☐ **Phase 6: PD↔ACU loopback.** `tests/test_loopback_pair.c`: both real
   state machines derive an identical SCBK, then the **in-place cleartext→SC2
   handoff on the same wire** feeds the existing SC2 handshake + a POLL/ACK

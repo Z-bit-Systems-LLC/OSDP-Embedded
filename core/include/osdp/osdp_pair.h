@@ -411,6 +411,157 @@ osdp_status_t osdp_pair_th4(const osdp_pair_crypto_t *crypto,
                             const uint8_t mac_a[OSDP_PAIR_MAC_LEN],
                             uint8_t out_th4[OSDP_PAIR_HASH_LEN]);
 
+/* ---- Session state machines --------------------------------------------
+ *
+ * Transport-free responder (PD) and initiator (ACU) handshakes that
+ * orchestrate the codecs + crypto above. Pure: no allocation, no I/O; the
+ * caller owns the session struct and every message buffer, and drives the
+ * exchange step by step. The higher layers (osdp::pd / osdp::acu) wrap these
+ * with fragment reassembly, timeouts, and the cleartext->SC2 handoff.
+ *
+ * Both sides present a full C509 certificate (credential type "cert") and
+ * authenticate the peer against a trust anchor: either a CA public key (the
+ * peer cert must be CA-signed) or a set of pinned thumbprints (the peer cert
+ * must be self-consistent and its thumbprint pinned). Thumbprint-reference
+ * presentation (peer sends only a 32-byte thumbprint) is not yet
+ * supported. */
+
+/* Result status byte (wire), mirroring PairingStatus. */
+#define OSDP_PAIR_STATUS_SUCCESS      0x00U
+#define OSDP_PAIR_STATUS_AUTH_FAIL    0x01U
+#define OSDP_PAIR_STATUS_PERSIST_FAIL 0x02U
+#define OSDP_PAIR_STATUS_POLICY       0x03U
+#define OSDP_PAIR_STATUS_PROTOCOL     0x04U
+
+/* Trust anchor: set exactly one of `ca_pubkey` or the pinned set. */
+typedef struct osdp_pair_trust {
+    const uint8_t *ca_pubkey;   /* ML-DSA-44 CA key (1312), or NULL         */
+    const uint8_t (*pinned_thumbprints)[OSDP_PAIR_HASH_LEN]; /* or NULL      */
+    size_t         pinned_count;
+} osdp_pair_trust_t;
+
+/* This side's credential to present: its encoded C509 certificate. The
+ * matching ML-DSA-44 signing key lives in the crypto HAL's `user` context. */
+typedef struct osdp_pair_local {
+    const uint8_t *cert;
+    size_t         cert_len;
+} osdp_pair_local_t;
+
+/* The authenticated peer, captured during validation. */
+typedef struct osdp_pair_peer {
+    uint8_t pubkey[OSDP_MLDSA44_PK_LEN];
+    uint8_t thumbprint[OSDP_PAIR_HASH_LEN];
+    char    manufacturer[OSDP_PAIR_STR_MAX]; size_t manufacturer_len;
+    char    model[OSDP_PAIR_STR_MAX];        size_t model_len;
+    char    serial[OSDP_PAIR_STR_MAX];       size_t serial_len;
+} osdp_pair_peer_t;
+
+/* ---- PD responder ---- */
+
+typedef enum osdp_pair_pd_state {
+    OSDP_PAIR_PD_IDLE = 0,
+    OSDP_PAIR_PD_AWAIT_MSG3,
+    OSDP_PAIR_PD_AWAIT_PERSIST,
+    OSDP_PAIR_PD_COMPLETE,
+    OSDP_PAIR_PD_FAILED
+} osdp_pair_pd_state_t;
+
+typedef struct osdp_pair_pd_session {
+    const osdp_pair_crypto_t *crypto;
+    osdp_pair_local_t         local;
+    osdp_pair_trust_t         trust;
+    osdp_pair_pd_state_t      state;
+
+    uint8_t nonce_p[OSDP_PAIR_NONCE_LEN];
+    uint8_t ss[OSDP_PAIR_SS_LEN];
+    uint8_t th2[OSDP_PAIR_HASH_LEN];
+    uint8_t th4[OSDP_PAIR_HASH_LEN];
+    osdp_pair_confirm_keys_t ck;
+    uint8_t sig_p[OSDP_PAIR_SIG_LEN];   /* retained from Msg2 for TH3 */
+    uint8_t mac_p[OSDP_PAIR_MAC_LEN];
+    uint8_t scbk[OSDP_PAIR_SCBK_LEN];
+    osdp_pair_peer_t peer;
+} osdp_pair_pd_session_t;
+
+/* Initialise a PD session with its credential and trust anchor. */
+void osdp_pair_pd_init(osdp_pair_pd_session_t *s,
+                       const osdp_pair_crypto_t *crypto,
+                       const osdp_pair_local_t *local,
+                       const osdp_pair_trust_t *trust);
+
+/* Consume Message 1 and produce the response. On success `*out` is Message 2
+ * and `*is_rejection` is false; on a validation/protocol failure `*out` is a
+ * rejection Result and `*is_rejection` is true (either way it is the bytes to
+ * send). A hard error (buffer too small, crypto fault) returns non-OK. */
+osdp_status_t osdp_pair_pd_process_msg1(osdp_pair_pd_session_t *s,
+                                        const uint8_t *msg1_wire, size_t len,
+                                        uint8_t *out, size_t out_cap,
+                                        size_t *out_len, bool *is_rejection);
+
+/* Consume Message 3 and verify the ACU. On a valid exchange `*ok` is true and
+ * the derived SCBK is written to `out_scbk` (the caller then persists it and
+ * calls build_result); on verification failure `*ok` is false. */
+osdp_status_t osdp_pair_pd_process_msg3(osdp_pair_pd_session_t *s,
+                                        const uint8_t *msg3_wire, size_t len,
+                                        bool *ok,
+                                        uint8_t out_scbk[OSDP_PAIR_SCBK_LEN]);
+
+/* Build the Result reply. `status` is OSDP_PAIR_STATUS_SUCCESS once the key
+ * is persisted (adds mac_R over TH4), or a failure code (empty MAC). */
+osdp_status_t osdp_pair_pd_build_result(osdp_pair_pd_session_t *s,
+                                        uint64_t status,
+                                        uint8_t *out, size_t out_cap,
+                                        size_t *out_len);
+
+/* ---- ACU initiator ---- */
+
+typedef enum osdp_pair_acu_state {
+    OSDP_PAIR_ACU_CREATED = 0,
+    OSDP_PAIR_ACU_AWAIT_MSG2,
+    OSDP_PAIR_ACU_AWAIT_RESULT,
+    OSDP_PAIR_ACU_COMPLETE,
+    OSDP_PAIR_ACU_FAILED
+} osdp_pair_acu_state_t;
+
+typedef struct osdp_pair_acu_session {
+    const osdp_pair_crypto_t *crypto;
+    osdp_pair_local_t         local;
+    osdp_pair_trust_t         trust;
+    osdp_pair_acu_state_t     state;
+
+    uint8_t nonce_a[OSDP_PAIR_NONCE_LEN];
+    uint8_t th1[OSDP_PAIR_HASH_LEN];
+    uint8_t th4[OSDP_PAIR_HASH_LEN];
+    osdp_pair_confirm_keys_t ck;
+    uint8_t scbk[OSDP_PAIR_SCBK_LEN];
+    osdp_pair_peer_t peer;
+} osdp_pair_acu_session_t;
+
+/* Initialise an ACU session with its credential and trust anchor. */
+void osdp_pair_acu_init(osdp_pair_acu_session_t *s,
+                        const osdp_pair_crypto_t *crypto,
+                        const osdp_pair_local_t *local,
+                        const osdp_pair_trust_t *trust);
+
+/* Produce Message 1 (generates the ephemeral ML-KEM keypair + nonce). */
+osdp_status_t osdp_pair_acu_create_msg1(osdp_pair_acu_session_t *s,
+                                        uint8_t *out, size_t out_cap,
+                                        size_t *out_len);
+
+/* Consume Message 2 (validate the PD, decapsulate, confirm) and produce
+ * Message 3. On peer-validation / verification failure returns non-OK and
+ * moves to FAILED (the ACU aborts). */
+osdp_status_t osdp_pair_acu_process_msg2(osdp_pair_acu_session_t *s,
+                                         const uint8_t *msg2_wire, size_t len,
+                                         uint8_t *out, size_t out_cap,
+                                         size_t *out_len);
+
+/* Consume the Result: verify mac_R and, on success, expose the SCBK. A
+ * rejection Result or a bad MAC returns non-OK. */
+osdp_status_t osdp_pair_acu_process_result(osdp_pair_acu_session_t *s,
+                                           const uint8_t *result_wire, size_t len,
+                                           uint8_t out_scbk[OSDP_PAIR_SCBK_LEN]);
+
 #ifdef __cplusplus
 }
 #endif
