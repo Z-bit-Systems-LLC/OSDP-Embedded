@@ -423,6 +423,77 @@ negotiation (the ACU picks via the CHLNG SCB type).
   (`osdp-pd-mock`, `osdp-acu-mock`) speak `--sc=scbk2:HEX64`. Docs:
   PLAN.md + CLAUDE.md.
 
+## Iteration 8 — SC2 asymmetric device pairing (planned)
+
+**Goal:** certificate-based (asymmetric, post-quantum) initialization for
+Secure Channel 2 — a cleartext pairing exchange that runs **once, before**
+any secure channel and whose only output is the 32-byte SC2 SCBK. After
+pairing derives the SCBK, the existing SCS_21..28 handshake + record layer
+(Iteration 7) run unchanged with that key. This is a new opt-in front-end
+that provisions the key the SC2 code already consumes; the SC2 record layer
+is untouched. Agreed 2026-07-05. Full design, wire protocol, crypto, key
+schedule, memory budget, and test vectors: **[pairing-design.md](pairing-design.md)**.
+
+Mirrors OSDP.Net `feature/osdp-sc2` (`src/OSDP.Net/Pairing/`,
+`docs/pairing-overview.md`) byte-for-byte — an EDHOC-style mutual-auth key
+agreement over **ML-KEM-768** (KEM) + **ML-DSA-44** (deterministic
+signatures + a compact C509 CBOR cert PKI) + **HKDF/HMAC/SHA-256**. Rides
+two cleartext commands, osdp_PAIR (`0xB0`) / osdp_PAIRR (`0x8A`), fragmented
+over CRAUTH-style 2-byte multipart framing (4 messages, ~5.3/7.7/2.5 KB +
+60 B).
+
+Locked decisions (2026-07-05):
+- **Target: full MCU, freestanding.** Same no-malloc / no-OS /
+  caller-owned-buffer rules as the rest of `core/`/`pd/`/`acu/`. All PQC is
+  HAL callbacks; the core only hands fixed-size caller-owned buffers across
+  the boundary. Memory is a first-class constraint (~15–20 KB of
+  provisioning-time buffers; see pairing-design.md §7).
+- **Crypto fully pluggable via a new `osdp_pair_crypto_t` HAL** (ML-KEM-768
+  / ML-DSA-44 / SHA-256 / HMAC-SHA256 / HKDF), exactly like the SC1/SC2
+  HALs. The core vendors **zero** PQC code. **WolfSSL is the test/tool
+  backend** (wolfCrypt has native ML-KEM + ML-DSA + the symmetric bits),
+  bound in `tools/` + `tests/` only; any other backend (mbedTLS+liboqs,
+  OpenSSL 3.5+, hardware PQC, MCU PQClean) drops in behind the same HAL.
+- **Multipart scoped to pairing only** — a minimal 2-byte reassembly helper
+  dedicated to PAIR/PAIRR; not generalized to CRAUTH/file-transfer (those
+  stay out of scope per CLAUDE.md).
+- **Wire format mirrored exactly** (experimental / not SIA-assigned);
+  provisional codes/strings centralized so a future spec reassignment is a
+  one-file change.
+
+- ☑ **Phase 0: Transport.** `core/src/pair/fragment.c` (osdp_PAIR/osdp_PAIRR
+  0xB0/0x8A fragment carrier codec) + `core/src/pair/multipart.c` (in-order
+  2-byte multipart reassembler + outbound fragment iterator) in the new
+  opt-in `osdp::pair` target; `OSDP_CMD_PAIR` / `OSDP_REPLY_PAIRR` +
+  buffer-sizing constants (`osdp_pair.h`). 18 Unity tests
+  (`tests/test_pair_transport.c`): full fragment→wire→reassemble round trip
+  plus short-header / size-mismatch / overrun / gap / bad-total /
+  buffer-too-small / idempotent-retransmit / offset-0-restart negatives.
+  Whole C suite 31/31 green.
+- ☐ **Phase 1: Crypto HAL + CBOR + C509.** `osdp_pair_crypto.h`,
+  `osdp_cbor.h`/`cbor.c`, `cert.c`. KATs: demo-CA thumbprint, ML-KEM/ML-DSA
+  pubkey hashes, C509 round-trip / deterministic encoding / stable
+  thumbprint / CA-verify+reject / self-signed verify.
+- ☐ **Phase 2: Key schedule.** `keyschedule.c`; assert K_m2/3/4 + SCBK vs
+  the fixed vectors; HKDF RFC-5869 sanity vector.
+- ☐ **Phase 3: Message codecs.** `messages.c` Msg1/2/3/Result CBOR
+  encode/parse; TH1..TH4 span extraction; tampered/negative cases.
+- ☐ **Phase 4: PD side.** PD-responder state machine + `pd/src/pd_pair.c`
+  driver (reassembly, 30 s timeout, `on_scbk_established` persistence);
+  opt-in gate / NAK-when-unconfigured.
+- ☐ **Phase 5: ACU side.** ACU-initiator state machine + `acu/src/acu_pair.c`
+  driver (fragment send, multipart receive, per-message timeout, rejection
+  surfacing).
+- ☐ **Phase 6: PD↔ACU loopback.** `tests/test_loopback_pair.c`: both real
+  state machines derive an identical SCBK, which then feeds the existing SC2
+  handshake + a POLL/ACK under SCS_27 — full provisioning-through-operation
+  in-process; untrusted-CA / tampered-Msg2/3 / persist-fail negatives.
+- ☐ **Phase 7: WolfSSL backend + live interop.** WolfSSL
+  `osdp_pair_crypto_t` binding in `tools/`+`tests/`; tools gain a pairing
+  mode; live-validate vs OSDP.Net `feature/osdp-sc2` over a serial pair.
+- ☐ **Phase 8: Rust + MCP + docs.** `PairCrypto` trait + pair APIs; `sys.rs`
+  / `build.rs` grown; osdp-mcp pairing option; PLAN.md + CLAUDE.md.
+
 ## Iteration 6+ — Optional extensions (not yet planned)
 
 - File transfer, biometric, keypad extensions, manufacturer-specific

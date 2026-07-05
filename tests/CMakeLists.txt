@@ -32,6 +32,12 @@ osdp_add_test(test_stream)
 osdp_add_test(test_dispatch)
 osdp_add_test(test_led_state)
 
+# SC2 asymmetric pairing — Phase 0 transport (fragment codec + multipart).
+# Links only osdp_pair (self-contained opt-in module) + unity.
+add_executable(test_pair_transport test_pair_transport.c)
+target_link_libraries(test_pair_transport PRIVATE osdp_pair unity)
+add_test(NAME test_pair_transport COMMAND test_pair_transport)
+
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)
 target_link_libraries(test_pd PRIVATE

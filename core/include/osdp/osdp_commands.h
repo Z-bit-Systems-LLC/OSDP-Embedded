@@ -40,6 +40,9 @@ extern "C" {
 #define OSDP_CMD_GENAUTH      0xA4U
 #define OSDP_CMD_CRAUTH       0xA5U
 #define OSDP_CMD_KEEPACTIVE   0xA7U
+/* osdp_PAIR — SC2 asymmetric device pairing (ACU -> PD). Experimental /
+ * NOT SIA-assigned; see osdp_pair.h and docs/pairing-design.md. */
+#define OSDP_CMD_PAIR         0xB0U
 
 /* ========================================================================
  * osdp_POLL (0x60) — empty payload

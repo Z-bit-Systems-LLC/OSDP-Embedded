@@ -38,6 +38,9 @@ extern "C" {
 #define OSDP_REPLY_MFGERRR   0x84U
 #define OSDP_REPLY_MFGREP    0x90U
 #define OSDP_REPLY_XRD       0xB1U
+/* osdp_PAIRR — SC2 asymmetric device pairing (PD -> ACU). Experimental /
+ * NOT SIA-assigned; see osdp_pair.h and docs/pairing-design.md. */
+#define OSDP_REPLY_PAIRR     0x8AU
 
 /* NAK error codes per spec Table 47. */
 #define OSDP_NAK_NO_ERROR              0x00U

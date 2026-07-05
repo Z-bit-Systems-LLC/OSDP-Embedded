@@ -70,6 +70,26 @@ target_compile_features(osdp_messages PUBLIC c_std_11)
 
 add_library(osdp::messages ALIAS osdp_messages)
 
+# osdp::pair — optional SC2 asymmetric device pairing. A self-contained,
+# opt-in module (linked only by applications that pair) whose only output
+# is the 32-byte SC2 SCBK; the SC2 record layer in osdp::core does not
+# depend on it. Phase 0 ships the cleartext transport (osdp_PAIR / osdp_PAIRR
+# fragment carrier + multipart reassembly); later phases add the C509 cert,
+# key schedule, message codecs, and the PD/ACU session state machines.
+add_library(osdp_pair STATIC
+    src/pair/fragment.c
+    src/pair/multipart.c
+)
+
+target_include_directories(osdp_pair
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_features(osdp_pair PUBLIC c_std_11)
+
+add_library(osdp::pair ALIAS osdp_pair)
+
 # osdp::dispatch — optional bulk-routing helpers. Iteration 1 ships a
 # pure classifier (no per-message decoder references) so consumers can
 # link this without dragging every codec into the binary; richer routing
