@@ -450,10 +450,13 @@ Locked decisions (2026-07-05):
   provisioning-time buffers; see pairing-design.md §7).
 - **Crypto fully pluggable via a new `osdp_pair_crypto_t` HAL** (ML-KEM-768
   / ML-DSA-44 / SHA-256 / HMAC-SHA256 / HKDF), exactly like the SC1/SC2
-  HALs. The core vendors **zero** PQC code. **WolfSSL is the test/tool
-  backend** (wolfCrypt has native ML-KEM + ML-DSA + the symmetric bits),
-  bound in `tools/` + `tests/` only; any other backend (mbedTLS+liboqs,
-  OpenSSL 3.5+, hardware PQC, MCU PQClean) drops in behind the same HAL.
+  HALs. The core vendors **zero** PQC code. **Tests/CI use vendored PQClean**
+  (ML-KEM-768 + ML-DSA-44 + SHA-256 under `vendor/pqclean/`, CC0), self-
+  contained like tiny-*, so KATs run hermetically on the existing Linux CI
+  with no external dependency (decided 2026-07-05 after confirming CI is
+  hermetic/vendored). **WolfSSL is the documented production backend + a
+  live-interop target**; any other backend (mbedTLS+liboqs, OpenSSL 3.5+,
+  hardware PQC) drops in behind the same HAL.
 - **Multipart scoped to pairing only** — a minimal 2-byte reassembly helper
   dedicated to PAIR/PAIRR; not generalized to CRAUTH/file-transfer (those
   stay out of scope per CLAUDE.md).
@@ -470,10 +473,15 @@ Locked decisions (2026-07-05):
   plus short-header / size-mismatch / overrun / gap / bad-total /
   buffer-too-small / idempotent-retransmit / offset-0-restart negatives.
   Whole C suite 31/31 green.
-- ☐ **Phase 1: Crypto HAL + CBOR + C509.** `osdp_pair_crypto.h`,
-  `osdp_cbor.h`/`cbor.c`, `cert.c`. KATs: demo-CA thumbprint, ML-KEM/ML-DSA
-  pubkey hashes, C509 round-trip / deterministic encoding / stable
-  thumbprint / CA-verify+reject / self-signed verify.
+- ☑ **Phase 1: Crypto HAL + CBOR + C509.** `osdp_pair_crypto.h` (pluggable
+  ML-KEM-768/ML-DSA-44/SHA-256/HMAC/HKDF contract), `osdp_cbor.h`/`cbor.c`
+  (canonical CBOR, 12 tests), `cert.c` (C509 encode/decode/thumbprint/verify,
+  9 structural tests). Vendored PQClean test backend (`vendor/pqclean/`,
+  `tests/pair_test_crypto.c`) drives 8 crypto KATs: SHA-256 + HKDF RFC-5869
+  vectors, KEM round trip, C509 thumbprint + self-signed verify + tamper-
+  reject, and **fixed-seed ML-DSA-44 demo-CA + ML-KEM-768 public-key hashes
+  that match OSDP.Net's published constants byte-for-byte** (PQClean ↔
+  BouncyCastle crypto interop confirmed). Whole C suite green.
 - ☐ **Phase 2: Key schedule.** `keyschedule.c`; assert K_m2/3/4 + SCBK vs
   the fixed vectors; HKDF RFC-5869 sanity vector.
 - ☐ **Phase 3: Message codecs.** `messages.c` Msg1/2/3/Result CBOR
@@ -488,9 +496,11 @@ Locked decisions (2026-07-05):
   state machines derive an identical SCBK, which then feeds the existing SC2
   handshake + a POLL/ACK under SCS_27 — full provisioning-through-operation
   in-process; untrusted-CA / tampered-Msg2/3 / persist-fail negatives.
-- ☐ **Phase 7: WolfSSL backend + live interop.** WolfSSL
-  `osdp_pair_crypto_t` binding in `tools/`+`tests/`; tools gain a pairing
-  mode; live-validate vs OSDP.Net `feature/osdp-sc2` over a serial pair.
+- ☐ **Phase 7: Live interop (WolfSSL).** WolfSSL `osdp_pair_crypto_t`
+  binding for the interop tools; tools gain a pairing mode; live-validate vs
+  OSDP.Net `feature/osdp-sc2` over a serial pair. (Hermetic KATs already run
+  on PQClean from Phase 1; this phase is the production-backend + on-wire
+  cross-check.)
 - ☐ **Phase 8: Rust + MCP + docs.** `PairCrypto` trait + pair APIs; `sys.rs`
   / `build.rs` grown; osdp-mcp pairing option; PLAN.md + CLAUDE.md.
 

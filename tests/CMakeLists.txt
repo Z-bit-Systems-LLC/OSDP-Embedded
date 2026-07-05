@@ -49,6 +49,20 @@ add_executable(test_pair_cert test_pair_cert.c)
 target_link_libraries(test_pair_cert PRIVATE osdp_pair unity)
 add_test(NAME test_pair_cert COMMAND test_pair_cert)
 
+# Pairing crypto test backend: osdp_pair_crypto_t over vendored PQClean
+# (ML-KEM-768 + ML-DSA-44 + SHA-256) with HMAC/HKDF on top. Host-only, never
+# in a production core. Mirrors sc2_test_crypto.
+add_library(pair_test_crypto STATIC pair_test_crypto.c)
+target_include_directories(pair_test_crypto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pair_test_crypto
+    PUBLIC osdp_pair pqclean_mlkem768 pqclean_mldsa44)
+
+# SC2 asymmetric pairing — Phase 1 crypto KATs (thumbprint, cert verify,
+# SHA-256/HKDF vectors, ML-KEM/ML-DSA fixed-seed pubkey cross-checks).
+add_executable(test_pair_crypto test_pair_crypto.c)
+target_link_libraries(test_pair_crypto PRIVATE pair_test_crypto unity)
+add_test(NAME test_pair_crypto COMMAND test_pair_crypto)
+
 # PD-side tests need the osdp_pd library in addition to the core.
 add_executable(test_pd test_pd.c)
 target_link_libraries(test_pd PRIVATE

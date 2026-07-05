@@ -82,3 +82,73 @@ target_include_directories(tiny_gcm
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-gcm
 )
 target_link_libraries(tiny_gcm PUBLIC tiny_aes256)
+
+# ---- PQClean: post-quantum primitives for OSDP-SC2 asymmetric pairing ----
+#
+# The "clean" reference C implementations of ML-KEM-768 (FIPS 203) and
+# ML-DSA-44 (FIPS 204) from https://github.com/PQClean/PQClean (Public
+# Domain / CC0), plus their shared Keccak (fips202) and a SHA-256 (sha2).
+# Self-contained, vendored exactly like tiny-* so the pairing KATs run
+# hermetically on CI with no external package. Never linked into a
+# production core — a firmware/host integrator binds its own PQC backend
+# (WolfSSL, mbedTLS+liboqs, OpenSSL 3.5+, hardware) behind
+# osdp_pair_crypto_t. Used by tests/pair_test_crypto.c.
+#
+# Symbols are namespaced (PQCLEAN_MLKEM768_CLEAN_* / PQCLEAN_MLDSA44_CLEAN_*)
+# so the two schemes' identically-named TUs (poly.c, ntt.c, ...) never
+# collide. randombytes() is intentionally NOT vendored here; the test
+# binding supplies PQCLEAN_randombytes so KATs can inject fixed seeds.
+
+# Shared: Keccak-f[1600]/SHAKE (used by both schemes) + SHA-256 (used by the
+# pairing key schedule and C509 thumbprint).
+add_library(pqclean_common STATIC
+    pqclean/common/fips202.c
+    pqclean/common/sha2.c
+)
+target_include_directories(pqclean_common
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pqclean/common
+)
+
+add_library(pqclean_mlkem768 STATIC
+    pqclean/mlkem768/cbd.c
+    pqclean/mlkem768/indcpa.c
+    pqclean/mlkem768/kem.c
+    pqclean/mlkem768/ntt.c
+    pqclean/mlkem768/poly.c
+    pqclean/mlkem768/polyvec.c
+    pqclean/mlkem768/reduce.c
+    pqclean/mlkem768/symmetric-shake.c
+    pqclean/mlkem768/verify.c
+)
+target_include_directories(pqclean_mlkem768
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pqclean/mlkem768
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pqclean/common
+)
+target_link_libraries(pqclean_mlkem768 PUBLIC pqclean_common)
+
+add_library(pqclean_mldsa44 STATIC
+    pqclean/mldsa44/ntt.c
+    pqclean/mldsa44/packing.c
+    pqclean/mldsa44/poly.c
+    pqclean/mldsa44/polyvec.c
+    pqclean/mldsa44/reduce.c
+    pqclean/mldsa44/rounding.c
+    pqclean/mldsa44/sign.c
+    pqclean/mldsa44/symmetric-shake.c
+)
+target_include_directories(pqclean_mldsa44
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pqclean/mldsa44
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pqclean/common
+)
+target_link_libraries(pqclean_mldsa44 PUBLIC pqclean_common)
+
+# Upstream reference code is not warning-clean under this project's strict
+# flags; silence warnings on the vendored targets only (we don't modify the
+# upstream source), mirroring tiny-*.
+foreach(_pqc pqclean_common pqclean_mlkem768 pqclean_mldsa44)
+    if(MSVC)
+        target_compile_options(${_pqc} PRIVATE /w)
+    else()
+        target_compile_options(${_pqc} PRIVATE -w)
+    endif()
+endforeach()

@@ -48,13 +48,18 @@ provisions the key those files already consume.
 - **Crypto is fully pluggable; no backend is baked in.** Every asymmetric
   and hashing primitive crosses the `osdp_pair_crypto_t` HAL (§4) — exactly
   like SC1's `osdp_sc_crypto_t` and SC2's `osdp_sc2_crypto_t`. The core
-  contains zero ML-KEM / ML-DSA / SHA-3 / HKDF code. **WolfSSL is the
-  chosen test/tool backend** (wolfCrypt ships native ML-KEM, ML-DSA,
-  SHA-256, HMAC, and HKDF), bound in `tools/` + `tests/` only — never in a
-  production core. Any other backend (mbedTLS + liboqs, OpenSSL 3.5+,
-  a hardware PQC accelerator, an MCU-oriented PQClean build) satisfies the
-  same HAL and drops in with no core change. The HAL is the contract; the
-  backend is the integrator's choice.
+  contains zero ML-KEM / ML-DSA / SHA-3 / HKDF code. **Tests/CI use vendored
+  PQClean** (ML-KEM-768 + ML-DSA-44 + SHA-256, CC0, under `vendor/pqclean/`)
+  — self-contained like `tiny-*`, so the KATs run hermetically on the
+  existing Linux CI with no external dependency (decided 2026-07-05 after
+  confirming CI is hermetic/vendored; a WolfSSL CI step would need a
+  from-source PQC build). **WolfSSL is the documented production backend and
+  a live-interop target** (wolfCrypt ships native ML-KEM/ML-DSA); any other
+  backend (mbedTLS + liboqs, OpenSSL 3.5+, hardware PQC) satisfies the same
+  HAL and drops in with no core change. The HAL is the contract; the backend
+  is the integrator's choice. PQClean's fixed-seed ML-KEM/ML-DSA public keys
+  hash byte-identically to OSDP.Net's published constants, so the vendored
+  test backend is confirmed interoperable with the BouncyCastle reference.
 
 ## 2. Wire protocol
 
@@ -243,10 +248,12 @@ pd/src/pd_pair.c       # PD wire driver: reassembly, session drive, 30 s timeout
                        #   on_scbk_established persistence callback
 acu/src/acu_pair.c     # ACU wire driver: fragment send, reassembly, per-message timeout
 
-tools/                 # osdp-pd-mock / osdp-acu-mock gain a pairing mode, backed by
-tests/                 #   a WolfSSL osdp_pair_crypto_t binding (also used by the KAT
-                       #   + loopback tests). NO PQC code vendored into core; the
-                       #   backend is external and swappable per §Locked-decisions.
+vendor/pqclean/        # [Phase 1 ☑] vendored ML-KEM-768 + ML-DSA-44 + SHA-256
+                       #   (CC0), self-contained like tiny-*; the hermetic CI/test
+                       #   PQC backend. NEVER linked into a production core.
+tests/pair_test_crypto.c # [Phase 1 ☑] osdp_pair_crypto_t over PQClean (+ HMAC/HKDF)
+tools/                 # osdp-pd-mock / osdp-acu-mock gain a pairing mode; a WolfSSL
+                       #   osdp_pair_crypto_t binding for live interop (Phase 7).
 rust/osdp/             # safe wrapper: PairCrypto trait + pair APIs; sys.rs + build.rs grown
 ```
 
@@ -369,10 +376,12 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
 - **Phase 0 — transport.** `cmd_pair.c` / `reply_pairr.c` (0xB0/0x8A) +
   `shared/multipart.c` (2-byte reassembly, pairing-scoped). Buffer-sizing
   constants + bounds checks. Round-trip + truncated/oversized negatives.
-- **Phase 1 — crypto HAL + CBOR + C509.** `osdp_pair_crypto.h`,
-  `osdp_cbor.h`/`cbor.c`, `cert.c`. KATs: demo-CA thumbprint, ML-KEM/ML-DSA
-  pubkey hashes, C509 round-trip + deterministic encoding + stable
-  thumbprint + CA-verify/reject + self-signed verify (§9).
+- **Phase 1 ☑ — crypto HAL + CBOR + C509.** `osdp_pair_crypto.h`,
+  `osdp_cbor.h`/`cbor.c` (12 tests), `cert.c` (9 structural tests). Vendored
+  PQClean backend (`vendor/pqclean/`, `tests/pair_test_crypto.c`) drives 8
+  KATs: SHA-256 + HKDF RFC-5869 vectors, KEM round trip, C509 thumbprint +
+  self-signed verify + tamper-reject, and the fixed-seed ML-DSA-44 /
+  ML-KEM-768 pubkey hashes matching OSDP.Net byte-for-byte (§9).
 - **Phase 2 — key schedule.** `keyschedule.c`; assert K_m2/3/4 + SCBK
   against the fixed vectors (§9). HKDF RFC-5869 sanity vector.
 - **Phase 3 — message codecs.** `messages.c` Msg1/2/3/Result CBOR
