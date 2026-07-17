@@ -7,7 +7,13 @@
 //! Milestone 2 ships the "default" behavior — the same baseline the
 //! [`osdp-pd-mock`](../../../tools/osdp-pd-mock/main.c) tool provides:
 //! POLL → ACK, ID → PDID, CAP → PDCAP, LED / BUZ / OUT / TEXT /
-//! KEYSET / COMSET → ACK, everything else → NAK (unknown command).
+//! KEYSET → ACK, everything else → NAK (unknown command).
+//!
+//! `osdp_COMSET` never reaches this handler: the C library intercepts it,
+//! builds the `osdp_COM` reply, and switches the PD address itself. The
+//! virtual PD's COMSET policy lives in [`DefaultComsetHandler`] instead
+//! (registered in the actor). One consequence: the override / fault-
+//! injection tools can't target COMSET, the same as the SC handshake.
 //!
 //! Later milestones add an override table the agent can populate via
 //! `set_reply_for` etc.; the override check will be wired into the
@@ -18,11 +24,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use osdp_embedded::messages::{
-    Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_COMSET, OSDP_CMD_ID,
-    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
-    OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_KEYSET,
+    OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT, OSDP_NAK_UNKNOWN_CMD,
+    OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
-use osdp_embedded::pd::{CommandHandler, Reply};
+use osdp_embedded::pd::{
+    CommandHandler, ComsetHandler, FileFragment, FileReceiver, FileReject, Reply,
+};
 
 use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
@@ -44,13 +52,72 @@ pub struct PdStats {
     pub last_reply_code: Option<u8>,
 }
 
+/// COMSET policy for the virtual PD. The C library builds the `osdp_COM`
+/// reply and switches the PD's address on its own; this handler decides the
+/// values that reply reports and reacts once the change is live.
+///
+/// Baud is deliberately pinned to the port's configured rate: the MCP's live
+/// serial link isn't reconfigured mid-session (change it with `pd_configure`
+/// instead), so reporting a new baud in `osdp_COM` while staying at the old
+/// rate would desync the link. Pinning the current baud is the spec 6.13
+/// "unable to comply — report what I'll use" behavior, and keeps the wire
+/// working while the ACU's requested address still takes effect.
+pub struct DefaultComsetHandler {
+    baud: u32,
+}
+
+impl DefaultComsetHandler {
+    pub fn new(baud: u32) -> Self {
+        Self { baud }
+    }
+}
+
+impl ComsetHandler for DefaultComsetHandler {
+    fn decide(&mut self, req_address: u8, _req_baud: u32) -> (u8, u32) {
+        // Accept the address; keep our baud (see struct docs).
+        (req_address, self.baud)
+    }
+
+    fn applied(&mut self, address: u8, baud: u32) {
+        tracing::info!(
+            address = format!("0x{:02X}", address),
+            baud,
+            "osdp_COMSET applied — PD now answering on the new address"
+        );
+    }
+}
+
+/// Default `osdp_FILETRANSFER` receiver for the virtual PD. Registered in
+/// **streaming** mode (no reassembly buffer), so it accepts a file of any size
+/// without a ceiling — the MCP PD is a protocol simulator, not a firmware
+/// target, so it just logs progress and accepts every fragment (the PD then
+/// reports "proceed" mid-file and "processed" on completion). A consumer that
+/// needs to reject a file (bad header, unsupported type) can extend this to
+/// return [`FileReject`].
+pub struct DefaultFileReceiver;
+
+impl FileReceiver for DefaultFileReceiver {
+    fn on_fragment(&mut self, f: &FileFragment) -> Result<(), FileReject> {
+        // Streaming mode: read `received` (cumulative), not `data` (empty).
+        tracing::info!(
+            ft_type = format!("0x{:02X}", f.ft_type),
+            received = f.received,
+            total = f.total_size,
+            offset = f.offset,
+            complete = f.complete,
+            "osdp_FILETRANSFER fragment accepted"
+        );
+        Ok(())
+    }
+}
+
 /// Default PDID — matches the osdp-pd-mock CLI tool so behavior is
 /// consistent across the two interop harnesses. Vendor "ZBC" is a
 /// placeholder; consumers override it at runtime via the `pd_set_pdid`
 /// tool when they want a realistic device identity.
 pub fn default_pdid() -> Pdid {
     Pdid {
-        vendor_code: [b'Z', b'B', b'C'],
+        vendor_code: *b"ZBC",
         model: 0x01,
         version: 0x00,
         serial: 0x0000_0001,
@@ -345,8 +412,9 @@ impl CommandHandler for DefaultHandler {
                 let n = pdcap.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDCAP, n)
             }
-            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET
-            | OSDP_CMD_COMSET => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET => {
+                (OSDP_REPLY_ACK, 0)
+            }
             OSDP_CMD_LSTAT => {
                 // Local status query. Hard-coded "all clear" for now:
                 // tamper=0, power=0 (spec D.2.1 LSTATR payload is two

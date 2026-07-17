@@ -156,6 +156,73 @@ serial_ctx_t *serial_open(const char *port_name,
     return ctx;
 }
 
+bool serial_baud_supported(unsigned int baud)
+{
+    /* Win32 drivers accept arbitrary rates via DCB.BaudRate; gate only
+     * on a nonzero value. */
+    return baud != 0U;
+}
+
+bool serial_set_baud(serial_ctx_t *ctx, unsigned int baud,
+                     char *errbuf, size_t errbuf_cap)
+{
+    if (ctx == NULL || ctx->handle == INVALID_HANDLE_VALUE) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "internal: port not open");
+        return false;
+    }
+    /* The osdp_COM reply MUST be fully on the wire at the OLD baud before we
+     * switch — otherwise its tail bytes clock out at the new rate and the ACU
+     * sees a mangled reply (spec 6.13: settings take effect only after the
+     * response completes).
+     *
+     * Read the current (old) baud first so we can time the drain against it. */
+    DCB dcb;
+    (void)memset(&dcb, 0, sizeof(dcb));
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(ctx->handle, &dcb)) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "GetCommState: %lu",
+                                           (unsigned long)GetLastError());
+        return false;
+    }
+    const DWORD old_baud = (dcb.BaudRate != 0) ? dcb.BaudRate : 9600U;
+
+    /* Step 1: empty the driver's software output queue. */
+    for (unsigned i = 0; i < 2000U; ++i) {
+        DWORD   errs = 0;
+        COMSTAT st;
+        if (!ClearCommError(ctx->handle, &errs, &st)) {
+            break;  /* can't query — fall through */
+        }
+        if (st.cbOutQue == 0) {
+            break;  /* driver queue drained */
+        }
+        Sleep(1);
+    }
+    /* Step 2: push the driver buffer toward the device. */
+    (void)FlushFileBuffers(ctx->handle);
+
+    /* Step 3: wait out the physical transmission. On a USB adapter (FTDI et
+     * al.) cbOutQue and FlushFileBuffers report "done" while bytes are still
+     * in the chip's hardware FIFO, plus the USB latency-timer delay (~16 ms
+     * default). Neither is observable from here, so sleep for the time a
+     * worst-case OSDP frame takes at the OLD baud, plus a USB-latency margin.
+     * ~64 bytes * 10 bits/byte gives ample headroom over the ~13-byte
+     * osdp_COM frame; the whole thing only runs on the rare COMSET. */
+    const DWORD frame_ms = (64UL * 10UL * 1000UL) / old_baud; /* e.g. 66 ms @ 9600 */
+    Sleep(frame_ms + 40UL /* USB latency + safety margin */);
+
+    dcb.BaudRate = baud;
+    if (!SetCommState(ctx->handle, &dcb)) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "SetCommState: %lu",
+                                           (unsigned long)GetLastError());
+        return false;
+    }
+    return true;
+}
+
 void serial_close(serial_ctx_t *ctx)
 {
     if (ctx == NULL) return;

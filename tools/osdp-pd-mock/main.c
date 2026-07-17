@@ -96,10 +96,14 @@ typedef struct app_state {
     osdp_pdcap_record_t  pdcap[16];
     size_t               pdcap_count;
     uint8_t              address;
+    uint32_t             baud;      /* current line rate (for COMSET) */
     int                  verbose;
 
     /* Scratch for build_* outputs returned to the PD via reply.payload. */
     uint8_t              scratch[OSDP_PD_TX_BUF_LEN];
+
+    /* Running total of file bytes streamed in (for the -v progress log). */
+    uint32_t             file_received;
 } app_state_t;
 
 static const char *cmd_name(uint8_t code)
@@ -114,6 +118,7 @@ static const char *cmd_name(uint8_t code)
     case OSDP_CMD_OUT:    return "OUT";
     case OSDP_CMD_COMSET: return "COMSET";
     case OSDP_CMD_KEYSET: return "KEYSET";
+    case OSDP_CMD_FILETRANSFER: return "FILETRANSFER";
     case OSDP_CMD_LSTAT:  return "LSTAT";
     case OSDP_CMD_ISTAT:  return "ISTAT";
     case OSDP_CMD_OSTAT:  return "OSTAT";
@@ -238,12 +243,14 @@ static osdp_status_t app_handler(void           *user,
         break;
     }
 
+    /* osdp_COMSET is intercepted by the library (it replies osdp_COM and
+     * mutates the PD address), so it never reaches this handler — see the
+     * comset decide/applied hooks registered in main(). */
     case OSDP_CMD_LED:
     case OSDP_CMD_BUZ:
     case OSDP_CMD_OUT:
     case OSDP_CMD_TEXT:
     case OSDP_CMD_KEYSET:
-    case OSDP_CMD_COMSET:
         reply->code        = OSDP_REPLY_ACK;
         reply->payload     = NULL;
         reply->payload_len = 0;
@@ -405,6 +412,9 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             out->baud = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--address") == 0 && i + 1 < argc) {
             const unsigned long v = strtoul(argv[++i], NULL, 0);
+            /* A configured working address is 0x00..0x7E. 0x7F is the
+             * configuration/broadcast address: the PD always also responds
+             * to it, but it is never assigned as a working address. */
             if (v > 0x7EU) {
                 fprintf(stderr, "address out of range: 0x%lx\n", v);
                 return false;
@@ -451,6 +461,83 @@ static bool parse_args(int argc, char **argv, cli_t *out)
     return true;
 }
 
+/* ---- osdp_COMSET hooks ----------------------------------------------- */
+
+/* Threaded into the COMSET callbacks: the open serial port (to switch its
+ * baud) and the app state (to track the current address/baud and honour
+ * -v verbosity). */
+typedef struct comset_ctx {
+    serial_ctx_t *serial;
+    app_state_t  *app;
+} comset_ctx_t;
+
+/* Decide phase: accept the requested address; accept the requested baud
+ * only if the serial layer can actually switch to it, otherwise keep the
+ * current rate so the osdp_COM reply is truthful (spec 6.13). */
+static void mock_comset_decide(void *user, uint8_t req_addr, uint32_t req_baud,
+                               uint8_t *eff_addr, uint32_t *eff_baud)
+{
+    comset_ctx_t *c = (comset_ctx_t *)user;
+    *eff_addr = req_addr;
+    if (serial_baud_supported(req_baud)) {
+        *eff_baud = req_baud;
+    } else {
+        *eff_baud = c->app->baud;
+        fprintf(stderr,
+                "COMSET: requested baud %u unsupported, keeping %u\n",
+                (unsigned)req_baud, (unsigned)c->app->baud);
+    }
+}
+
+/* Apply phase: the osdp_COM reply has been sent and the PD has already
+ * adopted `address`. Mirror it into the app state and switch the UART baud
+ * (a real PD would also persist both to non-volatile storage here). */
+static void mock_comset_applied(void *user, uint8_t address, uint32_t baud)
+{
+    comset_ctx_t *c = (comset_ctx_t *)user;
+    c->app->address = address;
+    if (baud != c->app->baud) {
+        char err[128];
+        if (serial_set_baud(c->serial, baud, err, sizeof(err))) {
+            c->app->baud = baud;
+        } else {
+            fprintf(stderr, "COMSET: serial_set_baud(%u) failed: %s\n",
+                    (unsigned)baud, err);
+        }
+    }
+    fprintf(stderr, "=== COMSET applied: address 0x%02X, baud %u ===\n",
+            address, (unsigned)c->app->baud);
+}
+
+/* ---- osdp_FILETRANSFER receiver -------------------------------------- */
+
+/* Per-fragment file evaluation in STREAMING mode: the library hands us each
+ * fragment (info->fragment / fragment_len) as it arrives without buffering
+ * the whole file — info->data is NULL — so RAM use is independent of file
+ * size. A real PD would write info->fragment straight to a flash staging
+ * partition here (and could validate a firmware header at offset 0, rejecting
+ * with OSDP_ERR_BAD_PAYLOAD → FtStatusDetail -3). We just log progress and
+ * accept, which makes the library report proceed (0) mid-file and processed
+ * (1) on the final fragment. */
+static osdp_status_t mock_file_eval(void *user, const osdp_pd_file_info_t *info)
+{
+    app_state_t *app = (app_state_t *)user;
+    app->file_received = info->received;
+    if (app->verbose > 0) {
+        fprintf(stderr,
+                "FILETRANSFER: type 0x%02X  %u/%u bytes  offset %u%s\n",
+                info->ft_type, (unsigned)info->received,
+                (unsigned)info->total_size, (unsigned)info->offset,
+                info->complete ? "  [complete]" : "");
+    }
+    if (info->complete) {
+        fprintf(stderr,
+                "=== FILETRANSFER complete: %u bytes (type 0x%02X) ===\n",
+                (unsigned)info->total_size, info->ft_type);
+    }
+    return OSDP_OK;
+}
+
 /* ---- Main ------------------------------------------------------------ */
 
 /* Derive the 8-byte cUID from a PDID per spec D.4.3: cUID is the first
@@ -481,6 +568,7 @@ int main(int argc, char **argv)
     app.pdcap_count = DEFAULT_PDCAP_COUNT;
     (void)memcpy(app.pdcap, kDefaultPdcap, sizeof(kDefaultPdcap));
     app.address     = cli.address;
+    app.baud        = cli.baud;
     app.verbose     = cli.verbose;
 
     /* Open the serial port. */
@@ -504,6 +592,17 @@ int main(int argc, char **argv)
     osdp_pd_init(&pd, cli.address);
     osdp_pd_set_transport(&pd, &transport);
     osdp_pd_set_command_handler(&pd, app_handler, &app);
+
+    /* osdp_COMSET: let the library drive the reply/address change and use
+     * the applied hook to switch the UART baud on this host tool. */
+    comset_ctx_t comset_ctx = { .serial = serial, .app = &app };
+    osdp_pd_set_comset_handler(&pd, mock_comset_decide, mock_comset_applied,
+                               &comset_ctx);
+
+    /* osdp_FILETRANSFER: use STREAMING mode — the library hands each fragment
+     * to mock_file_eval without buffering the whole file, so the tool handles
+     * arbitrarily large images with no reassembly buffer. */
+    osdp_pd_set_file_stream(&pd, mock_file_eval, &app);
 
     /* Optionally configure Secure Channel. The crypto vtable, the cUID
      * (derived from our PDID), and the requested key all need to be

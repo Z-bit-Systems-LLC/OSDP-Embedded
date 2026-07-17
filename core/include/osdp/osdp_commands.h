@@ -252,6 +252,48 @@ osdp_status_t osdp_keyset_decode(const uint8_t *payload, size_t len,
 osdp_status_t osdp_keyset_build(const osdp_keyset_cmd_t *in,
                                 uint8_t *buf, size_t buf_cap, size_t *written);
 
+/* ========================================================================
+ * osdp_FILETRANSFER (0x7C) — a fragment of a file (firmware image, config
+ * blob, ...) streamed ACU → PD, 11-byte header + optional fragment bytes.
+ *
+ * Wire layout (spec 6.26, Table 34):
+ *   0        FtType         — file content type (see osdp_ft_type_t)
+ *   1..4     FtSizeTotal    — total file size, uint32 little-endian
+ *   5..8     FtOffset       — offset of this fragment, uint32 LE; must be
+ *                             monotonically increasing across a transfer
+ *   9..10    FtFragmentSize — fragment byte count, uint16 LE
+ *   11..     FtData         — `FtFragmentSize` fragment bytes (optional; an
+ *                             "idle" fragment during PD "finishing" is 0)
+ *
+ * (Table 34 labels the header "DATA (12 bytes)" but the fields sum to 11;
+ * that label is a PDF-extraction artifact. libosdp uses the same 11-byte
+ * header.)
+ * ==================================================================== */
+
+#define OSDP_FILETRANSFER_HEADER_BYTES 11U
+
+/* FtType values (spec Table 34). 0x04-0x7F reserved, 0x80-0xFF private. */
+typedef enum osdp_ft_type {
+    OSDP_FT_TYPE_OPAQUE   = 0x01U,  /* opaque file contents            */
+    OSDP_FT_TYPE_BIOMATCH = 0x02U,  /* template for next osdp_BIOMATCH  */
+    OSDP_FT_TYPE_DISPLAY  = 0x03U   /* PD-specific "display" data       */
+} osdp_ft_type_t;
+
+typedef struct osdp_filetransfer_cmd {
+    uint8_t        ft_type;         /* see osdp_ft_type_t                    */
+    uint32_t       total_size;      /* FtSizeTotal                           */
+    uint32_t       offset;          /* FtOffset (monotonically increasing)   */
+    uint16_t       fragment_size;   /* FtFragmentSize; must equal data_len   */
+    const uint8_t *data;            /* fragment bytes; NULL when size == 0   */
+    size_t         data_len;        /* size of `data`; must equal fragment_size */
+} osdp_filetransfer_cmd_t;
+
+osdp_status_t osdp_filetransfer_decode(const uint8_t *payload, size_t len,
+                                       osdp_filetransfer_cmd_t *out);
+osdp_status_t osdp_filetransfer_build(const osdp_filetransfer_cmd_t *in,
+                                      uint8_t *buf, size_t buf_cap,
+                                      size_t *written);
+
 #ifdef __cplusplus
 }
 #endif

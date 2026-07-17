@@ -39,12 +39,14 @@ seems to need a change, raise it explicitly with the user first.
 8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel
    (SC1) and Secure Channel 2 (SC2).** Currently implemented: Layer 1
    framing, the baseline command/reply set, PD-side state machine (with
-   SC1 + SC2), ACU-side state machine (with SC1 + SC2). SC2 is the
+   SC1 + SC2), ACU-side state machine (with SC1 + SC2), and PD-side file
+   transfer (osdp_FILETRANSFER / osdp_FTSTAT). SC2 is the
    quantum-resistant channel (AES-256-GCM + KMAC256) built as a parallel
    implementation in the SCS_21..28 range; both sides are live-validated
-   against OSDP.Net's `feature/osdp-sc2`. Still deferred: file transfer,
-   biometric, manufacturer-specific commands, multi-part messages. See
-   [docs/PLAN.md](docs/PLAN.md) for what's done and what's next.
+   against OSDP.Net's `feature/osdp-sc2`. Still deferred: biometric,
+   manufacturer-specific commands, multi-part messages, ACU-side file
+   transfer. See [docs/PLAN.md](docs/PLAN.md) for what's done and what's
+   next.
 
 ## Module layout
 
@@ -142,6 +144,79 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
+
+## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
+
+Most commands flow to the application's `osdp_pd_command_cb`, which chooses
+the reply. A few are intercepted by the PD state machine itself because they
+mutate library-owned state and/or mandate a specific reply the app shouldn't
+have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
+(`pd/src/pd_sc.c`) dispatch paths intercept them identically.
+
+- **`osdp_KEYSET`** — flows to `cmd_cb` (the app ACKs it), then the core
+  applies the new SCBK in place. See the Secure Channel conventions below.
+- **`osdp_COMSET`** — handled entirely by the core: it never reaches
+  `cmd_cb`. The library builds the mandated `osdp_COM` reply and switches
+  `pd->address` for it (the state machine owns the address — it filters
+  inbound frames and stamps replies with it). Per spec 6.13 the change takes
+  effect only *after* the reply is sent, so the reply goes out at the old
+  address and the switch is deferred to `process_frame` after `send_bytes`.
+  Two optional app hooks bracket the exchange (`osdp_pd_set_comset_handler`):
+  `decide` (before the reply — veto/clamp the requested address/baud, the
+  spec-6.13 "return what I'll use" path) and `applied` (after the reply is
+  sent — enact the baud change on the transport and persist to NVM). The
+  address is switched by the core; only the baud is the app's job, because
+  the core has no UART. Critical gotcha the app hook must respect: a
+  transport `write()` returning does not mean the bytes are physically on the
+  wire, so `applied` must **drain the transmitter before changing baud** (a
+  premature switch clocks out the tail of `osdp_COM` at the new rate and the
+  ACU never follows). `tcdrain` on POSIX; on Windows `FlushFileBuffers` plus
+  a timed wait, since USB adapters hold bytes in a chip FIFO past
+  `FlushFileBuffers`/`cbOutQue`. `tools/osdp-pd-mock/serial_*.c` implements
+  both. Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
+  > 0x7E is rejected and the current address kept — 0x7F is **not** an
+  assignable working address, it is the *configuration address*
+  (`OSDP_CONFIG_ADDR`, the spec's 0x7F "broadcast"). A COMSET that *arrives
+  at* 0x7F, however, is the config-discovery flow: the PD processes it and
+  assigns the requested (0x00..0x7E) working address. Address / reply rules
+  (spec 5.9 Note 2): the PD accepts frames sent to **either** its configured
+  address **or** 0x7F, and a reply to a 0x7F-addressed command goes out at
+  0x7F | reply-flag = **0xFF** (not the PD's own address). `build_reply` in
+  `pd/src/pd.c` implements this by mirroring the inbound `cmd->address`.
+- **`osdp_FILETRANSFER`** — handled entirely by the core: it never reaches
+  `cmd_cb`. The library decodes each fragment, enforces the offset invariants,
+  tracks the running position, and builds every mandated `osdp_FTSTAT` reply.
+  The app supplies only a per-fragment evaluation callback (`osdp_pd_file_cb`),
+  whose return maps to `FtStatusDetail` — `OSDP_OK` → proceed (0) mid-file /
+  processed (1) on the final fragment; `OSDP_ERR_BAD_PAYLOAD` → malformed (−3);
+  `OSDP_ERR_NOT_SUPPORTED` → unrecognized (−2); anything else → abort (−1).
+  The callback fires on every accepted fragment so the app can validate
+  incrementally (check a firmware header at offset 0, hash as it goes) and
+  reject mid-transfer. **Two modes**, both driving the same callback, chosen by
+  which setter registers it:
+  - `osdp_pd_set_file_receiver(buf, cap, …)` — **reassembly**: the core copies
+    each fragment into the caller-owned buffer (no malloc; app sizes it to the
+    largest expected file) and hands the whole accumulated file to the callback
+    (`info->data`). A `total_size` > `cap` aborts with −1. For validate-then-
+    commit of small blobs (biomatch template, display data) or whole-file
+    signature checks.
+  - `osdp_pd_set_file_stream(…)` — **streaming**: no buffer. The core hands
+    each fragment to the callback as it arrives (`info->fragment`; `info->data`
+    is NULL) without accumulating, with no size ceiling — RAM use is
+    independent of file size. For firmware update on RAM-constrained MCUs that
+    persist each fragment to flash. `file_buf == NULL` is the internal mode
+    flag; the two setters linker-GC independently.
+
+  Invariants enforced in both modes — first fragment at offset 0,
+  contiguous/monotonic offsets, stable type/size (plus `total_size` ≤ capacity
+  in reassembly mode) — and any violation aborts with −1 and resets so the ACU
+  can restart at offset 0. Byte-identical retransmits replay from the SQN cache
+  before the callback runs, so a lost FTSTAT never corrupts the offset. With no
+  receiver registered, FILETRANSFER → NAK 0x03; an undecodable frame (payload <
+  11-byte header) → NAK 0x02. The `osdp_FTSTAT` reply is data-bearing, so under
+  SC it wraps as SCS_18. Deferred while the callback is synchronous: the
+  "finishing" (status 3) idle-fragment protocol and `FtUpdateMsgMax` throttling
+  (the PD always reports `update_msg_max = 0`).
 
 ## Coding rules
 
@@ -301,8 +376,9 @@ that differ from SC1:
   `tools/osdp-pd-mock` use tiny-AES-c (vendor/tiny-aes/, Unlicense)
   but production binaries are expected to bind their own (mbedTLS,
   hardware AES, BCryptGenRandom / /dev/urandom, etc.).
-- File transfer, biometric, manufacturer-specific commands, multi-
-  part / multi-record messages, PIV data exchange.
+- ACU-side file transfer (the PD side is implemented; the ACU currently
+  has no file-send driver). Biometric, manufacturer-specific commands,
+  multi-part / multi-record messages, PIV data exchange.
 - Auto-poll scheduling on the ACU (the application currently drives
   every command).
 

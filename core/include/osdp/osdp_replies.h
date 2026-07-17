@@ -248,6 +248,47 @@ osdp_status_t osdp_com_decode(const uint8_t *payload, size_t len,
 osdp_status_t osdp_com_build(const osdp_com_t *in,
                              uint8_t *buf, size_t buf_cap, size_t *written);
 
+/* ========================================================================
+ * osdp_FTSTAT (0x7A) — file-transfer status, sent in reply to every
+ * osdp_FILETRANSFER, 7-byte payload.
+ *
+ * Wire layout (spec 7.25, Table 68):
+ *   0        FtAction        — control flags (see OSDP_FTSTAT_ACTION_*)
+ *   1..2     FtDelay         — ms the ACU should wait before the next
+ *                             osdp_FILETRANSFER, uint16 LE (0 = no delay)
+ *   3..4     FtStatusDetail  — SIGNED int16 LE status (see OSDP_FTSTAT_*)
+ *   5..6     FtUpdateMsgMax  — alternate max fragment size for subsequent
+ *                             messages, uint16 LE (0 = no change requested)
+ * ==================================================================== */
+
+#define OSDP_FTSTAT_PAYLOAD_BYTES 7U
+
+/* FtStatusDetail values (spec Table 68). Signed: negative = failure. */
+#define OSDP_FTSTAT_MALFORMED     (-3)  /* file data unacceptable (malformed) */
+#define OSDP_FTSTAT_UNRECOGNIZED  (-2)  /* unrecognized file contents         */
+#define OSDP_FTSTAT_ABORT         (-1)  /* abort file transfer                */
+#define OSDP_FTSTAT_OK             (0)  /* ok to proceed                      */
+#define OSDP_FTSTAT_PROCESSED      (1)  /* file contents processed            */
+#define OSDP_FTSTAT_REBOOTING      (2)  /* rebooting now; expect comms reset  */
+#define OSDP_FTSTAT_FINISHING      (3)  /* PD finishing; ACU sends idle msgs  */
+
+/* FtAction control-flag bits (spec Table 68). */
+#define OSDP_FTSTAT_ACTION_INTERLEAVE_OK 0x01U  /* bit0: ok to interleave     */
+#define OSDP_FTSTAT_ACTION_LEAVE_SC      0x02U  /* bit1: leave SC for transfer */
+#define OSDP_FTSTAT_ACTION_POLL_AVAIL    0x04U  /* bit2: separate poll response */
+
+typedef struct osdp_ftstat {
+    uint8_t   action;          /* FtAction flags (OSDP_FTSTAT_ACTION_*)      */
+    uint16_t  delay_ms;        /* FtDelay before next osdp_FILETRANSFER      */
+    int16_t   status_detail;   /* FtStatusDetail, signed (OSDP_FTSTAT_*)     */
+    uint16_t  update_msg_max;  /* FtUpdateMsgMax (0 = no change)             */
+} osdp_ftstat_t;
+
+osdp_status_t osdp_ftstat_decode(const uint8_t *payload, size_t len,
+                                 osdp_ftstat_t *out);
+osdp_status_t osdp_ftstat_build(const osdp_ftstat_t *in,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
 #ifdef __cplusplus
 }
 #endif

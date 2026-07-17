@@ -380,6 +380,69 @@ static void test_com_decode_rejects_wrong_size(void)
 }
 
 /* ========================================================================
+ * osdp_FTSTAT
+ * ====================================================================== */
+
+static void test_ftstat_round_trip_positive_status(void)
+{
+    osdp_ftstat_t in = {
+        .action         = OSDP_FTSTAT_ACTION_INTERLEAVE_OK,
+        .delay_ms       = 250,
+        .status_detail  = OSDP_FTSTAT_PROCESSED,
+        .update_msg_max = 128,
+    };
+    uint8_t buf[OSDP_FTSTAT_PAYLOAD_BYTES]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_ftstat_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FTSTAT_PAYLOAD_BYTES, w);
+
+    osdp_ftstat_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_ftstat_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(in.action, got.action);
+    TEST_ASSERT_EQUAL_UINT16(250, got.delay_ms);
+    TEST_ASSERT_EQUAL_INT16(OSDP_FTSTAT_PROCESSED, got.status_detail);
+    TEST_ASSERT_EQUAL_UINT16(128, got.update_msg_max);
+}
+
+/* The signed FtStatusDetail must survive the round trip through the
+ * unsigned wire encoding. */
+static void test_ftstat_round_trip_negative_status(void)
+{
+    osdp_ftstat_t in = {
+        .action         = 0,
+        .delay_ms       = 0,
+        .status_detail  = OSDP_FTSTAT_MALFORMED,   /* -3 */
+        .update_msg_max = 0,
+    };
+    uint8_t buf[OSDP_FTSTAT_PAYLOAD_BYTES]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_ftstat_build(&in, buf, sizeof(buf), &w));
+    /* -3 as little-endian int16 is 0xFD 0xFF. */
+    TEST_ASSERT_EQUAL_HEX8(0xFD, buf[3]);
+    TEST_ASSERT_EQUAL_HEX8(0xFF, buf[4]);
+
+    osdp_ftstat_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_ftstat_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_INT16(-3, got.status_detail);
+}
+
+static void test_ftstat_decode_rejects_wrong_size(void)
+{
+    osdp_ftstat_t got;
+    static const uint8_t six[] = { 1, 2, 3, 4, 5, 6 };
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_ftstat_decode(six, sizeof(six), &got));
+}
+
+static void test_ftstat_build_rejects_small_buffer(void)
+{
+    osdp_ftstat_t in = { .action = 0, .delay_ms = 0,
+                         .status_detail = 0, .update_msg_max = 0 };
+    uint8_t buf[OSDP_FTSTAT_PAYLOAD_BYTES - 1]; size_t w;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_ftstat_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+}
+
+/* ========================================================================
  * Registration
  * ====================================================================== */
 
@@ -423,5 +486,10 @@ int main(void)
     /* COM */
     RUN_TEST(test_com_round_trip);
     RUN_TEST(test_com_decode_rejects_wrong_size);
+    /* FTSTAT */
+    RUN_TEST(test_ftstat_round_trip_positive_status);
+    RUN_TEST(test_ftstat_round_trip_negative_status);
+    RUN_TEST(test_ftstat_decode_rejects_wrong_size);
+    RUN_TEST(test_ftstat_build_rejects_small_buffer);
     return UNITY_END();
 }

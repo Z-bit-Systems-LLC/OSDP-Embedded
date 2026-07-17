@@ -205,6 +205,126 @@ typedef void (*osdp_pd_buzzer_cb)(void   *user,
                                   bool    sounding,
                                   uint8_t tone);
 
+/* ---- Communication configuration (osdp_COMSET) -------------------------
+ *
+ * osdp_COMSET (0x6E) asks the PD to adopt a new address and/or baud rate.
+ * Per spec 6.13 the change takes effect only AFTER the PD has finished
+ * replying, and the reply (osdp_COM, 0x54) reports the values the PD will
+ * actually use. The PD state machine owns the 7-bit address (it filters
+ * inbound frames on it and stamps it into every reply), so COMSET is
+ * handled inside the library rather than by the application command
+ * handler — analogous to how osdp_KEYSET rotates the stored SCBK.
+ *
+ * Two optional application hooks bracket the exchange:
+ *
+ *   - `decide`  runs BEFORE the osdp_COM reply is built. `eff_*` are
+ *     pre-seeded with the ACU's requested values; the handler may lower or
+ *     replace them if the PD cannot comply (spec 6.13: "it will return the
+ *     values that it will use"). Leave them untouched to accept the request.
+ *     If no handler is registered the request is accepted verbatim. An
+ *     effective address above 0x7E is rejected and the current address is
+ *     kept instead.
+ *
+ *   - `applied` runs AFTER the osdp_COM reply has been handed to the
+ *     transport and the PD has adopted the new address. The application MUST
+ *     now reconfigure its transport to `baud` and SHOULD persist
+ *     (address, baud) to non-volatile storage. Reconfiguring the UART any
+ *     earlier would corrupt the in-flight reply. NOTE: the transport's
+ *     write() returning does not guarantee the bytes are physically on the
+ *     wire (most drivers only queue them), so `applied` must DRAIN the
+ *     transmitter before changing the baud — otherwise the tail of the
+ *     osdp_COM reply clocks out at the new rate and the ACU never follows.
+ *     tcdrain() on POSIX; FlushFileBuffers plus a wait on Windows (USB
+ *     adapters hold bytes in a chip FIFO past FlushFileBuffers).
+ *
+ * A malformed COMSET payload (not exactly 5 bytes) is answered with
+ * NAK 0x02 (bad command length) and neither hook fires. */
+
+/* Decide the effective comms parameters for an inbound COMSET. `eff_*`
+ * arrive holding the requested values; write the values the PD will use. */
+typedef void (*osdp_pd_comset_cb)(void     *user,
+                                  uint8_t   req_address,
+                                  uint32_t  req_baud,
+                                  uint8_t  *eff_address,
+                                  uint32_t *eff_baud);
+
+/* Notify that the COMSET reply has been sent and the new address is now
+ * live. Switch the transport to `baud` here and persist to NVM. */
+typedef void (*osdp_pd_comset_applied_cb)(void    *user,
+                                          uint8_t  address,
+                                          uint32_t baud);
+
+/* ---- File transfer (osdp_FILETRANSFER) ---------------------------------
+ *
+ * osdp_FILETRANSFER (0x7C) streams a file (firmware image, config blob, ...)
+ * ACU → PD as a sequence of fragments at monotonically increasing offsets,
+ * each answered with an osdp_FTSTAT (0x7A) status. Like osdp_COMSET the
+ * command is handled inside the library rather than by the app command
+ * handler: the PD decodes each fragment, REASSEMBLES it into a caller-owned
+ * buffer, tracks the running offset, and builds/sends the FTSTAT — the
+ * application never parses the wire message. It only *evaluates* the bytes
+ * through a per-fragment callback whose verdict drives the reported status.
+ *
+ * Two receiver modes, both driving the same per-fragment callback:
+ *   - REASSEMBLY (osdp_pd_set_file_receiver): supply a buffer + capacity
+ *     (caller-owned — the freestanding core allocates nothing). The core
+ *     copies each fragment into it and hands the whole accumulated file to
+ *     the callback (info->data). A transfer larger than the buffer is
+ *     aborted. Best for small config/display blobs, or targets with room to
+ *     hold the whole file.
+ *   - STREAMING (osdp_pd_set_file_stream): no buffer. The core hands each
+ *     fragment to the callback as it arrives (info->fragment) without
+ *     accumulating — info->data is NULL — and there is no size ceiling. Best
+ *     for RAM-constrained targets that persist each fragment to flash as it
+ *     comes in (firmware update). The app owns storage entirely.
+ * Without a registered receiver the PD NAKs osdp_FILETRANSFER with code 0x03
+ * (does not support file transfer).
+ *
+ * Reassembly invariants the core enforces (any violation aborts the
+ * transfer with FtStatusDetail = -1 and resets state, so the ACU may
+ * restart at offset 0):
+ *   - the first fragment of a transfer has offset 0;
+ *   - total_size fits within the receiver buffer capacity;
+ *   - offsets are contiguous (each fragment's offset equals the number of
+ *     bytes already received) and the fragment stays within total_size;
+ *   - the FtType / total_size do not change mid-transfer.
+ * A byte-identical retransmit of the previous fragment is replayed from the
+ * SQN cache (spec 5.9) BEFORE reassembly runs, so a lost FTSTAT never
+ * corrupts the running offset.
+ *
+ * Deferred (not needed while the evaluation callback is synchronous): the
+ * "finishing" (FtStatusDetail = 3) idle-fragment protocol and FtUpdateMsgMax
+ * fragment-size throttling. The PD always reports update_msg_max = 0. */
+
+/* Snapshot of an accepted osdp_FILETRANSFER fragment handed to the
+ * evaluation callback. `fragment` / `fragment_len` are THIS message's bytes;
+ * `received` is the contiguous byte count so far (including this fragment).
+ * `data` is the accumulated reassembly buffer in REASSEMBLY mode, or NULL in
+ * STREAMING mode (where only `fragment` is available). `complete` is true on
+ * the final fragment (received == total_size). Every pointer is valid only
+ * for the duration of the callback. */
+typedef struct osdp_pd_file_info {
+    uint8_t        ft_type;       /* FtType (see osdp_ft_type_t)            */
+    uint32_t       total_size;    /* full declared file size               */
+    uint32_t       offset;        /* offset of this fragment               */
+    const uint8_t *fragment;      /* this fragment's bytes (NULL if empty) */
+    size_t         fragment_len;  /* length of this fragment               */
+    const uint8_t *data;          /* reassembly buffer base, or NULL when
+                                   * streaming (use `fragment` instead)     */
+    uint32_t       received;      /* contiguous bytes so far, incl. this   */
+    bool           complete;      /* received == total_size                */
+} osdp_pd_file_info_t;
+
+/* Per-fragment file evaluation callback. Return an osdp_status_t that the
+ * core maps into the outgoing osdp_FTSTAT.FtStatusDetail:
+ *   OSDP_OK                -> proceed (0) mid-file; processed (1) when complete
+ *   OSDP_ERR_BAD_PAYLOAD   -> malformed (-3), transfer aborted
+ *   OSDP_ERR_NOT_SUPPORTED -> unrecognized (-2), transfer aborted
+ *   any other              -> abort (-1), transfer aborted
+ * The callback must not re-enter the PD API. */
+typedef osdp_status_t (*osdp_pd_file_cb)(void *user,
+                                         const osdp_pd_file_info_t *info);
+
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
@@ -353,6 +473,30 @@ typedef struct osdp_pd {
     osdp_pd_buzzer_cb          buzzer_cb;
     void                      *buzzer_user;
 
+    /* Communication configuration (osdp_COMSET) hooks and the deferred
+     * change staged by the current tick. `comset_pending` is set once the
+     * osdp_COM reply is built; process_frame adopts the new address and
+     * fires `comset_applied_cb` after the reply has been transmitted. */
+    osdp_pd_comset_cb          comset_cb;
+    osdp_pd_comset_applied_cb  comset_applied_cb;
+    void                      *comset_user;
+    bool                       comset_pending;
+    uint8_t                    comset_new_address;
+    uint32_t                   comset_new_baud;
+
+    /* File transfer (osdp_FILETRANSFER) receiver: caller-owned reassembly
+     * buffer + evaluation callback, and the running transfer bookkeeping.
+     * `ft_active` is true between the offset-0 fragment and completion/abort;
+     * `ft_received` is the count of contiguous bytes assembled so far. */
+    uint8_t                   *file_buf;
+    size_t                     file_cap;
+    osdp_pd_file_cb            file_cb;
+    void                      *file_user;
+    bool                       ft_active;
+    uint8_t                    ft_type;
+    uint32_t                   ft_total;
+    uint32_t                   ft_received;
+
     /* Optional SC2 asymmetric-pairing driver (osdp::pd_pair). NULL unless a
      * caller-owned osdp_pd_pair_t is attached via osdp_pd_attach_pair; its
      * first member is an osdp_pd_pair_hook_t through which pd.c dispatches.
@@ -415,6 +559,43 @@ void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb,
  * against the transport's now_ms clock (or time 0 if none). Returns false
  * for a reader no osdp_BUZ command has addressed. */
 bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no);
+
+/* ---- Communication configuration ---------------------------------------*/
+
+/* Bind the osdp_COMSET hooks (see osdp_pd_comset_cb / _applied_cb). Either
+ * callback may be NULL. With no `decide` handler the PD accepts the ACU's
+ * requested address/baud verbatim; with no `applied` handler the PD still
+ * switches its own address but the application gets no signal to change its
+ * transport baud — pass an `applied` handler if the baud can actually
+ * change. `user` is threaded into both. */
+void osdp_pd_set_comset_handler(osdp_pd_t                *pd,
+                                osdp_pd_comset_cb         decide,
+                                osdp_pd_comset_applied_cb applied,
+                                void                     *user);
+
+/* ---- File transfer -----------------------------------------------------*/
+
+/* Bind a file-transfer receiver. `buf` (capacity `cap` bytes) is the
+ * caller-owned buffer the core reassembles inbound osdp_FILETRANSFER data
+ * into; `cb` evaluates each accepted fragment (see osdp_pd_file_cb). `buf`
+ * must be large enough for the biggest file the ACU will send (a transfer
+ * whose total_size exceeds `cap` is aborted) and must stay valid for as long
+ * as it is registered — outliving any in-flight transfer. Pass cb=NULL and
+ * buf=NULL to detach, after which the PD NAKs file transfers with 0x03.
+ * `user` is threaded into the callback. */
+void osdp_pd_set_file_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
+                               osdp_pd_file_cb cb, void *user);
+
+/* Bind a STREAMING file-transfer receiver: no reassembly buffer. The core
+ * hands each osdp_FILETRANSFER fragment to `cb` as it arrives (read
+ * `info->fragment` / `fragment_len` / `offset`; `info->data` is NULL) without
+ * accumulating, so RAM usage is independent of the file size — the app
+ * persists each fragment (e.g. to flash) itself. There is no total-size
+ * ceiling. The offset-monotonicity invariants and the verdict → FtStatusDetail
+ * mapping are identical to osdp_pd_set_file_receiver. Pass cb=NULL to detach
+ * (the PD then NAKs file transfers with 0x03). Registering either receiver
+ * replaces the other. */
+void osdp_pd_set_file_stream(osdp_pd_t *pd, osdp_pd_file_cb cb, void *user);
 
 /* ---- Secure Channel configuration --------------------------------------
  *

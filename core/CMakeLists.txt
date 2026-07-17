@@ -47,6 +47,7 @@ add_library(osdp_messages STATIC
     src/commands/cmd_text.c
     src/commands/cmd_comset.c
     src/commands/cmd_keyset.c
+    src/commands/cmd_filetransfer.c
     # Replies (PD → ACU)
     src/replies/reply_ack.c
     src/replies/reply_nak.c
@@ -59,6 +60,7 @@ add_library(osdp_messages STATIC
     src/replies/reply_raw.c
     src/replies/reply_keypad.c
     src/replies/reply_com.c
+    src/replies/reply_ftstat.c
 )
 
 target_include_directories(osdp_messages

@@ -25,6 +25,8 @@ alongside this guide.
   - [`osdp_pd_is_online`](#osdp_pd_is_online--connection-state)
   - [LED observation](#led-observation--osdp_pd_set_led_handler--osdp_pd_led_color)
   - [Buzzer observation](#buzzer-observation--osdp_pd_set_buzzer_handler--osdp_pd_buzzer_sounding)
+  - [Communication configuration](#communication-configuration--osdp_pd_set_comset_handler)
+  - [File transfer](#file-transfer--osdp_pd_set_file_receiver)
   - [Secure Channel](#secure-channel--osdp_pd_set_sc_)
   - [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
 - [Reference tables](#reference-tables)
@@ -267,6 +269,17 @@ you still just ACK them, and the PD does the right thing on the wire:
   The rotation happens in RAM only — persisting the new key across a reboot
   is your job. See [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
   for the full contract, the exact NAK codes, and the persistence pattern.
+- **`osdp_COMSET`** — handled entirely by the PD: it builds the mandated
+  `osdp_COM` reply and switches its own address for you. It never reaches
+  your command handler. Register an
+  [`osdp_pd_set_comset_handler`](#communication-configuration--osdp_pd_set_comset_handler)
+  hook to veto/clamp the requested values and to enact the baud change on
+  your transport.
+- **`osdp_FILETRANSFER`** — handled entirely by the PD: it reassembles the
+  file into a buffer you provide and builds every `osdp_FTSTAT` reply. It
+  never reaches your command handler. Register an
+  [`osdp_pd_set_file_receiver`](#file-transfer--osdp_pd_set_file_receiver)
+  to supply the buffer and evaluate the bytes.
 
 ### Sequencing & retransmits are automatic
 
@@ -448,6 +461,173 @@ bool beeping = osdp_pd_buzzer_sounding(&pd, /*reader*/0);
 - The bank holds `OSDP_PD_MAX_BUZZERS` (4) readers (one buzzer each);
   beyond that, commands are ACKed but untracked.
 - Callbacks **must not** re-enter the PD API.
+
+---
+
+## Communication configuration — `osdp_pd_set_comset_handler`
+
+```c
+void osdp_pd_set_comset_handler(osdp_pd_t *pd,
+                                osdp_pd_comset_cb         decide,
+                                osdp_pd_comset_applied_cb applied,
+                                void *user);
+```
+
+`osdp_COMSET` (0x6E) asks the PD to adopt a new address and/or baud rate.
+The PD owns its 7-bit address (it filters inbound frames on it and stamps
+it into every reply), so — like `osdp_KEYSET` — the library handles COMSET
+itself instead of routing it to your command handler: it builds the
+mandated `osdp_COM` (0x54) reply and switches `pd->address` for you. Per
+spec 6.13 the change takes effect **only after the reply has been sent** at
+the old parameters.
+
+Two optional hooks bracket that exchange:
+
+```c
+/* decide: runs BEFORE osdp_COM is built. eff_* start as the requested
+ * values; overwrite them if you can't comply (spec 6.13 — report what you
+ * WILL use). Leave them alone to accept. */
+static void on_comset_decide(void *user, uint8_t req_addr, uint32_t req_baud,
+                             uint8_t *eff_addr, uint32_t *eff_baud) {
+    if (!baud_supported(req_baud)) *eff_baud = current_baud();  /* keep old */
+}
+
+/* applied: runs AFTER osdp_COM has been sent and the PD adopted the new
+ * address. Reconfigure your UART to `baud` and persist (address, baud) to
+ * non-volatile storage here — doing it earlier would corrupt the reply. */
+static void on_comset_applied(void *user, uint8_t address, uint32_t baud) {
+    uart_set_baud(baud);
+    nvm_store_comms(address, baud);
+}
+
+osdp_pd_set_comset_handler(&pd, on_comset_decide, on_comset_applied, &app);
+```
+
+- Both callbacks are optional (pass `NULL`). With no `decide` handler the
+  PD accepts the requested values verbatim; with no `applied` handler the
+  address still switches but you get no signal to change the baud — supply
+  one whenever the baud can actually change.
+- The **address** change is automatic; the `applied` hook only needs to
+  *persist* it. The **baud** change is yours to enact — the core has no
+  UART.
+- **Drain TX before you change the baud.** The library has already called
+  your transport's `write()` for the `osdp_COM` reply by the time `applied`
+  fires, but `write()` returning does **not** mean the bytes have physically
+  left the wire — most drivers return once the data is queued. If you switch
+  the line rate while the tail of the reply is still in a FIFO, the ACU sees
+  a corrupted `osdp_COM` and never follows you to the new rate. Block until
+  the reply has actually drained first: `tcdrain(fd)` on POSIX; on Windows
+  `FlushFileBuffers` **plus** a wait, since USB adapters (FTDI etc.) hold
+  bytes in a chip FIFO past `FlushFileBuffers`/`cbOutQue` and add USB
+  latency — waiting out one worst-case frame time at the *old* baud (plus a
+  small margin) is the reliable guard. See `tools/osdp-pd-mock/serial_*.c`
+  for a working implementation on both platforms.
+- An effective address above 0x7E is rejected (the current address is
+  kept). A malformed COMSET (payload ≠ 5 bytes) is NAK'd 0x02 and neither
+  hook fires.
+- Callbacks **must not** re-enter the PD API.
+
+---
+
+## File transfer — `osdp_pd_set_file_receiver`
+
+`osdp_FILETRANSFER` (0x7C) streams a file — a firmware image, a config blob —
+from the ACU to the PD as a sequence of fragments at increasing offsets, each
+answered with an `osdp_FTSTAT` (0x7A) status. The PD **owns the whole
+exchange**: it decodes each fragment, enforces the offset rules, tracks the
+running position, and builds every `osdp_FTSTAT`. Your only job is to evaluate
+(and store) the bytes, through one per-fragment callback.
+
+### Two modes — pick by what the target can afford
+
+The exact same callback runs in either mode; the choice is only about **who
+holds the file**:
+
+| | **Reassembly** — `osdp_pd_set_file_receiver` | **Streaming** — `osdp_pd_set_file_stream` |
+| --- | --- | --- |
+| Buffer | You supply one, sized for the whole file | None |
+| RAM cost | Whole file | One fragment (~128 B–1.5 KB) |
+| Size ceiling | `total_size` must fit the buffer (else abort `-1`) | No ceiling |
+| Callback reads | `info->data` (the complete file, on the final fragment) | `info->fragment` (this fragment only; `info->data` is `NULL`) |
+| **Use when…** | You must **validate the whole file before acting** (verify a signature/CRC over the complete image) or parse a small structured blob (biomatch template, display data) | You're doing **firmware update on a RAM-constrained MCU** — persist each fragment to a flash staging area as it arrives; RAM use is independent of file size |
+
+Rule of thumb: **small blob you want in one piece → reassembly; large image you
+stream to flash → streaming.** If you'd end up copying fragments into your own
+buffer in streaming mode anyway, use reassembly and let the core do it.
+
+**Reassembly** — the core hands you the complete file to validate then commit:
+
+```c
+/* A caller-owned reassembly buffer, sized for the largest file you expect. */
+static uint8_t g_file_buf[64 * 1024];
+
+static osdp_status_t on_file(void *user, const osdp_pd_file_info_t *info)
+{
+    if (info->offset == 0 && info->fragment_len >= 4 &&
+        memcmp(info->fragment, "FWUP", 4) != 0) {
+        return OSDP_ERR_BAD_PAYLOAD;   /* wrong file → FtStatusDetail -3 */
+    }
+    if (info->complete) {
+        if (!signature_ok(info->data, info->received)) {  /* whole-file check */
+            return OSDP_ERR_BAD_PAYLOAD;
+        }
+        flash_image(info->data, info->received);          /* commit the file */
+    }
+    return OSDP_OK;   /* proceed (0) mid-file; processed (1) when complete */
+}
+
+osdp_pd_set_file_receiver(&pd, g_file_buf, sizeof(g_file_buf), on_file, NULL);
+```
+
+**Streaming** — the core hands you each fragment; you persist it as it comes,
+holding no more than one fragment in RAM:
+
+```c
+static osdp_status_t on_chunk(void *user, const osdp_pd_file_info_t *info)
+{
+    /* info->data is NULL here — read info->fragment / fragment_len. */
+    flash_write(info->offset, info->fragment, info->fragment_len);
+    if (info->complete) {
+        flash_finalize();   /* whole image is now on flash */
+    }
+    return OSDP_OK;
+}
+
+osdp_pd_set_file_stream(&pd, on_chunk, NULL);   /* no buffer */
+```
+
+### What the core does for you in both modes
+
+- **The callback fires once per accepted fragment**, so you can validate
+  *incrementally* — check a header the moment `offset == 0` arrives, hash as
+  bytes stream in — and reject mid-transfer. The return value maps to the
+  reported status:
+
+  | return | `FtStatusDetail` | meaning |
+  | --- | --- | --- |
+  | `OSDP_OK` (mid-file) | `0` | ok to proceed |
+  | `OSDP_OK` (final fragment) | `1` | file processed |
+  | `OSDP_ERR_BAD_PAYLOAD` | `-3` | malformed — transfer aborts |
+  | `OSDP_ERR_NOT_SUPPORTED` | `-2` | unrecognized — transfer aborts |
+  | anything else | `-1` | abort |
+
+- **Offset invariants are enforced for you** (both modes). The first fragment
+  must be at offset 0; offsets must be contiguous and monotonic; the type/size
+  must not change mid-stream. Any violation aborts (`-1`) and resets, so the
+  ACU can restart at offset 0. A byte-identical retransmit of the previous
+  fragment replays the cached FTSTAT (spec 5.9) *before* the callback runs — a
+  lost reply never corrupts the running offset or re-delivers a fragment.
+- `info->received` is the cumulative contiguous byte count in both modes — use
+  it for "N of `total_size`" progress.
+- **No receiver registered → NAK 0x03** (the PD advertises no file-transfer
+  support). An undecodable frame (payload shorter than the 11-byte header) →
+  NAK 0x02.
+- Under Secure Channel the `osdp_FTSTAT` reply is data-bearing, so it wraps as
+  SCS_18 automatically — nothing extra to do.
+- Not yet implemented (the callback is synchronous, so you don't need them):
+  the "finishing" (`FtStatusDetail = 3`) idle-fragment protocol and
+  `FtUpdateMsgMax` throttling — the PD always reports `update_msg_max = 0`.
+- The callback **must not** re-enter the PD API.
 
 ---
 

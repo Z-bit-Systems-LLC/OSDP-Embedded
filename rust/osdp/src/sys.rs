@@ -86,7 +86,11 @@ extern "C" {
 // ====================================================================
 
 pub const OSDP_SOM: u8 = 0x53;
-pub const OSDP_BROADCAST_ADDR: u8 = 0x7F;
+/// Configuration / unaddressed PD address (spec 5.9 Note 2). A PD assigned
+/// this address accepts and responds to every frame. `OSDP_BROADCAST_ADDR`
+/// is the broadcast-context alias for the same value.
+pub const OSDP_CONFIG_ADDR: u8 = 0x7F;
+pub const OSDP_BROADCAST_ADDR: u8 = OSDP_CONFIG_ADDR;
 pub const OSDP_REPLY_FLAG: u8 = 0x80;
 pub const OSDP_ADDR_MASK: u8 = 0x7F;
 
@@ -392,6 +396,18 @@ extern "C" {
         buf_cap: usize,
         written: *mut usize,
     ) -> osdp_status_t;
+
+    pub fn osdp_filetransfer_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_filetransfer_cmd_t,
+    ) -> osdp_status_t;
+    pub fn osdp_filetransfer_build(
+        in_: *const osdp_filetransfer_cmd_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
 }
 
 pub const OSDP_KEYSET_HEADER_BYTES: usize = 2;
@@ -402,6 +418,23 @@ pub struct osdp_keyset_cmd_t {
     pub key_length: u8,
     pub key_data: *const u8,
     pub key_data_len: usize,
+}
+
+pub const OSDP_FILETRANSFER_HEADER_BYTES: usize = 11;
+
+// FtType values (spec Table 34).
+pub const OSDP_FT_TYPE_OPAQUE: u8 = 0x01;
+pub const OSDP_FT_TYPE_BIOMATCH: u8 = 0x02;
+pub const OSDP_FT_TYPE_DISPLAY: u8 = 0x03;
+
+#[repr(C)]
+pub struct osdp_filetransfer_cmd_t {
+    pub ft_type: u8,
+    pub total_size: u32,
+    pub offset: u32,
+    pub fragment_size: u16,
+    pub data: *const u8,
+    pub data_len: usize,
 }
 
 // ====================================================================
@@ -581,6 +614,30 @@ pub struct osdp_com_t {
     pub baud_rate: u32,
 }
 
+pub const OSDP_FTSTAT_PAYLOAD_BYTES: usize = 7;
+
+// FtStatusDetail values (spec Table 68); signed.
+pub const OSDP_FTSTAT_MALFORMED: i16 = -3;
+pub const OSDP_FTSTAT_UNRECOGNIZED: i16 = -2;
+pub const OSDP_FTSTAT_ABORT: i16 = -1;
+pub const OSDP_FTSTAT_OK: i16 = 0;
+pub const OSDP_FTSTAT_PROCESSED: i16 = 1;
+pub const OSDP_FTSTAT_REBOOTING: i16 = 2;
+pub const OSDP_FTSTAT_FINISHING: i16 = 3;
+
+// FtAction control-flag bits (spec Table 68).
+pub const OSDP_FTSTAT_ACTION_INTERLEAVE_OK: u8 = 0x01;
+pub const OSDP_FTSTAT_ACTION_LEAVE_SC: u8 = 0x02;
+pub const OSDP_FTSTAT_ACTION_POLL_AVAIL: u8 = 0x04;
+
+#[repr(C)]
+pub struct osdp_ftstat_t {
+    pub action: u8,
+    pub delay_ms: u16,
+    pub status_detail: i16,
+    pub update_msg_max: u16,
+}
+
 extern "C" {
     pub fn osdp_ack_decode(payload: *const u8, len: usize) -> osdp_status_t;
     pub fn osdp_ack_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
@@ -640,6 +697,18 @@ extern "C" {
     pub fn osdp_com_decode(payload: *const u8, len: usize, out: *mut osdp_com_t) -> osdp_status_t;
     pub fn osdp_com_build(
         in_: *const osdp_com_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_ftstat_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_ftstat_t,
+    ) -> osdp_status_t;
+    pub fn osdp_ftstat_build(
+        in_: *const osdp_ftstat_t,
         buf: *mut u8,
         buf_cap: usize,
         written: *mut usize,
@@ -983,6 +1052,37 @@ mod pd_ffi {
     pub type osdp_pd_buzzer_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, reader_no: u8, sounding: bool, tone: u8)>;
 
+    pub type osdp_pd_comset_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            req_address: u8,
+            req_baud: u32,
+            eff_address: *mut u8,
+            eff_baud: *mut u32,
+        ),
+    >;
+
+    pub type osdp_pd_comset_applied_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, address: u8, baud: u32)>;
+
+    /// Mirror of C `osdp_pd_file_info_t` — a snapshot of an accepted
+    /// osdp_FILETRANSFER fragment passed to the evaluation callback.
+    #[repr(C)]
+    pub struct osdp_pd_file_info_t {
+        pub ft_type: u8,
+        pub total_size: u32,
+        pub offset: u32,
+        pub fragment: *const u8,
+        pub fragment_len: usize,
+        pub data: *const u8,
+        pub received: u32,
+        pub complete: bool,
+    }
+
+    pub type osdp_pd_file_cb = Option<
+        unsafe extern "C" fn(user: *mut c_void, info: *const osdp_pd_file_info_t) -> osdp_status_t,
+    >;
+
     /// Mirror of C `osdp_pd_buz_slot_t` (16 bytes, align 4).
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -1055,6 +1155,22 @@ mod pd_ffi {
         pub buzzer_cb: osdp_pd_buzzer_cb,
         pub buzzer_user: *mut c_void,
 
+        pub comset_cb: osdp_pd_comset_cb,
+        pub comset_applied_cb: osdp_pd_comset_applied_cb,
+        pub comset_user: *mut c_void,
+        pub comset_pending: bool,
+        pub comset_new_address: u8,
+        pub comset_new_baud: u32,
+
+        pub file_buf: *mut u8,
+        pub file_cap: usize,
+        pub file_cb: osdp_pd_file_cb,
+        pub file_user: *mut c_void,
+        pub ft_active: bool,
+        pub ft_type: u8,
+        pub ft_total: u32,
+        pub ft_received: u32,
+
         // Opt-in SC2 asymmetric-pairing driver (osdp::pd_pair). Opaque here;
         // Rust does not expose pairing yet (that is a later phase), so this is
         // always null in Rust-driven PDs. Mirrors the trailing `void *pair`
@@ -1083,6 +1199,23 @@ mod pd_ffi {
             user: *mut c_void,
         );
         pub fn osdp_pd_buzzer_sounding(pd: *const osdp_pd_t, reader_no: u8) -> bool;
+
+        pub fn osdp_pd_set_comset_handler(
+            pd: *mut osdp_pd_t,
+            decide: osdp_pd_comset_cb,
+            applied: osdp_pd_comset_applied_cb,
+            user: *mut c_void,
+        );
+
+        pub fn osdp_pd_set_file_receiver(
+            pd: *mut osdp_pd_t,
+            buf: *mut u8,
+            cap: usize,
+            cb: osdp_pd_file_cb,
+            user: *mut c_void,
+        );
+
+        pub fn osdp_pd_set_file_stream(pd: *mut osdp_pd_t, cb: osdp_pd_file_cb, user: *mut c_void);
 
         pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
         pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
