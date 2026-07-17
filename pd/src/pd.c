@@ -24,7 +24,12 @@ static osdp_status_t build_reply(osdp_pd_t                *pd,
 {
     osdp_frame_t out;
     (void)memset(&out, 0, sizeof(out));
-    out.address     = pd->address;
+    /* Mirror the inbound destination address (spec 5.9 Note 2). A command
+     * addressed to 0x7F (the configuration/broadcast address) is answered at
+     * 0x7F + reply flag = 0xFF, not at the PD's own address; a command to the
+     * configured address is answered there. cmd->address is the decoded 7-bit
+     * value, so this is either pd->address or OSDP_CONFIG_ADDR. */
+    out.address     = cmd->address;
     out.reply       = true;
     out.sequence    = cmd->sequence;
     out.integrity   = cmd->integrity;
@@ -89,8 +94,10 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
     return OSDP_OK;
 }
 
-/* Highest legal PD address (spec 6.13 Table 22: 0x00..0x7E). 0x7F is the
- * broadcast address and is never a valid COMSET target. */
+/* Highest address a COMSET may assign (spec 6.13 Table 22: 0x00..0x7E).
+ * 0x7F is the configuration/broadcast address (OSDP_CONFIG_ADDR): the PD
+ * always responds to it, but it is never a valid COMSET assignment target,
+ * so a request to set the working address to 0x7F is rejected. */
 #define OSDP_PD_MAX_ADDR 0x7EU
 
 osdp_status_t osdp_pd_internal_comset_effective(osdp_pd_t     *pd,

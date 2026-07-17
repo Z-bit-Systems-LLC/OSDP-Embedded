@@ -5,6 +5,8 @@
 
 #include "shared/pack.h"
 
+/* Spec 6.13 Table 22: a COMSET may assign 0x00..0x7E. 0x7F is the
+ * configuration/broadcast address and is never a valid assignment target. */
 #define OSDP_COMSET_MAX_ADDR 0x7EU
 
 osdp_status_t osdp_comset_decode(const uint8_t *payload, size_t len,

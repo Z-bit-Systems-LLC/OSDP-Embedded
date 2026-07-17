@@ -348,6 +348,7 @@ static void test_comset_round_trip(void)
     TEST_ASSERT_EQUAL_HEX32(in.baud_rate, got.baud_rate);
 }
 
+/* 0x7F (the config/broadcast address) is not an assignable COMSET target. */
 static void test_comset_build_rejects_address_above_7e(void)
 {
     osdp_comset_cmd_t in = { .address = 0x7F, .baud_rate = 9600u };

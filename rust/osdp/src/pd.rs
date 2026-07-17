@@ -321,8 +321,10 @@ pub struct Pd {
 }
 
 impl Pd {
-    /// Create a fresh PD listening on `address` (7-bit, 0x00..0x7E).
-    /// Address 0x7F (broadcast) is implicitly accepted.
+    /// Create a fresh PD with working `address` (7-bit, 0x00..0x7E). The PD
+    /// also always accepts and responds to frames sent to 0x7F, the
+    /// configuration/broadcast address, answering those at 0x7F | reply flag
+    /// (0xFF) per spec 5.9 Note 2.
     pub fn new(address: u8) -> Self {
         let mut inner = Box::<sys::osdp_pd_t>::new(unsafe { MaybeUninit::zeroed().assume_init() });
         unsafe { sys::osdp_pd_init(&mut *inner, address) };

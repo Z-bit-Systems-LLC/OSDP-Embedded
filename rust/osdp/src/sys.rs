@@ -86,7 +86,11 @@ extern "C" {
 // ====================================================================
 
 pub const OSDP_SOM: u8 = 0x53;
-pub const OSDP_BROADCAST_ADDR: u8 = 0x7F;
+/// Configuration / unaddressed PD address (spec 5.9 Note 2). A PD assigned
+/// this address accepts and responds to every frame. `OSDP_BROADCAST_ADDR`
+/// is the broadcast-context alias for the same value.
+pub const OSDP_CONFIG_ADDR: u8 = 0x7F;
+pub const OSDP_BROADCAST_ADDR: u8 = OSDP_CONFIG_ADDR;
 pub const OSDP_REPLY_FLAG: u8 = 0x80;
 pub const OSDP_ADDR_MASK: u8 = 0x7F;
 

@@ -13,7 +13,13 @@ extern "C" {
 /* ---- Constants from SIA OSDP v2.2.2 section 5.9 -------------------------*/
 
 #define OSDP_SOM             0x53U   /* Start-Of-Message marker          */
-#define OSDP_BROADCAST_ADDR  0x7FU   /* Broadcast address                */
+/* 0x7F is the configuration address (spec 5.9 Note 2). Every PD accepts a
+ * frame directed to 0x7F in addition to its own configured address, and
+ * answers it at 0x7F | reply-flag = 0xFF. 0x7F is never assigned as a PD's
+ * working address (0x00..0x7E). The spec historically names 0x7F
+ * "broadcast"; OSDP_BROADCAST_ADDR remains as a wire-context alias.        */
+#define OSDP_CONFIG_ADDR     0x7FU   /* Configuration / broadcast address */
+#define OSDP_BROADCAST_ADDR  OSDP_CONFIG_ADDR /* broadcast-context alias  */
 #define OSDP_REPLY_FLAG      0x80U   /* Set in ADDR for replies (PD->ACU)*/
 #define OSDP_ADDR_MASK       0x7FU   /* Mask for the 7-bit address       */
 

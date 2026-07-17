@@ -407,6 +407,9 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             out->baud = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--address") == 0 && i + 1 < argc) {
             const unsigned long v = strtoul(argv[++i], NULL, 0);
+            /* A configured working address is 0x00..0x7E. 0x7F is the
+             * configuration/broadcast address: the PD always also responds
+             * to it, but it is never assigned as a working address. */
             if (v > 0x7EU) {
                 fprintf(stderr, "address out of range: 0x%lx\n", v);
                 return false;

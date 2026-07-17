@@ -163,7 +163,15 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   a timed wait, since USB adapters hold bytes in a chip FIFO past
   `FlushFileBuffers`/`cbOutQue`. `tools/osdp-pd-mock/serial_*.c` implements
   both. Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
-  > 0x7E is rejected and the current address kept.
+  > 0x7E is rejected and the current address kept — 0x7F is **not** an
+  assignable working address, it is the *configuration address*
+  (`OSDP_CONFIG_ADDR`, the spec's 0x7F "broadcast"). A COMSET that *arrives
+  at* 0x7F, however, is the config-discovery flow: the PD processes it and
+  assigns the requested (0x00..0x7E) working address. Address / reply rules
+  (spec 5.9 Note 2): the PD accepts frames sent to **either** its configured
+  address **or** 0x7F, and a reply to a 0x7F-addressed command goes out at
+  0x7F | reply-flag = **0xFF** (not the PD's own address). `build_reply` in
+  `pd/src/pd.c` implements this by mirroring the inbound `cmd->address`.
 - **`osdp_FILETRANSFER`** — handled entirely by the core: it never reaches
   `cmd_cb`. The library decodes each fragment, enforces the offset invariants,
   tracks the running position, and builds every mandated `osdp_FTSTAT` reply.

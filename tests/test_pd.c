@@ -196,7 +196,7 @@ static void test_poll_to_own_address_is_acked(void)
     TEST_ASSERT_EQUAL_size_t(0, reply.payload_len);
 }
 
-static void test_poll_to_broadcast_is_acked_with_own_address(void)
+static void test_poll_to_broadcast_is_acked_at_config_address(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -206,14 +206,16 @@ static void test_poll_to_broadcast_is_acked_with_own_address(void)
     osdp_pd_set_transport(&pd, &t);
     osdp_pd_set_command_handler(&pd, default_handler, NULL);
 
-    inject_command(&m, OSDP_BROADCAST_ADDR, OSDP_CMD_POLL, NULL, 0,
+    inject_command(&m, OSDP_CONFIG_ADDR, OSDP_CMD_POLL, NULL, 0,
                    OSDP_INTEGRITY_CRC, 0);
     osdp_pd_tick(&pd);
 
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
-    /* PD replies with ITS OWN address, not the broadcast address. */
-    TEST_ASSERT_EQUAL_UINT8(0x12, reply.address);
+    /* A command addressed to 0x7F is answered at 0x7F + reply flag = 0xFF
+     * (spec 5.9 Note 2), NOT at the PD's own address. */
+    TEST_ASSERT_EQUAL_UINT8(OSDP_CONFIG_ADDR, reply.address);
+    TEST_ASSERT_TRUE(reply.reply);
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
 }
 
@@ -861,8 +863,9 @@ static void test_comset_decide_override_is_reported_and_applied(void)
     TEST_ASSERT_EQUAL_UINT32(9600u, cap.applied_baud);
 }
 
-/* An effective address above 0x7E is rejected: the current address is kept
- * and reported, but the baud change still applies. */
+/* An effective address of 0x7F (the configuration address) is rejected as a
+ * COMSET assignment target: the current address is kept and reported, but the
+ * baud change still applies. */
 static void test_comset_out_of_range_address_keeps_current(void)
 {
     mock_transport_t m;
@@ -873,7 +876,7 @@ static void test_comset_out_of_range_address_keeps_current(void)
     osdp_pd_set_transport(&pd, &t);
     osdp_pd_set_command_handler(&pd, default_handler, NULL);
 
-    /* Hand-build a COMSET whose address byte is 0x7F (broadcast) — an
+    /* Hand-build a COMSET whose address byte is 0x7F (config address) — an
      * invalid target the builder would refuse, so craft the 5-byte wire
      * payload directly to exercise the decoder/clamp path. */
     const uint8_t bad_addr_payload[OSDP_COMSET_PAYLOAD_BYTES] = {
@@ -890,6 +893,39 @@ static void test_comset_out_of_range_address_keeps_current(void)
                       osdp_com_decode(reply.payload, reply.payload_len, &com));
     TEST_ASSERT_EQUAL_UINT8(0x05, com.address);       /* unchanged */
     TEST_ASSERT_EQUAL_UINT32(19200u, com.baud_rate);  /* baud still set */
+    TEST_ASSERT_EQUAL_UINT8(0x05, pd.address);
+}
+
+/* Config-discovery flow: a COMSET addressed to 0x7F (the config address)
+ * assigns the PD a real working address. Per spec 5.9 Note 2 the osdp_COM
+ * reply goes out at 0x7F + reply flag = 0xFF, and per spec 6.13 the switch
+ * to the new address takes effect only after that reply is sent. */
+static void test_comset_at_config_address_assigns_and_replies_0xff(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x00);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* COMSET sent TO the broadcast/config address, assigning working
+     * address 0x05 at 19200 baud. */
+    inject_comset(&m, OSDP_CONFIG_ADDR, 0x05, 19200u, 0);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    /* Reply mirrors the 0x7F destination with the reply flag set (0xFF). */
+    TEST_ASSERT_EQUAL_UINT8(OSDP_CONFIG_ADDR, reply.address);
+    TEST_ASSERT_TRUE(reply.reply);
+    osdp_com_t com;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_com_decode(reply.payload, reply.payload_len, &com));
+    TEST_ASSERT_EQUAL_UINT8(0x05, com.address);       /* new address */
+    TEST_ASSERT_EQUAL_UINT32(19200u, com.baud_rate);
+    /* The switch to 0x05 has taken effect after the reply. */
     TEST_ASSERT_EQUAL_UINT8(0x05, pd.address);
 }
 
@@ -1304,7 +1340,7 @@ int main(void)
     RUN_TEST(test_init_zero_initializes_address_correctly);
     RUN_TEST(test_init_strips_high_bit_of_address);
     RUN_TEST(test_poll_to_own_address_is_acked);
-    RUN_TEST(test_poll_to_broadcast_is_acked_with_own_address);
+    RUN_TEST(test_poll_to_broadcast_is_acked_at_config_address);
     RUN_TEST(test_poll_to_other_address_is_ignored);
     RUN_TEST(test_unknown_command_returns_nak_with_unknown_cmd_code);
     RUN_TEST(test_no_handler_attached_yields_nak_for_every_command);
@@ -1330,6 +1366,7 @@ int main(void)
     RUN_TEST(test_comset_hooks_fire_with_effective_values);
     RUN_TEST(test_comset_decide_override_is_reported_and_applied);
     RUN_TEST(test_comset_out_of_range_address_keeps_current);
+    RUN_TEST(test_comset_at_config_address_assigns_and_replies_0xff);
     RUN_TEST(test_comset_malformed_payload_naks);
 
     RUN_TEST(test_filetransfer_without_receiver_naks);
