@@ -686,6 +686,246 @@ static void test_reply_direction_frames_are_ignored(void)
     TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
 }
 
+/* ---- osdp_COMSET --------------------------------------------------------*/
+
+/* Captures the COMSET decide/applied hook activity and can optionally force
+ * an override of the effective values (to exercise the "can't comply"
+ * path). */
+typedef struct comset_capture {
+    bool     decide_called;
+    uint8_t  req_addr;
+    uint32_t req_baud;
+
+    bool     force_override;
+    uint8_t  override_addr;
+    uint32_t override_baud;
+
+    bool     applied_called;
+    uint8_t  applied_addr;
+    uint32_t applied_baud;
+} comset_capture_t;
+
+static void comset_decide(void *user, uint8_t req_a, uint32_t req_b,
+                          uint8_t *eff_a, uint32_t *eff_b)
+{
+    comset_capture_t *c = (comset_capture_t *)user;
+    c->decide_called = true;
+    c->req_addr      = req_a;
+    c->req_baud      = req_b;
+    if (c->force_override) {
+        *eff_a = c->override_addr;
+        *eff_b = c->override_baud;
+    }
+}
+
+static void comset_applied(void *user, uint8_t a, uint32_t b)
+{
+    comset_capture_t *c = (comset_capture_t *)user;
+    c->applied_called = true;
+    c->applied_addr   = a;
+    c->applied_baud   = b;
+}
+
+/* Build a COMSET frame carrying (address, baud) and feed it to the PD. */
+static void inject_comset(mock_transport_t *m, uint8_t to_addr,
+                          uint8_t new_addr, uint32_t new_baud, uint8_t seq)
+{
+    const osdp_comset_cmd_t cs = { .address = new_addr, .baud_rate = new_baud };
+    uint8_t payload[OSDP_COMSET_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_comset_build(&cs, payload, sizeof(payload), &w));
+    inject_command(m, to_addr, OSDP_CMD_COMSET, payload, w,
+                   OSDP_INTEGRITY_CRC, seq);
+}
+
+/* A well-formed COMSET is answered with osdp_COM (reporting the new values)
+ * at the OLD address, and the PD adopts the new address afterwards. */
+static void test_comset_reports_com_and_changes_address(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    inject_comset(&m, 0x05, 0x0A, 38400u, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    /* Reply goes out at the OLD address (change takes effect afterwards). */
+    TEST_ASSERT_EQUAL_UINT8(0x05, reply.address);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_COM, reply.code);
+
+    osdp_com_t com;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_com_decode(reply.payload, reply.payload_len, &com));
+    TEST_ASSERT_EQUAL_UINT8(0x0A, com.address);
+    TEST_ASSERT_EQUAL_UINT32(38400u, com.baud_rate);
+
+    /* The new address is now live. */
+    TEST_ASSERT_EQUAL_UINT8(0x0A, pd.address);
+}
+
+/* After COMSET the PD answers on the new address and ignores the old one. */
+static void test_comset_pd_moves_to_new_address(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    inject_comset(&m, 0x05, 0x0A, 9600u, 1);
+    osdp_pd_tick(&pd);
+    m.outgoing_len = 0;   /* discard the COM reply */
+
+    /* A POLL to the OLD address is now ignored. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+
+    /* A POLL to the NEW address is answered. */
+    inject_command(&m, 0x0A, OSDP_CMD_POLL, NULL, 0, OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_UINT8(0x0A, reply.address);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
+/* The decide hook sees the requested values and the applied hook fires with
+ * the effective values after the reply is sent. */
+static void test_comset_hooks_fire_with_effective_values(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    comset_capture_t cap;
+    (void)memset(&cap, 0, sizeof(cap));
+    osdp_pd_set_comset_handler(&pd, comset_decide, comset_applied, &cap);
+
+    inject_comset(&m, 0x05, 0x0A, 115200u, 1);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_TRUE(cap.decide_called);
+    TEST_ASSERT_EQUAL_UINT8(0x0A, cap.req_addr);
+    TEST_ASSERT_EQUAL_UINT32(115200u, cap.req_baud);
+
+    TEST_ASSERT_TRUE(cap.applied_called);
+    TEST_ASSERT_EQUAL_UINT8(0x0A, cap.applied_addr);
+    TEST_ASSERT_EQUAL_UINT32(115200u, cap.applied_baud);
+    TEST_ASSERT_EQUAL_UINT8(0x0A, pd.address);
+}
+
+/* When the app can't comply, its override is what the PD reports in COM and
+ * what it actually adopts (spec 6.13). */
+static void test_comset_decide_override_is_reported_and_applied(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    comset_capture_t cap;
+    (void)memset(&cap, 0, sizeof(cap));
+    cap.force_override = true;
+    cap.override_addr  = 0x07;      /* keep our address */
+    cap.override_baud  = 9600u;     /* clamp the unsupported baud */
+    osdp_pd_set_comset_handler(&pd, comset_decide, comset_applied, &cap);
+
+    inject_comset(&m, 0x05, 0x0A, 921600u, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    osdp_com_t com;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_com_decode(reply.payload, reply.payload_len, &com));
+    TEST_ASSERT_EQUAL_UINT8(0x07, com.address);
+    TEST_ASSERT_EQUAL_UINT32(9600u, com.baud_rate);
+    TEST_ASSERT_EQUAL_UINT8(0x07, pd.address);
+    TEST_ASSERT_EQUAL_UINT32(9600u, cap.applied_baud);
+}
+
+/* An effective address above 0x7E is rejected: the current address is kept
+ * and reported, but the baud change still applies. */
+static void test_comset_out_of_range_address_keeps_current(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* Hand-build a COMSET whose address byte is 0x7F (broadcast) — an
+     * invalid target the builder would refuse, so craft the 5-byte wire
+     * payload directly to exercise the decoder/clamp path. */
+    const uint8_t bad_addr_payload[OSDP_COMSET_PAYLOAD_BYTES] = {
+        0x7F, 0x00, 0x4B, 0x00, 0x00,   /* addr 0x7F, baud 19200 (LE) */
+    };
+    inject_command(&m, 0x05, OSDP_CMD_COMSET, bad_addr_payload,
+                   sizeof(bad_addr_payload), OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    osdp_com_t com;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_com_decode(reply.payload, reply.payload_len, &com));
+    TEST_ASSERT_EQUAL_UINT8(0x05, com.address);       /* unchanged */
+    TEST_ASSERT_EQUAL_UINT32(19200u, com.baud_rate);  /* baud still set */
+    TEST_ASSERT_EQUAL_UINT8(0x05, pd.address);
+}
+
+/* A malformed COMSET (wrong payload length) is NAK'd with bad-length and
+ * leaves the address unchanged; no hooks fire. */
+static void test_comset_malformed_payload_naks(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    comset_capture_t cap;
+    (void)memset(&cap, 0, sizeof(cap));
+    osdp_pd_set_comset_handler(&pd, comset_decide, comset_applied, &cap);
+
+    /* 4-byte payload — one short of the mandated 5. */
+    const uint8_t bad[4] = { 0x0A, 0x80, 0x25, 0x00 };
+    inject_command(&m, 0x05, OSDP_CMD_COMSET, bad, sizeof(bad),
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_CMD_LENGTH, reply.payload[0]);
+
+    TEST_ASSERT_EQUAL_UINT8(0x05, pd.address);   /* unchanged */
+    TEST_ASSERT_FALSE(cap.decide_called);
+    TEST_ASSERT_FALSE(cap.applied_called);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -712,5 +952,12 @@ int main(void)
     RUN_TEST(test_offline_clears_sequence_cache);
     RUN_TEST(test_continuous_traffic_keeps_pd_online);
     RUN_TEST(test_no_clock_callback_means_online_after_first_reply_forever);
+
+    RUN_TEST(test_comset_reports_com_and_changes_address);
+    RUN_TEST(test_comset_pd_moves_to_new_address);
+    RUN_TEST(test_comset_hooks_fire_with_effective_values);
+    RUN_TEST(test_comset_decide_override_is_reported_and_applied);
+    RUN_TEST(test_comset_out_of_range_address_keeps_current);
+    RUN_TEST(test_comset_malformed_payload_naks);
     return UNITY_END();
 }

@@ -25,6 +25,7 @@ alongside this guide.
   - [`osdp_pd_is_online`](#osdp_pd_is_online--connection-state)
   - [LED observation](#led-observation--osdp_pd_set_led_handler--osdp_pd_led_color)
   - [Buzzer observation](#buzzer-observation--osdp_pd_set_buzzer_handler--osdp_pd_buzzer_sounding)
+  - [Communication configuration](#communication-configuration--osdp_pd_set_comset_handler)
   - [Secure Channel](#secure-channel--osdp_pd_set_sc_)
   - [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
 - [Reference tables](#reference-tables)
@@ -267,6 +268,12 @@ you still just ACK them, and the PD does the right thing on the wire:
   The rotation happens in RAM only — persisting the new key across a reboot
   is your job. See [Key rotation with `osdp_KEYSET`](#key-rotation-with-osdp_keyset)
   for the full contract, the exact NAK codes, and the persistence pattern.
+- **`osdp_COMSET`** — handled entirely by the PD: it builds the mandated
+  `osdp_COM` reply and switches its own address for you. It never reaches
+  your command handler. Register an
+  [`osdp_pd_set_comset_handler`](#communication-configuration--osdp_pd_set_comset_handler)
+  hook to veto/clamp the requested values and to enact the baud change on
+  your transport.
 
 ### Sequencing & retransmits are automatic
 
@@ -447,6 +454,71 @@ bool beeping = osdp_pd_buzzer_sounding(&pd, /*reader*/0);
   fires immediately regardless.
 - The bank holds `OSDP_PD_MAX_BUZZERS` (4) readers (one buzzer each);
   beyond that, commands are ACKed but untracked.
+- Callbacks **must not** re-enter the PD API.
+
+---
+
+## Communication configuration — `osdp_pd_set_comset_handler`
+
+```c
+void osdp_pd_set_comset_handler(osdp_pd_t *pd,
+                                osdp_pd_comset_cb         decide,
+                                osdp_pd_comset_applied_cb applied,
+                                void *user);
+```
+
+`osdp_COMSET` (0x6E) asks the PD to adopt a new address and/or baud rate.
+The PD owns its 7-bit address (it filters inbound frames on it and stamps
+it into every reply), so — like `osdp_KEYSET` — the library handles COMSET
+itself instead of routing it to your command handler: it builds the
+mandated `osdp_COM` (0x54) reply and switches `pd->address` for you. Per
+spec 6.13 the change takes effect **only after the reply has been sent** at
+the old parameters.
+
+Two optional hooks bracket that exchange:
+
+```c
+/* decide: runs BEFORE osdp_COM is built. eff_* start as the requested
+ * values; overwrite them if you can't comply (spec 6.13 — report what you
+ * WILL use). Leave them alone to accept. */
+static void on_comset_decide(void *user, uint8_t req_addr, uint32_t req_baud,
+                             uint8_t *eff_addr, uint32_t *eff_baud) {
+    if (!baud_supported(req_baud)) *eff_baud = current_baud();  /* keep old */
+}
+
+/* applied: runs AFTER osdp_COM has been sent and the PD adopted the new
+ * address. Reconfigure your UART to `baud` and persist (address, baud) to
+ * non-volatile storage here — doing it earlier would corrupt the reply. */
+static void on_comset_applied(void *user, uint8_t address, uint32_t baud) {
+    uart_set_baud(baud);
+    nvm_store_comms(address, baud);
+}
+
+osdp_pd_set_comset_handler(&pd, on_comset_decide, on_comset_applied, &app);
+```
+
+- Both callbacks are optional (pass `NULL`). With no `decide` handler the
+  PD accepts the requested values verbatim; with no `applied` handler the
+  address still switches but you get no signal to change the baud — supply
+  one whenever the baud can actually change.
+- The **address** change is automatic; the `applied` hook only needs to
+  *persist* it. The **baud** change is yours to enact — the core has no
+  UART.
+- **Drain TX before you change the baud.** The library has already called
+  your transport's `write()` for the `osdp_COM` reply by the time `applied`
+  fires, but `write()` returning does **not** mean the bytes have physically
+  left the wire — most drivers return once the data is queued. If you switch
+  the line rate while the tail of the reply is still in a FIFO, the ACU sees
+  a corrupted `osdp_COM` and never follows you to the new rate. Block until
+  the reply has actually drained first: `tcdrain(fd)` on POSIX; on Windows
+  `FlushFileBuffers` **plus** a wait, since USB adapters (FTDI etc.) hold
+  bytes in a chip FIFO past `FlushFileBuffers`/`cbOutQue` and add USB
+  latency — waiting out one worst-case frame time at the *old* baud (plus a
+  small margin) is the reliable guard. See `tools/osdp-pd-mock/serial_*.c`
+  for a working implementation on both platforms.
+- An effective address above 0x7E is rejected (the current address is
+  kept). A malformed COMSET (payload ≠ 5 bytes) is NAK'd 0x02 and neither
+  hook fires.
 - Callbacks **must not** re-enter the PD API.
 
 ---

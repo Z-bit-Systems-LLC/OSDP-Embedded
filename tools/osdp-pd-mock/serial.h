@@ -52,6 +52,20 @@ serial_ctx_t *serial_open(const char *port_name,
                           osdp_pd_transport_t *transport,
                           char *errbuf, size_t errbuf_cap);
 
+/* True if `baud` is a rate this platform's adapter can switch to. Used to
+ * answer osdp_COMSET truthfully: an unsupported requested rate is declined
+ * and the current rate reported instead (spec 6.13). */
+bool serial_baud_supported(unsigned int baud);
+
+/* Change the line rate of an already-open port at runtime (used to enact
+ * an osdp_COMSET baud change). Drains any pending TX first so the caller's
+ * in-flight reply is transmitted at the OLD rate before the switch. Returns
+ * true on success; on failure writes a message to `errbuf` and leaves the
+ * port at its previous rate. `baud` must be one of the standard rates the
+ * platform supports (see serial_open). */
+bool serial_set_baud(serial_ctx_t *ctx, unsigned int baud,
+                     char *errbuf, size_t errbuf_cap);
+
 /* Close and free. Safe to call with NULL. */
 void serial_close(serial_ctx_t *ctx);
 

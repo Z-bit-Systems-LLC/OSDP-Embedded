@@ -1203,6 +1203,79 @@ static void test_keyset_unsupported_key_type_naks_0x09(void)
     TEST_ASSERT_EQUAL_MEMORY(scbk_before, pd.sc.scbk, OSDP_SC_KEY_LEN);
 }
 
+/* ---- osdp_COMSET under Secure Channel ---------------------------------*/
+
+/* A COMSET arriving under an established session is answered with an
+ * SCS_18-wrapped osdp_COM (reporting the new values), and the PD adopts
+ * the new address afterwards. The SC session keys survive — like KEYSET,
+ * COMSET does not force a re-handshake; the ACU re-establishes comms on
+ * the new parameters when it chooses. */
+static void test_comset_under_sc_reports_com_and_moves_address(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    uint8_t s_enc_before[OSDP_SC_KEY_LEN];
+    (void)memcpy(s_enc_before, pd.sc.session.keys.s_enc, OSDP_SC_KEY_LEN);
+
+    const osdp_comset_cmd_t cs = { .address = 0x0A, .baud_rate = 115200u };
+    uint8_t comset_payload[OSDP_COMSET_PAYLOAD_BYTES];
+    size_t  cs_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_comset_build(&cs, comset_payload, sizeof(comset_payload), &cs_len));
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_COMSET;
+    cmd_template.payload     = comset_payload;
+    cmd_template.payload_len = cs_len;
+
+    uint8_t cmd_wire[64]; size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    /* Reply: SCS_18 (data-bearing) osdp_COM reporting the new values. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_UINT8(0x05, reply.address);   /* still the old address */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+    uint8_t plain[16]; size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_COM, reply.code);
+
+    osdp_com_t com;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_com_decode(plain, plain_len, &com));
+    TEST_ASSERT_EQUAL_UINT8(0x0A, com.address);
+    TEST_ASSERT_EQUAL_UINT32(115200u, com.baud_rate);
+
+    /* Address adopted; session keys untouched and still established. */
+    TEST_ASSERT_EQUAL_UINT8(0x0A, pd.address);
+    TEST_ASSERT_EQUAL_MEMORY(s_enc_before, pd.sc.session.keys.s_enc,
+                             OSDP_SC_KEY_LEN);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+}
+
 /* ---- Regression: clear-text SQN 0 drops a stale SC session -------------
  *
  * Mirrors OSDP.Net commit 02e478476. A clear-text command at sequence 0
@@ -1328,6 +1401,7 @@ int main(void)
     RUN_TEST(test_keyset_under_sc_rotates_scbk_without_restart);
     RUN_TEST(test_keyset_with_malformed_payload_naks_and_preserves_scbk);
     RUN_TEST(test_keyset_unsupported_key_type_naks_0x09);
+    RUN_TEST(test_comset_under_sc_reports_com_and_moves_address);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_drops_established_session);
     RUN_TEST(test_cleartext_nonzero_sqn_keeps_session);

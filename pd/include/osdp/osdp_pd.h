@@ -184,6 +184,55 @@ typedef void (*osdp_pd_buzzer_cb)(void   *user,
                                   bool    sounding,
                                   uint8_t tone);
 
+/* ---- Communication configuration (osdp_COMSET) -------------------------
+ *
+ * osdp_COMSET (0x6E) asks the PD to adopt a new address and/or baud rate.
+ * Per spec 6.13 the change takes effect only AFTER the PD has finished
+ * replying, and the reply (osdp_COM, 0x54) reports the values the PD will
+ * actually use. The PD state machine owns the 7-bit address (it filters
+ * inbound frames on it and stamps it into every reply), so COMSET is
+ * handled inside the library rather than by the application command
+ * handler — analogous to how osdp_KEYSET rotates the stored SCBK.
+ *
+ * Two optional application hooks bracket the exchange:
+ *
+ *   - `decide`  runs BEFORE the osdp_COM reply is built. `eff_*` are
+ *     pre-seeded with the ACU's requested values; the handler may lower or
+ *     replace them if the PD cannot comply (spec 6.13: "it will return the
+ *     values that it will use"). Leave them untouched to accept the request.
+ *     If no handler is registered the request is accepted verbatim. An
+ *     effective address above 0x7E is rejected and the current address is
+ *     kept instead.
+ *
+ *   - `applied` runs AFTER the osdp_COM reply has been handed to the
+ *     transport and the PD has adopted the new address. The application MUST
+ *     now reconfigure its transport to `baud` and SHOULD persist
+ *     (address, baud) to non-volatile storage. Reconfiguring the UART any
+ *     earlier would corrupt the in-flight reply. NOTE: the transport's
+ *     write() returning does not guarantee the bytes are physically on the
+ *     wire (most drivers only queue them), so `applied` must DRAIN the
+ *     transmitter before changing the baud — otherwise the tail of the
+ *     osdp_COM reply clocks out at the new rate and the ACU never follows.
+ *     tcdrain() on POSIX; FlushFileBuffers plus a wait on Windows (USB
+ *     adapters hold bytes in a chip FIFO past FlushFileBuffers).
+ *
+ * A malformed COMSET payload (not exactly 5 bytes) is answered with
+ * NAK 0x02 (bad command length) and neither hook fires. */
+
+/* Decide the effective comms parameters for an inbound COMSET. `eff_*`
+ * arrive holding the requested values; write the values the PD will use. */
+typedef void (*osdp_pd_comset_cb)(void     *user,
+                                  uint8_t   req_address,
+                                  uint32_t  req_baud,
+                                  uint8_t  *eff_address,
+                                  uint32_t *eff_baud);
+
+/* Notify that the COMSET reply has been sent and the new address is now
+ * live. Switch the transport to `baud` here and persist to NVM. */
+typedef void (*osdp_pd_comset_applied_cb)(void    *user,
+                                          uint8_t  address,
+                                          uint32_t baud);
+
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
@@ -303,6 +352,17 @@ typedef struct osdp_pd {
     osdp_pd_buz_slot_t         buzzers[OSDP_PD_MAX_BUZZERS];
     osdp_pd_buzzer_cb          buzzer_cb;
     void                      *buzzer_user;
+
+    /* Communication configuration (osdp_COMSET) hooks and the deferred
+     * change staged by the current tick. `comset_pending` is set once the
+     * osdp_COM reply is built; process_frame adopts the new address and
+     * fires `comset_applied_cb` after the reply has been transmitted. */
+    osdp_pd_comset_cb          comset_cb;
+    osdp_pd_comset_applied_cb  comset_applied_cb;
+    void                      *comset_user;
+    bool                       comset_pending;
+    uint8_t                    comset_new_address;
+    uint32_t                   comset_new_baud;
 } osdp_pd_t;
 
 /* ---- API ----------------------------------------------------------------*/
@@ -360,6 +420,19 @@ void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb,
  * against the transport's now_ms clock (or time 0 if none). Returns false
  * for a reader no osdp_BUZ command has addressed. */
 bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no);
+
+/* ---- Communication configuration ---------------------------------------*/
+
+/* Bind the osdp_COMSET hooks (see osdp_pd_comset_cb / _applied_cb). Either
+ * callback may be NULL. With no `decide` handler the PD accepts the ACU's
+ * requested address/baud verbatim; with no `applied` handler the PD still
+ * switches its own address but the application gets no signal to change its
+ * transport baud — pass an `applied` handler if the baud can actually
+ * change. `user` is threaded into both. */
+void osdp_pd_set_comset_handler(osdp_pd_t                *pd,
+                                osdp_pd_comset_cb         decide,
+                                osdp_pd_comset_applied_cb applied,
+                                void                     *user);
 
 /* ---- Secure Channel configuration --------------------------------------
  *

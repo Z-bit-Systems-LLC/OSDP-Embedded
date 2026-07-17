@@ -894,6 +894,19 @@ mod pd_ffi {
     pub type osdp_pd_buzzer_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, reader_no: u8, sounding: bool, tone: u8)>;
 
+    pub type osdp_pd_comset_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            req_address: u8,
+            req_baud: u32,
+            eff_address: *mut u8,
+            eff_baud: *mut u32,
+        ),
+    >;
+
+    pub type osdp_pd_comset_applied_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, address: u8, baud: u32)>;
+
     /// Mirror of C `osdp_pd_buz_slot_t` (16 bytes, align 4).
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -949,6 +962,13 @@ mod pd_ffi {
         pub buzzers: [osdp_pd_buz_slot_t; OSDP_PD_MAX_BUZZERS],
         pub buzzer_cb: osdp_pd_buzzer_cb,
         pub buzzer_user: *mut c_void,
+
+        pub comset_cb: osdp_pd_comset_cb,
+        pub comset_applied_cb: osdp_pd_comset_applied_cb,
+        pub comset_user: *mut c_void,
+        pub comset_pending: bool,
+        pub comset_new_address: u8,
+        pub comset_new_baud: u32,
     }
 
     extern "C" {
@@ -971,6 +991,13 @@ mod pd_ffi {
             user: *mut c_void,
         );
         pub fn osdp_pd_buzzer_sounding(pd: *const osdp_pd_t, reader_no: u8) -> bool;
+
+        pub fn osdp_pd_set_comset_handler(
+            pd: *mut osdp_pd_t,
+            decide: osdp_pd_comset_cb,
+            applied: osdp_pd_comset_applied_cb,
+            user: *mut c_void,
+        );
 
         pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
         pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);

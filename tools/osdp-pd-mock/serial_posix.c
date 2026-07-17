@@ -171,6 +171,47 @@ serial_ctx_t *serial_open(const char *port_name,
     return ctx;
 }
 
+bool serial_baud_supported(unsigned int baud)
+{
+    return baud_to_speed(baud) != B0;
+}
+
+bool serial_set_baud(serial_ctx_t *ctx, unsigned int baud,
+                     char *errbuf, size_t errbuf_cap)
+{
+    if (ctx == NULL || ctx->fd < 0) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "internal: port not open");
+        return false;
+    }
+    speed_t speed = baud_to_speed(baud);
+    if (speed == B0) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "unsupported baud %u", baud);
+        return false;
+    }
+    /* Block until the in-flight osdp_COM reply has drained, so the ACU
+     * receives it at the OLD rate before we switch. */
+    (void)tcdrain(ctx->fd);
+
+    struct termios tio;
+    if (tcgetattr(ctx->fd, &tio) != 0) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "tcgetattr: %s", strerror(errno));
+        return false;
+    }
+    cfsetispeed(&tio, speed);
+    cfsetospeed(&tio, speed);
+    /* TCSADRAIN: apply once output already flushed (belt and braces with
+     * the tcdrain above). */
+    if (tcsetattr(ctx->fd, TCSADRAIN, &tio) != 0) {
+        if (errbuf && errbuf_cap) snprintf(errbuf, errbuf_cap,
+                                           "tcsetattr: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 void serial_close(serial_ctx_t *ctx)
 {
     if (ctx == NULL) return;

@@ -234,6 +234,60 @@ static size_t handle_scrypt(osdp_pd_t *pd, const osdp_frame_t *cmd)
     return built;
 }
 
+/* ---- osdp_COMSET under Secure Channel --------------------------------- */
+
+/* Handle an osdp_COMSET carried under an established session. Mirrors the
+ * plaintext path in pd.c: compute the effective comms parameters, reply
+ * osdp_COM wrapped as SCS_18 (data-bearing), and stage the change so it
+ * takes effect only after the reply is transmitted. `plaintext` is the
+ * already-unwrapped COMSET payload. */
+static size_t handle_comset_sc(osdp_pd_t          *pd,
+                               const osdp_frame_t *cmd,
+                               const uint8_t      *plaintext,
+                               size_t              plaintext_len)
+{
+    uint8_t  eff_addr = pd->address;
+    uint32_t eff_baud = 0;
+    uint8_t  com_payload[OSDP_COM_PAYLOAD_BYTES];
+    const osdp_status_t s = osdp_pd_internal_comset_effective(
+        pd, plaintext, plaintext_len, &eff_addr, &eff_baud, com_payload);
+
+    osdp_frame_t reply_template;
+    (void)memset(&reply_template, 0, sizeof(reply_template));
+    reply_template.address     = pd->address;
+    reply_template.reply       = true;
+    reply_template.sequence    = cmd->sequence;
+    reply_template.integrity   = cmd->integrity;
+    reply_template.has_scb     = true;
+    reply_template.scb_length  = OSDP_SCB_MIN_LEN;
+    reply_template.scb_type    = OSDP_SCS_18;
+
+    uint8_t nak_byte = OSDP_NAK_CMD_LENGTH;
+    if (s != OSDP_OK) {
+        reply_template.code        = OSDP_REPLY_NAK;
+        reply_template.payload     = &nak_byte;
+        reply_template.payload_len = 1;
+    } else {
+        reply_template.code        = OSDP_REPLY_COM;
+        reply_template.payload     = com_payload;
+        reply_template.payload_len = OSDP_COM_PAYLOAD_BYTES;
+    }
+
+    size_t built = 0;
+    if (osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session, &reply_template,
+                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built) != OSDP_OK) {
+        return 0;
+    }
+    /* Stage the address/baud change only on success; process_frame applies
+     * it after this SCS_18 reply is sent. */
+    if (s == OSDP_OK) {
+        pd->comset_pending     = true;
+        pd->comset_new_address = eff_addr;
+        pd->comset_new_baud    = eff_baud;
+    }
+    return built;
+}
+
 /* ---- SCS_15 / SCS_17: operational traffic ---------------------------- */
 
 static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
@@ -256,6 +310,13 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
          * recovery path (spec D.6). Sending a NAK with a wrong MAC
          * would only confuse the chain further. */
         return 0;
+    }
+
+    /* osdp_COMSET is handled by the library (see the plaintext path in
+     * pd.c): it produces an osdp_COM reply and mutates pd->address, so it
+     * never reaches the application command handler. */
+    if (cmd->code == OSDP_CMD_COMSET) {
+        return handle_comset_sc(pd, cmd, plaintext, plaintext_len);
     }
 
     /* Dispatch the plaintext payload to the application handler. */

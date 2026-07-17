@@ -133,6 +133,37 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
 
+## Library-handled commands (KEYSET, COMSET)
+
+Most commands flow to the application's `osdp_pd_command_cb`, which chooses
+the reply. A few are intercepted by the PD state machine itself because they
+mutate library-owned state and/or mandate a specific reply the app shouldn't
+have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
+(`pd/src/pd_sc.c`) dispatch paths intercept them identically.
+
+- **`osdp_KEYSET`** — flows to `cmd_cb` (the app ACKs it), then the core
+  applies the new SCBK in place. See the Secure Channel conventions below.
+- **`osdp_COMSET`** — handled entirely by the core: it never reaches
+  `cmd_cb`. The library builds the mandated `osdp_COM` reply and switches
+  `pd->address` for it (the state machine owns the address — it filters
+  inbound frames and stamps replies with it). Per spec 6.13 the change takes
+  effect only *after* the reply is sent, so the reply goes out at the old
+  address and the switch is deferred to `process_frame` after `send_bytes`.
+  Two optional app hooks bracket the exchange (`osdp_pd_set_comset_handler`):
+  `decide` (before the reply — veto/clamp the requested address/baud, the
+  spec-6.13 "return what I'll use" path) and `applied` (after the reply is
+  sent — enact the baud change on the transport and persist to NVM). The
+  address is switched by the core; only the baud is the app's job, because
+  the core has no UART. Critical gotcha the app hook must respect: a
+  transport `write()` returning does not mean the bytes are physically on the
+  wire, so `applied` must **drain the transmitter before changing baud** (a
+  premature switch clocks out the tail of `osdp_COM` at the new rate and the
+  ACU never follows). `tcdrain` on POSIX; on Windows `FlushFileBuffers` plus
+  a timed wait, since USB adapters hold bytes in a chip FIFO past
+  `FlushFileBuffers`/`cbOutQue`. `tools/osdp-pd-mock/serial_*.c` implements
+  both. Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
+  > 0x7E is rejected and the current address kept.
+
 ## Coding rules
 
 - C11. Freestanding-only headers (`<stdint.h>`, `<stddef.h>`, `<string.h>`,

@@ -89,6 +89,95 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t     *pd,
     return OSDP_OK;
 }
 
+/* Highest legal PD address (spec 6.13 Table 22: 0x00..0x7E). 0x7F is the
+ * broadcast address and is never a valid COMSET target. */
+#define OSDP_PD_MAX_ADDR 0x7EU
+
+osdp_status_t osdp_pd_internal_comset_effective(osdp_pd_t     *pd,
+                                                const uint8_t *payload,
+                                                size_t         payload_len,
+                                                uint8_t       *eff_addr,
+                                                uint32_t      *eff_baud,
+                                                uint8_t       *com_payload)
+{
+    osdp_comset_cmd_t req;
+    osdp_status_t s = osdp_comset_decode(payload, payload_len, &req);
+    if (s != OSDP_OK) {
+        return s;  /* malformed → caller NAK's with bad-length */
+    }
+
+    /* Seed the effective values with the request, then let the
+     * application override them if it cannot comply (spec 6.13). */
+    uint8_t  addr = req.address;
+    uint32_t baud = req.baud_rate;
+    if (pd->comset_cb != NULL) {
+        pd->comset_cb(pd->comset_user, req.address, req.baud_rate,
+                      &addr, &baud);
+    }
+    /* An out-of-range effective address means "can't comply" — keep the
+     * current address rather than adopting an unaddressable value. */
+    if (addr > OSDP_PD_MAX_ADDR) {
+        addr = pd->address;
+    }
+
+    const osdp_com_t com = { .address = addr, .baud_rate = baud };
+    size_t written = 0;
+    s = osdp_com_build(&com, com_payload, OSDP_COM_PAYLOAD_BYTES, &written);
+    if (s != OSDP_OK) {
+        return s;
+    }
+    *eff_addr = addr;
+    *eff_baud = baud;
+    return OSDP_OK;
+}
+
+void osdp_pd_internal_apply_comset(osdp_pd_t *pd)
+{
+    pd->comset_pending = false;
+    pd->address        = pd->comset_new_address;
+    /* The address change invalidates the retransmit / SQN cache: a resend
+     * of the COMSET would arrive at the old address and no longer match,
+     * and the ACU will reset the sequence when it reconnects at the new
+     * parameters. Drop the cache so the reconnect starts clean. */
+    pd->have_last = false;
+    if (pd->comset_applied_cb != NULL) {
+        pd->comset_applied_cb(pd->comset_user,
+                              pd->comset_new_address, pd->comset_new_baud);
+    }
+}
+
+/* Handle a plaintext osdp_COMSET: compute the effective comms parameters,
+ * reply osdp_COM at the CURRENT address, and stage the change so it takes
+ * effect only after the reply is transmitted (spec 6.13). Returns the
+ * reply length in pd->tx_buf, or a NAK on a malformed payload. */
+static size_t handle_comset_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
+{
+    uint8_t  eff_addr = pd->address;
+    uint32_t eff_baud = 0;
+    uint8_t  com_payload[OSDP_COM_PAYLOAD_BYTES];
+    const osdp_status_t s = osdp_pd_internal_comset_effective(
+        pd, cmd->payload, cmd->payload_len, &eff_addr, &eff_baud, com_payload);
+    if (s != OSDP_OK) {
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
+        return n;
+    }
+
+    const osdp_pd_reply_t reply = {
+        .code        = OSDP_REPLY_COM,
+        .payload     = com_payload,
+        .payload_len = OSDP_COM_PAYLOAD_BYTES,
+    };
+    size_t built = 0;
+    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
+        return 0;
+    }
+    pd->comset_pending     = true;
+    pd->comset_new_address = eff_addr;
+    pd->comset_new_baud    = eff_baud;
+    return built;
+}
+
 /* Exposed under a stable name (declared in pd_internal.h) so the SC
  * handlers in pd_sc.c can build NAKs without duplicating the helper.
  * Same signature as the static `build_nak` above. */
@@ -170,6 +259,15 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
             return 0;
         }
         return n;
+    }
+
+    /* osdp_COMSET is answered by the library, not the application handler:
+     * the reply is osdp_COM (not an app-chosen ACK) and the command mutates
+     * pd->address, which only the state machine owns. The optional COMSET
+     * hooks let the application veto/clamp the values and enact the baud
+     * change once the reply has gone out. */
+    if (cmd->code == OSDP_CMD_COMSET) {
+        return handle_comset_plain(pd, cmd);
     }
 
     osdp_pd_reply_t reply = {
@@ -290,6 +388,14 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     cache_reply(pd, cmd, built);
     if (built > 0) {
         send_bytes(pd, pd->tx_buf, built);
+    }
+
+    /* osdp_COMSET: the new comms parameters take effect only AFTER the
+     * osdp_COM reply has been transmitted at the old parameters (spec
+     * 6.13). Apply the staged change now — this also drops the SQN cache
+     * populated by cache_reply() above. */
+    if (pd->comset_pending) {
+        osdp_pd_internal_apply_comset(pd);
     }
 }
 
@@ -504,6 +610,19 @@ void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb, void *user)
     }
     pd->buzzer_cb   = cb;
     pd->buzzer_user = user;
+}
+
+void osdp_pd_set_comset_handler(osdp_pd_t                *pd,
+                                osdp_pd_comset_cb         decide,
+                                osdp_pd_comset_applied_cb applied,
+                                void                     *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->comset_cb         = decide;
+    pd->comset_applied_cb = applied;
+    pd->comset_user       = user;
 }
 
 bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no)

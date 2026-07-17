@@ -162,6 +162,45 @@ pub trait BuzzerHandler: 'static {
     fn on_buzzer_change(&mut self, reader_no: u8, sounding: bool, tone: u8);
 }
 
+/// Communication-configuration (`osdp_COMSET`) handler. The PD intercepts
+/// inbound COMSET itself — building the `osdp_COM` reply and switching its
+/// own 7-bit address — and drives this handler around that exchange:
+///
+/// - [`decide`](ComsetHandler::decide) runs *before* the reply is built. It
+///   receives the ACU's requested `(address, baud)` and returns the values
+///   the PD will actually use. Return the input unchanged to accept; lower or
+///   replace either field to signal "unable to comply" (spec 6.13 — the PD
+///   reports what it *will* use). An effective address above 0x7E is rejected
+///   by the library, which keeps the current address instead.
+/// - [`applied`](ComsetHandler::applied) runs *after* the `osdp_COM` reply
+///   has been transmitted at the old parameters and the PD has adopted the
+///   new address. Reconfigure the transport to `baud` and persist
+///   `(address, baud)` to non-volatile storage here — doing so any earlier
+///   would corrupt the in-flight reply.
+///
+/// Both methods have accept-the-request / do-nothing defaults, so a handler
+/// only overrides the phase it cares about.
+pub trait ComsetHandler: 'static {
+    /// Decide the effective `(address, baud)`. Default: accept the request.
+    fn decide(&mut self, req_address: u8, req_baud: u32) -> (u8, u32) {
+        (req_address, req_baud)
+    }
+
+    /// The change is now live: the PD answers on `address` and the caller
+    /// should switch its transport to `baud`. Default: no-op.
+    ///
+    /// Drain the transmitter before changing the baud. By the time this runs
+    /// the library has handed the `osdp_COM` reply to the transport, but a
+    /// `write()` returning does not mean the bytes are physically on the wire
+    /// — switching the rate too early clocks out the tail of the reply at the
+    /// new baud and the ACU never follows. Block until the reply has drained
+    /// (`tcdrain` on POSIX; `FlushFileBuffers` plus a wait on Windows, since
+    /// USB adapters hold bytes in a chip FIFO past `FlushFileBuffers`).
+    fn applied(&mut self, address: u8, baud: u32) {
+        let _ = (address, baud);
+    }
+}
+
 // ---- Internal storage ---------------------------------------------------
 //
 // Each trait object is wrapped in a `Box<dyn Trait>`. We need the
@@ -172,6 +211,7 @@ type TransportBox = Box<dyn Transport>;
 type CommandHandlerBox = Box<dyn CommandHandler>;
 type LedHandlerBox = Box<dyn LedHandler>;
 type BuzzerHandlerBox = Box<dyn BuzzerHandler>;
+type ComsetHandlerBox = Box<dyn ComsetHandler>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -190,6 +230,8 @@ pub struct Pd {
     led_handler: Option<Box<LedHandlerBox>>,
     /// Same arrangement for the buzzer change handler (`buzzer_user`).
     buzzer_handler: Option<Box<BuzzerHandlerBox>>,
+    /// Same arrangement for the COMSET handler (`comset_user`).
+    comset_handler: Option<Box<ComsetHandlerBox>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
@@ -209,6 +251,7 @@ impl Pd {
             cmd_handler: None,
             led_handler: None,
             buzzer_handler: None,
+            comset_handler: None,
             sc_crypto: None,
         }
     }
@@ -310,6 +353,29 @@ impl Pd {
     /// transport's `now_ms` clock (or time 0 if none).
     pub fn buzzer_sounding(&self, reader_no: u8) -> bool {
         unsafe { sys::osdp_pd_buzzer_sounding(&*self.inner, reader_no) }
+    }
+
+    // ---- Communication configuration ----------------------------------
+
+    /// Bind the `osdp_COMSET` handler (see [`ComsetHandler`]). The PD builds
+    /// the `osdp_COM` reply and switches its own address internally; this
+    /// handler lets the application veto/clamp the requested values and enact
+    /// the baud change once the reply has gone out. Replaces any previously-
+    /// set handler (the old one is dropped).
+    pub fn set_comset_handler<H: ComsetHandler>(&mut self, handler: H) {
+        let boxed: Box<ComsetHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            sys::osdp_pd_set_comset_handler(
+                &mut *self.inner,
+                Some(comset_decide_thunk),
+                Some(comset_applied_thunk),
+                user_ptr,
+            );
+        }
+
+        self.comset_handler = Some(unsafe { Box::from_raw(user_ptr as *mut ComsetHandlerBox) });
     }
 
     // ---- Secure Channel configuration ---------------------------------
@@ -447,6 +513,34 @@ unsafe extern "C" fn buzzer_handler_thunk(
     storage.on_buzzer_change(reader_no, sounding, tone);
 }
 
+unsafe extern "C" fn comset_decide_thunk(
+    user: *mut c_void,
+    req_address: u8,
+    req_baud: u32,
+    eff_address: *mut u8,
+    eff_baud: *mut u32,
+) {
+    if user.is_null() {
+        return;
+    }
+    let storage = &mut *(user as *mut ComsetHandlerBox);
+    let (address, baud) = storage.decide(req_address, req_baud);
+    if !eff_address.is_null() {
+        *eff_address = address;
+    }
+    if !eff_baud.is_null() {
+        *eff_baud = baud;
+    }
+}
+
+unsafe extern "C" fn comset_applied_thunk(user: *mut c_void, address: u8, baud: u32) {
+    if user.is_null() {
+        return;
+    }
+    let storage = &mut *(user as *mut ComsetHandlerBox);
+    storage.applied(address, baud);
+}
+
 // ---- Drop impl ---------------------------------------------------------
 
 impl Drop for Pd {
@@ -462,6 +556,8 @@ impl Drop for Pd {
             sys::osdp_pd_set_led_handler(&mut *self.inner, None, ptr::null_mut());
             // And the buzzer change handler.
             sys::osdp_pd_set_buzzer_handler(&mut *self.inner, None, ptr::null_mut());
+            // And the COMSET decide/applied handlers.
+            sys::osdp_pd_set_comset_handler(&mut *self.inner, None, None, ptr::null_mut());
             // Replace the transport with one whose callbacks are NULL
             // so future tick()s can't dereference our (about to be
             // dropped) trait objects. We still own the C struct; the

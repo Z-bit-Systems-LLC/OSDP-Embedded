@@ -67,4 +67,24 @@ osdp_status_t osdp_pd_internal_apply_keyset(osdp_pd_t      *pd,
                                             const uint8_t  *payload,
                                             size_t          payload_len);
 
+/* Decode an inbound osdp_COMSET payload, run it through the application's
+ * `decide` hook (if any), clamp an out-of-range address to the current one,
+ * and emit the 5-byte osdp_COM report body. On success writes the effective
+ * address/baud to *eff_addr / *eff_baud and OSDP_COM_PAYLOAD_BYTES into
+ * com_payload. Returns OSDP_ERR_BAD_PAYLOAD if the COMSET is malformed (the
+ * caller then NAKs). Shared by the plaintext (pd.c) and Secure Channel
+ * (pd_sc.c) dispatch paths; defined in pd.c. */
+osdp_status_t osdp_pd_internal_comset_effective(osdp_pd_t     *pd,
+                                                const uint8_t *payload,
+                                                size_t         payload_len,
+                                                uint8_t       *eff_addr,
+                                                uint32_t      *eff_baud,
+                                                uint8_t       *com_payload);
+
+/* Apply the COMSET change staged in pd->comset_{new_address,new_baud}:
+ * adopt the new address, drop the SQN/retransmit cache, clear the pending
+ * flag, and fire the application's `applied` hook. Called by process_frame
+ * AFTER the osdp_COM reply has been transmitted. Defined in pd.c. */
+void osdp_pd_internal_apply_comset(osdp_pd_t *pd);
+
 #endif /* OSDP_PD_INTERNAL_H */
