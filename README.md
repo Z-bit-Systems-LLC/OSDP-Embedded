@@ -1,6 +1,6 @@
 # OSDP-Embedded
 
-[![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status/6?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
+[![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status%2FOSDP%20Embedded-CI?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
 
 A portable, embedded-friendly implementation of the SIA OSDP (Open Supervised
 Device Protocol) v2.2.2, written in freestanding C11 with a `no_std`-compatible
