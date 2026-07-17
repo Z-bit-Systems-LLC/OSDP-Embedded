@@ -939,6 +939,11 @@ fn open_pd(
     // sync (see DefaultComsetHandler docs).
     pd.set_comset_handler(crate::handler::DefaultComsetHandler::new(baud));
 
+    // osdp_FILETRANSFER: streaming mode — the C library hands each fragment to
+    // the receiver (which logs + accepts) and replies osdp_FTSTAT, with no
+    // buffer and no file-size ceiling.
+    pd.set_file_stream(crate::handler::DefaultFileReceiver);
+
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is
     // independent across configures. The cUID is derived from the

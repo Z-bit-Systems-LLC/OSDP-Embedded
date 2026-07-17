@@ -35,9 +35,16 @@ use crate::error::{Error, Result};
 // ---- Re-exports: command + reply + NAK code constants ------------------
 
 pub use sys::{
-    OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_CHLNG, OSDP_CMD_COMSET, OSDP_CMD_ID, OSDP_CMD_ISTAT,
-    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL,
-    OSDP_CMD_RSTAT, OSDP_CMD_SCRYPT, OSDP_CMD_TEXT,
+    OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_CHLNG, OSDP_CMD_COMSET, OSDP_CMD_FILETRANSFER,
+    OSDP_CMD_ID, OSDP_CMD_ISTAT, OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OSTAT,
+    OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_RSTAT, OSDP_CMD_SCRYPT, OSDP_CMD_TEXT,
+};
+// File-transfer type + status constants.
+pub use sys::{
+    OSDP_FTSTAT_ABORT, OSDP_FTSTAT_ACTION_INTERLEAVE_OK, OSDP_FTSTAT_ACTION_LEAVE_SC,
+    OSDP_FTSTAT_ACTION_POLL_AVAIL, OSDP_FTSTAT_FINISHING, OSDP_FTSTAT_MALFORMED, OSDP_FTSTAT_OK,
+    OSDP_FTSTAT_PROCESSED, OSDP_FTSTAT_REBOOTING, OSDP_FTSTAT_UNRECOGNIZED, OSDP_FT_TYPE_BIOMATCH,
+    OSDP_FT_TYPE_DISPLAY, OSDP_FT_TYPE_OPAQUE,
 };
 pub use sys::{
     OSDP_NAK_BAD_CHECK, OSDP_NAK_CMD_LENGTH, OSDP_NAK_ENCRYPTION_REQUIRED, OSDP_NAK_NO_ERROR,
@@ -46,8 +53,9 @@ pub use sys::{
 };
 pub use sys::{
     OSDP_REPLY_ACK, OSDP_REPLY_BUSY, OSDP_REPLY_CCRYPT, OSDP_REPLY_COM, OSDP_REPLY_FMT,
-    OSDP_REPLY_ISTATR, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_NAK, OSDP_REPLY_OSTATR,
-    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW, OSDP_REPLY_RMAC_I, OSDP_REPLY_RSTATR,
+    OSDP_REPLY_FTSTAT, OSDP_REPLY_ISTATR, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_NAK,
+    OSDP_REPLY_OSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW, OSDP_REPLY_RMAC_I,
+    OSDP_REPLY_RSTATR,
 };
 
 // ========================================================================
@@ -499,6 +507,61 @@ impl<'a> Keyset<'a> {
     }
 }
 
+/// `osdp_FILETRANSFER` (0x7C) — one fragment of a file streamed ACU → PD:
+/// an 11-byte header plus optional fragment bytes.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct FileTransfer<'a> {
+    /// FtType — 0x01 opaque, 0x02 biomatch template, 0x03 display, ...
+    pub ft_type: u8,
+    /// Total file size.
+    pub total_size: u32,
+    /// Byte offset of this fragment (monotonically increasing).
+    pub offset: u32,
+    /// This fragment's bytes (may be empty for an idle fragment).
+    pub data: &'a [u8],
+}
+
+impl<'a> FileTransfer<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_filetransfer_cmd_t>::zeroed();
+        let s = unsafe {
+            sys::osdp_filetransfer_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr())
+        };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            ft_type: r.ft_type,
+            total_size: r.total_size,
+            offset: r.offset,
+            data: unsafe { slice_from_raw_or_empty(r.data, r.data_len) },
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        if self.data.len() > u16::MAX as usize {
+            return Err(Error::InvalidArg);
+        }
+        let raw = sys::osdp_filetransfer_cmd_t {
+            ft_type: self.ft_type,
+            total_size: self.total_size,
+            offset: self.offset,
+            fragment_size: self.data.len() as u16,
+            data: if self.data.is_empty() {
+                ptr::null()
+            } else {
+                self.data.as_ptr()
+            },
+            data_len: self.data.len(),
+        };
+        let mut written: usize = 0;
+        let s = unsafe {
+            sys::osdp_filetransfer_build(&raw, out.as_mut_ptr(), out.len(), &mut written)
+        };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
 // ========================================================================
 // REPLIES (PD → ACU)
 // ========================================================================
@@ -797,6 +860,49 @@ impl Com {
     }
 }
 
+/// `osdp_FTSTAT` (0x7A) — file-transfer status. Fixed 7-byte payload.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct Ftstat {
+    /// FtAction control flags (see `OSDP_FTSTAT_ACTION_*`).
+    pub action: u8,
+    /// FtDelay — ms the ACU should wait before the next FILETRANSFER.
+    pub delay_ms: u16,
+    /// FtStatusDetail — signed status (see `OSDP_FTSTAT_*`): negative =
+    /// failure, 0 = proceed, 1 = processed, 2 = rebooting, 3 = finishing.
+    pub status_detail: i16,
+    /// FtUpdateMsgMax — alternate max fragment size (0 = no change).
+    pub update_msg_max: u16,
+}
+
+impl Ftstat {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_ftstat_t>::zeroed();
+        let s =
+            unsafe { sys::osdp_ftstat_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            action: r.action,
+            delay_ms: r.delay_ms,
+            status_detail: r.status_detail,
+            update_msg_max: r.update_msg_max,
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_ftstat_t {
+            action: self.action,
+            delay_ms: self.delay_ms,
+            status_detail: self.status_detail,
+            update_msg_max: self.update_msg_max,
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_ftstat_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
 // ========================================================================
 // Internals
 // ========================================================================
@@ -958,5 +1064,38 @@ mod tests {
         // PDID is exactly 12 bytes; 11 must fail.
         let too_short = [0u8; 11];
         assert!(Pdid::decode(&too_short).is_err());
+    }
+
+    #[test]
+    fn file_transfer_round_trip_with_fragment() {
+        let frag = [0xDE, 0xAD, 0xBE, 0xEF];
+        let cmd = FileTransfer {
+            ft_type: OSDP_FT_TYPE_OPAQUE,
+            total_size: 0x1234,
+            offset: 0x100,
+            data: &frag,
+        };
+        let bytes = round_trip(|b| cmd.build(b));
+        let decoded = FileTransfer::decode(&bytes).unwrap();
+        assert_eq!(decoded.ft_type, OSDP_FT_TYPE_OPAQUE);
+        assert_eq!(decoded.total_size, 0x1234);
+        assert_eq!(decoded.offset, 0x100);
+        assert_eq!(decoded.data, &frag);
+    }
+
+    #[test]
+    fn ftstat_round_trip_negative_status() {
+        let st = Ftstat {
+            action: OSDP_FTSTAT_ACTION_INTERLEAVE_OK,
+            delay_ms: 250,
+            status_detail: OSDP_FTSTAT_MALFORMED,
+            update_msg_max: 128,
+        };
+        let bytes = round_trip(|b| st.build(b));
+        let decoded = Ftstat::decode(&bytes).unwrap();
+        assert_eq!(decoded.status_detail, -3);
+        assert_eq!(decoded.delay_ms, 250);
+        assert_eq!(decoded.update_msg_max, 128);
+        assert_eq!(decoded.action, OSDP_FTSTAT_ACTION_INTERLEAVE_OK);
     }
 }

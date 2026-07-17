@@ -95,10 +95,12 @@ struct ReplyCapture {
 }
 impl ReplyHandler for ReplyCapture {
     fn on_reply(&mut self, e: &ReplyEvent<'_>) {
-        self.inner
-            .borrow_mut()
-            .replies
-            .push((e.pd_address, e.cmd_code, e.reply_code, e.payload.to_vec()));
+        self.inner.borrow_mut().replies.push((
+            e.pd_address,
+            e.cmd_code,
+            e.reply_code,
+            e.payload.to_vec(),
+        ));
     }
 }
 
@@ -167,7 +169,10 @@ fn comset_reports_effective_values_and_fires_applied() {
         com_reply.2
     );
     let com = Com::decode(&com_reply.3).expect("decode osdp_COM payload");
-    assert_eq!(com.address, REQUESTED_NEW_ADDRESS, "COM must report new address");
+    assert_eq!(
+        com.address, REQUESTED_NEW_ADDRESS,
+        "COM must report new address"
+    );
     assert_eq!(
         com.baud_rate, CONFIGURED_BAUD,
         "COM must report the pinned baud, not the requested one"

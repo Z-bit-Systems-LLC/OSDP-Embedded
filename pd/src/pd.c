@@ -178,6 +178,154 @@ static size_t handle_comset_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
     return built;
 }
 
+osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
+                                            const uint8_t *payload,
+                                            size_t         payload_len,
+                                            uint8_t       *ftstat_payload)
+{
+    /* No handler bound → the PD does not implement file transfer. The
+     * caller turns this into NAK 0x03 (Unknown Command Code). */
+    if (pd->file_cb == NULL) {
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
+
+    /* Two modes, distinguished by whether a reassembly buffer was supplied:
+     *   - reassembly (file_buf != NULL): the core copies each fragment into
+     *     the buffer and hands the accumulated file to the callback. Bounded
+     *     by file_cap.
+     *   - streaming  (file_buf == NULL): the core hands each fragment to the
+     *     callback as it arrives without accumulating (for RAM-constrained
+     *     targets that persist fragments to flash). No capacity ceiling. */
+    const bool streaming = (pd->file_buf == NULL);
+
+    osdp_filetransfer_cmd_t ft;
+    if (osdp_filetransfer_decode(payload, payload_len, &ft) != OSDP_OK) {
+        return OSDP_ERR_BAD_PAYLOAD;  /* undecodable frame → caller NAKs 0x02 */
+    }
+
+    /* Reassembly bookkeeping. Any invariant violation aborts the transfer:
+     * we report FtStatusDetail = -1 and drop the active state so the ACU can
+     * restart from offset 0. */
+    bool ok = true;
+    if (ft.offset == 0) {
+        /* First fragment: (re)start the transfer. */
+        pd->ft_active   = true;
+        pd->ft_type     = ft.ft_type;
+        pd->ft_total    = ft.total_size;
+        pd->ft_received = 0;
+        if (!streaming && ft.total_size > pd->file_cap) {
+            ok = false;  /* file won't fit the receiver buffer */
+        }
+    } else if (!pd->ft_active) {
+        ok = false;      /* continuation with no transfer in progress */
+    } else if (ft.offset != pd->ft_received) {
+        ok = false;      /* gap / out-of-order / non-monotonic offset */
+    } else if (ft.ft_type != pd->ft_type || ft.total_size != pd->ft_total) {
+        ok = false;      /* transfer parameters changed mid-stream */
+    }
+    if (ok && ft.fragment_size > 0) {
+        /* 64-bit math so a hostile offset+size can't wrap. */
+        const uint64_t end = (uint64_t)ft.offset + ft.fragment_size;
+        if (end > pd->ft_total) {
+            ok = false;  /* fragment runs past the declared size */
+        } else if (!streaming && end > pd->file_cap) {
+            ok = false;  /* fragment runs past the receiver buffer */
+        }
+    }
+
+    osdp_ftstat_t st = {
+        .action         = 0,
+        .delay_ms       = 0,
+        .status_detail  = OSDP_FTSTAT_OK,
+        .update_msg_max = 0,
+    };
+
+    if (!ok) {
+        pd->ft_active     = false;
+        st.status_detail  = OSDP_FTSTAT_ABORT;
+    } else {
+        /* Reassembly mode copies the fragment into the buffer; streaming mode
+         * leaves it in place (the callback reads info->fragment). Either way
+         * advance the running offset for progress + monotonicity. */
+        if (ft.fragment_size > 0 && ft.data != NULL) {
+            if (!streaming) {
+                (void)memcpy(&pd->file_buf[ft.offset], ft.data,
+                             ft.fragment_size);
+            }
+            pd->ft_received += ft.fragment_size;
+        }
+        const bool complete = (pd->ft_received >= pd->ft_total);
+
+        const osdp_pd_file_info_t info = {
+            .ft_type      = pd->ft_type,
+            .total_size   = pd->ft_total,
+            .offset       = ft.offset,
+            .fragment     = ft.data,
+            .fragment_len = ft.fragment_size,
+            .data         = streaming ? NULL : pd->file_buf,
+            .received     = pd->ft_received,
+            .complete     = complete,
+        };
+        const osdp_status_t verdict = pd->file_cb(pd->file_user, &info);
+
+        switch (verdict) {
+        case OSDP_OK:
+            st.status_detail = complete ? OSDP_FTSTAT_PROCESSED
+                                        : OSDP_FTSTAT_OK;
+            break;
+        case OSDP_ERR_BAD_PAYLOAD:
+            st.status_detail = OSDP_FTSTAT_MALFORMED;
+            break;
+        case OSDP_ERR_NOT_SUPPORTED:
+            st.status_detail = OSDP_FTSTAT_UNRECOGNIZED;
+            break;
+        default:
+            st.status_detail = OSDP_FTSTAT_ABORT;
+            break;
+        }
+
+        /* A negative verdict or a clean completion ends the transfer. */
+        if (st.status_detail < 0 || complete) {
+            pd->ft_active = false;
+        }
+    }
+
+    size_t written = 0;
+    return osdp_ftstat_build(&st, ftstat_payload,
+                             OSDP_FTSTAT_PAYLOAD_BYTES, &written);
+}
+
+/* Handle a plaintext osdp_FILETRANSFER: reassemble + evaluate via the shared
+ * helper and reply osdp_FTSTAT, or NAK when the frame is undecodable (0x02)
+ * or no receiver is registered (0x03). Returns the reply length in
+ * pd->tx_buf. */
+static size_t handle_filetransfer_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
+{
+    uint8_t ftstat_payload[OSDP_FTSTAT_PAYLOAD_BYTES];
+    const osdp_status_t s = osdp_pd_internal_filetransfer(
+        pd, cmd->payload, cmd->payload_len, ftstat_payload);
+
+    if (s != OSDP_OK) {
+        const uint8_t err = (s == OSDP_ERR_NOT_SUPPORTED)
+                                ? OSDP_NAK_UNKNOWN_CMD   /* 0x03 */
+                                : OSDP_NAK_CMD_LENGTH;   /* 0x02 */
+        size_t n = 0;
+        (void)build_nak(pd, cmd, err, &n);
+        return n;
+    }
+
+    const osdp_pd_reply_t reply = {
+        .code        = OSDP_REPLY_FTSTAT,
+        .payload     = ftstat_payload,
+        .payload_len = OSDP_FTSTAT_PAYLOAD_BYTES,
+    };
+    size_t built = 0;
+    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
+        return 0;
+    }
+    return built;
+}
+
 /* Exposed under a stable name (declared in pd_internal.h) so the SC
  * handlers in pd_sc.c can build NAKs without duplicating the helper.
  * Same signature as the static `build_nak` above. */
@@ -268,6 +416,14 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * change once the reply has gone out. */
     if (cmd->code == OSDP_CMD_COMSET) {
         return handle_comset_plain(pd, cmd);
+    }
+
+    /* osdp_FILETRANSFER is likewise library-handled: the PD reassembles the
+     * file into the caller's buffer and replies osdp_FTSTAT, so it never
+     * reaches cmd_cb. The application only evaluates the bytes via the
+     * file-receiver callback. */
+    if (cmd->code == OSDP_CMD_FILETRANSFER) {
+        return handle_filetransfer_plain(pd, cmd);
     }
 
     osdp_pd_reply_t reply = {
@@ -623,6 +779,36 @@ void osdp_pd_set_comset_handler(osdp_pd_t                *pd,
     pd->comset_cb         = decide;
     pd->comset_applied_cb = applied;
     pd->comset_user       = user;
+}
+
+void osdp_pd_set_file_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
+                               osdp_pd_file_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->file_buf  = buf;
+    pd->file_cap  = cap;
+    pd->file_cb   = cb;
+    pd->file_user = user;
+    /* Rebinding a receiver discards any transfer that was mid-flight. */
+    pd->ft_active   = false;
+    pd->ft_received = 0;
+}
+
+void osdp_pd_set_file_stream(osdp_pd_t *pd, osdp_pd_file_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    /* Streaming mode: no reassembly buffer. file_buf == NULL is the mode
+     * flag that osdp_pd_internal_filetransfer keys off. */
+    pd->file_buf  = NULL;
+    pd->file_cap  = 0;
+    pd->file_cb   = cb;
+    pd->file_user = user;
+    pd->ft_active   = false;
+    pd->ft_received = 0;
 }
 
 bool osdp_pd_buzzer_sounding(const osdp_pd_t *pd, uint8_t reader_no)

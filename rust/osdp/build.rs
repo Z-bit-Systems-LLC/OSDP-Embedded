@@ -83,6 +83,7 @@ fn main() {
         "core/src/commands/cmd_buz.c",
         "core/src/commands/cmd_cap.c",
         "core/src/commands/cmd_comset.c",
+        "core/src/commands/cmd_filetransfer.c",
         "core/src/commands/cmd_id.c",
         "core/src/commands/cmd_keyset.c",
         "core/src/commands/cmd_led.c",
@@ -92,6 +93,7 @@ fn main() {
         // core: per-message reply codecs
         "core/src/replies/reply_ack.c",
         "core/src/replies/reply_com.c",
+        "core/src/replies/reply_ftstat.c",
         "core/src/replies/reply_keypad.c",
         "core/src/replies/reply_nak.c",
         "core/src/replies/reply_pdcap.c",

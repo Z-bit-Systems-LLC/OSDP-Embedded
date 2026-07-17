@@ -87,4 +87,23 @@ osdp_status_t osdp_pd_internal_comset_effective(osdp_pd_t     *pd,
  * AFTER the osdp_COM reply has been transmitted. Defined in pd.c. */
 void osdp_pd_internal_apply_comset(osdp_pd_t *pd);
 
+/* Process an inbound (plaintext) osdp_FILETRANSFER payload: reassemble the
+ * fragment into the registered receiver buffer, run the evaluation callback,
+ * update the running transfer state, and emit the 7-byte osdp_FTSTAT reply
+ * body into `ftstat_payload` (must hold OSDP_FTSTAT_PAYLOAD_BYTES).
+ *
+ * Returns:
+ *   OSDP_OK                — ftstat_payload holds the FTSTAT body to send
+ *                            (including abort / malformed / unrecognized
+ *                            statuses — those are still FTSTAT replies).
+ *   OSDP_ERR_NOT_SUPPORTED — no receiver registered (caller NAKs 0x03).
+ *   OSDP_ERR_BAD_PAYLOAD   — the frame will not decode (caller NAKs 0x02).
+ *
+ * Shared by the plaintext (pd.c) and Secure Channel (pd_sc.c) dispatch
+ * paths; defined in pd.c. */
+osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
+                                            const uint8_t *payload,
+                                            size_t         payload_len,
+                                            uint8_t       *ftstat_payload);
+
 #endif /* OSDP_PD_INTERNAL_H */

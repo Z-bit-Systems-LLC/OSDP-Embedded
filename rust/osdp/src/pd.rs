@@ -45,6 +45,7 @@
 //! ```
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::c_int;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
@@ -201,6 +202,79 @@ pub trait ComsetHandler: 'static {
     }
 }
 
+/// A snapshot of one accepted `osdp_FILETRANSFER` fragment, passed to a
+/// [`FileReceiver`]. `fragment` is this message's bytes and is available in
+/// both modes. `data` is the accumulated reassembly buffer so far — populated
+/// in reassembly mode ([`Pd::set_file_receiver`]), **empty** in streaming mode
+/// ([`Pd::set_file_stream`]), where you read `fragment` instead. `complete` is
+/// true on the final fragment.
+pub struct FileFragment<'a> {
+    /// FtType (0x01 opaque, 0x02 biomatch template, 0x03 display, ...).
+    pub ft_type: u8,
+    /// The full declared file size.
+    pub total_size: u32,
+    /// Byte offset of this fragment within the file.
+    pub offset: u32,
+    /// This fragment's bytes (empty for an idle fragment). Available in both
+    /// reassembly and streaming modes.
+    pub fragment: &'a [u8],
+    /// The reassembly buffer filled so far (`0 ..= received`) in reassembly
+    /// mode; **empty in streaming mode** — use [`fragment`](Self::fragment).
+    pub data: &'a [u8],
+    /// Contiguous bytes received so far, including this fragment. Useful for
+    /// "N of total" progress in both modes.
+    pub received: u32,
+    /// True once the whole file has been received.
+    pub complete: bool,
+}
+
+/// Why a [`FileReceiver`] rejects a fragment. The PD reports the mapped
+/// negative `osdp_FTSTAT` status and aborts the transfer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FileReject {
+    /// File data is malformed (FtStatusDetail = -3).
+    Malformed,
+    /// File contents are unrecognized (FtStatusDetail = -2).
+    Unrecognized,
+    /// Abort the transfer for any other reason (FtStatusDetail = -1).
+    Abort,
+}
+
+/// File-transfer receiver. The PD intercepts inbound `osdp_FILETRANSFER`
+/// itself — building every `osdp_FTSTAT` reply — and calls this handler once
+/// per accepted fragment to *evaluate* the bytes. The verdict drives the
+/// reported status:
+///
+/// - `Ok(())` → the PD reports "proceed" mid-file and "processed" on the
+///   final fragment.
+/// - `Err(reject)` → the PD reports the mapped negative status
+///   ([`FileReject`]) and aborts the transfer; the ACU may restart at
+///   offset 0.
+///
+/// Register the same handler in one of two modes, depending on what the
+/// target can afford:
+///
+/// - [`Pd::set_file_receiver`] (**reassembly**): the PD collects the whole
+///   file into a buffer it owns and hands you the complete image on the final
+///   fragment ([`FileFragment::data`]). Use this to validate a signature/CRC
+///   over the entire file before acting, or to parse a small structured blob
+///   (biomatch template, display data). Bounded by the buffer capacity.
+/// - [`Pd::set_file_stream`] (**streaming**): no buffer — the PD hands you
+///   each fragment ([`FileFragment::fragment`]) as it arrives and you persist
+///   it yourself (e.g. write to flash). RAM use is independent of file size,
+///   with no ceiling. Use this for firmware update on RAM-constrained targets.
+///
+/// Structural / bookkeeping failures (a file bigger than a reassembly buffer,
+/// a gapped offset, a malformed frame) are handled by the library before this
+/// runs — the handler only sees fragments that passed the invariants.
+pub trait FileReceiver: 'static {
+    /// Evaluate an accepted fragment. Default: accept everything.
+    fn on_fragment(&mut self, fragment: &FileFragment) -> core::result::Result<(), FileReject> {
+        let _ = fragment;
+        Ok(())
+    }
+}
+
 // ---- Internal storage ---------------------------------------------------
 //
 // Each trait object is wrapped in a `Box<dyn Trait>`. We need the
@@ -212,6 +286,7 @@ type CommandHandlerBox = Box<dyn CommandHandler>;
 type LedHandlerBox = Box<dyn LedHandler>;
 type BuzzerHandlerBox = Box<dyn BuzzerHandler>;
 type ComsetHandlerBox = Box<dyn ComsetHandler>;
+type FileReceiverBox = Box<dyn FileReceiver>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -232,6 +307,12 @@ pub struct Pd {
     buzzer_handler: Option<Box<BuzzerHandlerBox>>,
     /// Same arrangement for the COMSET handler (`comset_user`).
     comset_handler: Option<Box<ComsetHandlerBox>>,
+    /// Same arrangement for the file-transfer receiver (`file_user`).
+    file_receiver: Option<Box<FileReceiverBox>>,
+    /// The reassembly buffer the C side writes inbound file fragments into.
+    /// Its heap allocation must outlive registration (the C side holds a raw
+    /// `file_buf` pointer into it); held here for exactly `self`'s lifetime.
+    file_buffer: Option<Vec<u8>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
@@ -252,6 +333,8 @@ impl Pd {
             led_handler: None,
             buzzer_handler: None,
             comset_handler: None,
+            file_receiver: None,
+            file_buffer: None,
             sc_crypto: None,
         }
     }
@@ -376,6 +459,59 @@ impl Pd {
         }
 
         self.comset_handler = Some(unsafe { Box::from_raw(user_ptr as *mut ComsetHandlerBox) });
+    }
+
+    // ---- File transfer ------------------------------------------------
+
+    /// Bind a file-transfer receiver (see [`FileReceiver`]). The PD
+    /// reassembles inbound `osdp_FILETRANSFER` data into a `capacity`-byte
+    /// buffer owned by this `Pd` and calls `receiver` to evaluate each
+    /// accepted fragment. `capacity` must be at least as large as the biggest
+    /// file the ACU will send — a transfer whose declared size exceeds it is
+    /// aborted. Without a receiver the PD NAKs file transfers with 0x03.
+    /// Replaces any previously-set receiver and its buffer (both dropped).
+    pub fn set_file_receiver<R: FileReceiver>(&mut self, capacity: usize, receiver: R) {
+        let boxed: Box<FileReceiverBox> = Box::new(Box::new(receiver));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        // Heap-allocate the reassembly buffer. The Vec's backing allocation
+        // has a stable address; moving the Vec handle into `self` below does
+        // not move it, so the raw pointer we hand to C stays valid.
+        let mut buffer: Vec<u8> = alloc::vec![0u8; capacity];
+        let buf_ptr = buffer.as_mut_ptr();
+
+        unsafe {
+            sys::osdp_pd_set_file_receiver(
+                &mut *self.inner,
+                buf_ptr,
+                capacity,
+                Some(file_receiver_thunk),
+                user_ptr,
+            );
+        }
+
+        self.file_buffer = Some(buffer);
+        self.file_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut FileReceiverBox) });
+    }
+
+    /// Bind a **streaming** file-transfer receiver (see [`FileReceiver`]). No
+    /// reassembly buffer: the PD hands each `osdp_FILETRANSFER` fragment to
+    /// `receiver` as it arrives ([`FileFragment::fragment`];
+    /// [`FileFragment::data`] is empty) and you persist it yourself. RAM use
+    /// is independent of file size and there is no size ceiling — use this for
+    /// firmware update on RAM-constrained targets. Replaces any previously-set
+    /// receiver (and frees its reassembly buffer, if any).
+    pub fn set_file_stream<R: FileReceiver>(&mut self, receiver: R) {
+        let boxed: Box<FileReceiverBox> = Box::new(Box::new(receiver));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            sys::osdp_pd_set_file_stream(&mut *self.inner, Some(file_receiver_thunk), user_ptr);
+        }
+
+        // Streaming needs no reassembly buffer; drop any previously-held one.
+        self.file_buffer = None;
+        self.file_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut FileReceiverBox) });
     }
 
     // ---- Secure Channel configuration ---------------------------------
@@ -541,6 +677,45 @@ unsafe extern "C" fn comset_applied_thunk(user: *mut c_void, address: u8, baud: 
     storage.applied(address, baud);
 }
 
+unsafe extern "C" fn file_receiver_thunk(
+    user: *mut c_void,
+    info: *const sys::osdp_pd_file_info_t,
+) -> sys::osdp_status_t {
+    if user.is_null() || info.is_null() {
+        return sys::osdp_status_t::OSDP_ERR_INVALID_ARG;
+    }
+    let storage = &mut *(user as *mut FileReceiverBox);
+    let info = &*info;
+
+    let fragment = if info.fragment_len == 0 || info.fragment.is_null() {
+        &[][..]
+    } else {
+        slice::from_raw_parts(info.fragment, info.fragment_len)
+    };
+    let data = if info.received == 0 || info.data.is_null() {
+        &[][..]
+    } else {
+        slice::from_raw_parts(info.data, info.received as usize)
+    };
+
+    let fragment = FileFragment {
+        ft_type: info.ft_type,
+        total_size: info.total_size,
+        offset: info.offset,
+        fragment,
+        data,
+        received: info.received,
+        complete: info.complete,
+    };
+
+    match storage.on_fragment(&fragment) {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(FileReject::Malformed) => sys::osdp_status_t::OSDP_ERR_BAD_PAYLOAD,
+        Err(FileReject::Unrecognized) => sys::osdp_status_t::OSDP_ERR_NOT_SUPPORTED,
+        Err(FileReject::Abort) => sys::osdp_status_t::OSDP_ERR_INVALID_ARG,
+    }
+}
+
 // ---- Drop impl ---------------------------------------------------------
 
 impl Drop for Pd {
@@ -558,6 +733,15 @@ impl Drop for Pd {
             sys::osdp_pd_set_buzzer_handler(&mut *self.inner, None, ptr::null_mut());
             // And the COMSET decide/applied handlers.
             sys::osdp_pd_set_comset_handler(&mut *self.inner, None, None, ptr::null_mut());
+            // And the file-transfer receiver (also clears the C-side buffer
+            // pointer before we drop the backing Vec).
+            sys::osdp_pd_set_file_receiver(
+                &mut *self.inner,
+                ptr::null_mut(),
+                0,
+                None,
+                ptr::null_mut(),
+            );
             // Replace the transport with one whose callbacks are NULL
             // so future tick()s can't dereference our (about to be
             // dropped) trait objects. We still own the C struct; the

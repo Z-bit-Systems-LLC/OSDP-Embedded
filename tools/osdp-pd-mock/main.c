@@ -99,6 +99,9 @@ typedef struct app_state {
 
     /* Scratch for build_* outputs returned to the PD via reply.payload. */
     uint8_t              scratch[OSDP_PD_TX_BUF_LEN];
+
+    /* Running total of file bytes streamed in (for the -v progress log). */
+    uint32_t             file_received;
 } app_state_t;
 
 static const char *cmd_name(uint8_t code)
@@ -113,6 +116,7 @@ static const char *cmd_name(uint8_t code)
     case OSDP_CMD_OUT:    return "OUT";
     case OSDP_CMD_COMSET: return "COMSET";
     case OSDP_CMD_KEYSET: return "KEYSET";
+    case OSDP_CMD_FILETRANSFER: return "FILETRANSFER";
     case OSDP_CMD_LSTAT:  return "LSTAT";
     case OSDP_CMD_ISTAT:  return "ISTAT";
     case OSDP_CMD_OSTAT:  return "OSTAT";
@@ -488,6 +492,35 @@ static void mock_comset_applied(void *user, uint8_t address, uint32_t baud)
             address, (unsigned)c->app->baud);
 }
 
+/* ---- osdp_FILETRANSFER receiver -------------------------------------- */
+
+/* Per-fragment file evaluation in STREAMING mode: the library hands us each
+ * fragment (info->fragment / fragment_len) as it arrives without buffering
+ * the whole file — info->data is NULL — so RAM use is independent of file
+ * size. A real PD would write info->fragment straight to a flash staging
+ * partition here (and could validate a firmware header at offset 0, rejecting
+ * with OSDP_ERR_BAD_PAYLOAD → FtStatusDetail -3). We just log progress and
+ * accept, which makes the library report proceed (0) mid-file and processed
+ * (1) on the final fragment. */
+static osdp_status_t mock_file_eval(void *user, const osdp_pd_file_info_t *info)
+{
+    app_state_t *app = (app_state_t *)user;
+    app->file_received = info->received;
+    if (app->verbose > 0) {
+        fprintf(stderr,
+                "FILETRANSFER: type 0x%02X  %u/%u bytes  offset %u%s\n",
+                info->ft_type, (unsigned)info->received,
+                (unsigned)info->total_size, (unsigned)info->offset,
+                info->complete ? "  [complete]" : "");
+    }
+    if (info->complete) {
+        fprintf(stderr,
+                "=== FILETRANSFER complete: %u bytes (type 0x%02X) ===\n",
+                (unsigned)info->total_size, info->ft_type);
+    }
+    return OSDP_OK;
+}
+
 /* ---- Main ------------------------------------------------------------ */
 
 /* Derive the 8-byte cUID from a PDID per spec D.4.3: cUID is the first
@@ -548,6 +581,11 @@ int main(int argc, char **argv)
     comset_ctx_t comset_ctx = { .serial = serial, .app = &app };
     osdp_pd_set_comset_handler(&pd, mock_comset_decide, mock_comset_applied,
                                &comset_ctx);
+
+    /* osdp_FILETRANSFER: use STREAMING mode — the library hands each fragment
+     * to mock_file_eval without buffering the whole file, so the tool handles
+     * arbitrarily large images with no reassembly buffer. */
+    osdp_pd_set_file_stream(&pd, mock_file_eval, &app);
 
     /* Optionally configure Secure Channel. The crypto vtable, the cUID
      * (derived from our PDID), and the requested key all need to be

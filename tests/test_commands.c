@@ -442,6 +442,108 @@ static void test_keyset_build_rejects_buffer_too_small(void)
 }
 
 /* ========================================================================
+ * osdp_FILETRANSFER
+ * ====================================================================== */
+
+static void test_filetransfer_round_trip_with_fragment(void)
+{
+    static const uint8_t frag[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    osdp_filetransfer_cmd_t in = {
+        .ft_type       = OSDP_FT_TYPE_OPAQUE,
+        .total_size    = 0x00012345u,
+        .offset        = 0x00000100u,
+        .fragment_size = 4,
+        .data          = frag,
+        .data_len      = 4,
+    };
+    uint8_t buf[OSDP_FILETRANSFER_HEADER_BYTES + 4];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_filetransfer_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FILETRANSFER_HEADER_BYTES + 4, w);
+
+    /* Header is little-endian: type, size(4), offset(4), frag(2). */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_FT_TYPE_OPAQUE, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x45, buf[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x23, buf[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x01, buf[3]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[4]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[5]);  /* offset LSB */
+    TEST_ASSERT_EQUAL_HEX8(0x01, buf[6]);
+    TEST_ASSERT_EQUAL_HEX8(0x04, buf[9]);  /* frag size LSB */
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[10]);
+
+    osdp_filetransfer_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_filetransfer_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_FT_TYPE_OPAQUE, got.ft_type);
+    TEST_ASSERT_EQUAL_UINT32(0x00012345u, got.total_size);
+    TEST_ASSERT_EQUAL_UINT32(0x00000100u, got.offset);
+    TEST_ASSERT_EQUAL_UINT16(4, got.fragment_size);
+    TEST_ASSERT_EQUAL_size_t(4, got.data_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(frag, got.data, 4);
+}
+
+static void test_filetransfer_round_trip_empty_fragment(void)
+{
+    osdp_filetransfer_cmd_t in = {
+        .ft_type       = OSDP_FT_TYPE_OPAQUE,
+        .total_size    = 100,
+        .offset        = 100,   /* an "idle" fragment at end-of-file */
+        .fragment_size = 0,
+        .data          = NULL,
+        .data_len      = 0,
+    };
+    uint8_t buf[OSDP_FILETRANSFER_HEADER_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_filetransfer_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FILETRANSFER_HEADER_BYTES, w);
+
+    osdp_filetransfer_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_filetransfer_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_UINT16(0, got.fragment_size);
+    TEST_ASSERT_NULL(got.data);
+    TEST_ASSERT_EQUAL_size_t(0, got.data_len);
+}
+
+static void test_filetransfer_decode_rejects_short_header(void)
+{
+    uint8_t buf[OSDP_FILETRANSFER_HEADER_BYTES - 1] = { 0 };
+    osdp_filetransfer_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_filetransfer_decode(buf, sizeof(buf), &got));
+}
+
+static void test_filetransfer_decode_rejects_fragment_size_mismatch(void)
+{
+    /* Header declares a 4-byte fragment but only 2 bytes follow. */
+    uint8_t buf[OSDP_FILETRANSFER_HEADER_BYTES + 2] = { 0 };
+    buf[9]  = 0x04;   /* FtFragmentSize LSB = 4 */
+    buf[10] = 0x00;
+    osdp_filetransfer_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_filetransfer_decode(buf, sizeof(buf), &got));
+}
+
+static void test_filetransfer_build_rejects_inconsistent_length(void)
+{
+    static const uint8_t frag[2] = { 0x01, 0x02 };
+    osdp_filetransfer_cmd_t in = {
+        .ft_type       = OSDP_FT_TYPE_OPAQUE,
+        .total_size    = 2,
+        .offset        = 0,
+        .fragment_size = 4,     /* claims 4 but data_len is 2 */
+        .data          = frag,
+        .data_len      = 2,
+    };
+    uint8_t buf[32];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_filetransfer_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+}
+
+/* ========================================================================
  * Registration
  * ====================================================================== */
 
@@ -484,5 +586,11 @@ int main(void)
     RUN_TEST(test_keyset_decode_rejects_short_payload);
     RUN_TEST(test_keyset_build_rejects_inconsistent_length);
     RUN_TEST(test_keyset_build_rejects_buffer_too_small);
+    /* FILETRANSFER */
+    RUN_TEST(test_filetransfer_round_trip_with_fragment);
+    RUN_TEST(test_filetransfer_round_trip_empty_fragment);
+    RUN_TEST(test_filetransfer_decode_rejects_short_header);
+    RUN_TEST(test_filetransfer_decode_rejects_fragment_size_mismatch);
+    RUN_TEST(test_filetransfer_build_rejects_inconsistent_length);
     return UNITY_END();
 }

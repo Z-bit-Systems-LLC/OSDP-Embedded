@@ -39,8 +39,9 @@ seems to need a change, raise it explicitly with the user first.
 8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel.**
    Currently implemented: Layer 1 framing, the baseline command/reply
    set, PD-side state machine (with SC), ACU-side state machine (with
-   SC). Still deferred: file transfer, biometric, manufacturer-specific
-   commands, multi-part messages. See [docs/PLAN.md](docs/PLAN.md) for
+   SC), and PD-side file transfer (osdp_FILETRANSFER / osdp_FTSTAT).
+   Still deferred: biometric, manufacturer-specific commands, multi-part
+   messages, ACU-side file transfer. See [docs/PLAN.md](docs/PLAN.md) for
    what's done and what's next.
 
 ## Module layout
@@ -133,7 +134,7 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
 
-## Library-handled commands (KEYSET, COMSET)
+## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
 
 Most commands flow to the application's `osdp_pd_command_cb`, which chooses
 the reply. A few are intercepted by the PD state machine itself because they
@@ -163,6 +164,40 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   `FlushFileBuffers`/`cbOutQue`. `tools/osdp-pd-mock/serial_*.c` implements
   both. Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
   > 0x7E is rejected and the current address kept.
+- **`osdp_FILETRANSFER`** — handled entirely by the core: it never reaches
+  `cmd_cb`. The library decodes each fragment, enforces the offset invariants,
+  tracks the running position, and builds every mandated `osdp_FTSTAT` reply.
+  The app supplies only a per-fragment evaluation callback (`osdp_pd_file_cb`),
+  whose return maps to `FtStatusDetail` — `OSDP_OK` → proceed (0) mid-file /
+  processed (1) on the final fragment; `OSDP_ERR_BAD_PAYLOAD` → malformed (−3);
+  `OSDP_ERR_NOT_SUPPORTED` → unrecognized (−2); anything else → abort (−1).
+  The callback fires on every accepted fragment so the app can validate
+  incrementally (check a firmware header at offset 0, hash as it goes) and
+  reject mid-transfer. **Two modes**, both driving the same callback, chosen by
+  which setter registers it:
+  - `osdp_pd_set_file_receiver(buf, cap, …)` — **reassembly**: the core copies
+    each fragment into the caller-owned buffer (no malloc; app sizes it to the
+    largest expected file) and hands the whole accumulated file to the callback
+    (`info->data`). A `total_size` > `cap` aborts with −1. For validate-then-
+    commit of small blobs (biomatch template, display data) or whole-file
+    signature checks.
+  - `osdp_pd_set_file_stream(…)` — **streaming**: no buffer. The core hands
+    each fragment to the callback as it arrives (`info->fragment`; `info->data`
+    is NULL) without accumulating, with no size ceiling — RAM use is
+    independent of file size. For firmware update on RAM-constrained MCUs that
+    persist each fragment to flash. `file_buf == NULL` is the internal mode
+    flag; the two setters linker-GC independently.
+
+  Invariants enforced in both modes — first fragment at offset 0,
+  contiguous/monotonic offsets, stable type/size (plus `total_size` ≤ capacity
+  in reassembly mode) — and any violation aborts with −1 and resets so the ACU
+  can restart at offset 0. Byte-identical retransmits replay from the SQN cache
+  before the callback runs, so a lost FTSTAT never corrupts the offset. With no
+  receiver registered, FILETRANSFER → NAK 0x03; an undecodable frame (payload <
+  11-byte header) → NAK 0x02. The `osdp_FTSTAT` reply is data-bearing, so under
+  SC it wraps as SCS_18. Deferred while the callback is synchronous: the
+  "finishing" (status 3) idle-fragment protocol and `FtUpdateMsgMax` throttling
+  (the PD always reports `update_msg_max = 0`).
 
 ## Coding rules
 
@@ -276,8 +311,9 @@ that aren't explicit in the spec:
   `tools/osdp-pd-mock` use tiny-AES-c (vendor/tiny-aes/, Unlicense)
   but production binaries are expected to bind their own (mbedTLS,
   hardware AES, BCryptGenRandom / /dev/urandom, etc.).
-- File transfer, biometric, manufacturer-specific commands, multi-
-  part / multi-record messages, PIV data exchange.
+- ACU-side file transfer (the PD side is implemented; the ACU currently
+  has no file-send driver). Biometric, manufacturer-specific commands,
+  multi-part / multi-record messages, PIV data exchange.
 - Auto-poll scheduling on the ACU (the application currently drives
   every command).
 

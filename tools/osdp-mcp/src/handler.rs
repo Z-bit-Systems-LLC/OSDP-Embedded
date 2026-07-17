@@ -28,7 +28,9 @@ use osdp_embedded::messages::{
     OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT, OSDP_NAK_UNKNOWN_CMD,
     OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
-use osdp_embedded::pd::{CommandHandler, ComsetHandler, Reply};
+use osdp_embedded::pd::{
+    CommandHandler, ComsetHandler, FileFragment, FileReceiver, FileReject, Reply,
+};
 
 use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
@@ -82,6 +84,30 @@ impl ComsetHandler for DefaultComsetHandler {
             baud,
             "osdp_COMSET applied — PD now answering on the new address"
         );
+    }
+}
+
+/// Default `osdp_FILETRANSFER` receiver for the virtual PD. Registered in
+/// **streaming** mode (no reassembly buffer), so it accepts a file of any size
+/// without a ceiling — the MCP PD is a protocol simulator, not a firmware
+/// target, so it just logs progress and accepts every fragment (the PD then
+/// reports "proceed" mid-file and "processed" on completion). A consumer that
+/// needs to reject a file (bad header, unsupported type) can extend this to
+/// return [`FileReject`].
+pub struct DefaultFileReceiver;
+
+impl FileReceiver for DefaultFileReceiver {
+    fn on_fragment(&mut self, f: &FileFragment) -> Result<(), FileReject> {
+        // Streaming mode: read `received` (cumulative), not `data` (empty).
+        tracing::info!(
+            ft_type = format!("0x{:02X}", f.ft_type),
+            received = f.received,
+            total = f.total_size,
+            offset = f.offset,
+            complete = f.complete,
+            "osdp_FILETRANSFER fragment accepted"
+        );
+        Ok(())
     }
 }
 
