@@ -117,7 +117,7 @@ impl FileReceiver for DefaultFileReceiver {
 /// tool when they want a realistic device identity.
 pub fn default_pdid() -> Pdid {
     Pdid {
-        vendor_code: [b'Z', b'B', b'C'],
+        vendor_code: *b"ZBC",
         model: 0x01,
         version: 0x00,
         serial: 0x0000_0001,
