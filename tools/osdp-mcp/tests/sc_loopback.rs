@@ -23,7 +23,8 @@ use std::sync::{Arc as StdArc, Arc, Mutex};
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
 use osdp_embedded::messages::{
-    Keypad, OSDP_CMD_ID, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_PDID,
+    Keypad, Keyset, OSDP_CMD_ID, OSDP_CMD_KEYSET, OSDP_CMD_POLL, OSDP_KEYSET_KEY_TYPE_SCBK,
+    OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::Pd;
 use osdp_embedded::sc::{
@@ -386,6 +387,171 @@ fn pd_replies_to_empty_poll_with_data_bearing_event_under_sc() {
     let decoded = Keypad::decode(payload).expect("decode KEYPAD");
     assert_eq!(decoded.reader_no, 0);
     assert_eq!(decoded.digits, digits);
+}
+
+/// Regression: an `osdp_KEYSET` that rotates the SCBK during an SC
+/// session must survive a PD **Power Cycle** (the actor's
+/// `force_session_loss` / stop-start rebuild).
+///
+/// The bug: the C core rotates the live PD's SCBK in place, but osdp-mcp
+/// tracks the SC posture separately in the actor so it can rebuild the PD.
+/// The handler used to treat KEYSET as a bare ACK and never captured the
+/// new key, so a rebuild re-applied the install-time SCBK-D and silently
+/// dropped the rotated key — Secure Channel then broke on the ACU's next
+/// handshake (a Mercury panel keys the PD, then a Power Cycle knocks it
+/// offline). The fix stashes the accepted key in a shared cell that the
+/// actor folds into its remembered config.
+///
+/// This harness builds `Pd`/`Acu` directly (no actor/serial), so it
+/// exercises the two halves the fix hinges on:
+///   1. the handler captures the rotated key into the shared cell, and
+///   2. rebuilding the PD with *that captured key* (what the actor's
+///      Power-Cycle path does) lets the ACU re-handshake with the new key.
+/// Before the fix, step 1's cell stays `None` and the `.expect` below
+/// fails — so this test bites the moment the capture regresses.
+#[cfg(feature = "crypto-rustcrypto")]
+#[test]
+fn keyset_rotation_survives_power_cycle() {
+    let sel = Selector::RustCrypto;
+    // A per-installation SCBK distinct from the well-known SCBK-D, so a
+    // rebuild that wrongly fell back to SCBK-D would fail the re-handshake.
+    const NEW_SCBK: [u8; 16] = [
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        0xAF,
+    ];
+
+    let wire = Rc::new(RefCell::new(Wire::default()));
+
+    // ---- PD #1: install mode (SCBK-D), with the shared rotation cell ----
+    let stats = Arc::new(Mutex::new(handler::PdStats::default()));
+    let log = StdArc::new(LogInner::new(128));
+    let ovmap = overrides::new_map();
+    let evq = events::new_queue();
+    let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+    // The cell the actor would own; we hold a clone to observe the capture.
+    let key_rotation: handler::SharedKeyRotation = StdArc::new(Mutex::new(None));
+
+    let mut pd = Pd::new(PD_ADDRESS);
+    pd.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    pd.set_command_handler(
+        handler::DefaultHandler::new(
+            Arc::clone(&stats),
+            StdArc::clone(&log),
+            StdArc::clone(&ovmap),
+            StdArc::clone(&evq),
+            StdArc::clone(&drops),
+            PD_ADDRESS,
+        )
+        .with_key_rotation(StdArc::clone(&key_rotation)),
+    );
+    pd.set_sc_crypto(BoxedSc(fresh_crypto(sel)));
+    pd.set_sc_scbk_d(scbk_default());
+    pd.set_sc_cuid(&cuid_from_default_pdid());
+
+    // ---- ACU: handshake with the default key (install) ----
+    let captured = Rc::new(RefCell::new(Captured::default()));
+    let mut acu = Acu::new(1);
+    acu.set_transport(WireAdapter::<false> {
+        wire: Rc::clone(&wire),
+    });
+    acu.set_reply_handler(ReplyCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.set_sc_event_handler(ScEventCapture {
+        inner: Rc::clone(&captured),
+    });
+    acu.set_sc_crypto(BoxedSc(fresh_crypto(sel)));
+    acu.register_pd(0, PD_ADDRESS).expect("register_pd");
+    acu.set_pd_scbk_d(PD_ADDRESS, scbk_default())
+        .expect("set_pd_scbk_d");
+
+    acu.start_sc_handshake(PD_ADDRESS, true)
+        .expect("start_sc_handshake (install)");
+    cycle(&mut pd, &mut acu, 8);
+    assert!(pd.sc_established(), "install handshake never established");
+    assert!(acu.is_pd_sc_established(PD_ADDRESS));
+
+    // ---- ACU sends KEYSET (new SCBK) under the live SC session ----
+    let ks = Keyset {
+        key_type: OSDP_KEYSET_KEY_TYPE_SCBK,
+        key_length: 16,
+        key_data: &NEW_SCBK,
+    };
+    let mut ks_buf = [0u8; 2 + 16];
+    let n = ks.build(&mut ks_buf).expect("build KEYSET payload");
+    acu.send_command(PD_ADDRESS, OSDP_CMD_KEYSET, &ks_buf[..n])
+        .expect("send KEYSET");
+    cycle(&mut pd, &mut acu, 4);
+
+    // PD ACK'd it and the session is still up (rotation is in-place).
+    {
+        let cap = captured.borrow();
+        let kr = cap
+            .replies
+            .iter()
+            .find(|r| r.1 == OSDP_CMD_KEYSET)
+            .expect("ACU never captured a KEYSET reply");
+        assert_eq!(kr.2, OSDP_REPLY_ACK, "PD did not ACK the KEYSET");
+    }
+    assert!(pd.sc_established(), "KEYSET tore the SC session down");
+
+    // (1) The osdp-mcp handler captured the rotated key for the actor.
+    let captured_key = key_rotation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .copied()
+        .expect("handler did not capture the rotated SCBK from KEYSET");
+    assert_eq!(
+        captured_key, NEW_SCBK,
+        "captured SCBK does not match the KEYSET key"
+    );
+
+    // ---- Power Cycle: rebuild the PD with the *captured* key ----
+    // Mirrors the actor folding the cell into `ScConfig::Scbk(key)` and
+    // `open_pd` calling `set_sc_scbk`. A fresh serial buffer on a real
+    // reopen → clear the in-process wire.
+    drop(pd);
+    {
+        let mut w = wire.borrow_mut();
+        w.a2p.clear();
+        w.p2a.clear();
+    }
+    let mut pd2 = Pd::new(PD_ADDRESS);
+    pd2.set_transport(WireAdapter::<true> {
+        wire: Rc::clone(&wire),
+    });
+    pd2.set_command_handler(handler::DefaultHandler::new(
+        Arc::clone(&stats),
+        StdArc::clone(&log),
+        StdArc::clone(&ovmap),
+        StdArc::clone(&evq),
+        StdArc::clone(&drops),
+        PD_ADDRESS,
+    ));
+    pd2.set_sc_crypto(BoxedSc(fresh_crypto(sel)));
+    pd2.set_sc_scbk(&captured_key); // operational key, NOT scbk_d
+    pd2.set_sc_cuid(&cuid_from_default_pdid());
+
+    // ---- ACU re-handshakes with the operational key ----
+    acu.set_pd_scbk(PD_ADDRESS, &NEW_SCBK).expect("set_pd_scbk");
+    acu.start_sc_handshake(PD_ADDRESS, /*use_default_key=*/ false)
+        .expect("start_sc_handshake (operational)");
+    cycle(&mut pd2, &mut acu, 12);
+
+    // (2) The rebuilt PD re-handshakes with the rotated key — the panel
+    // stays online after the Power Cycle.
+    assert!(
+        pd2.sc_established(),
+        "rebuilt PD failed to re-handshake with the rotated SCBK — \
+         Power Cycle reverted to SCBK-D"
+    );
+    assert!(
+        acu.is_pd_sc_established(PD_ADDRESS),
+        "ACU failed to re-handshake with the rotated SCBK after Power Cycle"
+    );
 }
 
 // Silence the unused_imports warning for AES_KEY_LEN / AES_BLOCK_LEN

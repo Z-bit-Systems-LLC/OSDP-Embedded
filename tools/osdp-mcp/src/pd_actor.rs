@@ -26,7 +26,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
+use crate::handler::{
+    DefaultHandler, DropCounter, PdStats, SharedKeyRotation, SharedPdcap, SharedPdid,
+};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::reader_state::{
@@ -248,6 +250,10 @@ impl PdHandle {
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
         let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let reader_state = reader_state::new_shared();
+        // Hand-off cell for a KEYSET-rotated SCBK: the handler (on the
+        // actor thread) writes it, the actor loop folds it into the
+        // remembered SC config so a rebuild survives the rotation.
+        let key_rotation: SharedKeyRotation = Arc::new(Mutex::new(None));
         let log_for_thread = Arc::clone(&log);
         let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
@@ -256,6 +262,7 @@ impl PdHandle {
         let pdid_for_thread = Arc::clone(&pdid);
         let pdcap_for_thread = Arc::clone(&pdcap);
         let reader_state_for_thread = Arc::clone(&reader_state);
+        let key_rotation_for_thread = Arc::clone(&key_rotation);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -269,6 +276,7 @@ impl PdHandle {
                     pdid_for_thread,
                     pdcap_for_thread,
                     reader_state_for_thread,
+                    key_rotation_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -610,6 +618,7 @@ fn actor_loop(
     pdid: SharedPdid,
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
+    key_rotation: SharedKeyRotation,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
@@ -644,6 +653,7 @@ fn actor_loop(
                     &pdid,
                     &pdcap,
                     &reader_state,
+                    &key_rotation,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -656,6 +666,28 @@ fn actor_loop(
 
         if let Some(s) = slot.as_mut() {
             s.pd.tick();
+            // Fold a KEYSET-rotated SCBK (captured by the handler during
+            // the tick above) into the remembered SC config, so a later
+            // rebuild — Power Cycle (force_session_loss) or stop/start —
+            // comes back up with the operational key instead of reverting
+            // to the install-time SCBK-D and breaking Secure Channel.
+            // Both `s.sc` (replayed by force_session_loss) and
+            // `last_config` (replayed by Start) must move together.
+            // Guarded on `s.sc.is_some()`: a KEYSET on a clear-text PD is
+            // NAKed by the core and must not flip us into operational SC.
+            if let Some(key) = key_rotation.lock().ok().and_then(|mut c| c.take()) {
+                if s.sc.is_some() {
+                    let rotated = Some(ScConfig::Scbk(key));
+                    s.sc = rotated.clone();
+                    if let Some(cfg) = last_config.as_mut() {
+                        cfg.sc = rotated;
+                    }
+                    tracing::info!(
+                        "osdp_KEYSET accepted: SCBK rotated; remembered SC config is now \
+                         operational (survives Power Cycle / stop-start)"
+                    );
+                }
+            }
             // Refresh the reader UI's connection view (configured +
             // operational posture, polling) and publish only on a change.
             // The C library has no callback for SC establish/drop or the
@@ -686,6 +718,7 @@ fn handle_cmd(
     pdid: &SharedPdid,
     pdcap: &SharedPdcap,
     reader_state: &SharedReaderState,
+    key_rotation: &SharedKeyRotation,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -719,6 +752,7 @@ fn handle_cmd(
                 Arc::clone(pdid),
                 Arc::clone(pdcap),
                 Arc::clone(reader_state),
+                Arc::clone(key_rotation),
                 sc,
                 crypto_factory,
             )
@@ -759,6 +793,7 @@ fn handle_cmd(
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
+                        Arc::clone(key_rotation),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -804,6 +839,7 @@ fn handle_cmd(
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
+                        Arc::clone(key_rotation),
                         sc,
                         crypto_factory,
                     );
@@ -879,10 +915,17 @@ fn open_pd(
     pdid: SharedPdid,
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
+    key_rotation: SharedKeyRotation,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud, wire)?;
+    // A freshly-opened PD hasn't rotated its key yet; drop any pending
+    // rotation left over from a previous PD so it can't leak across a
+    // reconfigure onto a different SC posture.
+    if let Ok(mut c) = key_rotation.lock() {
+        *c = None;
+    }
     let stats = Arc::new(Mutex::new(PdStats::default()));
     // Anchor the PD-local clock before the handler is built so the
     // Slot and the handler's `last_command_at_ms` stamps share a zero
@@ -904,16 +947,19 @@ fn open_pd(
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::with_pdid(
-        pdid,
-        pdcap,
-        Arc::clone(&stats),
-        log,
-        overrides,
-        Arc::clone(&events),
-        drop_remaining,
-        address,
-    ));
+    pd.set_command_handler(
+        DefaultHandler::with_pdid(
+            pdid,
+            pdcap,
+            Arc::clone(&stats),
+            log,
+            overrides,
+            Arc::clone(&events),
+            drop_remaining,
+            address,
+        )
+        .with_key_rotation(key_rotation),
+    );
 
     // A freshly-opened PD starts with no LED state; clear any colours the
     // previous PD left in the snapshot, then bind the change callback so
