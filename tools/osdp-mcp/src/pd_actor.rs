@@ -34,7 +34,7 @@ use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::reader_state::{
     self, ConnectionView, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
 };
-use crate::serial_transport::SerialTransport;
+use crate::serial_transport::{SerialHealth, SerialTransport};
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
 /// How long after the most recent inbound command the link still
@@ -43,6 +43,35 @@ use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 /// while tolerating a slow ACU. Independent of the C library's
 /// (reply-based) ~8 s online window — see [`PdStatus::actively_polling`].
 const POLLING_WINDOW_MS: u32 = 2_000;
+
+/// First delay before the actor retries opening a port that died under
+/// it. The very first reconnect attempt fires immediately (the device
+/// may already be back); this only governs the wait after a *failed*
+/// attempt.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Ceiling on the reconnect backoff. Long enough that a device that
+/// stays gone doesn't spin the actor, short enough that recovery is
+/// prompt once it returns.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Exponential backoff step for reconnect retries: double, capped at
+/// [`RECONNECT_MAX_BACKOFF`]. Pulled out as a pure function so the
+/// schedule is unit-testable.
+fn next_backoff(cur: Duration) -> Duration {
+    (cur * 2).min(RECONNECT_MAX_BACKOFF)
+}
+
+/// A pending serial reconnect, armed only when a *running* PD's port
+/// latches a fatal I/O error. An explicit `pd_stop` / `pd_configure` /
+/// `pd_start` clears it, so the actor never fights an operator who
+/// deliberately changed the PD's lifecycle.
+struct Reconnect {
+    /// Earliest instant the next `open_pd` retry may run.
+    next_attempt: Instant,
+    /// Current backoff, grown by [`next_backoff`] after each failure.
+    backoff: Duration,
+}
 
 /// Configured Secure Channel posture of a running PD — the answer to
 /// "is this link clear text, install-keyed, or operationally keyed?".
@@ -605,6 +634,11 @@ struct Slot {
     /// `open_pd`), so `status` can age the last command to decide
     /// `actively_polling`.
     epoch: Instant,
+    /// Health latch for this slot's serial port. The tick loop polls it
+    /// each cycle; once it trips (fatal I/O error → device gone) the
+    /// slot is torn down and the port reopened. Cloned from the
+    /// transport before it was moved into the (`!Send`) PD.
+    health: Arc<SerialHealth>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,6 +657,11 @@ fn actor_loop(
     startup: Option<StartupConfig>,
 ) {
     let mut slot: Option<Slot> = None;
+    // A pending serial reconnect, armed only when a running PD's port
+    // dies under it (fatal I/O error). Kept separate from `slot` so an
+    // explicit stop/configure/start can cancel it — auto-recovery must
+    // never resurrect a PD the operator deliberately stopped.
+    let mut reconnect: Option<Reconnect> = None;
     // Survives `Stop` so `Start` can rebuild the PD from it. Seeded
     // from the operator's `OSDP_MCP_*` startup values so `pd_start`
     // has the startup posture as a baseline from the very first tick.
@@ -645,6 +684,7 @@ fn actor_loop(
                     cmd,
                     &mut slot,
                     &mut last_config,
+                    &mut reconnect,
                     &log,
                     &wire,
                     &overrides,
@@ -701,6 +741,80 @@ fn actor_loop(
             }
         }
 
+        // Serial-port health: the transport latches a fatal I/O error
+        // (device unplugged, tty node destroyed/re-enumerated). When a
+        // running PD's port dies, tear the PD down and arm the
+        // auto-reconnect so the link recovers on its own once the device
+        // reappears — the failure mode that previously wedged the PD
+        // offline until a manual `systemctl restart`.
+        if slot.as_ref().is_some_and(|s| s.health.is_failed()) {
+            let port = slot.as_ref().map(|s| s.port.clone()).unwrap_or_default();
+            tracing::warn!(
+                port = %port,
+                "serial port I/O error (device gone?); tearing down PD, will reconnect"
+            );
+            slot = None;
+            // No PD on the wire right now — clear the reader's badge.
+            if let Ok(mut rs) = reader_state.lock() {
+                rs.set_connection(ConnectionView::default());
+            }
+            // First retry is immediate; subsequent ones back off.
+            reconnect = Some(Reconnect {
+                next_attempt: Instant::now(),
+                backoff: RECONNECT_INITIAL_BACKOFF,
+            });
+        }
+
+        // Drive a pending reconnect. Only ever armed by the health
+        // failure above (an explicit stop/configure/start clears it),
+        // so this never resurrects a PD the operator stopped.
+        if slot.is_none() {
+            if let Some(rc) = reconnect.as_mut() {
+                if Instant::now() >= rc.next_attempt {
+                    match last_config.as_ref() {
+                        // Nothing to rebuild from — give up quietly.
+                        None => reconnect = None,
+                        Some(cfg) => match open_pd(
+                            &cfg.port,
+                            cfg.baud,
+                            cfg.address,
+                            Arc::clone(&log),
+                            Arc::clone(&wire),
+                            Arc::clone(&overrides),
+                            Arc::clone(&events),
+                            Arc::clone(&drop_remaining),
+                            Arc::clone(&pdid),
+                            Arc::clone(&pdcap),
+                            Arc::clone(&reader_state),
+                            Arc::clone(&key_rotation),
+                            cfg.sc.clone(),
+                            &crypto_factory,
+                        ) {
+                            Ok(s) => {
+                                tracing::info!(
+                                    port = %cfg.port,
+                                    "serial port reopened; PD reconnected"
+                                );
+                                slot = Some(s);
+                                reconnect = None;
+                            }
+                            Err(e) => {
+                                let backoff = next_backoff(rc.backoff);
+                                rc.backoff = backoff;
+                                rc.next_attempt = Instant::now() + backoff;
+                                tracing::warn!(
+                                    error = %e,
+                                    port = %cfg.port,
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "serial reconnect attempt failed; backing off"
+                                );
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
         thread::sleep(tick_period);
     }
 }
@@ -710,6 +824,7 @@ fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
     last_config: &mut Option<RememberedConfig>,
+    reconnect: &mut Option<Reconnect>,
     log: &Arc<LogInner>,
     wire: &Arc<WireTrace>,
     overrides: &OverrideMap,
@@ -729,6 +844,9 @@ fn handle_cmd(
             sc,
             reply,
         } => {
+            // An explicit (re)configure supersedes any in-flight
+            // auto-reconnect from a previous port failure.
+            *reconnect = None;
             // Remember the request before doing anything, so a later
             // `Start` (or a retry) replays these exact parameters even
             // if the open below fails.
@@ -762,6 +880,9 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
+            // An explicit stop cancels any pending auto-reconnect — the
+            // operator wants the PD down and it must stay down.
+            *reconnect = None;
             // Drop the running PD but keep `last_config` so `Start` can
             // bring it back.
             *slot = None;
@@ -772,6 +893,8 @@ fn handle_cmd(
             let _ = reply.send(());
         }
         Cmd::Start { reply } => {
+            // An explicit start takes over from any auto-reconnect.
+            *reconnect = None;
             let result = if slot.is_some() {
                 Err(anyhow::anyhow!(
                     "PD is already running; stop it first or use pd_configure to reconfigure"
@@ -805,6 +928,8 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::ForceSessionLoss { reply } => {
+            // A deliberate rebuild supersedes any pending auto-reconnect.
+            *reconnect = None;
             let result = match slot.take() {
                 None => Err(anyhow::anyhow!("no PD configured; nothing to force-reset")),
                 Some(old) => {
@@ -920,6 +1045,10 @@ fn open_pd(
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud, wire)?;
+    // Grab the port's health latch before the transport is moved into
+    // the PD, so the actor tick loop can detect a fatal I/O error and
+    // reopen the port.
+    let health = transport.health();
     // A freshly-opened PD hasn't rotated its key yet; drop any pending
     // rotation left over from a previous PD so it can't leak across a
     // reconfigure onto a different SC posture.
@@ -1045,6 +1174,7 @@ fn open_pd(
         last_conn: initial_conn,
         stats,
         epoch,
+        health,
     })
 }
 
@@ -1102,4 +1232,30 @@ fn derive_cuid_from_pdid(p: &Pdid) -> [u8; 8] {
         // continuity with the wire layout.
         serial_le[2],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_doubles_then_saturates() {
+        // Starts at the initial delay and doubles each failure.
+        let mut b = RECONNECT_INITIAL_BACKOFF;
+        assert_eq!(b, Duration::from_millis(250));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_millis(500));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(1));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(2));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(4));
+        // Next double would be 8s but the cap holds it at 5s...
+        b = next_backoff(b);
+        assert_eq!(b, RECONNECT_MAX_BACKOFF);
+        // ...and it stays capped no matter how long the device is gone.
+        b = next_backoff(b);
+        assert_eq!(b, RECONNECT_MAX_BACKOFF);
+    }
 }
