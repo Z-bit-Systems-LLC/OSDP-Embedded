@@ -407,6 +407,7 @@ fn pd_replies_to_empty_poll_with_data_bearing_event_under_sc() {
 ///   1. the handler captures the rotated key into the shared cell, and
 ///   2. rebuilding the PD with *that captured key* (what the actor's
 ///      Power-Cycle path does) lets the ACU re-handshake with the new key.
+///
 /// Before the fix, step 1's cell stays `None` and the `.expect` below
 /// fails — so this test bites the moment the capture regresses.
 #[cfg(feature = "crypto-rustcrypto")]
