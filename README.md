@@ -24,7 +24,10 @@ actually need** — no malloc, no globals, no OS dependencies in the core.
 - **PD-side state machine** (`osdp::pd`): address filtering,
   sequence-number policing with byte-identical retransmit detection,
   online/offline tracking, optional Secure Channel handshake +
-  operational SCS_15..18.
+  operational SCS_15..18. Bad-checksum/CRC commands addressed to the PD
+  are answered `NAK 0x01` (not dropped); clear-text commands are refused
+  `NAK 0x06` once secure operation is expected (during a session, or
+  before one on a full-security PD).
 - **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
   per-PD SQN, reply/timeout callbacks, optional Secure Channel
   handshake (fire-and-forget) and operational SCS_15..18 with

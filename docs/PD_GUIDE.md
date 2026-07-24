@@ -198,7 +198,11 @@ Binds the callback the PD invokes for each accepted command. Pass
 `cb = NULL` to detach (every command then NAKs with code `0x03`). The
 PD validates each inbound frame (CRC/checksum, address, length, and —
 under Secure Channel — the MAC and decryption) *before* calling you, so
-the handler only ever sees clean, plaintext commands:
+the handler only ever sees clean, plaintext commands. A frame that fails
+its CRC/checksum but is addressed to this PD is answered `NAK 0x01`
+(`OSDP_NAK_BAD_CHECK`) automatically — the ACU retransmits with the same
+sequence number — while bad-check frames for other addresses are dropped
+silently:
 
 ```c
 osdp_status_t handler(void *user,
@@ -703,9 +707,20 @@ down (the mock prints a banner on the transition):
 bool sc_up = osdp_pd_sc_established(&pd);
 ```
 
-> A clear-text command at sequence 0 signals the ACU is (re)starting the
-> connection and drops any stale SC session automatically; the ACU then
-> re-discovers the PD and re-handshakes. You don't manage any of this.
+> Clear-text traffic is policed for you once secure operation is expected.
+> **During an established session, any clear-text (unsecured) command tears
+> the session down and is answered `NAK 0x06` (`OSDP_NAK_ENCRYPTION_REQUIRED`)
+> in the clear** — interleaving unsecured packets inside a Secure Channel is
+> a protocol violation. The ACU then re-discovers the PD and re-handshakes.
+> **Before** a session exists, a PD keyed for full security (you set an
+> operational SCBK, not just SCBK-D) refuses restricted clear commands the
+> same way; only the discovery/config allowlist — `osdp_ID`, `osdp_CAP`,
+> `osdp_COMSET` — is answered in the clear so the ACU can find the PD and
+> bring SC up. The SCB-bearing handshake (`osdp_CHLNG`/`osdp_SCRYPT`) is
+> exempt, so a re-handshake still works mid-session. A PD with no operational
+> key (clear-only or install-only) stays permissive. You don't manage any of
+> this; `osdp_pd_sc_established()` simply flips to `false` when a session is
+> torn down this way.
 
 ---
 

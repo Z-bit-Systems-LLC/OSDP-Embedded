@@ -384,25 +384,27 @@ static void check_offline_timeout(osdp_pd_t *pd)
     }
 }
 
+/* Clear-text (unsecured) commands a full-security PD still answers before a
+ * Secure Channel session is established: the discovery and comms-config
+ * commands the ACU legitimately needs to find the PD and bring SC up
+ * (osdp_ID, osdp_CAP, osdp_COMSET). Every other clear-text command is
+ * refused with NAK 0x06 until SC is established. The SCS_11..14 handshake
+ * itself carries an SCB and never reaches this clear-text path, so it does
+ * not need to be listed here. */
+static bool clear_command_allowed_pre_sc(uint8_t code)
+{
+    return code == OSDP_CMD_ID ||
+           code == OSDP_CMD_CAP ||
+           code == OSDP_CMD_COMSET;
+}
+
 /* Compute the reply for a fresh command into pd->tx_buf and return
  * the byte count (or 0 if the command should produce no reply at all
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
-    /* OSDP.Net parity (commit 02e478476): a CLEAR-TEXT command at
-     * sequence 0 means the ACU is (re)starting the connection, so any
-     * established Secure Channel session is stale and must be dropped.
-     * The ACU then re-discovers the PD (osdp_CAP / osdp_ID answered in
-     * the clear) and drives a fresh handshake — e.g. after osdp_KEYSET —
-     * rather than the PD tearing down the session off the back of the
-     * KEYSET itself. A *secure* (SCB-bearing) frame at sequence 0 is part
-     * of an in-progress handshake and must NOT reset anything. */
-    if (!cmd->has_scb && cmd->sequence == 0 && pd->sc.session.established) {
-        osdp_sc_session_init(&pd->sc.session);
-        pd->sc.got_chlng = false;
-    }
-
-    /* Secure Channel: dispatch to the SC handler if the application
+    /* Secure Channel: SCB-bearing frames (the SCS_11..14 handshake and the
+     * SCS_15..18 operational traffic) go to the SC handler if the application
      * has supplied enough configuration; otherwise fall back to the
      * historical "NAK 0x05" behaviour. */
     if (cmd->has_scb) {
@@ -413,6 +415,41 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) != OSDP_OK) {
             return 0;
         }
+        return n;
+    }
+
+    /* Clear-text (unsecured, "USC") command: enforce the Secure Channel
+     * policy before touching it. Spec §"Interleaving USC packets during
+     * communication in a SCS is NOT allowed":
+     *
+     *   - During an established session, ANY clear-text command is a
+     *     violation. Tear the session down and answer osdp_NAK 0x06
+     *     ("Encrypted communication required") in the clear; the ACU then
+     *     re-discovers and re-handshakes. This holds for any established
+     *     session — install (SCBK-D) or operational (SCBK). It replaces the
+     *     older "clear command at SQN 0 silently resets and is processed"
+     *     reconnect shortcut: the ACU now sees an explicit NAK and the
+     *     first post-reset discovery command (osdp_ID/CAP, below) carries
+     *     it back online.
+     *   - With no session up but the PD keyed for full security (an
+     *     operational SCBK is set), a clear-text command that isn't one of
+     *     the discovery/config commands the ACU needs before the handshake
+     *     is likewise refused NAK 0x06 — SC must be established first.
+     *
+     * A PD with no operational key (clear-only or install-only, no session)
+     * falls through and processes clear-text commands normally. NAK 0x06 is
+     * one of the few replies the spec permits in the clear, so build_nak's
+     * plaintext frame is correct even though a session was just active. */
+    if (pd->sc.session.established) {
+        osdp_sc_session_init(&pd->sc.session);
+        pd->sc.got_chlng = false;
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+        return n;
+    }
+    if (pd->sc.scbk_set && !clear_command_allowed_pre_sc(cmd->code)) {
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
         return n;
     }
 

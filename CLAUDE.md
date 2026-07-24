@@ -162,7 +162,12 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   ACU never follows). `tcdrain` on POSIX; on Windows `FlushFileBuffers` plus
   a timed wait, since USB adapters hold bytes in a chip FIFO past
   `FlushFileBuffers`/`cbOutQue`. `tools/osdp-pd-mock/serial_*.c` implements
-  both. Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
+  both, and `tools/osdp-mcp/src/serial_transport.rs` does the same: its
+  `DefaultComsetHandler` accepts the requested address *and* baud and stages
+  the new rate on a lock-free `BaudControl`, which the `SerialTransport`
+  applies (drain, then `set_baud_rate`) on its next I/O — after the
+  `osdp_COM` reply has drained at the old rate (it previously pinned the baud
+  and never retuned). Malformed COMSET (payload ≠ 5 bytes) → NAK 0x02; effective address
   > 0x7E is rejected and the current address kept — 0x7F is **not** an
   assignable working address, it is the *configuration address*
   (`OSDP_CONFIG_ADDR`, the spec's 0x7F "broadcast"). A COMSET that *arrives
@@ -297,6 +302,32 @@ that aren't explicit in the spec:
   key_type) downgrade the wire reply from ACK to NAK 0x09
   (`OSDP_NAK_RECORD_INVALID`) so the ACU sees the failure; the
   stored SCBK is never overwritten on a bad write.
+- **Clear-text (USC) commands are refused once secure operation is
+  expected.** During an *established* session (either key), ANY clear-text
+  (non-SCB) command from the ACU tears the session down and is answered
+  `osdp_NAK 0x06` (`OSDP_NAK_ENCRYPTION_REQUIRED`) in the clear —
+  interleaving USC inside an SCS is a protocol violation (spec D
+  "Interleaving USC packets during communication in a SCS is NOT allowed").
+  This replaces the older "clear command at SQN 0 silently resets and is
+  processed" reconnect shortcut. *Before* a session exists, a PD keyed for
+  full security (an operational SCBK is set, not merely SCBK-D) refuses
+  restricted clear commands the same way; only the discovery/config
+  allowlist — `osdp_ID`, `osdp_CAP`, `osdp_COMSET` — is accepted so the ACU
+  can find the PD and bring SC up. The SCB-bearing handshake
+  (`osdp_CHLNG`/`osdp_SCRYPT`) never reaches the clear-text path, so a
+  re-handshake still works mid-session. A PD with no operational key
+  (clear-only / install-only) stays permissive. Implemented in
+  `pd/src/pd.c::handle_command_into_tx`.
+- **`osdp_NAK 0x01`/`0x06` and `osdp_BUSY` are the only replies allowed
+  plaintext under SC.** A frame that fails its CRC/checksum but is addressed
+  to this PD is answered `osdp_NAK 0x01` (`OSDP_NAK_BAD_CHECK`) rather than
+  silently dropped, so the ACU retransmits with the same SQN (spec Table 47
+  / §5). To make this possible `osdp_frame_decode` surfaces the frame
+  identity (address / reply / sequence / integrity) *before* the integrity
+  check; on `OSDP_ERR_BAD_CRC` / `_BAD_CHECKSUM` those fields are valid while
+  the rest of `*out` is not. Bad-check frames for another address,
+  broadcast/config traffic, and non-integrity decode errors stay silent.
+  Implemented in `pd/src/pd.c::osdp_pd_tick`.
 - **ACU session-loss conditions** (any one terminates the SC session,
   fires `OSDP_ACU_SC_EVENT_SESSION_LOST` or `_HANDSHAKE_FAILED`, and
   resets the slot to IDLE; the application can re-handshake at will):
