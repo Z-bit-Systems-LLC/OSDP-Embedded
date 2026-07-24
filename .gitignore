@@ -2,6 +2,7 @@ build/
 build-*/
 out/
 cmake-build-*/
+dist/
 
 *.obj
 *.o
