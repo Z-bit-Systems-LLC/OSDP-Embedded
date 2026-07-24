@@ -347,7 +347,7 @@ static void test_handler_receives_command_payload(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_CMD_POLL, counter.last_code);
 }
 
-static void test_bad_crc_command_is_silently_ignored(void)
+static void test_bad_crc_command_addressed_to_pd_naks_bad_check(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -357,8 +357,9 @@ static void test_bad_crc_command_is_silently_ignored(void)
     osdp_pd_set_transport(&pd, &t);
     osdp_pd_set_command_handler(&pd, default_handler, NULL);
 
-    /* Build a valid POLL, then corrupt its CRC. The PD should drop it
-     * silently — no reply, but also no crash. */
+    /* Build a valid POLL to this PD, then corrupt its CRC. Because it is
+     * addressed to us, the PD answers NAK 0x01 (bad check) so the ACU
+     * retransmits with the same SQN — rather than dropping it silently. */
     osdp_frame_t f = {0};
     f.address = 0x05; f.integrity = OSDP_INTEGRITY_CRC; f.code = OSDP_CMD_POLL;
     uint8_t buf[16]; size_t n = 0;
@@ -368,7 +369,11 @@ static void test_bad_crc_command_is_silently_ignored(void)
     m.incoming_len = n;
 
     osdp_pd_tick(&pd);
-    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_BAD_CHECK, reply.payload[0]);
 }
 
 /* ---- Sequence number policing (spec 5.9 Table 2) ----------------------- */
@@ -1346,7 +1351,7 @@ int main(void)
     RUN_TEST(test_no_handler_attached_yields_nak_for_every_command);
     RUN_TEST(test_scb_bearing_command_returns_nak_unsupported_scb);
     RUN_TEST(test_handler_receives_command_payload);
-    RUN_TEST(test_bad_crc_command_is_silently_ignored);
+    RUN_TEST(test_bad_crc_command_addressed_to_pd_naks_bad_check);
     RUN_TEST(test_reply_direction_frames_are_ignored);
     RUN_TEST(test_retransmit_replays_cached_reply_without_handler_call);
     RUN_TEST(test_new_sequence_invokes_handler_again);
