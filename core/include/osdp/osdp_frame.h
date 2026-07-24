@@ -146,7 +146,16 @@ typedef struct osdp_frame {
  * bits), the optional SCB header, and the trailing integrity bytes
  * (CRC-16 or 8-bit checksum, auto-selected from CTRL bit 2). On success
  * the slice pointers in `*out` reference the bytes of `buf` directly;
- * `buf` must remain valid as long as the frame is used. */
+ * `buf` must remain valid as long as the frame is used.
+ *
+ * Partial output on an integrity failure: when the frame is structurally
+ * valid but its check characters don't match — the decoder returns
+ * OSDP_ERR_BAD_CRC or OSDP_ERR_BAD_CHECKSUM — `*out` still carries the
+ * frame's identity (`address`, `reply`, `sequence`, `integrity`, `raw`,
+ * `raw_len`); all other fields are indeterminate. This lets a PD answer a
+ * bad-check command addressed to it with osdp_NAK 0x01 (spec Table 47 / §5)
+ * rather than dropping it silently. For every other error code `*out` is
+ * left untouched. */
 osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
                                 osdp_frame_t *out);
 

@@ -112,6 +112,22 @@ osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
     }
     const uint8_t *payload = (payload_len > 0) ? &buf[payload_start] : NULL;
 
+    /* Surface the frame's identity BEFORE the integrity check so a caller
+     * can act on a frame that fails it. On OSDP_ERR_BAD_CRC and
+     * OSDP_ERR_BAD_CHECKSUM these six fields — address, reply, sequence,
+     * integrity, raw, raw_len — are valid; every other field of *out is
+     * meaningful only on OSDP_OK. This lets a PD answer a bad-check command
+     * addressed to it with osdp_NAK 0x01 (spec Table 47 / §5) instead of
+     * dropping it silently. The SOM/length/ctrl/structure checks above have
+     * already passed, so the header bytes these read are well-formed even
+     * though the payload integrity is not. */
+    out->address   = (uint8_t)(addr_byte & OSDP_ADDR_MASK);
+    out->reply     = (addr_byte & OSDP_REPLY_FLAG) != 0;
+    out->sequence  = (uint8_t)(ctrl & OSDP_CTRL_SQN_MASK);
+    out->integrity = use_crc ? OSDP_INTEGRITY_CRC : OSDP_INTEGRITY_CHECKSUM;
+    out->raw       = buf;
+    out->raw_len   = len;
+
     /* Integrity check. */
     if (use_crc) {
         const uint16_t expected = osdp_crc16(buf, payload_end);

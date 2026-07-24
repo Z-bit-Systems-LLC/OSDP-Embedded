@@ -934,6 +934,28 @@ void osdp_pd_tick(osdp_pd_t *pd)
             break;
         }
         if (r != OSDP_OK) {
+            /* A frame that failed its integrity check but is addressed to
+             * this PD gets an explicit osdp_NAK 0x01 (spec Table 47 / §5)
+             * so the ACU retransmits with the same SQN instead of waiting
+             * out the reply timeout. It goes out PLAINTEXT even during an
+             * established Secure Channel: NAK 0x01 (and osdp_BUSY) are the
+             * only replies the spec permits outside the SCS packet format
+             * (§ "Interleaving USC packets"). Only integrity failures earn
+             * a reply — the frame's structure and address bytes are sound,
+             * just its check characters aren't. Other decode errors (bad
+             * SOM/length/ctrl, truncation, line noise) can't be trusted to
+             * be addressed to us, so they stay silent. Broadcast/config
+             * traffic is likewise left alone: a corrupt frame is too weak a
+             * basis to answer on an address shared with other PDs. */
+            if ((r == OSDP_ERR_BAD_CRC || r == OSDP_ERR_BAD_CHECKSUM) &&
+                !cmd.reply && cmd.address == pd->address) {
+                size_t nak_len = 0;
+                if (osdp_pd_internal_build_nak(pd, &cmd, OSDP_NAK_BAD_CHECK,
+                                               &nak_len) == OSDP_OK &&
+                    nak_len > 0) {
+                    send_bytes(pd, pd->tx_buf, nak_len);
+                }
+            }
             continue;  /* stream auto-advanced past the bad frame */
         }
         if (cmd.reply) {
