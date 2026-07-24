@@ -36,6 +36,7 @@ use osdp_embedded::pd::{
 use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
 use crate::overrides::{self, OverrideMap, OverrideReply};
+use crate::serial_transport::BaudControl;
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -55,35 +56,41 @@ pub struct PdStats {
 
 /// COMSET policy for the virtual PD. The C library builds the `osdp_COM`
 /// reply and switches the PD's address on its own; this handler decides the
-/// values that reply reports and reacts once the change is live.
+/// values that reply reports and enacts the baud change once it's live.
 ///
-/// Baud is deliberately pinned to the port's configured rate: the MCP's live
-/// serial link isn't reconfigured mid-session (change it with `pd_configure`
-/// instead), so reporting a new baud in `osdp_COM` while staying at the old
-/// rate would desync the link. Pinning the current baud is the spec 6.13
-/// "unable to comply — report what I'll use" behavior, and keeps the wire
-/// working while the ACU's requested address still takes effect.
+/// Both the address and the baud in the request are accepted. The C core owns
+/// the address switch (it filters and stamps frames); the baud is the MCP's
+/// job because the C core has no UART — so `applied` stages a retune on the
+/// [`BaudControl`], which the [`SerialTransport`](crate::serial_transport)
+/// picks up on its next I/O. Ordering matters (spec 6.13): the `osdp_COM`
+/// reply reporting the new rate goes out at the *old* rate, then the port
+/// retunes — the transport drains the reply before switching so its tail
+/// isn't clocked out at the wrong baud and the ACU follows cleanly.
 pub struct DefaultComsetHandler {
-    baud: u32,
+    baud_ctl: BaudControl,
 }
 
 impl DefaultComsetHandler {
-    pub fn new(baud: u32) -> Self {
-        Self { baud }
+    pub fn new(baud_ctl: BaudControl) -> Self {
+        Self { baud_ctl }
     }
 }
 
 impl ComsetHandler for DefaultComsetHandler {
-    fn decide(&mut self, req_address: u8, _req_baud: u32) -> (u8, u32) {
-        // Accept the address; keep our baud (see struct docs).
-        (req_address, self.baud)
+    fn decide(&mut self, req_address: u8, req_baud: u32) -> (u8, u32) {
+        // Accept both the requested address and baud; the transport retunes
+        // to the new rate when `applied` fires below.
+        (req_address, req_baud)
     }
 
     fn applied(&mut self, address: u8, baud: u32) {
+        // Stage the retune; the transport applies it on its next read/write,
+        // after this COMSET reply has drained at the old rate.
+        self.baud_ctl.request(baud);
         tracing::info!(
             address = format!("0x{:02X}", address),
             baud,
-            "osdp_COMSET applied — PD now answering on the new address"
+            "osdp_COMSET applied — PD now answering on the new address, retuning to new baud"
         );
     }
 }

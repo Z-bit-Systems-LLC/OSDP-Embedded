@@ -1049,6 +1049,9 @@ fn open_pd(
     // the PD, so the actor tick loop can detect a fatal I/O error and
     // reopen the port.
     let health = transport.health();
+    // Grab a handle to the port's baud control too (before the move), so the
+    // COMSET handler can retune the live rate.
+    let baud_ctl = transport.baud_control();
     // A freshly-opened PD hasn't rotated its key yet; drop any pending
     // rotation left over from a previous PD so it can't leak across a
     // reconfigure onto a different SC posture.
@@ -1110,9 +1113,10 @@ fn open_pd(
     pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
 
     // osdp_COMSET is handled by the C library (reply + address switch); this
-    // handler pins the reported baud to the current rate so the wire stays in
-    // sync (see DefaultComsetHandler docs).
-    pd.set_comset_handler(crate::handler::DefaultComsetHandler::new(baud));
+    // handler accepts the requested address+baud and retunes the serial port
+    // to the new rate once the osdp_COM reply has drained (see
+    // DefaultComsetHandler docs).
+    pd.set_comset_handler(crate::handler::DefaultComsetHandler::new(baud_ctl));
 
     // osdp_FILETRANSFER: streaming mode — the C library hands each fragment to
     // the receiver (which logs + accepts) and replies osdp_FTSTAT, with no

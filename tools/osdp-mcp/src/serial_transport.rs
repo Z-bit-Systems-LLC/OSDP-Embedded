@@ -9,7 +9,7 @@
 //! `now_ms()` whenever the state machine needs a timestamp.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,35 @@ fn classify_write(res: std::io::Result<usize>, health: &SerialHealth) -> WriteSt
     }
 }
 
+/// Lock-free channel for requesting a live baud change on the PD's serial
+/// port after an `osdp_COMSET`.
+///
+/// The COMSET `applied` hook (see `handler::DefaultComsetHandler`) stores the
+/// new rate here; the [`SerialTransport`] picks it up and retunes the port on
+/// its next `read`/`write`. Both the hook and the transport run on the PD
+/// actor thread (the hook fires synchronously from inside `Pd::tick`), so a
+/// single atomic is race-free and needs no mutex. `0` means "nothing pending"
+/// — a valid sentinel because 0 baud is never a real line rate.
+#[derive(Clone)]
+pub struct BaudControl {
+    pending: Arc<AtomicU32>,
+}
+
+impl BaudControl {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Request that the transport retune to `baud` before its next I/O.
+    /// Called from the COMSET `applied` hook once the `osdp_COM` reply has
+    /// gone out at the old rate, so the retune lands after the reply.
+    pub fn request(&self, baud: u32) {
+        self.pending.store(baud, Ordering::Release);
+    }
+}
+
 /// Single PD-side serial wire. Reads are non-blocking (zero timeout);
 /// writes attempt to send the whole buffer, returning the actual
 /// bytes accepted by the OS. Benign I/O errors (`WouldBlock` etc.) are
@@ -122,12 +151,16 @@ pub struct SerialTransport {
     epoch: Instant,
     wire: Arc<WireTrace>,
     /// Line rate, kept so `write` can derive the spec-5.7 ¶1 idle
-    /// guard (2 character-times) from it.
+    /// guard (2 character-times) from it. Updated in place when an
+    /// `osdp_COMSET` retunes the port so the guard tracks the live rate.
     baud: u32,
     /// Latched on a fatal I/O error. Shared with the actor via
     /// [`SerialTransport::health`] so the tick loop can detect a dead
     /// port and reopen it.
     health: Arc<SerialHealth>,
+    /// Pending baud change requested by the COMSET `applied` hook; applied
+    /// at the top of the next `read`/`write`. See [`BaudControl`].
+    baud_ctl: BaudControl,
 }
 
 impl SerialTransport {
@@ -149,6 +182,7 @@ impl SerialTransport {
             wire,
             baud,
             health: Arc::new(SerialHealth::default()),
+            baud_ctl: BaudControl::new(),
         })
     }
 
@@ -158,10 +192,55 @@ impl SerialTransport {
     pub fn health(&self) -> Arc<SerialHealth> {
         Arc::clone(&self.health)
     }
+
+    /// A handle the COMSET `applied` hook holds to request a live baud
+    /// change. Grab it before the transport is moved into the PD.
+    pub fn baud_control(&self) -> BaudControl {
+        self.baud_ctl.clone()
+    }
+
+    /// Apply a baud change staged by the COMSET `applied` hook, if any.
+    /// Called at the top of `read`/`write` so the port is retuned before the
+    /// next byte moves. Runs on the actor thread, same as the hook that
+    /// stages it, so the swap can't race.
+    fn apply_pending_baud(&mut self) {
+        let req = self.baud_ctl.pending.swap(0, Ordering::AcqRel);
+        if req == 0 || req == self.baud {
+            return;
+        }
+        // The `osdp_COM` reply that triggered this was already flushed by its
+        // own `write` before the hook ran, so nothing of it is left to clip;
+        // drain once more anyway so a retune never races an in-flight byte.
+        let _ = self.port.flush();
+        match self.port.set_baud_rate(req) {
+            Ok(()) => {
+                tracing::info!(
+                    old_baud = self.baud,
+                    new_baud = req,
+                    "serial port retuned after osdp_COMSET"
+                );
+                self.baud = req;
+            }
+            Err(e) => {
+                // The ACU has already moved to `req` (it saw it in osdp_COM),
+                // so a failure here means the link desyncs. Log loudly; the
+                // operator can recover with pd_configure at the new rate.
+                tracing::warn!(
+                    new_baud = req,
+                    current_baud = self.baud,
+                    error = %e,
+                    "failed to retune serial port after osdp_COMSET; link to the ACU will desync"
+                );
+            }
+        }
+    }
 }
 
 impl Transport for SerialTransport {
     fn read(&mut self, buf: &mut [u8]) -> usize {
+        // Retune first if an osdp_COMSET staged a new baud, so inbound bytes
+        // from the ACU (which has already switched rates) are read correctly.
+        self.apply_pending_baud();
         // A zero-timeout read returns immediately. A benign error
         // (`WouldBlock`, `TimedOut`) → 0 bytes and the PD tick loop
         // retries next iteration. A *fatal* error (the device is gone)
@@ -176,6 +255,9 @@ impl Transport for SerialTransport {
     }
 
     fn write(&mut self, buf: &[u8]) -> usize {
+        // Pick up a staged retune before deriving the idle guard below, so a
+        // reply that follows the COMSET reply uses the new rate's timing.
+        self.apply_pending_baud();
         // Spec 5.7 ¶1: guarantee >= 2 character-times of idle before
         // accessing the channel so the ACU's RS-485 signal converter /
         // multiplexer senses the line idle and is ready to receive
