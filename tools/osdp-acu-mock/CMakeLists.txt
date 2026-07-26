@@ -12,10 +12,23 @@
 # library itself stays freestanding — only this tool depends on the
 # OS.
 
+# SC2 crypto backend in its own static library — same reasoning as
+# tools/osdp-pd-mock/CMakeLists.txt: tiny_aes256's PUBLIC AES256=1 and
+# AES_* -> AES256_* renames reach every source of any target that links
+# tiny_gcm directly, which would silently recompile aes_adapter.c (the SC1
+# AES-128 backend) against the 256-bit key schedule and corrupt every SC1
+# cryptogram. Linking tiny_gcm / tiny_kmac PRIVATE here contains them.
+add_library(acu_mock_sc2 STATIC sc2_adapter.c)
+target_include_directories(acu_mock_sc2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(acu_mock_sc2 PRIVATE osdp_core tiny_gcm tiny_kmac)
+target_compile_features(acu_mock_sc2 PRIVATE c_std_11)
+if(MSVC)
+    target_compile_definitions(acu_mock_sc2 PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_executable(osdp-acu-mock
     main.c
     aes_adapter.c
-    sc2_adapter.c
 )
 
 if(WIN32)
@@ -26,13 +39,13 @@ else()
     message(FATAL_ERROR "osdp-acu-mock: no serial adapter for this platform")
 endif()
 
+# NOTE: tiny_gcm / tiny_kmac are reached only through acu_mock_sc2 (PRIVATE).
 target_link_libraries(osdp-acu-mock PRIVATE
     osdp_core
     osdp_messages
     osdp_acu
     tiny_aes
-    tiny_gcm
-    tiny_kmac
+    acu_mock_sc2
 )
 
 target_include_directories(osdp-acu-mock PRIVATE
