@@ -743,6 +743,122 @@ static void test_sc2_keyed_pd_allows_discovery_cleartext_before_sc(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
 }
 
+/* ---- Library-handled commands must behave identically under SC2 ---------
+ *
+ * osdp_COMSET and osdp_FILETRANSFER are intercepted by the core rather than
+ * reaching cmd_cb: COMSET mutates the PD address (which only the state
+ * machine owns) and mandates an osdp_COM reply, and FILETRANSFER is
+ * reassembled by the core into the caller's buffer with a mandated
+ * osdp_FTSTAT reply. The plaintext and SC1 paths both do this. These tests
+ * pin the same behaviour for SC2, which is the path most likely to drift
+ * because it is a separate dispatch function. */
+
+/* An application handler that ACKs POLL and NAKs everything else, so a
+ * library-handled command reaching cmd_cb shows up unmistakably as a NAK
+ * rather than being masked by a blanket ACK. */
+static osdp_status_t strict_handler(void *user, uint8_t cmd_code,
+                                    const uint8_t *payload, size_t len,
+                                    osdp_pd_reply_t *reply)
+{
+    (void)user; (void)payload; (void)len;
+    if (cmd_code == OSDP_CMD_POLL) {
+        reply->code = OSDP_REPLY_ACK;
+        reply->payload = NULL;
+        reply->payload_len = 0;
+        return OSDP_OK;
+    }
+    return OSDP_ERR_NOT_SUPPORTED;   /* -> NAK 0x03 if it ever gets here */
+}
+
+static void test_comset_under_sc2_is_library_handled(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, strict_handler, NULL);
+
+    osdp_sc2_session_t acu;
+    perform_sc2_handshake(&pd, &m, &acu);
+
+    /* COMSET: new address 0x09, 19200 baud (LE). */
+    const uint8_t payload[5] = { 0x09, 0x00, 0x4B, 0x00, 0x00 };
+
+    osdp_frame_t reply;
+    acu_send(&m, &pd, &acu, OSDP_SCS_27, OSDP_CMD_COMSET,
+             payload, sizeof(payload), 1, &reply);
+
+    uint8_t code = 0, plain[32]; size_t plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc2_unwrap_frame(sc2_test_crypto(), &acu, &reply, &code,
+                              plain, sizeof(plain), &plen));
+
+    /* The core must answer osdp_COM itself — not let the app NAK it. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_COM, code);
+    TEST_ASSERT_EQUAL_size_t(OSDP_COM_PAYLOAD_BYTES, plen);
+    TEST_ASSERT_EQUAL_HEX8(0x09, plain[0]);
+
+    /* ...and the address switch must actually take effect afterwards. */
+    TEST_ASSERT_EQUAL_HEX8(0x09, pd.address);
+}
+
+static osdp_status_t sc2_file_eval(void *user, const osdp_pd_file_info_t *info)
+{
+    unsigned *seen = (unsigned *)user;
+    *seen += (unsigned)info->fragment_len;
+    return OSDP_OK;
+}
+
+static void test_filetransfer_under_sc2_is_library_handled(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, strict_handler, NULL);
+
+    uint8_t   filebuf[64];
+    unsigned  seen = 0;
+    osdp_pd_set_file_receiver(&pd, filebuf, sizeof(filebuf),
+                              sc2_file_eval, &seen);
+
+    osdp_sc2_session_t acu;
+    perform_sc2_handshake(&pd, &m, &acu);
+
+    /* One complete 4-byte file in a single fragment at offset 0. */
+    const uint8_t frag[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    uint8_t payload[OSDP_FILETRANSFER_HEADER_BYTES + sizeof(frag)];
+    const osdp_filetransfer_cmd_t ft = {
+        .ft_type       = OSDP_FT_TYPE_OPAQUE,
+        .total_size    = sizeof(frag),
+        .offset        = 0,
+        .fragment_size = sizeof(frag),
+        .data          = frag,
+        .data_len      = sizeof(frag),
+    };
+    size_t plen_built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_filetransfer_build(&ft, payload, sizeof(payload), &plen_built));
+
+    osdp_frame_t reply;
+    acu_send(&m, &pd, &acu, OSDP_SCS_27, OSDP_CMD_FILETRANSFER,
+             payload, plen_built, 1, &reply);
+
+    uint8_t code = 0, plain[32]; size_t plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc2_unwrap_frame(sc2_test_crypto(), &acu, &reply, &code,
+                              plain, sizeof(plain), &plen));
+
+    /* The core must reassemble and answer osdp_FTSTAT itself. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_FTSTAT, code);
+    TEST_ASSERT_EQUAL_size_t(OSDP_FTSTAT_PAYLOAD_BYTES, plen);
+    TEST_ASSERT_EQUAL_UINT(sizeof(frag), seen);
+
+    osdp_ftstat_t st;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_ftstat_decode(plain, plen, &st));
+    TEST_ASSERT_EQUAL_INT16(OSDP_FTSTAT_PROCESSED, st.status_detail);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -763,5 +879,7 @@ int main(void)
     RUN_TEST(test_cleartext_nonzero_sqn_drops_sc2_session_with_nak);
     RUN_TEST(test_sc2_keyed_pd_refuses_restricted_cleartext_before_sc);
     RUN_TEST(test_sc2_keyed_pd_allows_discovery_cleartext_before_sc);
+    RUN_TEST(test_comset_under_sc2_is_library_handled);
+    RUN_TEST(test_filetransfer_under_sc2_is_library_handled);
     return UNITY_END();
 }

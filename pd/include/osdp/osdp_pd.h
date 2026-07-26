@@ -364,6 +364,15 @@ typedef struct osdp_pd_buz_slot {
  * templates) become first-class. */
 #define OSDP_PD_TX_BUF_LEN 256U
 
+/* Scratch for reply payloads the LIBRARY builds (as opposed to those the
+ * application hands back from its command handler). The unified command
+ * dispatch returns a reply whose payload may point here, so the buffer must
+ * outlive the dispatch call and live until the caller has framed the reply.
+ * Sized for the largest library-built payload today — osdp_FTSTAT is 7 bytes,
+ * osdp_COM 5, osdp_NAK 1 — with headroom for the status reports that later
+ * iterations will build here. */
+#define OSDP_PD_REPLY_SCRATCH_LEN 32U
+
 /* Spec 5.7: PD considers itself offline if the gap between messages
  * to which it responds exceeds 8 seconds. */
 #define OSDP_PD_OFFLINE_TIMEOUT_MS 8000U
@@ -430,6 +439,12 @@ typedef struct osdp_pd {
     osdp_pd_command_cb         cmd_cb;      /* app command handler   */
     void                      *cmd_user;
     uint8_t                    tx_buf[OSDP_PD_TX_BUF_LEN];
+
+    /* Payload scratch for library-built replies (osdp_COM, osdp_FTSTAT,
+     * osdp_NAK, ...). osdp_pd_internal_dispatch returns a reply that may
+     * point in here, so it must outlive that call — hence a context field
+     * rather than a local in the dispatch function. */
+    uint8_t                    reply_scratch[OSDP_PD_REPLY_SCRATCH_LEN];
 
     /* Sequence-number policing cache (spec 5.9 Table 2). When a
      * retransmit arrives — defined by the spec as a frame BYTE-

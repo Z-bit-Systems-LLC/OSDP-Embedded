@@ -123,6 +123,7 @@ fn main() {
 
     if pd_enabled {
         sources.push("pd/src/pd.c");
+        sources.push("pd/src/pd_dispatch.c");
         sources.push("pd/src/pd_sc.c");
         sources.push("pd/src/pd_sc2.c");
     }

@@ -153,38 +153,6 @@ void osdp_pd_internal_apply_comset(osdp_pd_t *pd)
     }
 }
 
-/* Handle a plaintext osdp_COMSET: compute the effective comms parameters,
- * reply osdp_COM at the CURRENT address, and stage the change so it takes
- * effect only after the reply is transmitted (spec 6.13). Returns the
- * reply length in pd->tx_buf, or a NAK on a malformed payload. */
-static size_t handle_comset_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
-{
-    uint8_t  eff_addr = pd->address;
-    uint32_t eff_baud = 0;
-    uint8_t  com_payload[OSDP_COM_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_comset_effective(
-        pd, cmd->payload, cmd->payload_len, &eff_addr, &eff_baud, com_payload);
-    if (s != OSDP_OK) {
-        size_t n = 0;
-        (void)build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
-        return n;
-    }
-
-    const osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_COM,
-        .payload     = com_payload,
-        .payload_len = OSDP_COM_PAYLOAD_BYTES,
-    };
-    size_t built = 0;
-    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
-        return 0;
-    }
-    pd->comset_pending     = true;
-    pd->comset_new_address = eff_addr;
-    pd->comset_new_baud    = eff_baud;
-    return built;
-}
-
 osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
                                             const uint8_t *payload,
                                             size_t         payload_len,
@@ -300,37 +268,6 @@ osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
     size_t written = 0;
     return osdp_ftstat_build(&st, ftstat_payload,
                              OSDP_FTSTAT_PAYLOAD_BYTES, &written);
-}
-
-/* Handle a plaintext osdp_FILETRANSFER: reassemble + evaluate via the shared
- * helper and reply osdp_FTSTAT, or NAK when the frame is undecodable (0x02)
- * or no receiver is registered (0x03). Returns the reply length in
- * pd->tx_buf. */
-static size_t handle_filetransfer_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
-{
-    uint8_t ftstat_payload[OSDP_FTSTAT_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_filetransfer(
-        pd, cmd->payload, cmd->payload_len, ftstat_payload);
-
-    if (s != OSDP_OK) {
-        const uint8_t err = (s == OSDP_ERR_NOT_SUPPORTED)
-                                ? OSDP_NAK_UNKNOWN_CMD   /* 0x03 */
-                                : OSDP_NAK_CMD_LENGTH;   /* 0x02 */
-        size_t n = 0;
-        (void)build_nak(pd, cmd, err, &n);
-        return n;
-    }
-
-    const osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_FTSTAT,
-        .payload     = ftstat_payload,
-        .payload_len = OSDP_FTSTAT_PAYLOAD_BYTES,
-    };
-    size_t built = 0;
-    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
-        return 0;
-    }
-    return built;
 }
 
 /* Exposed under a stable name (declared in pd_internal.h) so the SC
@@ -515,70 +452,20 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* osdp_COMSET is answered by the library, not the application handler:
-     * the reply is osdp_COM (not an app-chosen ACK) and the command mutates
-     * pd->address, which only the state machine owns. The optional COMSET
-     * hooks let the application veto/clamp the values and enact the baud
-     * change once the reply has gone out. */
-    if (cmd->code == OSDP_CMD_COMSET) {
-        return handle_comset_plain(pd, cmd);
+    /* Decide the reply. Everything that knows what a command MEANS —
+     * library-handled osdp_COMSET / osdp_FILETRANSFER, the application
+     * handler, the KEYSET hook, reader-state observation — lives in the
+     * shared dispatch (pd_dispatch.c) so the plaintext, SC1 and SC2 paths
+     * cannot drift apart. All that is left here is plaintext framing. */
+    osdp_pd_reply_t reply;
+    if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_PLAIN, cmd->code,
+                                  cmd->payload, cmd->payload_len,
+                                  &reply) != OSDP_OK) {
+        return 0;  /* internal handler error — drop silently */
     }
-
-    /* osdp_FILETRANSFER is likewise library-handled: the PD reassembles the
-     * file into the caller's buffer and replies osdp_FTSTAT, so it never
-     * reaches cmd_cb. The application only evaluates the bytes via the
-     * file-receiver callback. */
-    if (cmd->code == OSDP_CMD_FILETRANSFER) {
-        return handle_filetransfer_plain(pd, cmd);
-    }
-
-    osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_ACK,
-        .payload     = NULL,
-        .payload_len = 0,
-    };
-
-    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
-    if (pd->cmd_cb != NULL) {
-        app_status = pd->cmd_cb(pd->cmd_user,
-                                cmd->code,
-                                cmd->payload, cmd->payload_len,
-                                &reply);
-    }
-
-    /* Mirror reader-visible commands (osdp_LED) into the LED bank so the
-     * application's change callback / colour query stay current, whatever
-     * the handler chose to reply. */
-    osdp_pd_internal_observe_command(pd, cmd->code,
-                                     cmd->payload, cmd->payload_len);
 
     size_t built = 0;
-    osdp_status_t br;
-    if (app_status == OSDP_OK) {
-        /* KEYSET hook: if the app ACK'd a KEYSET, apply the new SCBK
-         * before transmitting the ACK. A malformed payload demotes the
-         * ACK to NAK so the ACU sees the failure. The application
-         * doesn't have to know about KEYSET — its existing "ACK
-         * everything I recognise" default works. */
-        if (cmd->code == OSDP_CMD_KEYSET) {
-            const osdp_status_t ks = osdp_pd_internal_apply_keyset(
-                pd, cmd->payload, cmd->payload_len);
-            if (ks != OSDP_OK) {
-                /* Any malformed-but-recognized KEYSET is spec Table 47
-                 * error 0x09 "Unable to process command record". */
-                br = build_nak(pd, cmd, OSDP_NAK_RECORD_INVALID, &built);
-                return (br == OSDP_OK) ? built : 0;
-            }
-        }
-        br = build_reply(pd, cmd, &reply, &built);
-    } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
-        br = build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &built);
-    } else {
-        /* Internal handler error — drop silently. */
-        return 0;
-    }
-
-    return (br == OSDP_OK) ? built : 0;
+    return (build_reply(pd, cmd, &reply, &built) == OSDP_OK) ? built : 0;
 }
 
 /* Cache the command we just accepted alongside the reply we just
