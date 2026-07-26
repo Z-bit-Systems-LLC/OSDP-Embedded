@@ -586,6 +586,77 @@ static void test_keyset_sc2_wrong_length_naks(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, plain[0]);
 }
 
+/* ---- Clear-text policy under an established SC2 session ------------------
+ *
+ * Spec D "Interleaving USC packets during communication in a SCS is NOT
+ * allowed". The rule is version-agnostic: a clear-text command during an
+ * established SC2 session tears the session down and is answered osdp_NAK
+ * 0x06 in the clear, exactly as it is under SC1 (see
+ * test_pd_sc.c::test_cleartext_sqn0_drops_established_session). This
+ * replaced the older "clear command at SQN 0 silently resets the session"
+ * shortcut, which SC2 previously mirrored. */
+
+static void inject_plaintext_command_sc2(mock_transport_t *m,
+                                         uint8_t cmd_code, uint8_t sequence)
+{
+    osdp_frame_t f = {0};
+    f.address     = PD_ADDR;
+    f.sequence    = sequence;
+    f.integrity   = OSDP_INTEGRITY_CRC;
+    f.code        = cmd_code;
+    f.payload     = NULL;
+    f.payload_len = 0;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &built));
+    mock_reset_incoming(m);
+    (void)memcpy(m->incoming, buf, built);
+    m->incoming_len = built;
+}
+
+/* Parameterised over the sequence number: SQN 0 used to be the "reset"
+ * signal that was silently honoured, so both it and a normal SQN must now
+ * produce the same NAK 0x06 teardown. */
+static void cleartext_drops_established_sc2_session(uint8_t sequence)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc2_app_handler, NULL);
+
+    osdp_sc2_session_t acu;
+    perform_sc2_handshake(&pd, &m, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc2_established(&pd));
+
+    m.outgoing_len = 0;
+    inject_plaintext_command_sc2(&m, OSDP_CMD_POLL, sequence);
+    osdp_pd_tick(&pd);
+
+    /* Session is gone... */
+    TEST_ASSERT_FALSE(osdp_pd_sc2_established(&pd));
+
+    /* ...and the refusal goes out in the clear (no SCB), since NAK 0x06 is
+     * one of the few replies the spec permits outside the SCS format. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
+}
+
+static void test_cleartext_sqn0_drops_established_sc2_session(void)
+{
+    cleartext_drops_established_sc2_session(0);
+}
+
+static void test_cleartext_nonzero_sqn_drops_established_sc2_session(void)
+{
+    cleartext_drops_established_sc2_session(1);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -601,5 +672,7 @@ int main(void)
     RUN_TEST(test_operational_tampered_tag_drops_silently);
     RUN_TEST(test_keyset_sc2_rotates_scbk_without_restart);
     RUN_TEST(test_keyset_sc2_wrong_length_naks);
+    RUN_TEST(test_cleartext_sqn0_drops_established_sc2_session);
+    RUN_TEST(test_cleartext_nonzero_sqn_drops_established_sc2_session);
     return UNITY_END();
 }

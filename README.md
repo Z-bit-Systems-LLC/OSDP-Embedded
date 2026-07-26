@@ -1,6 +1,6 @@
 # OSDP-Embedded
 
-[![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status/6?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
+[![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status%2FOSDP%20Embedded-CI?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
 
 A portable, embedded-friendly implementation of the SIA OSDP (Open Supervised
 Device Protocol) v2.2.2, written in freestanding C11 with a `no_std`-compatible
@@ -28,6 +28,10 @@ channel):
   sequence-number policing with byte-identical retransmit detection,
   online/offline tracking, and an optional Secure Channel handshake +
   operational traffic — SC1 (SCS_11..18) and SC2 (SCS_21..28).
+  Bad-checksum/CRC commands addressed to the PD are answered `NAK 0x01`
+  (not dropped); clear-text commands are refused `NAK 0x06` once secure
+  operation is expected (during a session, or before one on a
+  full-security PD).
 - **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
   per-PD SQN, reply/timeout callbacks, optional SC1 or SC2 handshake
   (fire-and-forget) and operational traffic with automatic session-loss

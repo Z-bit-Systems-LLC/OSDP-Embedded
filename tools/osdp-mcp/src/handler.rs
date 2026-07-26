@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use osdp_embedded::messages::{
-    Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_KEYSET,
-    OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT, OSDP_NAK_UNKNOWN_CMD,
-    OSDP_REPLY_ACK, OSDP_REPLY_LSTATR, OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    Keyset, Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_KEYSET,
+    OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
+    OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR,
+    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{
     CommandHandler, ComsetHandler, FileFragment, FileReceiver, FileReject, Reply,
@@ -35,6 +36,7 @@ use osdp_embedded::pd::{
 use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
 use crate::overrides::{self, OverrideMap, OverrideReply};
+use crate::serial_transport::BaudControl;
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -54,35 +56,41 @@ pub struct PdStats {
 
 /// COMSET policy for the virtual PD. The C library builds the `osdp_COM`
 /// reply and switches the PD's address on its own; this handler decides the
-/// values that reply reports and reacts once the change is live.
+/// values that reply reports and enacts the baud change once it's live.
 ///
-/// Baud is deliberately pinned to the port's configured rate: the MCP's live
-/// serial link isn't reconfigured mid-session (change it with `pd_configure`
-/// instead), so reporting a new baud in `osdp_COM` while staying at the old
-/// rate would desync the link. Pinning the current baud is the spec 6.13
-/// "unable to comply — report what I'll use" behavior, and keeps the wire
-/// working while the ACU's requested address still takes effect.
+/// Both the address and the baud in the request are accepted. The C core owns
+/// the address switch (it filters and stamps frames); the baud is the MCP's
+/// job because the C core has no UART — so `applied` stages a retune on the
+/// [`BaudControl`], which the [`SerialTransport`](crate::serial_transport)
+/// picks up on its next I/O. Ordering matters (spec 6.13): the `osdp_COM`
+/// reply reporting the new rate goes out at the *old* rate, then the port
+/// retunes — the transport drains the reply before switching so its tail
+/// isn't clocked out at the wrong baud and the ACU follows cleanly.
 pub struct DefaultComsetHandler {
-    baud: u32,
+    baud_ctl: BaudControl,
 }
 
 impl DefaultComsetHandler {
-    pub fn new(baud: u32) -> Self {
-        Self { baud }
+    pub fn new(baud_ctl: BaudControl) -> Self {
+        Self { baud_ctl }
     }
 }
 
 impl ComsetHandler for DefaultComsetHandler {
-    fn decide(&mut self, req_address: u8, _req_baud: u32) -> (u8, u32) {
-        // Accept the address; keep our baud (see struct docs).
-        (req_address, self.baud)
+    fn decide(&mut self, req_address: u8, req_baud: u32) -> (u8, u32) {
+        // Accept both the requested address and baud; the transport retunes
+        // to the new rate when `applied` fires below.
+        (req_address, req_baud)
     }
 
     fn applied(&mut self, address: u8, baud: u32) {
+        // Stage the retune; the transport applies it on its next read/write,
+        // after this COMSET reply has drained at the old rate.
+        self.baud_ctl.request(baud);
         tracing::info!(
             address = format!("0x{:02X}", address),
             baud,
-            "osdp_COMSET applied — PD now answering on the new address"
+            "osdp_COMSET applied — PD now answering on the new address, retuning to new baud"
         );
     }
 }
@@ -210,6 +218,20 @@ pub fn default_pdcap() -> Pdcap {
 /// `drop_next_n_replies` can write it while the handler decrements.
 pub type DropCounter = Arc<AtomicU32>;
 
+/// A KEYSET-rotated SCBK captured by the handler, waiting for the actor
+/// loop to fold it into the remembered SC config. `None` means no pending
+/// rotation.
+///
+/// The C library rotates the PD's live SCBK in place for a well-formed
+/// `osdp_KEYSET`, but the actor tracks the SC posture separately (in
+/// `Slot.sc` / the remembered config) so it can rebuild the PD on a Power
+/// Cycle / stop-start. Without this hand-off a rebuild re-applies the
+/// original install-time SCBK-D and silently drops the rotated key,
+/// breaking Secure Channel exactly after an ACU keys the PD — which is the
+/// whole point of a KEYSET. Written by the handler on an accepted KEYSET;
+/// drained once per tick by the actor loop.
+pub type SharedKeyRotation = Arc<Mutex<Option<[u8; 16]>>>;
+
 /// The PD identity reported in the `osdp_PDID` (0x45) reply. Shared
 /// (`Arc<Mutex<_>>`) so the `pd_get_pdid` / `pd_set_pdid` tools on the
 /// async side can read and mutate it while the handler — pinned to the
@@ -242,6 +264,11 @@ pub struct DefaultHandler {
     drop_remaining: DropCounter,
     pd_address: u8,
     epoch: Instant,
+    /// Where an accepted KEYSET stashes its rotated SCBK for the actor
+    /// loop to pick up. Defaults to a private, unwatched cell (the test
+    /// constructors); the actor binds the shared one via
+    /// [`DefaultHandler::with_key_rotation`].
+    key_rotation: SharedKeyRotation,
 }
 
 impl DefaultHandler {
@@ -293,7 +320,18 @@ impl DefaultHandler {
             drop_remaining,
             pd_address,
             epoch: Instant::now(),
+            key_rotation: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Bind the shared KEYSET-rotation cell so an accepted `osdp_KEYSET`
+    /// hands its new SCBK back to the actor loop (which folds it into the
+    /// remembered SC config so a rebuild survives the rotation). The actor
+    /// calls this in `open_pd`; tests that don't care leave the private
+    /// default in place.
+    pub fn with_key_rotation(mut self, cell: SharedKeyRotation) -> Self {
+        self.key_rotation = cell;
+        self
     }
 
     /// Emit a pre-baked reply borrowed from `self.scratch`. Shared
@@ -412,7 +450,29 @@ impl CommandHandler for DefaultHandler {
                 let n = pdcap.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDCAP, n)
             }
-            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT | OSDP_CMD_KEYSET => {
+            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_KEYSET => {
+                // The C library rotates the PD's live SCBK in place for a
+                // well-formed SCBK KEYSET (and NAKs a malformed one,
+                // keeping the old key). Mirror that acceptance test and
+                // stash the rotated key so the actor loop can update its
+                // remembered SC config; otherwise a later rebuild (Power
+                // Cycle / stop-start) would re-apply the install-time
+                // SCBK-D and drop the new key, breaking Secure Channel
+                // right after the ACU keyed the PD. We still just ACK —
+                // the core applies the rotation on the way out.
+                if let Ok(ks) = Keyset::decode(payload) {
+                    if ks.key_type == OSDP_KEYSET_KEY_TYPE_SCBK
+                        && ks.key_length == 16
+                        && ks.key_data.len() == 16
+                    {
+                        let mut key = [0u8; 16];
+                        key.copy_from_slice(ks.key_data);
+                        if let Ok(mut cell) = self.key_rotation.lock() {
+                            *cell = Some(key);
+                        }
+                    }
+                }
                 (OSDP_REPLY_ACK, 0)
             }
             OSDP_CMD_LSTAT => {

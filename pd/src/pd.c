@@ -393,35 +393,35 @@ static void check_offline_timeout(osdp_pd_t *pd)
     }
 }
 
+/* Clear-text (unsecured) commands a full-security PD still answers before a
+ * Secure Channel session is established: the discovery and comms-config
+ * commands the ACU legitimately needs to find the PD and bring SC up
+ * (osdp_ID, osdp_CAP, osdp_COMSET). Every other clear-text command is
+ * refused with NAK 0x06 until SC is established. The SCS_11..14 handshake
+ * itself carries an SCB and never reaches this clear-text path, so it does
+ * not need to be listed here. */
+static bool clear_command_allowed_pre_sc(uint8_t code)
+{
+    return code == OSDP_CMD_ID ||
+           code == OSDP_CMD_CAP ||
+           code == OSDP_CMD_COMSET;
+}
+
 /* Compute the reply for a fresh command into pd->tx_buf and return
  * the byte count (or 0 if the command should produce no reply at all
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
-    /* OSDP.Net parity (commit 02e478476): a CLEAR-TEXT command at
-     * sequence 0 means the ACU is (re)starting the connection, so any
-     * established Secure Channel session is stale and must be dropped.
-     * The ACU then re-discovers the PD (osdp_CAP / osdp_ID answered in
-     * the clear) and drives a fresh handshake — e.g. after osdp_KEYSET —
-     * rather than the PD tearing down the session off the back of the
-     * KEYSET itself. A *secure* (SCB-bearing) frame at sequence 0 is part
-     * of an in-progress handshake and must NOT reset anything. */
-    if (!cmd->has_scb && cmd->sequence == 0) {
-        if (pd->sc.session.established) {
-            osdp_sc_session_init(&pd->sc.session);
-            pd->sc.got_chlng = false;
-        }
-        if (pd->sc2.session.established) {
-            osdp_sc2_session_init(&pd->sc2.session);
-            pd->sc2.got_chlng = false;
-        }
-    }
-
     /* SC2 asymmetric pairing (opt-in). A cleartext osdp_PAIR — or a POLL
      * while a multi-fragment Message 2 is mid-delivery — is handled by the
      * attached pairing driver through its hook, entirely ahead of the SC and
      * application paths. Dispatched through the pointer so pd.c carries no
-     * pairing dependency. */
+     * pairing dependency.
+     *
+     * This runs BEFORE the clear-text Secure Channel policy below: osdp_PAIR
+     * and the mid-delivery POLL are both unsecured frames, so a PD that
+     * already holds an operational SCBK would otherwise refuse them NAK 0x06
+     * and pairing could never run. */
     if (pd->pair != NULL) {
         const osdp_pd_pair_hook_t *h = (const osdp_pd_pair_hook_t *)pd->pair;
         if (h->wants(pd, cmd)) {
@@ -429,7 +429,8 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         }
     }
 
-    /* Secure Channel: dispatch to the SC handler if the application
+    /* Secure Channel: SCB-bearing frames (the SCS_11..14 handshake and the
+     * SCS_15..18 operational traffic) go to the SC handler if the application
      * has supplied enough configuration; otherwise fall back to the
      * historical "NAK 0x05" behaviour. SC2 SCB types (0x21..0x28) route
      * to the SC2 state machine; the SC1 types (0x11..0x18) to SC1. */
@@ -451,6 +452,54 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         if (build_nak(pd, cmd, OSDP_NAK_UNSUPPORTED_SCB, &n) != OSDP_OK) {
             return 0;
         }
+        return n;
+    }
+
+    /* Clear-text (unsecured, "USC") command: enforce the Secure Channel
+     * policy before touching it. Spec §"Interleaving USC packets during
+     * communication in a SCS is NOT allowed":
+     *
+     *   - During an established session, ANY clear-text command is a
+     *     violation. Tear the session down and answer osdp_NAK 0x06
+     *     ("Encrypted communication required") in the clear; the ACU then
+     *     re-discovers and re-handshakes. This holds for any established
+     *     session — install (SCBK-D) or operational (SCBK). It replaces the
+     *     older "clear command at SQN 0 silently resets and is processed"
+     *     reconnect shortcut: the ACU now sees an explicit NAK and the
+     *     first post-reset discovery command (osdp_ID/CAP, below) carries
+     *     it back online.
+     *   - With no session up but the PD keyed for full security (an
+     *     operational SCBK is set), a clear-text command that isn't one of
+     *     the discovery/config commands the ACU needs before the handshake
+     *     is likewise refused NAK 0x06 — SC must be established first.
+     *
+     * A PD with no operational key (clear-only or install-only, no session)
+     * falls through and processes clear-text commands normally. NAK 0x06 is
+     * one of the few replies the spec permits in the clear, so build_nak's
+     * plaintext frame is correct even though a session was just active.
+     *
+     * The rule is version-agnostic: an established SC2 session is torn down
+     * on the same terms as an SC1 one. (The pre-handshake refusal above stays
+     * keyed on the SC1 `scbk_set` only — extending it to `sc2.scbk_set` would
+     * refuse clear-text to every PD that has completed pairing, which is a
+     * behaviour change rather than a merge resolution.) */
+    if (pd->sc.session.established) {
+        osdp_sc_session_init(&pd->sc.session);
+        pd->sc.got_chlng = false;
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+        return n;
+    }
+    if (pd->sc2.session.established) {
+        osdp_sc2_session_init(&pd->sc2.session);
+        pd->sc2.got_chlng = false;
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+        return n;
+    }
+    if (pd->sc.scbk_set && !clear_command_allowed_pre_sc(cmd->code)) {
+        size_t n = 0;
+        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
         return n;
     }
 
@@ -1022,6 +1071,28 @@ void osdp_pd_tick(osdp_pd_t *pd)
             break;
         }
         if (r != OSDP_OK) {
+            /* A frame that failed its integrity check but is addressed to
+             * this PD gets an explicit osdp_NAK 0x01 (spec Table 47 / §5)
+             * so the ACU retransmits with the same SQN instead of waiting
+             * out the reply timeout. It goes out PLAINTEXT even during an
+             * established Secure Channel: NAK 0x01 (and osdp_BUSY) are the
+             * only replies the spec permits outside the SCS packet format
+             * (§ "Interleaving USC packets"). Only integrity failures earn
+             * a reply — the frame's structure and address bytes are sound,
+             * just its check characters aren't. Other decode errors (bad
+             * SOM/length/ctrl, truncation, line noise) can't be trusted to
+             * be addressed to us, so they stay silent. Broadcast/config
+             * traffic is likewise left alone: a corrupt frame is too weak a
+             * basis to answer on an address shared with other PDs. */
+            if ((r == OSDP_ERR_BAD_CRC || r == OSDP_ERR_BAD_CHECKSUM) &&
+                !cmd.reply && cmd.address == pd->address) {
+                size_t nak_len = 0;
+                if (osdp_pd_internal_build_nak(pd, &cmd, OSDP_NAK_BAD_CHECK,
+                                               &nak_len) == OSDP_OK &&
+                    nak_len > 0) {
+                    send_bytes(pd, pd->tx_buf, nak_len);
+                }
+            }
             continue;  /* stream auto-advanced past the bad frame */
         }
         if (cmd.reply) {

@@ -26,13 +26,15 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedPdcap, SharedPdid};
+use crate::handler::{
+    DefaultHandler, DropCounter, PdStats, SharedKeyRotation, SharedPdcap, SharedPdid,
+};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::reader_state::{
     self, ConnectionView, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
 };
-use crate::serial_transport::SerialTransport;
+use crate::serial_transport::{SerialHealth, SerialTransport};
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
 /// How long after the most recent inbound command the link still
@@ -41,6 +43,35 @@ use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 /// while tolerating a slow ACU. Independent of the C library's
 /// (reply-based) ~8 s online window — see [`PdStatus::actively_polling`].
 const POLLING_WINDOW_MS: u32 = 2_000;
+
+/// First delay before the actor retries opening a port that died under
+/// it. The very first reconnect attempt fires immediately (the device
+/// may already be back); this only governs the wait after a *failed*
+/// attempt.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Ceiling on the reconnect backoff. Long enough that a device that
+/// stays gone doesn't spin the actor, short enough that recovery is
+/// prompt once it returns.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Exponential backoff step for reconnect retries: double, capped at
+/// [`RECONNECT_MAX_BACKOFF`]. Pulled out as a pure function so the
+/// schedule is unit-testable.
+fn next_backoff(cur: Duration) -> Duration {
+    (cur * 2).min(RECONNECT_MAX_BACKOFF)
+}
+
+/// A pending serial reconnect, armed only when a *running* PD's port
+/// latches a fatal I/O error. An explicit `pd_stop` / `pd_configure` /
+/// `pd_start` clears it, so the actor never fights an operator who
+/// deliberately changed the PD's lifecycle.
+struct Reconnect {
+    /// Earliest instant the next `open_pd` retry may run.
+    next_attempt: Instant,
+    /// Current backoff, grown by [`next_backoff`] after each failure.
+    backoff: Duration,
+}
 
 /// Configured Secure Channel posture of a running PD — the answer to
 /// "is this link clear text, install-keyed, or operationally keyed?".
@@ -256,6 +287,10 @@ impl PdHandle {
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
         let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let reader_state = reader_state::new_shared();
+        // Hand-off cell for a KEYSET-rotated SCBK: the handler (on the
+        // actor thread) writes it, the actor loop folds it into the
+        // remembered SC config so a rebuild survives the rotation.
+        let key_rotation: SharedKeyRotation = Arc::new(Mutex::new(None));
         let log_for_thread = Arc::clone(&log);
         let wire_for_thread = Arc::clone(&wire);
         let overrides_for_thread = Arc::clone(&overrides);
@@ -264,6 +299,7 @@ impl PdHandle {
         let pdid_for_thread = Arc::clone(&pdid);
         let pdcap_for_thread = Arc::clone(&pdcap);
         let reader_state_for_thread = Arc::clone(&reader_state);
+        let key_rotation_for_thread = Arc::clone(&key_rotation);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -277,6 +313,7 @@ impl PdHandle {
                     pdid_for_thread,
                     pdcap_for_thread,
                     reader_state_for_thread,
+                    key_rotation_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -605,6 +642,11 @@ struct Slot {
     /// `open_pd`), so `status` can age the last command to decide
     /// `actively_polling`.
     epoch: Instant,
+    /// Health latch for this slot's serial port. The tick loop polls it
+    /// each cycle; once it trips (fatal I/O error → device gone) the
+    /// slot is torn down and the port reopened. Cloned from the
+    /// transport before it was moved into the (`!Send`) PD.
+    health: Arc<SerialHealth>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,10 +660,16 @@ fn actor_loop(
     pdid: SharedPdid,
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
+    key_rotation: SharedKeyRotation,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
     let mut slot: Option<Slot> = None;
+    // A pending serial reconnect, armed only when a running PD's port
+    // dies under it (fatal I/O error). Kept separate from `slot` so an
+    // explicit stop/configure/start can cancel it — auto-recovery must
+    // never resurrect a PD the operator deliberately stopped.
+    let mut reconnect: Option<Reconnect> = None;
     // Survives `Stop` so `Start` can rebuild the PD from it. Seeded
     // from the operator's `OSDP_MCP_*` startup values so `pd_start`
     // has the startup posture as a baseline from the very first tick.
@@ -644,6 +692,7 @@ fn actor_loop(
                     cmd,
                     &mut slot,
                     &mut last_config,
+                    &mut reconnect,
                     &log,
                     &wire,
                     &overrides,
@@ -652,6 +701,7 @@ fn actor_loop(
                     &pdid,
                     &pdcap,
                     &reader_state,
+                    &key_rotation,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -664,6 +714,28 @@ fn actor_loop(
 
         if let Some(s) = slot.as_mut() {
             s.pd.tick();
+            // Fold a KEYSET-rotated SCBK (captured by the handler during
+            // the tick above) into the remembered SC config, so a later
+            // rebuild — Power Cycle (force_session_loss) or stop/start —
+            // comes back up with the operational key instead of reverting
+            // to the install-time SCBK-D and breaking Secure Channel.
+            // Both `s.sc` (replayed by force_session_loss) and
+            // `last_config` (replayed by Start) must move together.
+            // Guarded on `s.sc.is_some()`: a KEYSET on a clear-text PD is
+            // NAKed by the core and must not flip us into operational SC.
+            if let Some(key) = key_rotation.lock().ok().and_then(|mut c| c.take()) {
+                if s.sc.is_some() {
+                    let rotated = Some(ScConfig::Scbk(key));
+                    s.sc = rotated.clone();
+                    if let Some(cfg) = last_config.as_mut() {
+                        cfg.sc = rotated;
+                    }
+                    tracing::info!(
+                        "osdp_KEYSET accepted: SCBK rotated; remembered SC config is now \
+                         operational (survives Power Cycle / stop-start)"
+                    );
+                }
+            }
             // Refresh the reader UI's connection view (configured +
             // operational posture, polling) and publish only on a change.
             // The C library has no callback for SC establish/drop or the
@@ -677,6 +749,80 @@ fn actor_loop(
             }
         }
 
+        // Serial-port health: the transport latches a fatal I/O error
+        // (device unplugged, tty node destroyed/re-enumerated). When a
+        // running PD's port dies, tear the PD down and arm the
+        // auto-reconnect so the link recovers on its own once the device
+        // reappears — the failure mode that previously wedged the PD
+        // offline until a manual `systemctl restart`.
+        if slot.as_ref().is_some_and(|s| s.health.is_failed()) {
+            let port = slot.as_ref().map(|s| s.port.clone()).unwrap_or_default();
+            tracing::warn!(
+                port = %port,
+                "serial port I/O error (device gone?); tearing down PD, will reconnect"
+            );
+            slot = None;
+            // No PD on the wire right now — clear the reader's badge.
+            if let Ok(mut rs) = reader_state.lock() {
+                rs.set_connection(ConnectionView::default());
+            }
+            // First retry is immediate; subsequent ones back off.
+            reconnect = Some(Reconnect {
+                next_attempt: Instant::now(),
+                backoff: RECONNECT_INITIAL_BACKOFF,
+            });
+        }
+
+        // Drive a pending reconnect. Only ever armed by the health
+        // failure above (an explicit stop/configure/start clears it),
+        // so this never resurrects a PD the operator stopped.
+        if slot.is_none() {
+            if let Some(rc) = reconnect.as_mut() {
+                if Instant::now() >= rc.next_attempt {
+                    match last_config.as_ref() {
+                        // Nothing to rebuild from — give up quietly.
+                        None => reconnect = None,
+                        Some(cfg) => match open_pd(
+                            &cfg.port,
+                            cfg.baud,
+                            cfg.address,
+                            Arc::clone(&log),
+                            Arc::clone(&wire),
+                            Arc::clone(&overrides),
+                            Arc::clone(&events),
+                            Arc::clone(&drop_remaining),
+                            Arc::clone(&pdid),
+                            Arc::clone(&pdcap),
+                            Arc::clone(&reader_state),
+                            Arc::clone(&key_rotation),
+                            cfg.sc.clone(),
+                            &crypto_factory,
+                        ) {
+                            Ok(s) => {
+                                tracing::info!(
+                                    port = %cfg.port,
+                                    "serial port reopened; PD reconnected"
+                                );
+                                slot = Some(s);
+                                reconnect = None;
+                            }
+                            Err(e) => {
+                                let backoff = next_backoff(rc.backoff);
+                                rc.backoff = backoff;
+                                rc.next_attempt = Instant::now() + backoff;
+                                tracing::warn!(
+                                    error = %e,
+                                    port = %cfg.port,
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "serial reconnect attempt failed; backing off"
+                                );
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
         thread::sleep(tick_period);
     }
 }
@@ -686,6 +832,7 @@ fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
     last_config: &mut Option<RememberedConfig>,
+    reconnect: &mut Option<Reconnect>,
     log: &Arc<LogInner>,
     wire: &Arc<WireTrace>,
     overrides: &OverrideMap,
@@ -694,6 +841,7 @@ fn handle_cmd(
     pdid: &SharedPdid,
     pdcap: &SharedPdcap,
     reader_state: &SharedReaderState,
+    key_rotation: &SharedKeyRotation,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -704,6 +852,9 @@ fn handle_cmd(
             sc,
             reply,
         } => {
+            // An explicit (re)configure supersedes any in-flight
+            // auto-reconnect from a previous port failure.
+            *reconnect = None;
             // Remember the request before doing anything, so a later
             // `Start` (or a retry) replays these exact parameters even
             // if the open below fails.
@@ -727,6 +878,7 @@ fn handle_cmd(
                 Arc::clone(pdid),
                 Arc::clone(pdcap),
                 Arc::clone(reader_state),
+                Arc::clone(key_rotation),
                 sc,
                 crypto_factory,
             )
@@ -736,6 +888,9 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::Stop { reply } => {
+            // An explicit stop cancels any pending auto-reconnect — the
+            // operator wants the PD down and it must stay down.
+            *reconnect = None;
             // Drop the running PD but keep `last_config` so `Start` can
             // bring it back.
             *slot = None;
@@ -746,6 +901,8 @@ fn handle_cmd(
             let _ = reply.send(());
         }
         Cmd::Start { reply } => {
+            // An explicit start takes over from any auto-reconnect.
+            *reconnect = None;
             let result = if slot.is_some() {
                 Err(anyhow::anyhow!(
                     "PD is already running; stop it first or use pd_configure to reconfigure"
@@ -767,6 +924,7 @@ fn handle_cmd(
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
+                        Arc::clone(key_rotation),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -778,6 +936,8 @@ fn handle_cmd(
             let _ = reply.send(result);
         }
         Cmd::ForceSessionLoss { reply } => {
+            // A deliberate rebuild supersedes any pending auto-reconnect.
+            *reconnect = None;
             let result = match slot.take() {
                 None => Err(anyhow::anyhow!("no PD configured; nothing to force-reset")),
                 Some(old) => {
@@ -812,6 +972,7 @@ fn handle_cmd(
                         Arc::clone(pdid),
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
+                        Arc::clone(key_rotation),
                         sc,
                         crypto_factory,
                     );
@@ -887,10 +1048,24 @@ fn open_pd(
     pdid: SharedPdid,
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
+    key_rotation: SharedKeyRotation,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
     let transport = SerialTransport::open(port, baud, wire)?;
+    // Grab the port's health latch before the transport is moved into
+    // the PD, so the actor tick loop can detect a fatal I/O error and
+    // reopen the port.
+    let health = transport.health();
+    // Grab a handle to the port's baud control too (before the move), so the
+    // COMSET handler can retune the live rate.
+    let baud_ctl = transport.baud_control();
+    // A freshly-opened PD hasn't rotated its key yet; drop any pending
+    // rotation left over from a previous PD so it can't leak across a
+    // reconfigure onto a different SC posture.
+    if let Ok(mut c) = key_rotation.lock() {
+        *c = None;
+    }
     let stats = Arc::new(Mutex::new(PdStats::default()));
     // Anchor the PD-local clock before the handler is built so the
     // Slot and the handler's `last_command_at_ms` stamps share a zero
@@ -912,16 +1087,19 @@ fn open_pd(
 
     let mut pd = Pd::new(address);
     pd.set_transport(transport);
-    pd.set_command_handler(DefaultHandler::with_pdid(
-        pdid,
-        pdcap,
-        Arc::clone(&stats),
-        log,
-        overrides,
-        Arc::clone(&events),
-        drop_remaining,
-        address,
-    ));
+    pd.set_command_handler(
+        DefaultHandler::with_pdid(
+            pdid,
+            pdcap,
+            Arc::clone(&stats),
+            log,
+            overrides,
+            Arc::clone(&events),
+            drop_remaining,
+            address,
+        )
+        .with_key_rotation(key_rotation),
+    );
 
     // A freshly-opened PD starts with no LED state; clear any colours the
     // previous PD left in the snapshot, then bind the change callback so
@@ -943,9 +1121,10 @@ fn open_pd(
     pd.set_buzzer_handler(ReaderBuzzerHandler::new(reader_state));
 
     // osdp_COMSET is handled by the C library (reply + address switch); this
-    // handler pins the reported baud to the current rate so the wire stays in
-    // sync (see DefaultComsetHandler docs).
-    pd.set_comset_handler(crate::handler::DefaultComsetHandler::new(baud));
+    // handler accepts the requested address+baud and retunes the serial port
+    // to the new rate once the osdp_COM reply has drained (see
+    // DefaultComsetHandler docs).
+    pd.set_comset_handler(crate::handler::DefaultComsetHandler::new(baud_ctl));
 
     // osdp_FILETRANSFER: streaming mode — the C library hands each fragment to
     // the receiver (which logs + accepts) and replies osdp_FTSTAT, with no
@@ -1026,6 +1205,7 @@ fn open_pd(
         last_conn: initial_conn,
         stats,
         epoch,
+        health,
     })
 }
 
@@ -1087,4 +1267,30 @@ fn derive_cuid_from_pdid(p: &Pdid) -> [u8; 8] {
         // continuity with the wire layout.
         serial_le[2],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_doubles_then_saturates() {
+        // Starts at the initial delay and doubles each failure.
+        let mut b = RECONNECT_INITIAL_BACKOFF;
+        assert_eq!(b, Duration::from_millis(250));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_millis(500));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(1));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(2));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(4));
+        // Next double would be 8s but the cap holds it at 5s...
+        b = next_backoff(b);
+        assert_eq!(b, RECONNECT_MAX_BACKOFF);
+        // ...and it stays capped no matter how long the device is gone.
+        b = next_backoff(b);
+        assert_eq!(b, RECONNECT_MAX_BACKOFF);
+    }
 }

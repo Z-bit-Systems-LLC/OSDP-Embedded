@@ -357,20 +357,32 @@ static void test_decode_rejects_bad_crc(void)
 {
     uint8_t frame[16];
     const size_t n = build_crc_frame(frame, sizeof(frame),
-                                     0, false, 0, 0x60, NULL, 0);
+                                     0x12, false, 2, 0x60, NULL, 0);
     frame[n - 1] ^= 0xFF;  /* corrupt MSB of CRC */
     osdp_frame_t f;
+    (void)memset(&f, 0xEE, sizeof(f));  /* poison so populated != zero-init */
     TEST_ASSERT_EQUAL(OSDP_ERR_BAD_CRC, osdp_frame_decode(frame, n, &f));
+    /* Identity is still surfaced on an integrity failure so a PD can NAK
+     * 0x01 a bad-check command addressed to it (see osdp_frame.h). */
+    TEST_ASSERT_EQUAL_HEX8(0x12, f.address);
+    TEST_ASSERT_FALSE(f.reply);
+    TEST_ASSERT_EQUAL_UINT8(2, f.sequence);
+    TEST_ASSERT_EQUAL(OSDP_INTEGRITY_CRC, f.integrity);
 }
 
 static void test_decode_rejects_bad_checksum(void)
 {
     uint8_t frame[8];
     const size_t n = build_checksum_frame(frame, sizeof(frame),
-                                          0, false, 0, 0x60, NULL, 0);
+                                          0x0A, false, 1, 0x60, NULL, 0);
     frame[n - 1] ^= 0xFF;
     osdp_frame_t f;
+    (void)memset(&f, 0xEE, sizeof(f));  /* poison so populated != zero-init */
     TEST_ASSERT_EQUAL(OSDP_ERR_BAD_CHECKSUM, osdp_frame_decode(frame, n, &f));
+    TEST_ASSERT_EQUAL_HEX8(0x0A, f.address);
+    TEST_ASSERT_FALSE(f.reply);
+    TEST_ASSERT_EQUAL_UINT8(1, f.sequence);
+    TEST_ASSERT_EQUAL(OSDP_INTEGRITY_CHECKSUM, f.integrity);
 }
 
 static void test_decode_rejects_scb_length_below_min(void)

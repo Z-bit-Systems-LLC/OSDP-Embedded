@@ -1320,21 +1320,24 @@ static void test_cleartext_sqn0_drops_established_session(void)
     perform_handshake(&pd, &m, /*selector*/ 1, &acu);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 
-    /* Clear-text POLL at SQN 0 → ACU restart → drop the session. */
+    /* Clear-text POLL during an established session → tear it down. */
     m.outgoing_len = 0;
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
 
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
 
-    /* The PD still answers the POLL in the clear. */
+    /* The clear command is refused NAK 0x06 (encryption required), in the
+     * clear (no SCB). */
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
     TEST_ASSERT_FALSE(reply.has_scb);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
 }
 
-static void test_cleartext_nonzero_sqn_keeps_session(void)
+static void test_cleartext_nonzero_sqn_also_drops_session(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -1346,16 +1349,21 @@ static void test_cleartext_nonzero_sqn_keeps_session(void)
     perform_handshake(&pd, &m, /*selector*/ 1, &acu);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 
-    /* Clear-text POLL at SQN 2 is NOT a restart signal; the session
-     * stays established. */
+    /* ANY clear-text command during an established session tears it down —
+     * SQN 2 included, not just the SQN-0 restart case — and is answered
+     * NAK 0x06. */
     m.outgoing_len = 0;
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 2);
     osdp_pd_tick(&pd);
 
-    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
 }
 
-static void test_cleartext_sqn0_on_unsecured_is_noop(void)
+static void test_cleartext_restricted_before_sc_naks_encryption_required(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -1363,8 +1371,10 @@ static void test_cleartext_sqn0_on_unsecured_is_noop(void)
     configure_pd_sc(&pd, &m, &t);
     osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
 
-    /* No handshake performed: session not established. A SQN-0 command
-     * must be a clean no-op and still get its normal clear-text ACK. */
+    /* PD keyed for full security (operational SCBK), no session yet. A
+     * restricted clear-text command (POLL) is refused NAK 0x06 — the ACU
+     * must establish SC first. Discovery commands (ID/CAP/COMSET) would
+     * still be answered in the clear; POLL is not one of them. */
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
@@ -1372,7 +1382,8 @@ static void test_cleartext_sqn0_on_unsecured_is_noop(void)
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
-    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
 }
 
 /* ---- osdp_FILETRANSFER under Secure Channel ----------------------------*/
@@ -1490,7 +1501,7 @@ int main(void)
     RUN_TEST(test_filetransfer_under_sc_yields_scs_18_ftstat);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_drops_established_session);
-    RUN_TEST(test_cleartext_nonzero_sqn_keeps_session);
-    RUN_TEST(test_cleartext_sqn0_on_unsecured_is_noop);
+    RUN_TEST(test_cleartext_nonzero_sqn_also_drops_session);
+    RUN_TEST(test_cleartext_restricted_before_sc_naks_encryption_required);
     return UNITY_END();
 }
