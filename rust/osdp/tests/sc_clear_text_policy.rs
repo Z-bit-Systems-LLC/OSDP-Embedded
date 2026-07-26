@@ -79,12 +79,13 @@ fn clear_command(code: u8, sequence: u8) -> Vec<u8> {
 }
 
 /// Drive a fresh full-security PD (operational SCBK, no session) with one
-/// clear-text command and return its reply bytes (SOM-aligned).
-fn drive_pre_sc(code: u8) -> Vec<u8> {
+/// clear-text command at the given sequence, returning its reply bytes
+/// (SOM-aligned).
+fn drive_pre_sc_at(code: u8, sequence: u8) -> Vec<u8> {
     let output = Rc::new(RefCell::new(Vec::new()));
     let mut pd = Pd::new(PD_ADDRESS);
     pd.set_transport(FeedTransport {
-        input: clear_command(code, 1),
+        input: clear_command(code, sequence),
         pos: 0,
         output: Rc::clone(&output),
     });
@@ -93,6 +94,11 @@ fn drive_pre_sc(code: u8) -> Vec<u8> {
     pd.tick();
     let out = output.borrow().clone();
     out
+}
+
+/// Same, at a normal (non-restart) sequence number.
+fn drive_pre_sc(code: u8) -> Vec<u8> {
+    drive_pre_sc_at(code, 1)
 }
 
 fn reply_of(bytes: &[u8]) -> (u8, Vec<u8>) {
@@ -107,6 +113,33 @@ fn pre_sc_restricted_clear_command_naks_0x06() {
     let (code, payload) = reply_of(&out);
     assert_eq!(code, OSDP_REPLY_NAK);
     assert_eq!(payload, [NAK_ENCRYPTION_REQUIRED]);
+}
+
+/// Sequence 0 is the ACU's connection-restart sentinel (spec 5.9), but it only
+/// buys a stale-session reset — it does NOT exempt the command from the
+/// secure-mode allowlist. A restricted command is refused at SQN 0 just as it
+/// is at SQN 1, so SQN 0 cannot be used to drive a full-security PD in the
+/// clear.
+#[test]
+fn restart_sequence_zero_does_not_bypass_pre_sc_refusal() {
+    let out = drive_pre_sc_at(OSDP_CMD_POLL, 0);
+    assert!(!out.is_empty(), "PD gave no reply to a clear POLL at SQN 0");
+    let (code, payload) = reply_of(&out);
+    assert_eq!(
+        code, OSDP_REPLY_NAK,
+        "SQN 0 must not be an escape hatch around Secure Channel"
+    );
+    assert_eq!(payload, [NAK_ENCRYPTION_REQUIRED]);
+}
+
+/// ...while a discovery command at SQN 0 is still answered, which is what makes
+/// the restart useful: the ACU gets back into discovery in one message.
+#[test]
+fn restart_sequence_zero_still_allows_discovery() {
+    let out = drive_pre_sc_at(OSDP_CMD_ID, 0);
+    assert!(!out.is_empty(), "PD gave no reply to a clear ID at SQN 0");
+    let (code, _payload) = reply_of(&out);
+    assert_eq!(code, OSDP_REPLY_ACK);
 }
 
 #[test]

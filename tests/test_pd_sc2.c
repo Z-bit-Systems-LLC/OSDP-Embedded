@@ -588,13 +588,13 @@ static void test_keyset_sc2_wrong_length_naks(void)
 
 /* ---- Clear-text policy under an established SC2 session ------------------
  *
- * Spec D "Interleaving USC packets during communication in a SCS is NOT
- * allowed". The rule is version-agnostic: a clear-text command during an
- * established SC2 session tears the session down and is answered osdp_NAK
- * 0x06 in the clear, exactly as it is under SC1 (see
- * test_pd_sc.c::test_cleartext_sqn0_drops_established_session). This
- * replaced the older "clear command at SQN 0 silently resets the session"
- * shortcut, which SC2 previously mirrored. */
+ * Two rules, split on the sequence number, both version-agnostic (identical
+ * under SC1 — see test_pd_sc.c):
+ *   - SQN 0 is the ACU's connection-restart sentinel: the stale session is
+ *     dropped and the command is PROCESSED, so a reconnect costs one message.
+ *   - SQN != 0 during an established session is a protocol violation (spec D,
+ *     "interleaving USC packets during communication in a SCS is NOT
+ *     allowed"): the session is dropped and the command refused NAK 0x06. */
 
 static void inject_plaintext_command_sc2(mock_transport_t *m,
                                          uint8_t cmd_code, uint8_t sequence)
@@ -615,10 +615,10 @@ static void inject_plaintext_command_sc2(mock_transport_t *m,
     m->incoming_len = built;
 }
 
-/* Parameterised over the sequence number: SQN 0 used to be the "reset"
- * signal that was silently honoured, so both it and a normal SQN must now
- * produce the same NAK 0x06 teardown. */
-static void cleartext_drops_established_sc2_session(uint8_t sequence)
+/* SQN 0 = connection restart: the stale session is dropped, but the command
+ * still has to satisfy the secure-mode allowlist. A restricted command (POLL)
+ * is refused NAK 0x06 — SQN 0 is not an escape hatch around SC2. */
+static void test_cleartext_sqn0_resets_sc2_session_but_enforces_allowlist(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -631,14 +631,66 @@ static void cleartext_drops_established_sc2_session(uint8_t sequence)
     TEST_ASSERT_TRUE(osdp_pd_sc2_established(&pd));
 
     m.outgoing_len = 0;
-    inject_plaintext_command_sc2(&m, OSDP_CMD_POLL, sequence);
+    inject_plaintext_command_sc2(&m, OSDP_CMD_POLL, /*sequence*/ 0);
     osdp_pd_tick(&pd);
 
-    /* Session is gone... */
+    /* Session dropped... */
     TEST_ASSERT_FALSE(osdp_pd_sc2_established(&pd));
 
-    /* ...and the refusal goes out in the clear (no SCB), since NAK 0x06 is
-     * one of the few replies the spec permits outside the SCS format. */
+    /* ...but POLL is not on the allowlist, so it is still refused. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
+}
+
+/* The reconnect the SQN-0 reset exists to serve, SC2 flavour: a discovery
+ * command at sequence 0 drops the stale session AND is answered. */
+static void test_cleartext_sqn0_discovery_resets_sc2_and_processes(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc2_app_handler, NULL);
+
+    osdp_sc2_session_t acu;
+    perform_sc2_handshake(&pd, &m, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc2_established(&pd));
+
+    m.outgoing_len = 0;
+    inject_plaintext_command_sc2(&m, OSDP_CMD_ID, /*sequence*/ 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc2_established(&pd));
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
+}
+
+/* SQN != 0 during an established session is an interleaving violation, not a
+ * restart: session dropped and the command refused NAK 0x06 in the clear. */
+static void test_cleartext_nonzero_sqn_drops_sc2_session_with_nak(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc2_app_handler, NULL);
+
+    osdp_sc2_session_t acu;
+    perform_sc2_handshake(&pd, &m, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc2_established(&pd));
+
+    m.outgoing_len = 0;
+    inject_plaintext_command_sc2(&m, OSDP_CMD_POLL, /*sequence*/ 1);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc2_established(&pd));
+
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
     TEST_ASSERT_FALSE(reply.has_scb);
@@ -647,14 +699,48 @@ static void cleartext_drops_established_sc2_session(uint8_t sequence)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
 }
 
-static void test_cleartext_sqn0_drops_established_sc2_session(void)
+/* The pre-handshake refusal now covers an SC2-keyed PD as well as an
+ * SC1-keyed one: with no session up, a restricted clear-text command at a
+ * non-zero SQN is refused NAK 0x06 even though only sc2.scbk is set. */
+static void test_sc2_keyed_pd_refuses_restricted_cleartext_before_sc(void)
 {
-    cleartext_drops_established_sc2_session(0);
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc2_app_handler, NULL);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc2_established(&pd));
+    TEST_ASSERT_TRUE(pd.sc2.scbk_set);
+    TEST_ASSERT_FALSE(pd.sc.scbk_set);
+
+    m.outgoing_len = 0;
+    inject_plaintext_command_sc2(&m, OSDP_CMD_POLL, /*sequence*/ 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
 }
 
-static void test_cleartext_nonzero_sqn_drops_established_sc2_session(void)
+/* ...but a discovery command (osdp_ID) still gets through, so the ACU can
+ * find the PD and bring SC2 up. */
+static void test_sc2_keyed_pd_allows_discovery_cleartext_before_sc(void)
 {
-    cleartext_drops_established_sc2_session(1);
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc2(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc2_app_handler, NULL);
+
+    m.outgoing_len = 0;
+    inject_plaintext_command_sc2(&m, OSDP_CMD_ID, /*sequence*/ 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
 }
 
 int main(void)
@@ -672,7 +758,10 @@ int main(void)
     RUN_TEST(test_operational_tampered_tag_drops_silently);
     RUN_TEST(test_keyset_sc2_rotates_scbk_without_restart);
     RUN_TEST(test_keyset_sc2_wrong_length_naks);
-    RUN_TEST(test_cleartext_sqn0_drops_established_sc2_session);
-    RUN_TEST(test_cleartext_nonzero_sqn_drops_established_sc2_session);
+    RUN_TEST(test_cleartext_sqn0_resets_sc2_session_but_enforces_allowlist);
+    RUN_TEST(test_cleartext_sqn0_discovery_resets_sc2_and_processes);
+    RUN_TEST(test_cleartext_nonzero_sqn_drops_sc2_session_with_nak);
+    RUN_TEST(test_sc2_keyed_pd_refuses_restricted_cleartext_before_sc);
+    RUN_TEST(test_sc2_keyed_pd_allows_discovery_cleartext_before_sc);
     return UNITY_END();
 }

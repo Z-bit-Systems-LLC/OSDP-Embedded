@@ -1308,7 +1308,12 @@ static void inject_plaintext_command(mock_transport_t *m, uint8_t cmd_code,
     m->incoming_len = built;
 }
 
-static void test_cleartext_sqn0_drops_established_session(void)
+/* Sequence 0 is the ACU's connection-restart sentinel (spec 5.9): the stale
+ * session is dropped without that counting as an interleaving violation. But
+ * dropping the session is ALL it buys — the command still has to satisfy the
+ * secure-mode allowlist, so a restricted command (POLL) is still refused
+ * NAK 0x06. SQN 0 is not an escape hatch around Secure Channel. */
+static void test_cleartext_sqn0_resets_session_but_still_enforces_allowlist(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -1320,21 +1325,47 @@ static void test_cleartext_sqn0_drops_established_session(void)
     perform_handshake(&pd, &m, /*selector*/ 1, &acu);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 
-    /* Clear-text POLL during an established session → tear it down. */
+    /* Clear-text POLL at SQN 0 during an established session. */
     m.outgoing_len = 0;
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
 
+    /* Session dropped... */
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
 
-    /* The clear command is refused NAK 0x06 (encryption required), in the
-     * clear (no SCB). */
+    /* ...but POLL is not on the allowlist, so it is still refused. */
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
     TEST_ASSERT_FALSE(reply.has_scb);
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
-    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
+}
+
+/* The reconnect the SQN-0 reset exists to serve: a discovery command at
+ * sequence 0 drops the stale session AND is answered, so the ACU is back in
+ * discovery in a single message rather than a NAK/retry round trip. */
+static void test_cleartext_sqn0_discovery_resets_session_and_processes(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    m.outgoing_len = 0;
+    inject_plaintext_command(&m, OSDP_CMD_ID, NULL, 0, /*sequence*/ 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
 }
 
 static void test_cleartext_nonzero_sqn_also_drops_session(void)
@@ -1374,7 +1405,11 @@ static void test_cleartext_restricted_before_sc_naks_encryption_required(void)
     /* PD keyed for full security (operational SCBK), no session yet. A
      * restricted clear-text command (POLL) is refused NAK 0x06 — the ACU
      * must establish SC first. Discovery commands (ID/CAP/COMSET) would
-     * still be answered in the clear; POLL is not one of them. */
+     * still be answered in the clear; POLL is not one of them.
+     *
+     * Deliberately at sequence 0: the restart sentinel drops a stale session
+     * but does NOT exempt the command from this allowlist, so SQN 0 cannot be
+     * used to drive a full-security PD in the clear. */
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
@@ -1500,7 +1535,8 @@ int main(void)
     /* File transfer under SC. */
     RUN_TEST(test_filetransfer_under_sc_yields_scs_18_ftstat);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
-    RUN_TEST(test_cleartext_sqn0_drops_established_session);
+    RUN_TEST(test_cleartext_sqn0_resets_session_but_still_enforces_allowlist);
+    RUN_TEST(test_cleartext_sqn0_discovery_resets_session_and_processes);
     RUN_TEST(test_cleartext_nonzero_sqn_also_drops_session);
     RUN_TEST(test_cleartext_restricted_before_sc_naks_encryption_required);
     return UNITY_END();

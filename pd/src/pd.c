@@ -455,49 +455,61 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* Clear-text (unsecured, "USC") command: enforce the Secure Channel
-     * policy before touching it. Spec §"Interleaving USC packets during
-     * communication in a SCS is NOT allowed":
+    /* Clear-text (unsecured, "USC") command. A *secure* (SCB-bearing) frame is
+     * handled above and never reaches here, so this is the USC policy.
      *
-     *   - During an established session, ANY clear-text command is a
-     *     violation. Tear the session down and answer osdp_NAK 0x06
-     *     ("Encrypted communication required") in the clear; the ACU then
-     *     re-discovers and re-handshakes. This holds for any established
-     *     session — install (SCBK-D) or operational (SCBK). It replaces the
-     *     older "clear command at SQN 0 silently resets and is processed"
-     *     reconnect shortcut: the ACU now sees an explicit NAK and the
-     *     first post-reset discovery command (osdp_ID/CAP, below) carries
-     *     it back online.
-     *   - With no session up but the PD keyed for full security (an
-     *     operational SCBK is set), a clear-text command that isn't one of
-     *     the discovery/config commands the ACU needs before the handshake
-     *     is likewise refused NAK 0x06 — SC must be established first.
+     * Sequence 0 is the ACU's connection-restart sentinel (spec 5.9): it is
+     * only sent when the link is being (re)started, so any Secure Channel
+     * session the PD still believes in is stale and is dropped — SC1 and SC2
+     * alike — WITHOUT that counting as an interleaving violation. Dropping the
+     * session is all SQN 0 buys, though: the command still has to satisfy the
+     * secure-mode allowlist below. Once a PD is keyed for full security only
+     * the discovery/config commands are ever answered in the clear, whatever
+     * the sequence number; SQN 0 is not an escape hatch around Secure Channel.
      *
-     * A PD with no operational key (clear-only or install-only, no session)
-     * falls through and processes clear-text commands normally. NAK 0x06 is
-     * one of the few replies the spec permits in the clear, so build_nak's
-     * plaintext frame is correct even though a session was just active.
-     *
-     * The rule is version-agnostic: an established SC2 session is torn down
-     * on the same terms as an SC1 one. (The pre-handshake refusal above stays
-     * keyed on the SC1 `scbk_set` only — extending it to `sc2.scbk_set` would
-     * refuse clear-text to every PD that has completed pairing, which is a
-     * behaviour change rather than a merge resolution.) */
-    if (pd->sc.session.established) {
-        osdp_sc_session_init(&pd->sc.session);
-        pd->sc.got_chlng = false;
-        size_t n = 0;
-        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
-        return n;
+     * Sequence != 0 during an established session IS an interleaving violation
+     * (spec D "Interleaving USC packets during communication in a SCS is NOT
+     * allowed"): drop the session and answer osdp_NAK 0x06 immediately, so the
+     * ACU sees the refusal rather than a silently-processed command. */
+    if (cmd->sequence == 0) {
+        if (pd->sc.session.established) {
+            osdp_sc_session_init(&pd->sc.session);
+            pd->sc.got_chlng = false;
+        }
+        if (pd->sc2.session.established) {
+            osdp_sc2_session_init(&pd->sc2.session);
+            pd->sc2.got_chlng = false;
+        }
+    } else {
+        if (pd->sc.session.established) {
+            osdp_sc_session_init(&pd->sc.session);
+            pd->sc.got_chlng = false;
+            size_t n = 0;
+            (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+            return n;
+        }
+        if (pd->sc2.session.established) {
+            osdp_sc2_session_init(&pd->sc2.session);
+            pd->sc2.got_chlng = false;
+            size_t n = 0;
+            (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+            return n;
+        }
     }
-    if (pd->sc2.session.established) {
-        osdp_sc2_session_init(&pd->sc2.session);
-        pd->sc2.got_chlng = false;
-        size_t n = 0;
-        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
-        return n;
-    }
-    if (pd->sc.scbk_set && !clear_command_allowed_pre_sc(cmd->code)) {
+
+    /* Secure-mode allowlist, applied at EVERY sequence number including 0.
+     * A PD keyed for full security (an operational SCBK is set for either
+     * channel version — not merely SCBK-D) answers only the discovery/config
+     * commands the ACU needs to find it and bring SC up: osdp_ID, osdp_CAP,
+     * osdp_COMSET. Everything else is refused osdp_NAK 0x06 until a session
+     * exists. A PD with no operational key (clear-only or install-only) is
+     * not in secure mode and falls through, processing clear-text normally.
+     *
+     * NAK 0x06 is one of the few replies the spec permits in the clear, so
+     * build_nak's plaintext frame is correct even when a session was active a
+     * moment ago. */
+    if ((pd->sc.scbk_set || pd->sc2.scbk_set) &&
+        !clear_command_allowed_pre_sc(cmd->code)) {
         size_t n = 0;
         (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
         return n;

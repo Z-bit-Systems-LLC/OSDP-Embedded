@@ -313,22 +313,39 @@ that aren't explicit in the spec:
   key_type) downgrade the wire reply from ACK to NAK 0x09
   (`OSDP_NAK_RECORD_INVALID`) so the ACU sees the failure; the
   stored SCBK is never overwritten on a bad write.
-- **Clear-text (USC) commands are refused once secure operation is
-  expected.** During an *established* session (either key), ANY clear-text
-  (non-SCB) command from the ACU tears the session down and is answered
-  `osdp_NAK 0x06` (`OSDP_NAK_ENCRYPTION_REQUIRED`) in the clear —
-  interleaving USC inside an SCS is a protocol violation (spec D
-  "Interleaving USC packets during communication in a SCS is NOT allowed").
-  This replaces the older "clear command at SQN 0 silently resets and is
-  processed" reconnect shortcut. *Before* a session exists, a PD keyed for
-  full security (an operational SCBK is set, not merely SCBK-D) refuses
-  restricted clear commands the same way; only the discovery/config
-  allowlist — `osdp_ID`, `osdp_CAP`, `osdp_COMSET` — is accepted so the ACU
-  can find the PD and bring SC up. The SCB-bearing handshake
-  (`osdp_CHLNG`/`osdp_SCRYPT`) never reaches the clear-text path, so a
-  re-handshake still works mid-session. A PD with no operational key
-  (clear-only / install-only) stays permissive. Implemented in
-  `pd/src/pd.c::handle_command_into_tx`.
+- **Once in secure mode only the discovery commands are answered in the
+  clear; sequence 0 resets a stale session but is not an escape hatch.** The
+  clear-text (USC) policy has two independent parts, and both are identical
+  for SC1 and SC2:
+
+  1. *Session handling*, split on the sequence number:
+     - **SQN 0** is the ACU's connection-restart sentinel (spec 5.9): it is
+       only sent when the link is being (re)started, so any session the PD
+       still believes in is stale. The PD drops it — both `sc` and `sc2` —
+       **without** treating it as a violation, and moves on to (2).
+     - **SQN != 0 during an established session** is a genuine interleaving
+       violation (spec D "Interleaving USC packets during communication in a
+       SCS is NOT allowed"): the session is torn down and the command
+       answered `osdp_NAK 0x06` (`OSDP_NAK_ENCRYPTION_REQUIRED`) immediately.
+
+  2. *Secure-mode allowlist*, applied at **every** sequence number including
+     0. A PD keyed for full security — an operational SCBK is set for
+     *either* channel version (`sc.scbk_set` or `sc2.scbk_set`), not merely
+     SCBK-D — answers only `osdp_ID`, `osdp_CAP`, `osdp_COMSET` in the clear,
+     the commands the ACU needs to find the PD and bring SC up. Everything
+     else gets `osdp_NAK 0x06` until a session exists. A PD with no
+     operational key (clear-only / install-only) is not in secure mode and
+     stays permissive.
+
+  So SQN 0 buys a session reset and nothing more: a clear-text `osdp_POLL` at
+  SQN 0 against a full-security PD still gets NAK 0x06, while an `osdp_ID` at
+  SQN 0 both clears the stale session and is answered — the reconnect costs
+  one message without opening a hole around Secure Channel.
+
+  The SCB-bearing handshake (`osdp_CHLNG`/`osdp_SCRYPT`) never reaches the
+  clear-text path, so a re-handshake still works mid-session, and the SC2
+  pairing hook runs ahead of all of this so `osdp_PAIR` is never refused.
+  Implemented in `pd/src/pd.c::handle_command_into_tx`.
 - **`osdp_NAK 0x01`/`0x06` and `osdp_BUSY` are the only replies allowed
   plaintext under SC.** A frame that fails its CRC/checksum but is addressed
   to this PD is answered `osdp_NAK 0x01` (`OSDP_NAK_BAD_CHECK`) rather than
