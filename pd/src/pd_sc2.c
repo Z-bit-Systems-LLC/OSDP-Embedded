@@ -66,9 +66,9 @@ static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
  * OSDP_ERR_BAD_PAYLOAD for a malformed / wrong-type / wrong-length
  * record so the caller can NAK 0x09; the stored SCBK is untouched on
  * failure. */
-static osdp_status_t apply_sc2_keyset(osdp_pd_t     *pd,
-                                      const uint8_t *payload,
-                                      size_t         payload_len)
+osdp_status_t osdp_pd_internal_apply_sc2_keyset(osdp_pd_t     *pd,
+                                                const uint8_t *payload,
+                                                size_t         payload_len)
 {
     osdp_keyset_cmd_t parsed;
     const osdp_status_t s = osdp_keyset_decode(payload, payload_len, &parsed);
@@ -248,25 +248,25 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return 0;
     }
 
-    /* Dispatch the decrypted command to the application handler. */
-    osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_ACK,
-        .payload     = NULL,
-        .payload_len = 0,
-    };
-    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
-    if (pd->cmd_cb != NULL) {
-        app_status = pd->cmd_cb(pd->cmd_user, cmd_code,
-                                plaintext, plaintext_len, &reply);
+    /* Decide the reply via the shared dispatch, exactly as the plaintext and
+     * SC1 paths do. Before this was unified, SC2 called cmd_cb directly and
+     * intercepted neither osdp_COMSET nor osdp_FILETRANSFER, so under SC2 a
+     * COMSET never switched the PD address and a FILETRANSFER never reached
+     * the registered receiver. Only the SCS_28 framing below is specific to
+     * this path. */
+    osdp_pd_reply_t reply;
+    if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC2, cmd_code,
+                                  plaintext, plaintext_len,
+                                  &reply) != OSDP_OK) {
+        return 0;  /* internal handler error — drop */
     }
-
-    /* Mirror reader-visible commands (osdp_LED) into the LED bank. */
-    osdp_pd_internal_observe_command(pd, cmd_code, plaintext, plaintext_len);
 
     /* Reply is always the encrypted PD→ACU variant (SCS_28). */
     osdp_frame_t reply_template;
     (void)memset(&reply_template, 0, sizeof(reply_template));
-    reply_template.address    = pd->address;
+    /* Mirror the inbound destination address — see the matching comment in
+     * pd_sc.c and the plaintext build_reply in pd.c (spec 5.9 Note 2). */
+    reply_template.address    = cmd->address;
     reply_template.reply      = true;
     reply_template.sequence   = cmd->sequence;
     reply_template.integrity  = cmd->integrity;
@@ -274,31 +274,10 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     reply_template.scb_length = OSDP_SCB_MIN_LEN;
     reply_template.scb_type   = OSDP_SCS_28;
 
-    uint8_t nak_byte = OSDP_NAK_UNKNOWN_CMD;
-    if (app_status == OSDP_OK) {
-        if (cmd_code == OSDP_CMD_KEYSET) {
-            const osdp_status_t ks =
-                apply_sc2_keyset(pd, plaintext, plaintext_len);
-            if (ks != OSDP_OK) {
-                nak_byte = OSDP_NAK_RECORD_INVALID;
-                reply_template.code        = OSDP_REPLY_NAK;
-                reply_template.payload     = &nak_byte;
-                reply_template.payload_len = 1;
-                goto wrap;
-            }
-        }
-        reply_template.code        = reply.code;
-        reply_template.payload     = reply.payload;
-        reply_template.payload_len = reply.payload_len;
-    } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
-        reply_template.code        = OSDP_REPLY_NAK;
-        reply_template.payload     = &nak_byte;
-        reply_template.payload_len = 1;
-    } else {
-        return 0;  /* internal handler error — drop */
-    }
+    reply_template.code        = reply.code;
+    reply_template.payload     = reply.payload;
+    reply_template.payload_len = reply.payload_len;
 
-wrap:;
     size_t built = 0;
     s = osdp_sc2_wrap_frame(&pd->sc2.crypto, &pd->sc2.session,
                             &reply_template,
