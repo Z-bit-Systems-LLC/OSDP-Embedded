@@ -7,6 +7,7 @@ add_library(osdp_core STATIC
     src/shared/crc16.c
     src/shared/checksum.c
     src/shared/frame.c
+    src/shared/multipart.c
     src/shared/stream.c
     src/shared/led_state.c
     src/shared/buz_state.c

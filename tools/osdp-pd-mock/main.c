@@ -98,10 +98,21 @@ typedef struct app_state {
     int                  verbose;
 
     /* Scratch for build_* outputs returned to the PD via reply.payload. */
-    uint8_t              scratch[OSDP_PD_TX_BUF_LEN];
+    uint8_t              scratch[OSDP_PD_BUF_LEN];
 
     /* Running total of file bytes streamed in (for the -v progress log). */
     uint32_t             file_received;
+
+    /* Reported through the status provider; flipped by --tamper so an
+     * operator can watch the ACU react to a state change. */
+    bool                 tamper;
+
+    /* Last osdp_ACURXSIZE the ACU declared, for the -v log. */
+    uint16_t             acu_rx_size;
+
+    /* Poll-response event queue storage, handed to the library. Sized for a
+     * handful of queued card reads. */
+    uint8_t              events[512];
 } app_state_t;
 
 static const char *cmd_name(uint8_t code)
@@ -193,6 +204,76 @@ static uint8_t cap_num_objects(const app_state_t *s, uint8_t fc, uint8_t dflt)
     return dflt;
 }
 
+/* ---- Status providers (osdp_LSTAT / ISTAT / OSTAT / RSTAT) --------------
+ *
+ * The library frames the reports; these supply the values. A real PD would
+ * read GPIO here — the mock reports a healthy device, and lets the operator
+ * force a tamper with --tamper so the ACU can be seen reacting to a change.
+ * The counts come from the PD's own advertised PDCAP, so what it reports and
+ * what it claims cannot drift. */
+
+static void status_local(void *user, uint8_t *tamper, uint8_t *power)
+{
+    const app_state_t *s = (const app_state_t *)user;
+    *tamper = s->tamper ? OSDP_LSTATR_TAMPER : OSDP_LSTATR_NORMAL;
+    *power  = OSDP_LSTATR_NORMAL;
+}
+
+static size_t status_fill(const app_state_t *s, uint8_t fc, uint8_t value,
+                          uint8_t *out, size_t cap)
+{
+    size_t n = cap_num_objects(s, fc, 1);
+    if (n > cap) {
+        n = cap;
+    }
+    (void)memset(out, value, n);
+    return n;
+}
+
+static size_t status_inputs(void *user, uint8_t *out, size_t cap)
+{
+    return status_fill((const app_state_t *)user, 1 /* contact monitor */,
+                       OSDP_ISTATR_INACTIVE, out, cap);
+}
+
+static size_t status_outputs(void *user, uint8_t *out, size_t cap)
+{
+    return status_fill((const app_state_t *)user, 2 /* output control */,
+                       OSDP_OSTATR_INACTIVE, out, cap);
+}
+
+static size_t status_readers(void *user, uint8_t *out, size_t cap)
+{
+    return status_fill((const app_state_t *)user, 13 /* readers */,
+                       OSDP_RSTATR_NORMAL, out, cap);
+}
+
+/* ---- Library-handled command hooks -------------------------------------- */
+
+static osdp_status_t on_abort(void *user)
+{
+    app_state_t *s = (app_state_t *)user;
+    fprintf(stderr, "*** ABORT: operation cancelled by ACU\n");
+    s->file_received = 0;
+    return OSDP_OK;
+}
+
+static void on_acurxsize(void *user, uint16_t max_size)
+{
+    app_state_t *s = (app_state_t *)user;
+    fprintf(stderr, "*** ACURXSIZE: ACU can receive %u bytes\n",
+            (unsigned)max_size);
+    s->acu_rx_size = max_size;
+}
+
+static osdp_status_t on_keepactive(void *user, uint16_t time_ms)
+{
+    (void)user;
+    fprintf(stderr, "*** KEEPACTIVE: hold reader active for %u ms\n",
+            (unsigned)time_ms);
+    return OSDP_OK;
+}
+
 static osdp_status_t app_handler(void           *user,
                                  uint8_t         cmd_code,
                                  const uint8_t  *payload,
@@ -254,61 +335,32 @@ static osdp_status_t app_handler(void           *user,
         reply->payload_len = 0;
         break;
 
-    /* Status requests must be answered with the mandated report, not an
-     * ACK (spec 7.6-7.9; mirrors OSDP.Net commit d42c1cad5). We report
-     * a healthy device: no tamper, no power failure, all inputs/outputs
-     * inactive, all readers normal. */
-    case OSDP_CMD_LSTAT: {
-        const osdp_lstatr_t st = {
-            .tamper = OSDP_LSTATR_NORMAL,
-            .power  = OSDP_LSTATR_NORMAL,
-        };
-        size_t built = 0;
-        r = osdp_lstatr_build(&st, s->scratch, sizeof(s->scratch), &built);
-        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
-        reply->code        = OSDP_REPLY_LSTATR;
-        reply->payload     = s->scratch;
-        reply->payload_len = built;
-        break;
-    }
+    /* osdp_LSTAT / ISTAT / OSTAT / RSTAT no longer appear here: they are
+     * answered by the library from the status provider registered in main().
+     * This mock used to hand-build all four reports, which is exactly the
+     * duplication osdp_pd_set_status_provider removed. Likewise osdp_ABORT,
+     * osdp_ACURXSIZE and osdp_KEEPACTIVE are library-handled via their hooks. */
 
-    case OSDP_CMD_ISTAT: {
-        uint8_t statuses[256];
-        const uint8_t n = cap_num_objects(s, 1 /* contact monitor */, 1);
-        (void)memset(statuses, OSDP_ISTATR_INACTIVE, n);
+    case OSDP_CMD_MFG: {
+        /* Manufacturer-specific messages stay with the application by
+         * design — only the vendor knows what the bytes mean. Answer our own
+         * vendor code and refuse anyone else's. */
+        osdp_mfg_cmd_t req;
+        if (osdp_mfg_decode(payload, payload_len, &req) != OSDP_OK) {
+            r = OSDP_ERR_BAD_PAYLOAD;
+            break;
+        }
+        if (memcmp(req.vendor_code, s->pdid.vendor_code, 3) != 0) {
+            r = OSDP_ERR_INVALID_ARG;    /* -> NAK 0x09 */
+            break;
+        }
+        /* Echo the request data back, so the ACU can check the round-trip. */
+        osdp_mfgrep_t rep = { .data = req.data, .data_len = req.data_len };
+        (void)memcpy(rep.vendor_code, s->pdid.vendor_code, 3);
         size_t built = 0;
-        r = osdp_istatr_build(statuses, n, s->scratch, sizeof(s->scratch),
-                              &built);
+        r = osdp_mfgrep_build(&rep, s->scratch, sizeof(s->scratch), &built);
         if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
-        reply->code        = OSDP_REPLY_ISTATR;
-        reply->payload     = s->scratch;
-        reply->payload_len = built;
-        break;
-    }
-
-    case OSDP_CMD_OSTAT: {
-        uint8_t statuses[256];
-        const uint8_t n = cap_num_objects(s, 2 /* output control */, 1);
-        (void)memset(statuses, OSDP_OSTATR_INACTIVE, n);
-        size_t built = 0;
-        r = osdp_ostatr_build(statuses, n, s->scratch, sizeof(s->scratch),
-                              &built);
-        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
-        reply->code        = OSDP_REPLY_OSTATR;
-        reply->payload     = s->scratch;
-        reply->payload_len = built;
-        break;
-    }
-
-    case OSDP_CMD_RSTAT: {
-        uint8_t statuses[256];
-        const uint8_t n = cap_num_objects(s, 13 /* readers */, 1);
-        (void)memset(statuses, OSDP_RSTATR_NORMAL, n);
-        size_t built = 0;
-        r = osdp_rstatr_build(statuses, n, s->scratch, sizeof(s->scratch),
-                              &built);
-        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
-        reply->code        = OSDP_REPLY_RSTATR;
+        reply->code        = OSDP_REPLY_MFGREP;
         reply->payload     = s->scratch;
         reply->payload_len = built;
         break;
@@ -353,6 +405,8 @@ typedef struct cli {
     }            sc_mode;
     uint8_t      sc_custom_key[OSDP_SC_KEY_LEN];
     int          verbose;
+    bool         tamper;        /* report tamper in osdp_LSTATR */
+    unsigned int card_every_ms; /* 0 = off; queue an osdp_RAW this often */
 } cli_t;
 
 static void usage(const char *prog)
@@ -366,16 +420,19 @@ static void usage(const char *prog)
         "  --baud N           baud rate (default 9600)\n"
         "  --sc=MODE          Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
         "                                     'scbk:HEX32' (custom 16-byte key)\n"
+        "  --tamper           report a tamper condition in osdp_LSTATR\n"
+        "  --card-every MS    queue a synthetic card read (osdp_RAW) every MS\n"
+        "                       milliseconds, delivered on the next osdp_POLL\n"
         "  -v / -vv           print decoded commands (-v) or every byte (-vv)\n"
         "  -h, --help         this help\n",
         prog);
 }
 
-/* Parse 32 hex chars into a 16-byte key. Returns true on success. */
-static bool parse_hex_key(const char *s, uint8_t out[OSDP_SC_KEY_LEN])
+/* Parse `n*2` hex chars into an n-byte key. Returns true on success. */
+static bool parse_hex_keyn(const char *s, uint8_t *out, size_t n)
 {
-    if (s == NULL || strlen(s) != OSDP_SC_KEY_LEN * 2U) return false;
-    for (size_t i = 0; i < OSDP_SC_KEY_LEN; i++) {
+    if (s == NULL || strlen(s) != n * 2U) return false;
+    for (size_t i = 0; i < n; i++) {
         unsigned int b;
         if (sscanf(s + i * 2, "%2x", &b) != 1) return false;
         out[i] = (uint8_t)b;
@@ -401,6 +458,10 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             out->verbose = 1;
         } else if (strcmp(a, "-vv") == 0) {
             out->verbose = 2;
+        } else if (strcmp(a, "--tamper") == 0) {
+            out->tamper = true;
+        } else if (strcmp(a, "--card-every") == 0 && i + 1 < argc) {
+            out->card_every_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
             out->port = argv[++i];
         } else if (strcmp(a, "--baud") == 0 && i + 1 < argc) {
@@ -422,7 +483,8 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             } else if (strcmp(mode, "scbkd") == 0) {
                 out->sc_mode = SC_SCBKD;
             } else if (strncmp(mode, "scbk:", 5) == 0) {
-                if (!parse_hex_key(mode + 5, out->sc_custom_key)) {
+                if (!parse_hex_keyn(mode + 5, out->sc_custom_key,
+                                    OSDP_SC_KEY_LEN)) {
                     fprintf(stderr,
                             "--sc=scbk:HEX requires 32 hex chars (16 bytes)\n");
                     return false;
@@ -556,6 +618,8 @@ int main(int argc, char **argv)
     app.address     = cli.address;
     app.baud        = cli.baud;
     app.verbose     = cli.verbose;
+    app.tamper      = cli.tamper;
+    app.acu_rx_size = 0;
 
     /* Open the serial port. */
     osdp_pd_transport_t transport;
@@ -590,6 +654,29 @@ int main(int argc, char **argv)
      * arbitrarily large images with no reassembly buffer. */
     osdp_pd_set_file_stream(&pd, mock_file_eval, &app);
 
+    /* Status reports (osdp_LSTAT / ISTAT / OSTAT / RSTAT) are built by the
+     * library from these; the mock used to hand-build all four. */
+    static const osdp_pd_status_provider_t status_provider = {
+        .local   = status_local,
+        .inputs  = status_inputs,
+        .outputs = status_outputs,
+        .readers = status_readers,
+    };
+    osdp_pd_set_status_provider(&pd, &status_provider, &app);
+
+    /* Poll-response queue: --card-every feeds synthetic osdp_RAW reads into
+     * it, and the library returns them in place of the ACK on the next poll. */
+    osdp_pd_set_event_queue(&pd, app.events, sizeof(app.events));
+
+    /* Library-handled commands with application-visible side effects. */
+    osdp_pd_set_abort_handler     (&pd, on_abort,      &app);
+    osdp_pd_set_acurxsize_handler (&pd, on_acurxsize,  &app);
+    osdp_pd_set_keepactive_handler(&pd, on_keepactive, &app);
+
+    /* The PDCAP consistency check lives further down, after Secure Channel is
+     * configured — that is the point at which this PD's real capabilities are
+     * known. */
+
     /* Optionally configure Secure Channel. The crypto vtable, the cUID
      * (derived from our PDID), and the requested key all need to be
      * set before the first inbound CHLNG / SCRYPT. */
@@ -605,13 +692,45 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Advertise AES128 only when Secure Channel is actually configured. The
+     * default capability set claims it unconditionally, which is a lie on a
+     * --sc=off run: an ACU reading function code 9 would open a handshake and
+     * get NAK 0x05. Fix the record rather than silence the check. */
+    for (size_t i = 0; i < app.pdcap_count; i++) {
+        if (app.pdcap[i].function_code == 9) {
+            const uint8_t aes = (cli.sc_mode == SC_NONE) ? 0x00U : 0x01U;
+            app.pdcap[i].compliance_level = aes;
+            app.pdcap[i].num_objects      = aes;
+        }
+    }
+
+    /* Check what we are about to advertise against what this PD can actually
+     * honour. Advisory: report and carry on, since an operator may be probing
+     * a deliberately odd configuration on purpose.
+     *
+     * Runs AFTER the Secure Channel setup above. An earlier version sat
+     * before it and reported every --sc run as inconsistent, which is exactly
+     * the false alarm that gets a check switched off. */
+    {
+        size_t bad = 0;
+        const osdp_status_t cap_check =
+            osdp_pd_check_pdcap(&pd, app.pdcap, app.pdcap_count, &bad);
+        if (cap_check != OSDP_OK) {
+            fprintf(stderr,
+                    "warning: PDCAP record %zu (function code %u) is "
+                    "inconsistent with this PD's configuration (%d)\n",
+                    bad, (unsigned)app.pdcap[bad].function_code,
+                    (int)cap_check);
+        }
+    }
+
     fprintf(stderr,
             "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x,"
             " SC=%s (Ctrl-C to exit)\n",
             cli.port, cli.baud, cli.address,
-            cli.sc_mode == SC_NONE   ? "off"
-          : cli.sc_mode == SC_SCBKD  ? "SCBK-D"
-                                     : "SCBK (custom)");
+            cli.sc_mode == SC_NONE        ? "off"
+          : cli.sc_mode == SC_SCBKD       ? "SCBK-D"
+                                          : "SCBK (custom)");
 
     /* Catch Ctrl-C for orderly shutdown. */
     signal(SIGINT, on_signal);
@@ -619,7 +738,9 @@ int main(int argc, char **argv)
     /* Tick loop. The application command callback can't observe Secure
      * Channel (CHLNG/SCRYPT and SCS_15..18 wrap/unwrap happen below it),
      * so watch the established flag here and announce transitions. */
-    bool sc_was_up = false;
+    bool     sc_was_up    = false;
+    uint32_t last_card_ms = 0;   /* clock at the last synthetic card read */
+    uint32_t card_serial  = 0;
     while (!g_should_exit) {
         osdp_pd_tick(&pd);
 
@@ -629,6 +750,58 @@ int main(int argc, char **argv)
                 fprintf(stderr, "=== Secure Channel %s ===\n",
                         sc_now ? "ESTABLISHED" : "torn down");
                 sc_was_up = sc_now;
+            }
+        }
+
+        /* Synthetic card reads. A real PD would enqueue from its reader ISR;
+         * the timing here just gives an ACU something to observe. The library
+         * returns the queued osdp_RAW in place of the ACK on the next poll,
+         * and discards anything still queued if the link drops (spec
+         * 7.11/7.12), so a card read never arrives late after a reconnect. */
+        if (cli.card_every_ms > 0 && transport.now_ms != NULL) {
+            /* Real clock, not a tick count: one loop iteration is a tick plus
+             * whatever the serial I/O took, which is nowhere near the 2 ms
+             * sleep. Counting iterations made --card-every 2000 fire roughly
+             * every 11 s. */
+            const uint32_t now = transport.now_ms(transport.user);
+            if (last_card_ms == 0) {
+                last_card_ms = now;
+            }
+            if ((uint32_t)(now - last_card_ms) >= cli.card_every_ms) {
+                last_card_ms = now;
+                card_serial++;
+
+                /* 26-bit Wiegand-shaped payload: reader 0, format 0,
+                 * bit count 26, then the card bits. Content is arbitrary —
+                 * what matters on the wire is that a RAW appears. */
+                const uint8_t bits[4] = {
+                    (uint8_t)(card_serial >> 16), (uint8_t)(card_serial >> 8),
+                    (uint8_t)card_serial,         0x00,
+                };
+                const osdp_raw_t raw = {
+                    .reader_no    = 0,
+                    .format_code  = 0,
+                    .bit_count    = 26,
+                    .bit_data     = bits,
+                    .bit_data_len = sizeof(bits),
+                };
+                uint8_t body[32];
+                size_t  body_len = 0;
+                if (osdp_raw_build(&raw, body, sizeof(body),
+                                   &body_len) == OSDP_OK) {
+                    const osdp_status_t q =
+                        osdp_pd_enqueue_event(&pd, OSDP_REPLY_RAW,
+                                              body, body_len);
+                    if (q == OSDP_OK) {
+                        fprintf(stderr, "*** queued card read #%u "
+                                        "(delivered on next POLL)\n",
+                                (unsigned)card_serial);
+                    } else {
+                        fprintf(stderr, "*** card read #%u DROPPED "
+                                        "(queue full)\n",
+                                (unsigned)card_serial);
+                    }
+                }
             }
         }
 

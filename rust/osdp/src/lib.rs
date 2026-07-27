@@ -34,7 +34,10 @@
 //!   reply in the OSDP v2.2.2 baseline set.
 //! - [`Transport`] - shared read/write/now_ms callback trait used by
 //!   both PD and ACU when bound via `set_transport`.
-//! - [`sc::ScCrypto`] for application-supplied AES + RNG.
+//! - [`sc::ScCrypto`] for application-supplied AES-128 + RNG (Secure
+//!   Channel 1), and [`sc::ScCrypto2`] for AES-256-GCM + KMAC256 +
+//!   AES-256 block + RNG (Secure Channel 2). PD/ACU expose matching
+//!   `set_sc_*` / `set_sc2_*` setters.
 //! - [`pd::Pd`] (feature `pd`) - PD-side state machine, with
 //!   [`pd::CommandHandler`].
 //! - [`acu::Acu`] (feature `acu`) - ACU-side state machine, with
@@ -55,6 +58,11 @@ extern crate alloc;
 // In-crate FFI seam. Private to the crate; consumers go through the
 // safe modules (frame, messages, pd, acu, sc).
 pub(crate) mod sys;
+
+// Layout guard for the hand-maintained osdp_pd_t mirror in `sys`. Lives
+// in-crate rather than under tests/ because `sys` is crate-private.
+#[cfg(all(test, feature = "pd"))]
+mod pd_layout_tests;
 
 pub mod error;
 pub mod frame;

@@ -8,6 +8,7 @@
 add_library(osdp_pd STATIC
     src/pd.c
     src/pd_dispatch.c
+    src/pd_pdcap.c
     src/pd_sc.c
 )
 

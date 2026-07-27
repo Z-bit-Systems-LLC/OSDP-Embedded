@@ -53,6 +53,115 @@ you use it:
 
 ---
 
+## Sizing the PD — `OSDP_PD_BUF_LEN` and `osdp_pd_set_buffers`
+
+`osdp_pd_t` is about **4.4 KB** at the defaults. Two build-time constants
+account for nearly all of it, and both are `#ifndef`-guarded so you can
+override them from your build without touching the headers:
+
+| Constant                 | Default | What it sizes                                                                                   |
+| ------------------------ | ------- | ----------------------------------------------------------------------------------------------- |
+| `OSDP_PD_BUF_LEN`        | 512     | four regions: the outbound frame, the Secure Channel plaintext scratch, and the two retransmit caches |
+| `OSDP_STREAM_BUFFER_LEN` | 1440    | inbound wire-level reassembly                                                                     |
+
+```cmake
+target_compile_definitions(my_pd_firmware PRIVATE
+    OSDP_PD_BUF_LEN=256          # 4 x 256 instead of 4 x 512
+    OSDP_STREAM_BUFFER_LEN=300)  # only if you control both ends of the bus
+```
+
+Two things to know before you shrink either.
+
+**`OSDP_PD_BUF_LEN` is also what you should advertise.** PDCAP function code
+10 ("Receive BufferSize", spec B.11) tells the ACU how large a message it may
+send you, and the ACU acts on it — spec §6 bounds `osdp_LED` record counts by
+it. Deriving the advertised number from the same constant that sizes the
+buffers is how you keep the two from drifting:
+
+```c
+static const osdp_pdcap_record_t caps[] = {
+    /* ... */
+    { .function_code    = 10,                                  /* Receive BufferSize */
+      .compliance_level = (uint8_t)(OSDP_PD_BUF_LEN & 0xFFU),  /* LSB */
+      .num_objects      = (uint8_t)(OSDP_PD_BUF_LEN >> 8) },   /* MSB */
+};
+```
+
+(Function code 10 is the one PDCAP record whose two trailing bytes are not a
+compliance level and an object count — spec B.11 uses them as the LSB and MSB
+of a 16-bit size.)
+
+**`OSDP_STREAM_BUFFER_LEN` is not the same question.** It is wire-level
+buffering, and the decoder resyncs through frames addressed to *other*
+devices on the bus, not just yours. Shrinking it below the largest frame any
+device on that bus sends costs you resync speed, not just your own messages.
+Leave it at the spec maximum unless you control every device on the wire.
+
+### Rebinding at run time
+
+If one PD in your system needs a different footprint from the rest, or the
+storage has to live in a particular memory region, bind it instead of moving
+the constant:
+
+```c
+static uint8_t big_tx[1440];
+
+osdp_pd_t pd;
+osdp_pd_init(&pd, 0x05);
+
+const osdp_pd_buffers_t bufs = { .tx = big_tx, .tx_cap = sizeof(big_tx) };
+if (osdp_pd_set_buffers(&pd, &bufs) != OSDP_OK) { /* too small */ }
+```
+
+- A **NULL** member leaves that region on its current binding, so the call
+  above enlarges only the TX path.
+- The buffers are **borrowed, not copied** — they must outlive the PD and
+  must not overlap each other.
+- An undersized region returns `OSDP_ERR_BUFFER_TOO_SMALL` and applies
+  *nothing*, so a rejected call leaves the PD exactly as it was.
+- Call it before the first `osdp_pd_tick()` where you can. Rebinding a
+  retransmit cache mid-session clears it, which costs one repeat command
+  processed fresh rather than replayed — correct, just not free.
+
+A PD that never calls this uses its embedded arrays and behaves exactly as
+if the API didn't exist.
+
+### How much fits in one reply — `osdp_pd_max_reply_payload`
+
+When a response is too big for one packet you have to split it across polls,
+and that means knowing the per-packet budget. Don't compute it: framing
+overhead is a marking byte, a 5-byte header, possibly a security block, the
+code byte, possibly a 4- or 16-byte MAC, and 1 or 2 integrity bytes — and
+under SC1 the payload is then padded up to an AES block with *always at least
+one* pad byte, so a 16-byte payload costs 32.
+
+```c
+const size_t budget = osdp_pd_max_reply_payload(&pd);
+```
+
+It resolves against live state — the currently bound TX capacity and which
+channel is actually established — so the number drops on its own the moment
+Secure Channel comes up:
+
+| PD state (512-byte TX bound) | `osdp_pd_max_reply_payload` |
+| ---------------------------- | ---------------------------- |
+| clear text                   | largest, framing overhead only |
+| SC1 established              | smaller — security block, 4-byte MAC, and CBC padding |
+
+Returns 0 for a NULL PD or a TX buffer too small for any reply at all — a
+usable answer, not an error.
+
+One caveat: this is *your* limit. If the ACU has sent `osdp_ACURXSIZE`, its
+declared size is a separate ceiling on top, and the real budget is the
+smaller of the two.
+
+The core primitives underneath are available too, if you are sizing something
+other than a PD reply — `osdp_frame_max_payload` for plain framing and
+`osdp_sc_max_payload` for Secure Channel. Each takes a frame *shape* (header
+fields only, payload ignored).
+
+---
+
 ## Getting started
 
 This section gets you from nothing to a PD that stays online and answers
@@ -232,7 +341,9 @@ typedef struct osdp_pd_reply {
 The payload buffer must stay valid only until the handler returns — the PD
 copies it into its own TX scratch before transmitting. The usual pattern
 is a scratch buffer inside your own application-state struct (pointed to
-by `user`), sized at most `OSDP_PD_TX_BUF_LEN`.
+by `user`), sized at most `OSDP_PD_BUF_LEN`. Pointing the reply back at the
+payload the handler was given is also fine; the PD never frames a reply over
+the buffer the command arrived in.
 
 ### Replies that carry data
 
@@ -303,23 +414,32 @@ OSDP is strictly master-slave: a PD **never** transmits spontaneously. So
 anything the device wants to tell the ACU — a card was presented (`RAW`),
 a key was pressed (`KEYPAD`), tamper/power changed (`LSTATR`) — has to
 wait for the next `OSDP_CMD_POLL` and be returned *in place of* the usual
-`ACK`. The natural implementation is an application-side FIFO that your
-POLL handler drains one entry per poll:
+`ACK`.
+
+The library has a queue for exactly this. Bind caller-owned storage once, and
+enqueue from wherever the card read or keypress is actually detected:
 
 ```c
-case OSDP_CMD_POLL: {
-    event_t ev;
-    if (event_queue_pop_fresh(&app->events, now_ms, &ev)) {
-        reply->code        = ev.code;       /* RAW / KEYPAD / LSTATR … */
-        reply->payload     = ev.payload;
-        reply->payload_len = ev.payload_len;
-    } else {
-        reply->code = OSDP_REPLY_ACK;       /* nothing pending */
-        reply->payload = NULL; reply->payload_len = 0;
-    }
-    return OSDP_OK;
+static uint8_t event_queue[512];
+osdp_pd_set_event_queue(&pd, event_queue, sizeof(event_queue));
+
+/* ... in your card-reader ISR or polling loop ... */
+uint8_t body[16];
+size_t  len = 0;
+osdp_raw_build(&card, body, sizeof(body), &len);
+if (osdp_pd_enqueue_event(&pd, OSDP_REPLY_RAW, body, len)
+        == OSDP_ERR_BUFFER_TOO_SMALL) {
+    /* Queue full. Only you know whether this read mattered. */
 }
 ```
+
+The PD answers the next `osdp_POLL` with the head of the queue instead of
+calling your command handler; an empty queue falls through to `cmd_cb`
+unchanged, so adding this does not disturb an existing handler. Records are
+FIFO, and `osdp_pd_event_pending` tells you whether anything is waiting.
+
+You can still do it by hand in your POLL handler if you prefer — the queue is
+opt-in — but the library version already implements the discard rule below.
 
 ### Stale events must be discarded, not replayed
 
@@ -330,13 +450,18 @@ entries live forever, an ACU that stopped polling and reconnected later
 would receive a **stale** card-read and could grant access for a
 credential presented minutes ago — a replay risk.
 
-So stamp each event with the time it was enqueued and **drop it once it
-ages past a short freshness window** (the reference MCP PD uses a 2 s TTL,
-matching its "actively polling" definition). A queued read is delivered
-promptly while the link is actively polled, or discarded — reported on the
-next poll or not at all. Prune from the front of the FIFO on each POLL;
-with a uniform TTL, once you reach a fresh entry the rest are fresher
-still.
+The library queue implements the spec's own version of this rule: per spec
+7.11/7.12 "unreported data is deleted in case of, or during, a communication
+loss", so the whole queue is discarded on the offline transition. An ACU that
+stopped polling and reconnected never receives what was queued before the
+outage.
+
+That covers the outage case but not a *slow* link. If your deployment needs a
+tighter bound, stamp each event with the time it was enqueued and **drop it
+once it ages past a short freshness window** before calling
+`osdp_pd_enqueue_event` (the reference MCP PD uses a 2 s TTL, matching its
+"actively polling" definition), or call `osdp_pd_clear_events` yourself when
+you decide what is queued has gone stale.
 
 ### Exception: status reports reflect current state
 
@@ -353,6 +478,229 @@ initialization (the first poll after the PD comes up), then reflects
 steady state thereafter. Don't apply the credential-style TTL to it —
 losing the power-on indication to an expiry timer would hide a genuine
 device-state change.
+
+Because those four are queries about current state, they get their own
+mechanism — providers, not the queue. See the next section.
+
+---
+
+## Sanity-check your PDCAP — `osdp_pd_check_pdcap`
+
+PDCAP is a set of promises, and the ACU acts on them: told the PD accepts
+1440-byte messages, it will send them. Over-advertising doesn't fail loudly —
+the PD drops frames the ACU believes were delivered, and you see it weeks
+later as unexplained retries.
+
+Call this once at start-up with the same records your handler returns for
+`osdp_CAP`:
+
+```c
+size_t bad = 0;
+osdp_status_t s = osdp_pd_check_pdcap(&pd, my_caps, my_cap_count, &bad);
+if (s != OSDP_OK) {
+    log("PDCAP record %zu (function code %u) is inconsistent: %d",
+        bad, my_caps[bad].function_code, (int)s);
+}
+```
+
+It only checks the three records describing the *library's* limits — how many
+inputs your device has is your business, not something it can know:
+
+| Record | Flagged when |
+| --- | --- |
+| fn 9 Communication Security | claims AES128 but no crypto vtable and key are bound → `OSDP_ERR_NOT_SUPPORTED` |
+| fn 10 Receive BufferSize | exceeds the stream buffer, or — with SC configured — implies a plaintext larger than your bound `rx_plain` → `OSDP_ERR_BUFFER_TOO_SMALL` |
+| fn 11 Largest Combined Message Size | non-zero, while multi-part messages are unimplemented → `OSDP_ERR_NOT_SUPPORTED` |
+
+The second half of the fn 10 check is the one worth knowing about: a message
+that fits the wire can still be too large to *decrypt*, because SC plaintext
+lands in `rx_plain`. The frame arrives cleanly and then fails to unwrap, which
+looks like a MAC failure and isn't.
+
+**Watch the encoding.** Function codes 10 and 11 carry a 16-bit size as
+LSB-then-MSB across the two bytes named "compliance level" and "number of"
+everywhere else in Annex B. Filling them in as their names suggest is exactly
+the mistake this checker catches:
+
+```c
+size_record(10, 512)  /* -> compliance_level = 0x00, num_objects = 0x02 */
+```
+
+Purely advisory: it changes no wire behaviour, nothing calls it for you, and a
+PD that never calls it doesn't link it.
+
+---
+
+## Status reports — `osdp_pd_set_status_provider`
+
+`osdp_LSTAT` / `osdp_ISTAT` / `osdp_OSTAT` / `osdp_RSTAT` ask the PD to report
+device state. The reply layout is fixed by the spec, so the library builds it;
+you supply only the values:
+
+```c
+static void my_local(void *user, uint8_t *tamper, uint8_t *power)
+{
+    app_t *app = user;
+    *tamper = app->tamper_open ? OSDP_LSTATR_TAMPER : OSDP_LSTATR_NORMAL;
+    *power  = app->on_battery  ? OSDP_LSTATR_POWER_FAILURE
+                               : OSDP_LSTATR_NORMAL;
+}
+
+static size_t my_inputs(void *user, uint8_t *out, size_t cap)
+{
+    app_t *app = user;
+    size_t n = (app->input_count < cap) ? app->input_count : cap;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = app->inputs[i] ? OSDP_ISTATR_ACTIVE : OSDP_ISTATR_INACTIVE;
+    }
+    return n;                       /* how many you actually wrote */
+}
+
+static const osdp_pd_status_provider_t provider = {
+    .local  = my_local,
+    .inputs = my_inputs,
+    /* .outputs and .readers left NULL — see below */
+};
+osdp_pd_set_status_provider(&pd, &provider, app);
+```
+
+Three things worth knowing:
+
+- **Members are independent.** A NULL member leaves that one command falling
+  through to your `cmd_cb`. Above, `osdp_LSTAT` and `osdp_ISTAT` are answered
+  by the library while `osdp_OSTAT` and `osdp_RSTAT` still reach your handler.
+  With no provider bound at all, nothing changes — this is purely additive.
+- **`cap` is `OSDP_PD_REPLY_SCRATCH_LEN`** (64 by default, overridable). Write
+  at most that many and return the count; a return larger than `cap` is
+  clamped rather than trusted, so an off-by-one in your provider cannot make
+  the PD read past the buffer it handed you.
+- **Returning 0 is legal** — a PD with no inputs genuinely has nothing to
+  report, and an empty `osdp_ISTATR` is the correct answer.
+
+---
+
+## Saying "not yet" — `OSDP_ERR_BUSY`
+
+When a command is valid but the answer is not available within the ACU's
+200 ms reply window, return `OSDP_ERR_BUSY` and the PD sends `osdp_BUSY`
+(spec 7.19). The ACU repeats the command unchanged until it gets something
+else:
+
+```c
+case OSDP_CMD_MFG:
+    if (!app->measurement_ready) {
+        return OSDP_ERR_BUSY;       /* ask me again shortly */
+    }
+    ...
+```
+
+The library handles the three awkward parts for you: the reply goes out at
+sequence 0, in the clear even during an established Secure Channel (without
+disturbing the MAC chain), and is not cached as the retransmit answer — so the
+repeat gets processed fresh rather than replayed.
+
+Use `osdp_ACK` instead when the data will simply arrive on a later poll: the
+spec's rule is that `osdp_BUSY` is for when a *specific non-ACK response* is
+required and cannot be produced in time.
+
+---
+
+## Abort, receive size, and keep-active
+
+Three more commands the library handles for you:
+
+- **`osdp_ABORT`** cancels any in-flight file transfer before your optional
+  `osdp_pd_set_abort_handler` hook runs. Return non-OK from the hook if you
+  genuinely cannot stop — a firmware write past the point of no return — and
+  the PD sends NAK 0x03 as the spec directs.
+- **`osdp_ACURXSIZE`** is stored for you; read it with
+  `osdp_pd_acu_rx_size(&pd)`. This is the **ACU's** limit on what it can
+  receive, so the real budget for a reply is the smaller of it and
+  `osdp_pd_max_reply_payload(&pd)`, which is yours.
+- **`osdp_KEEPACTIVE`** needs `osdp_pd_set_keepactive_handler`. Without one
+  the PD NAKs 0x03 rather than ACK a reader extension it cannot perform.
+
+---
+
+## Manufacturer-specific messages — `osdp_MFG` → `osdp_MFGREP`
+
+Not intercepted, deliberately: the content is yours to define. Decode the
+request, check the vendor code is actually yours, and build the reply body:
+
+```c
+case OSDP_CMD_MFG: {
+    osdp_mfg_cmd_t req;
+    if (osdp_mfg_decode(payload, payload_len, &req) != OSDP_OK) {
+        return OSDP_ERR_BAD_PAYLOAD;              /* -> NAK 0x02 */
+    }
+    if (memcmp(req.vendor_code, MY_VENDOR, 3) != 0) {
+        return OSDP_ERR_INVALID_ARG;              /* -> NAK 0x09 */
+    }
+    osdp_mfgrep_t rep = { .data = answer, .data_len = sizeof(answer) };
+    memcpy(rep.vendor_code, MY_VENDOR, 3);
+    size_t built = 0;
+    if (osdp_mfgrep_build(&rep, app->scratch, sizeof(app->scratch),
+                          &built) != OSDP_OK) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    reply->code        = OSDP_REPLY_MFGREP;
+    reply->payload     = app->scratch;
+    reply->payload_len = built;
+    return OSDP_OK;
+}
+```
+
+`osdp_MFGREP` may also be sent unprompted as a poll response — enqueue it with
+`osdp_pd_enqueue_event` like any other event.
+
+### When the vendor data doesn't fit one frame
+
+Use the spec's standard multi-part format (5.10). A fragmented `osdp_MFG`
+payload is:
+
+```
+vendor_code[3] || MpSizeTotal,MpOffset,MpFragmentSize[6] || fragment bytes
+```
+
+The vendor code sits *outside* the fragmentation and repeats on every
+fragment, so you can refuse a transfer that isn't yours at the **first**
+fragment instead of reassembling someone else's message to find out.
+
+Bind a reassembly buffer and the library handles the sequencing:
+
+```c
+static uint8_t mfg_buf[2048];
+
+static osdp_status_t on_mfg(void *user, const uint8_t *vendor_code,
+                            const uint8_t *data, size_t data_len,
+                            osdp_pd_reply_t *reply)
+{
+    /* Called once, with the whole vendor message and no Mp headers. */
+    return handle_my_vendor_message(data, data_len) ? OSDP_OK
+                                                    : OSDP_ERR_INVALID_ARG;
+}
+
+osdp_pd_set_mfg_receiver(&pd, mfg_buf, sizeof(mfg_buf), on_mfg, app);
+```
+
+Intermediate fragments are ACKed; your callback fires once, on the last one.
+Gaps, a changed total, or a continuation with nothing in progress are answered
+`NAK 0x09` — which spec 5.10.2 says aborts the ACU's sequence — and the
+reassembler resets so a restart at offset 0 works. An early-termination marker
+(the ACU giving up) discards the partial message and ACKs. `osdp_ABORT`
+terminates a transfer too.
+
+**One thing you must know:** nothing on the wire distinguishes a 6-byte
+multi-part header from six bytes of ordinary vendor data. Table 27 defines no
+multi-part fields for `osdp_MFG`, so this cannot be auto-detected. **Binding
+the receiver is your declaration that your vendor protocol uses the standard
+format.** Leave it unbound and payloads stay opaque, reaching your command
+handler exactly as before — so adding this never changes an existing PD's
+behaviour by accident.
+
+If you advertise PDCAP function code 11 (Largest Combined Message Size), bind
+a buffer at least that large; `osdp_pd_check_pdcap` will tell you if you
+haven't.
 
 ---
 

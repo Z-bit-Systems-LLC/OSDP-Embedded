@@ -134,7 +134,172 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
 
-## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
+## Buffer sizing and working buffers
+
+**One constant per role.** `OSDP_PD_BUF_LEN` (512) and `OSDP_ACU_BUF_LEN`
+(1440), both `#ifndef`-guarded so a build can override with `-D` or CMake
+`target_compile_definitions`, size every working buffer in `osdp_pd_t` /
+`osdp_acu_t`. A device is a PD or an ACU, rarely both, so one knob per role is
+enough. The roles default differently on purpose: a PD is the constrained end,
+an ACU is normally a host and is the side that receives whatever any PD sends.
+
+The same constant is what the role should advertise to its peer — the PD's
+**PDCAP function code 10** and the ACU's **`osdp_ACURXSIZE`** — so a device
+cannot promise more than it can hold.
+
+`OSDP_STREAM_BUFFER_LEN` (1440 = spec max) is separate and also overridable:
+it is *wire-level* reassembly, big enough to resync through any legal frame
+including traffic addressed to other devices, as distinct from the message
+size a role processes.
+
+`osdp_pd_set_buffers(pd, &bufs)` rebinds any subset at caller-owned storage at
+run time (a NULL member leaves that region alone; an undersized one returns
+`OSDP_ERR_BUFFER_TOO_SMALL` and applies nothing):
+
+- **`tx`** — outbound frame and the bytes handed to `transport.write()`.
+- **`rx_plain`** — decrypted plaintext of an inbound SCS_17 command. **Must
+  not alias `tx`**: the reply an application returns may point into this
+  plaintext, and the SC wrap then reads it while writing the outbound frame.
+- **`rpl_cache` / `cmd_cache`** — the spec-5.9 retransmit caches. Rebinding
+  either clears it, costing one retransmit processed fresh.
+
+Every internal user goes through `pd->tx` / `pd->tx_cap`, never the arrays or
+`sizeof()` — a path reaching for `pd->tx_buf` directly keeps passing
+field-inspection tests while writing to the wrong memory.
+
+**No fixed internal ceilings on the Secure Channel path.**
+`osdp_sc_wrap_frame` used to encrypt through a 256-byte stack scratch, capping
+every SC message there however much capacity was bound. It now encrypts
+directly into the output at the offset `osdp_frame_payload_offset` reports;
+`osdp_frame_build` detects a payload pointer already equal to its destination
+and skips the copy (self-`memcpy` is UB, so this is a check, not a
+coincidence).
+
+**Sizing helpers — use these instead of deriving overhead by hand:**
+`osdp_frame_max_payload` (plain framing), `osdp_sc_max_payload` (less spec
+D.4.5 padding, which always claims at least one byte then rounds to an AES
+block), and `osdp_pd_max_reply_payload(pd)` (what this PD can send right now,
+resolved against bound TX capacity and the live channel). Every one of their
+tests checks the answer against what `build`/`wrap` actually accepts — the
+reported maximum must succeed, one more byte must fail.
+
+## PD command dispatch — one path for every channel
+
+`pd/src/pd_dispatch.c::osdp_pd_internal_dispatch` decides the reply for one
+accepted command, whatever channel carried it. Plaintext and Secure Channel
+both funnel through it once the payload is in the clear; each caller then
+frames the result its own way, which is the only thing that legitimately
+differs. Anything added here works on both channels at once.
+
+It returns an `osdp_pd_dispatch_outcome_t`: `SEND` (frame `*reply` on the
+inbound channel — **refusals are `SEND`**, a NAK is an ordinary reply), `DROP`
+(no reply at all; only an unrecognised handler error), and `BUSY`.
+
+**Application handler status → wire reply (spec Table 47).** Before this
+mapping, anything other than `OSDP_OK` / `OSDP_ERR_NOT_SUPPORTED` was dropped
+silently and the ACU spent a full reply timeout learning nothing:
+
+| `cmd_cb` returns | PD sends |
+| --- | --- |
+| `OSDP_OK` | the reply the handler filled in |
+| `OSDP_ERR_NOT_SUPPORTED` | `osdp_NAK` 0x03 unknown command |
+| `OSDP_ERR_BAD_PAYLOAD` / `_BAD_LENGTH` | `osdp_NAK` 0x02 bad length |
+| `OSDP_ERR_INVALID_ARG` | `osdp_NAK` 0x09 unable to process record |
+| `OSDP_ERR_BUSY` | `osdp_BUSY` (appended to `osdp_status_t` as 11) |
+| anything else | nothing — silent drop survives as an escape hatch |
+
+**`osdp_BUSY` is the one reply that leaves its channel.** Spec 7.19 puts three
+rules on it, all centralised in `pd.c::osdp_pd_internal_build_busy`: sequence
+number **always 0**; **plaintext even during an established Secure Channel**,
+without advancing the MAC chain (which is why the SC path returns before its
+wrap rather than framing it itself — one of only three replies allowed outside
+the SCS format, with `osdp_NAK` 0x01 and 0x06); and **not cached** as the
+retransmit answer (`pd->reply_cacheable`), because the ACU repeats the command
+in its original form.
+
+## PD status providers and the poll-response event queue
+
+**Status providers** (`osdp_pd_set_status_provider`) answer osdp_LSTAT /
+ISTAT / OSTAT / RSTAT. The reply *layout* is the spec's business and the
+*values* are the application's. Every member is independent and optional: a
+NULL member leaves that one command falling through to `cmd_cb`, so existing
+consumers that hand-build their own osdp_LSTATR keep working. The
+array-valued members are capped at `OSDP_PD_REPLY_SCRATCH_LEN` (64) items and
+an over-reporting provider is clamped rather than trusted.
+
+**The event queue** (`osdp_pd_set_event_queue` / `osdp_pd_enqueue_event`)
+holds the "sent as a poll response" replies — osdp_RAW, osdp_FMT,
+osdp_KEYPAD, osdp_MFGREP — until the ACU next polls. Caller-owned storage, no
+malloc. Records are `[u16 len][u8 code][payload]` laid out from offset 0, and
+it is deliberately **not** a wrapping ring: a wrap would split a payload
+across the buffer end, and the dequeue hands the payload to the framer as a
+contiguous slice. Dequeue compacts what remains instead. An empty queue falls
+through to `cmd_cb`. Per spec 7.11/7.12 the queue is emptied on the offline
+transition — delivering a credential read from before an outage would have the
+ACU act on a stale presentation.
+
+## Multi-part messages (spec 5.10)
+
+`core/src/shared/multipart.c` + `osdp_multipart.h` (`osdp_mp_*`). Header:
+`MpSizeTotal(2) || MpOffset(2) || MpFragmentSize(2)`, little-endian, then the
+fragment bytes.
+
+5.10.2 rules implemented: sequential with no gaps; first fragment at offset 0
+(which also makes a retry idempotent — offset 0 restarts rather than
+erroring); and **early termination**, where a sender abandons a transfer by
+setting MpOffset at or past MpSizeTotal with MpFragmentSize 0.
+`osdp_mp_reasm_push` reports `OSDP_MP_TERMINATED` and discards the partial
+message. Two subtleties:
+
+- The marker must be recognised **before** the "cannot extend past
+  MpSizeTotal" bounds check, since sitting at or past the end is exactly what
+  identifies it.
+- **MpSizeTotal 0 does not count.** Read literally an all-zero header is a
+  valid marker, but a transfer declaring no bytes has nothing to terminate,
+  and all-zeros is the shape a truncated frame takes — treating it as a marker
+  would turn a malformed payload into a silent ACK instead of the NAK 0x09 it
+  deserves.
+
+Any sequencing violation is reported to the caller, which answers
+`osdp_NAK 0x09` — spec 5.10.2 says that reply aborts the sender's sequence.
+
+**`osdp_MFG` is the one in-scope v2.2 message that uses it.** Every other
+multi-part message (osdp_PIVDATAR 7.20, osdp_GENAUTHR 7.21, osdp_CRAUTHR,
+transparent-mode osdp_XWR/XRD) is in the deferred credential set. Fragmented
+MFG is `vendor_code[3] || Mp[6] || fragment`, with the vendor code **outside**
+the fragmentation and repeated on every fragment, so a PD can tell whether a
+transfer is addressed to it before committing buffer.
+
+**Nothing on the wire distinguishes a multi-part header from six bytes of
+ordinary vendor data** — Table 27 defines no multi-part fields for osdp_MFG —
+so it cannot be auto-detected. Binding `osdp_pd_set_mfg_receiver` IS the
+manufacturer's declaration that its protocol uses the standard format; leave
+it unbound and MFG payloads stay opaque and reach `cmd_cb` unchanged. A
+mid-transfer vendor-code switch is rejected rather than merged.
+
+## PDCAP consistency (advisory)
+
+`osdp_pd_check_pdcap` validates an application's capability records against
+what the library can honour. Own TU, so an application that never calls it
+does not link it; no wire behaviour, nothing calls it automatically.
+
+Only three records are checked — the ones describing the *library's* limits,
+since the rest describe the device: function code 9 claiming AES128 with no
+crypto vtable/key bound; function code 10 exceeding `OSDP_STREAM_BUFFER_LEN`,
+or (with SC configured) implying a plaintext larger than the bound `rx_plain`;
+function code 11 non-zero with no multi-part reassembly buffer bound, or
+larger than the one that is. Returns the offending record's index.
+
+The fn-10-under-SC half is the non-obvious one: a message that fits the wire
+can still be too large to *decrypt*, because SC plaintext lands in
+`rx_plain`. The frame arrives cleanly and then fails to unwrap, which reads as
+a MAC failure and isn't.
+
+**Codes 10 and 11 encode a 16-bit size as LSB-then-MSB** across the two bytes
+Annex B names "compliance level" and "number of" everywhere else. Filling them
+in as the names suggest is precisely the mistake this checker exists to catch.
+
+## Library-handled commands (KEYSET, COMSET, FILETRANSFER, ABORT, ACURXSIZE, KEEPACTIVE)
 
 Most commands flow to the application's `osdp_pd_command_cb`, which chooses
 the reply. A few are intercepted by the PD state machine itself because they
@@ -211,6 +376,24 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   SC it wraps as SCS_18. Deferred while the callback is synchronous: the
   "finishing" (status 3) idle-fragment protocol and `FtUpdateMsgMax` throttling
   (the PD always reports `update_msg_max = 0`).
+- **`osdp_ABORT`** — handled entirely by the core. It tears down the
+  file-transfer and multi-part state the spec requires terminated (6.22), then
+  runs the optional `osdp_pd_set_abort_handler` hook. ACK by default; a hook
+  returning non-OK becomes NAK 0x03, the spec's "PD unable to abort" case.
+- **`osdp_ACURXSIZE`** — handled entirely by the core: it stores the ACU's
+  declared receive capacity (`osdp_pd_acu_rx_size`, seeded to
+  `OSDP_PD_DEFAULT_ACU_RX_SIZE` = 128 per spec 6.26) and ACKs. The optional
+  hook is a notification, not a veto — refusing to believe the ACU about its
+  own buffer would only produce replies it drops. **This is the peer's limit**;
+  combine it with `osdp_pd_max_reply_payload` and honour the smaller.
+- **`osdp_KEEPACTIVE`** — decoded by the core, decided by the application via
+  `osdp_pd_set_keepactive_handler`. Unlike the hooks above, with **no** handler
+  the PD NAKs 0x03: holding a reader field energised is physical, so an ACK the
+  PD cannot honour would be a lie.
+- **`osdp_MFG` is deliberately NOT intercepted** unless a multi-part receiver
+  is bound. The content is vendor-defined, so it flows to `cmd_cb`, which
+  returns `reply.code = OSDP_REPLY_MFGREP` with a body built by
+  `osdp_mfgrep_build`.
 
 ## Coding rules
 

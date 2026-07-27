@@ -31,7 +31,17 @@ typedef enum osdp_status {
     OSDP_ERR_BAD_PAYLOAD,        /* payload length wrong for command/reply */
 
     /* Capability errors. */
-    OSDP_ERR_NOT_SUPPORTED       /* feature recognised but not implemented */
+    OSDP_ERR_NOT_SUPPORTED,      /* feature recognised but not implemented */
+
+    /* Temporary refusal. Appended rather than grouped so every value above
+     * keeps its number — the Rust mirror in rust/osdp/src/sys.rs pins these
+     * as explicit integers.
+     *
+     * Returned by an application command handler that cannot answer yet:
+     * the PD emits osdp_BUSY (spec 7.19) and the ACU repeats the command in
+     * its original form. Distinct from an error — the command was valid and
+     * will be answered on a later attempt. */
+    OSDP_ERR_BUSY                /* not ready; retry the same command      */
 } osdp_status_t;
 
 #ifdef __cplusplus
