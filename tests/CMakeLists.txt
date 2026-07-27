@@ -94,6 +94,12 @@ target_link_libraries(test_pd_buffers PRIVATE
     osdp_core osdp_messages osdp_pd unity)
 add_test(NAME test_pd_buffers COMMAND test_pd_buffers)
 
+# Advisory PDCAP consistency check.
+add_executable(test_pd_pdcap test_pd_pdcap.c)
+target_link_libraries(test_pd_pdcap PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_pdcap COMMAND test_pd_pdcap)
+
 # Status providers (osdp_LSTAT / ISTAT / OSTAT / RSTAT).
 add_executable(test_pd_status test_pd_status.c)
 target_link_libraries(test_pd_status PRIVATE
