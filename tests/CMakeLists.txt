@@ -38,6 +38,36 @@ target_link_libraries(test_pd PRIVATE
     osdp_core osdp_messages osdp_pd unity)
 add_test(NAME test_pd COMMAND test_pd)
 
+# Multi-part message transport (spec 5.10) — core-only, no PD needed.
+add_executable(test_multipart test_multipart.c)
+target_link_libraries(test_multipart PRIVATE osdp_core unity)
+add_test(NAME test_multipart COMMAND test_multipart)
+
+# Caller-supplied working buffers (osdp_pd_set_buffers).
+add_executable(test_pd_buffers test_pd_buffers.c)
+target_link_libraries(test_pd_buffers PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_buffers COMMAND test_pd_buffers)
+
+# Advisory PDCAP consistency check.
+add_executable(test_pd_pdcap test_pd_pdcap.c)
+target_link_libraries(test_pd_pdcap PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_pdcap COMMAND test_pd_pdcap)
+
+# Status providers (osdp_LSTAT / ISTAT / OSTAT / RSTAT).
+add_executable(test_pd_status test_pd_status.c)
+target_link_libraries(test_pd_status PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_status COMMAND test_pd_status)
+
+# Poll-response event queue, osdp_BUSY, the Table 47 NAK mapping, and
+# multi-part osdp_MFG.
+add_executable(test_pd_events test_pd_events.c)
+target_link_libraries(test_pd_events PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_events COMMAND test_pd_events)
+
 # ACU-side tests need the osdp_acu library in addition to the core.
 add_executable(test_acu test_acu.c)
 target_link_libraries(test_acu PRIVATE

@@ -7,12 +7,37 @@
 
 #include <string.h>
 
-/* Internal scratch sized to match the PD/ACU TX buffer. Holds the
- * encrypted payload between the encrypt step and the frame build for
- * SCS_17/18 frames. 256 bytes is enough for the baseline message set
- * even after worst-case padding; can grow alongside OSDP_PD_TX_BUF_LEN
- * if extended message types arrive. */
-#define OSDP_SC_WRAP_SCRATCH_LEN 256U
+osdp_status_t osdp_sc_max_payload(const osdp_frame_t *shape,
+                                  size_t buf_cap,
+                                  size_t *out_max_payload)
+{
+    if (shape == NULL || out_max_payload == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    size_t framed = 0;
+    const osdp_status_t s = osdp_frame_max_payload(shape, buf_cap, &framed);
+    if (s != OSDP_OK) {
+        return s;
+    }
+
+    if (!shape->has_scb || !osdp_scb_is_encrypted(shape->scb_type)) {
+        /* SCS_15/16 carry the payload in the clear under a MAC — no
+         * ciphertext expansion, so the framing answer stands. */
+        *out_max_payload = framed;
+        return OSDP_OK;
+    }
+
+    /* `framed` is how much CIPHERTEXT fits. Ciphertext is the plaintext
+     * padded per spec D.4.5: always at least one byte (0x80) added, then
+     * rounded up to a whole AES block. So the usable ciphertext is the
+     * largest whole number of blocks that fits, and the plaintext is one
+     * byte less than that — the pad marker always claims a byte, even when
+     * the plaintext already lands on a block boundary. */
+    const size_t whole_blocks = framed / OSDP_AES_BLOCK_LEN;
+    *out_max_payload =
+        (whole_blocks == 0) ? 0u : (whole_blocks * OSDP_AES_BLOCK_LEN) - 1u;
+    return OSDP_OK;
+}
 
 osdp_status_t osdp_sc_wrap_frame(
     const osdp_sc_crypto_t  *crypto,
@@ -76,17 +101,39 @@ osdp_status_t osdp_sc_wrap_frame(
         }
     }
 
-    uint8_t encrypt_scratch[OSDP_SC_WRAP_SCRATCH_LEN];
     if (osdp_scb_is_encrypted(built.scb_type)) {
-        size_t enc_len = 0;
-        const osdp_status_t s = osdp_sc_encrypt_payload(
-            crypto, session->keys.s_enc, session->last_inbound_mac,
-            plain_template->payload, plain_template->payload_len,
-            encrypt_scratch, sizeof(encrypt_scratch), &enc_len);
+        /* Encrypt straight into the ciphertext's final position in `out_buf`
+         * rather than through a scratch array. A fixed scratch would cap
+         * every Secure Channel message at its size no matter how much output
+         * capacity the caller supplied, and sizing it for the spec maximum
+         * would put 1440 bytes on the stack of every wrap call — unacceptable
+         * on the MCUs this library targets. Writing in place costs neither.
+         *
+         * osdp_frame_payload_offset owns the layout arithmetic, and
+         * osdp_frame_build recognises a payload pointer that already equals
+         * its destination and skips the copy. osdp_sc_encrypt_payload
+         * documents that its plaintext may alias its ciphertext (it memmoves
+         * before appending padding), which is what makes the SCS_17/18 case
+         * — where the plaintext is elsewhere and only the padding is written
+         * here — safe either way. */
+        size_t payload_off = 0;
+        osdp_status_t s = osdp_frame_payload_offset(&built, &payload_off);
         if (s != OSDP_OK) {
             return s;
         }
-        built.payload     = encrypt_scratch;
+        if (payload_off >= out_cap) {
+            return OSDP_ERR_BUFFER_TOO_SMALL;
+        }
+
+        size_t enc_len = 0;
+        s = osdp_sc_encrypt_payload(
+            crypto, session->keys.s_enc, session->last_inbound_mac,
+            plain_template->payload, plain_template->payload_len,
+            out_buf + payload_off, out_cap - payload_off, &enc_len);
+        if (s != OSDP_OK) {
+            return s;
+        }
+        built.payload     = out_buf + payload_off;
         built.payload_len = enc_len;
     }
 

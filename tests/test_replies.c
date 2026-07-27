@@ -446,6 +446,212 @@ static void test_ftstat_build_rejects_small_buffer(void)
  * Registration
  * ====================================================================== */
 
+/* ========================================================================
+ * osdp_BUSY — empty payload
+ *
+ * The interesting parts of osdp_BUSY (SQN always 0, sent in the clear under
+ * Secure Channel, never cached as the retransmit reply) live in the PD state
+ * machine, not here. The codec's whole job is to carry no data.
+ * ====================================================================== */
+
+static void test_busy_is_empty_payload(void)
+{
+    size_t  w = 999;
+    uint8_t buf[4];
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_busy_build(buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_busy_decode(NULL, 0));
+    static const uint8_t stray[1] = { 0x00 };
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_busy_decode(stray, 1));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_busy_build(buf, sizeof(buf), NULL));
+}
+
+/* ========================================================================
+ * osdp_FMT
+ * ====================================================================== */
+
+static void test_fmt_round_trip(void)
+{
+    static const uint8_t chars[] = { '1', '2', '3', '4', '5' };
+    osdp_fmt_t in = {
+        .reader_no  = 0x00,
+        .direction  = OSDP_FMT_DIR_FORWARD,
+        .char_count = (uint8_t)sizeof(chars),
+        .chars      = chars,
+        .chars_len  = sizeof(chars),
+    };
+    uint8_t buf[32];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_fmt_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FMT_HEADER_BYTES + sizeof(chars), w);
+    TEST_ASSERT_EQUAL_HEX8(0x00, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_FMT_DIR_FORWARD, buf[1]);
+    TEST_ASSERT_EQUAL_HEX8(sizeof(chars), buf[2]);
+
+    osdp_fmt_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_fmt_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(in.reader_no, got.reader_no);
+    TEST_ASSERT_EQUAL_HEX8(in.direction, got.direction);
+    TEST_ASSERT_EQUAL_UINT8(in.char_count, got.char_count);
+    TEST_ASSERT_EQUAL_size_t(sizeof(chars), got.chars_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(chars, got.chars, sizeof(chars));
+}
+
+static void test_fmt_round_trip_zero_chars(void)
+{
+    osdp_fmt_t in = { .reader_no = 0x00, .direction = OSDP_FMT_DIR_REVERSE,
+                      .char_count = 0, .chars = NULL, .chars_len = 0 };
+    uint8_t buf[8];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_fmt_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_FMT_HEADER_BYTES, w);
+
+    osdp_fmt_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_fmt_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_UINT8(0, got.char_count);
+    TEST_ASSERT_NULL(got.chars);
+}
+
+/* The count field must agree with the bytes actually present, so a frame
+ * padded or truncated in transit is rejected rather than mis-parsed. */
+static void test_fmt_decode_rejects_count_mismatch(void)
+{
+    static const uint8_t claims_five[] = { 0x00, 0x01, 0x05, 'a', 'b' };
+    osdp_fmt_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_fmt_decode(claims_five, sizeof(claims_five), &got));
+
+    static const uint8_t claims_one[] = { 0x00, 0x01, 0x01, 'a', 'b' };
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_fmt_decode(claims_one, sizeof(claims_one), &got));
+}
+
+static void test_fmt_decode_rejects_short_header(void)
+{
+    static const uint8_t two[2] = { 0x00, 0x01 };
+    osdp_fmt_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_fmt_decode(two, 2, &got));
+}
+
+static void test_fmt_build_rejects_inconsistent_length_fields(void)
+{
+    static const uint8_t chars[] = { 'x', 'y' };
+    osdp_fmt_t in = { .reader_no = 0, .direction = OSDP_FMT_DIR_FORWARD,
+                      .char_count = 5,          /* disagrees with chars_len */
+                      .chars = chars, .chars_len = sizeof(chars) };
+    uint8_t buf[16];
+    size_t  w = 999;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_fmt_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+}
+
+/* ========================================================================
+ * osdp_MFGREP
+ * ====================================================================== */
+
+static void test_mfgrep_round_trip(void)
+{
+    static const uint8_t vendor_data[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    osdp_mfgrep_t in = {
+        .vendor_code = { 0x5A, 0x42, 0x43 },
+        .data        = vendor_data,
+        .data_len    = sizeof(vendor_data),
+    };
+    uint8_t buf[32];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgrep_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFGREP_HEADER_BYTES + sizeof(vendor_data), w);
+    TEST_ASSERT_EQUAL_HEX8(0x5A, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x42, buf[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x43, buf[2]);
+
+    osdp_mfgrep_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgrep_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(in.vendor_code, got.vendor_code,
+                                 OSDP_MFGREP_VENDOR_CODE_BYTES);
+    TEST_ASSERT_EQUAL_size_t(sizeof(vendor_data), got.data_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(vendor_data, got.data, sizeof(vendor_data));
+}
+
+static void test_mfgrep_round_trip_no_data(void)
+{
+    osdp_mfgrep_t in = { .vendor_code = { 1, 2, 3 },
+                         .data = NULL, .data_len = 0 };
+    uint8_t buf[8];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgrep_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFGREP_HEADER_BYTES, w);
+
+    osdp_mfgrep_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgrep_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_size_t(0, got.data_len);
+    TEST_ASSERT_NULL(got.data);
+}
+
+static void test_mfgrep_decode_rejects_truncated_vendor_code(void)
+{
+    static const uint8_t two[2] = { 0x5A, 0x42 };
+    osdp_mfgrep_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfgrep_decode(two, 2, &got));
+}
+
+static void test_mfgrep_build_rejects_small_buffer(void)
+{
+    static const uint8_t data[4] = { 1, 2, 3, 4 };
+    osdp_mfgrep_t in = { .vendor_code = { 1, 2, 3 },
+                         .data = data, .data_len = sizeof(data) };
+    uint8_t buf[OSDP_MFGREP_HEADER_BYTES + 3];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_mfgrep_build(&in, buf, sizeof(buf), &w));
+}
+
+/* ========================================================================
+ * osdp_MFGSTATR / osdp_MFGERRR — one vendor byte each, both deprecated
+ * ====================================================================== */
+
+static void test_mfgstatr_round_trip(void)
+{
+    osdp_mfgstatr_t in = { .data = 0xA7 };
+    uint8_t buf[OSDP_MFGSTATR_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgstatr_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFGSTATR_PAYLOAD_BYTES, w);
+    TEST_ASSERT_EQUAL_HEX8(0xA7, buf[0]);
+
+    osdp_mfgstatr_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgstatr_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(in.data, got.data);
+}
+
+static void test_mfgerrr_round_trip(void)
+{
+    osdp_mfgerrr_t in = { .data = 0x5C };
+    uint8_t buf[OSDP_MFGERRR_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgerrr_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFGERRR_PAYLOAD_BYTES, w);
+    TEST_ASSERT_EQUAL_HEX8(0x5C, buf[0]);
+
+    osdp_mfgerrr_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfgerrr_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8(in.data, got.data);
+}
+
+static void test_mfgstatr_and_mfgerrr_reject_wrong_size(void)
+{
+    static const uint8_t two[2] = { 0x01, 0x02 };
+    osdp_mfgstatr_t s;
+    osdp_mfgerrr_t  e;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfgstatr_decode(two, 2, &s));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfgstatr_decode(two, 0, &s));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfgerrr_decode(two, 2, &e));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfgerrr_decode(two, 0, &e));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -491,5 +697,22 @@ int main(void)
     RUN_TEST(test_ftstat_round_trip_negative_status);
     RUN_TEST(test_ftstat_decode_rejects_wrong_size);
     RUN_TEST(test_ftstat_build_rejects_small_buffer);
+    /* BUSY */
+    RUN_TEST(test_busy_is_empty_payload);
+    /* FMT (deprecated by spec; decoded for Monitor use) */
+    RUN_TEST(test_fmt_round_trip);
+    RUN_TEST(test_fmt_round_trip_zero_chars);
+    RUN_TEST(test_fmt_decode_rejects_count_mismatch);
+    RUN_TEST(test_fmt_decode_rejects_short_header);
+    RUN_TEST(test_fmt_build_rejects_inconsistent_length_fields);
+    /* MFGREP */
+    RUN_TEST(test_mfgrep_round_trip);
+    RUN_TEST(test_mfgrep_round_trip_no_data);
+    RUN_TEST(test_mfgrep_decode_rejects_truncated_vendor_code);
+    RUN_TEST(test_mfgrep_build_rejects_small_buffer);
+    /* MFGSTATR / MFGERRR (both deprecated by spec) */
+    RUN_TEST(test_mfgstatr_round_trip);
+    RUN_TEST(test_mfgerrr_round_trip);
+    RUN_TEST(test_mfgstatr_and_mfgerrr_reject_wrong_size);
     return UNITY_END();
 }

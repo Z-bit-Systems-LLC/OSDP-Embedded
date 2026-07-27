@@ -548,6 +548,210 @@ static void test_filetransfer_build_rejects_inconsistent_length(void)
  * Registration
  * ====================================================================== */
 
+/* ========================================================================
+ * Status report requests (osdp_LSTAT / ISTAT / OSTAT / RSTAT) and osdp_ABORT
+ *
+ * All five are empty-payload, so the whole contract is "accept nothing,
+ * reject anything". Driven through a shared checker rather than five copies:
+ * the point is that they behave identically, and one checker makes a
+ * divergence a failure instead of something you have to notice by reading.
+ * ====================================================================== */
+
+typedef osdp_status_t (*empty_decode_fn)(const uint8_t *, size_t);
+typedef osdp_status_t (*empty_build_fn)(uint8_t *, size_t, size_t *);
+
+static void check_empty_payload_codec(empty_decode_fn dec, empty_build_fn bld,
+                                      const char *name)
+{
+    size_t  w = 12345;
+    uint8_t buf[4];
+    TEST_ASSERT_EQUAL_MESSAGE(OSDP_OK, bld(buf, sizeof(buf), &w), name);
+    TEST_ASSERT_EQUAL_size_t_MESSAGE(0, w, name);
+
+    /* A zero-length payload decodes; anything else is malformed. */
+    TEST_ASSERT_EQUAL_MESSAGE(OSDP_OK, dec(NULL, 0), name);
+    static const uint8_t stray[1] = { 0x00 };
+    TEST_ASSERT_EQUAL_MESSAGE(OSDP_ERR_BAD_PAYLOAD, dec(stray, 1), name);
+
+    /* Building with nowhere to report the length is a caller bug. */
+    TEST_ASSERT_EQUAL_MESSAGE(OSDP_ERR_INVALID_ARG,
+                              bld(buf, sizeof(buf), NULL), name);
+}
+
+static void test_status_request_codecs_are_empty_payload(void)
+{
+    check_empty_payload_codec(osdp_lstat_decode, osdp_lstat_build, "LSTAT");
+    check_empty_payload_codec(osdp_istat_decode, osdp_istat_build, "ISTAT");
+    check_empty_payload_codec(osdp_ostat_decode, osdp_ostat_build, "OSTAT");
+    check_empty_payload_codec(osdp_rstat_decode, osdp_rstat_build, "RSTAT");
+}
+
+static void test_abort_is_empty_payload(void)
+{
+    check_empty_payload_codec(osdp_abort_decode, osdp_abort_build, "ABORT");
+}
+
+/* ========================================================================
+ * osdp_ACURXSIZE
+ * ====================================================================== */
+
+static void test_acurxsize_round_trip(void)
+{
+    osdp_acurxsize_cmd_t in = { .max_size = 1440u };
+    uint8_t buf[OSDP_ACURXSIZE_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acurxsize_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_ACURXSIZE_PAYLOAD_BYTES, w);
+    /* Little-endian on the wire (spec 5.5): 1440 = 0x05A0 -> A0 05. */
+    TEST_ASSERT_EQUAL_HEX8(0xA0, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x05, buf[1]);
+
+    osdp_acurxsize_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_acurxsize_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_UINT16(in.max_size, got.max_size);
+}
+
+static void test_acurxsize_decode_rejects_wrong_size(void)
+{
+    static const uint8_t three[3] = { 0x01, 0x02, 0x03 };
+    osdp_acurxsize_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_acurxsize_decode(three, 1, &got));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_acurxsize_decode(three, 3, &got));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_acurxsize_decode(NULL, 2, &got));
+}
+
+static void test_acurxsize_build_rejects_small_buffer(void)
+{
+    osdp_acurxsize_cmd_t in = { .max_size = 256u };
+    uint8_t buf[1];
+    size_t  w = 999;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_acurxsize_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+}
+
+/* ========================================================================
+ * osdp_KEEPACTIVE
+ * ====================================================================== */
+
+static void test_keepactive_round_trip(void)
+{
+    osdp_keepactive_cmd_t in = { .time_ms = 5000u };
+    uint8_t buf[OSDP_KEEPACTIVE_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_keepactive_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_KEEPACTIVE_PAYLOAD_BYTES, w);
+    TEST_ASSERT_EQUAL_HEX8(0x88, buf[0]);   /* 5000 = 0x1388 -> 88 13 */
+    TEST_ASSERT_EQUAL_HEX8(0x13, buf[1]);
+
+    osdp_keepactive_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_keepactive_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_UINT16(in.time_ms, got.time_ms);
+}
+
+/* Zero is a real value — cancel the extension — not an omission. */
+static void test_keepactive_round_trip_zero_time(void)
+{
+    osdp_keepactive_cmd_t in = { .time_ms = 0 };
+    uint8_t buf[OSDP_KEEPACTIVE_PAYLOAD_BYTES];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_keepactive_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_KEEPACTIVE_PAYLOAD_BYTES, w);
+
+    osdp_keepactive_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_keepactive_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_UINT16(0, got.time_ms);
+}
+
+static void test_keepactive_decode_rejects_wrong_size(void)
+{
+    static const uint8_t one[1] = { 0x10 };
+    osdp_keepactive_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD,
+                      osdp_keepactive_decode(one, 1, &got));
+}
+
+/* ========================================================================
+ * osdp_MFG
+ * ====================================================================== */
+
+static void test_mfg_round_trip(void)
+{
+    static const uint8_t vendor_data[] = { 0x42, 0xAA, 0x55, 0x00, 0xFF };
+    osdp_mfg_cmd_t in = {
+        .vendor_code = { 0x5A, 0x42, 0x43 },
+        .data        = vendor_data,
+        .data_len    = sizeof(vendor_data),
+    };
+    uint8_t buf[32];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFG_HEADER_BYTES + sizeof(vendor_data), w);
+    /* Vendor code goes out first-octet-first, unchanged. */
+    TEST_ASSERT_EQUAL_HEX8(0x5A, buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x42, buf[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x43, buf[2]);
+
+    osdp_mfg_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(in.vendor_code, got.vendor_code,
+                                 OSDP_MFG_VENDOR_CODE_BYTES);
+    TEST_ASSERT_EQUAL_size_t(sizeof(vendor_data), got.data_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(vendor_data, got.data, sizeof(vendor_data));
+}
+
+/* Vendor code with no data is well-formed: the shortest legal osdp_MFG. */
+static void test_mfg_round_trip_no_data(void)
+{
+    osdp_mfg_cmd_t in = { .vendor_code = { 0x00, 0x11, 0x22 },
+                          .data = NULL, .data_len = 0 };
+    uint8_t buf[8];
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MFG_HEADER_BYTES, w);
+
+    osdp_mfg_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_decode(buf, w, &got));
+    TEST_ASSERT_EQUAL_size_t(0, got.data_len);
+    TEST_ASSERT_NULL(got.data);
+}
+
+static void test_mfg_decode_rejects_truncated_vendor_code(void)
+{
+    static const uint8_t two[2] = { 0x5A, 0x42 };
+    osdp_mfg_cmd_t got;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfg_decode(two, 2, &got));
+    TEST_ASSERT_EQUAL(OSDP_ERR_BAD_PAYLOAD, osdp_mfg_decode(two, 0, &got));
+}
+
+static void test_mfg_build_rejects_inconsistent_data(void)
+{
+    osdp_mfg_cmd_t in = { .vendor_code = { 1, 2, 3 },
+                          .data = NULL, .data_len = 4 };   /* len, no pointer */
+    uint8_t buf[16];
+    size_t  w = 999;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_mfg_build(&in, buf, sizeof(buf), &w));
+    TEST_ASSERT_EQUAL_size_t(0, w);
+}
+
+static void test_mfg_build_rejects_small_buffer(void)
+{
+    static const uint8_t data[4] = { 1, 2, 3, 4 };
+    osdp_mfg_cmd_t in = { .vendor_code = { 1, 2, 3 },
+                          .data = data, .data_len = sizeof(data) };
+    uint8_t buf[OSDP_MFG_HEADER_BYTES + 3];   /* one byte short */
+    size_t  w = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_mfg_build(&in, buf, sizeof(buf), &w));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -593,5 +797,22 @@ int main(void)
     RUN_TEST(test_filetransfer_decode_rejects_short_header);
     RUN_TEST(test_filetransfer_decode_rejects_fragment_size_mismatch);
     RUN_TEST(test_filetransfer_build_rejects_inconsistent_length);
+    /* Status requests + ABORT (empty payload). */
+    RUN_TEST(test_status_request_codecs_are_empty_payload);
+    RUN_TEST(test_abort_is_empty_payload);
+    /* ACURXSIZE */
+    RUN_TEST(test_acurxsize_round_trip);
+    RUN_TEST(test_acurxsize_decode_rejects_wrong_size);
+    RUN_TEST(test_acurxsize_build_rejects_small_buffer);
+    /* KEEPACTIVE */
+    RUN_TEST(test_keepactive_round_trip);
+    RUN_TEST(test_keepactive_round_trip_zero_time);
+    RUN_TEST(test_keepactive_decode_rejects_wrong_size);
+    /* MFG */
+    RUN_TEST(test_mfg_round_trip);
+    RUN_TEST(test_mfg_round_trip_no_data);
+    RUN_TEST(test_mfg_decode_rejects_truncated_vendor_code);
+    RUN_TEST(test_mfg_build_rejects_inconsistent_data);
+    RUN_TEST(test_mfg_build_rejects_small_buffer);
     return UNITY_END();
 }

@@ -277,6 +277,23 @@ osdp_status_t osdp_sc_wrap_frame(
     size_t                   out_cap,
     size_t                  *out_len);
 
+/* Largest plaintext payload osdp_sc_wrap_frame will fit into `out_cap`, for
+ * a frame shaped like `*shape` (header fields only — see
+ * osdp_frame_max_payload, which this builds on).
+ *
+ * Smaller than the plain-frame answer for the encrypted SCB types, because
+ * spec D.4.5 padding always appends at least one byte (the 0x80 marker) and
+ * rounds up to the AES block size: a payload of exactly 16 bytes occupies 32
+ * on the wire. Call this rather than deriving it — the "always at least one
+ * pad byte" rule is the part that is easy to get wrong, and being one byte
+ * over silently costs a whole extra block.
+ *
+ * This is the per-fragment budget for splitting a large message across
+ * packets under Secure Channel. `*out_max_payload` may be 0. */
+osdp_status_t osdp_sc_max_payload(const osdp_frame_t *shape,
+                                  size_t buf_cap,
+                                  size_t *out_max_payload);
+
 /* Verify and unwrap an inbound SCS_15..18 frame.
  *
  * `frame` must already have come from a successful osdp_frame_decode

@@ -10,11 +10,84 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_pd.h"
 
+/* Which channel an accepted command arrived on. The unified dispatch is
+ * otherwise channel-agnostic; this only selects the KEYSET variant, because
+ * a future Secure Channel version rotating a different key size needs to be
+ * told apart from SC1's 16-byte AES-128 SCBK (key_type 0x01). A plaintext
+ * KEYSET rotates the SC1 key, which is what the pre-refactor code did. */
+typedef enum osdp_pd_channel {
+    OSDP_PD_CH_PLAIN = 0,
+    OSDP_PD_CH_SC1
+} osdp_pd_channel_t;
+
+/* What the caller should do with the result of a dispatch.
+ *
+ * Most commands produce a reply to frame on the channel that carried them,
+ * which is OSDP_PD_DISPATCH_SEND. The other two exist because a couple of
+ * outcomes cannot be expressed as "a reply on this channel":
+ *
+ *   DROP  the command produces no reply at all, and the ACU waits out its
+ *         timeout. Reserved for an unrecognised application error.
+ *   BUSY  osdp_BUSY, which the spec (7.19) requires to go out at sequence 0
+ *         and OUTSIDE the Secure Channel even during an established session.
+ *         The dispatch cannot frame that itself — it does not own framing —
+ *         so it says "BUSY" and each caller routes to the plaintext builder
+ *         instead of its own wrap. */
+typedef enum osdp_pd_dispatch_outcome {
+    OSDP_PD_DISPATCH_SEND = 0,
+    OSDP_PD_DISPATCH_DROP,
+    OSDP_PD_DISPATCH_BUSY
+} osdp_pd_dispatch_outcome_t;
+
+/* Build osdp_BUSY into the bound TX buffer for `cmd`: plaintext framing with
+ * sequence number 0, whatever channel the command arrived on. Centralises the
+ * three spec-7.19 rules so no caller has to remember them; the "do not cache"
+ * half is handled by pd->reply_cacheable, which this clears. Defined in pd.c. */
+osdp_status_t osdp_pd_internal_build_busy(osdp_pd_t          *pd,
+                                          const osdp_frame_t *cmd,
+                                          size_t             *out_len);
+
+/* Decide the reply for ONE accepted command, whatever channel carried it.
+ *
+ * This is the single place that knows what a command *means*: which commands
+ * the library handles itself (osdp_COMSET, osdp_FILETRANSFER), when to call
+ * the application handler, the KEYSET hook, and the reader-state observation.
+ * It knows nothing about framing, Secure Channel wrapping, or the SQN cache —
+ * each caller frames the result its own way (plaintext build_reply, Secure
+ * Channel osdp_sc_wrap_frame), which is the ONLY thing that legitimately
+ * differs between the paths.
+ *
+ * `payload` is always plaintext: the SC callers unwrap before calling.
+ *
+ * On OSDP_OK, *reply holds the code and payload to send. A library-built
+ * payload points into pd->reply_scratch, so it stays valid until the caller
+ * has framed it (and until the next dispatch call). An application-supplied
+ * payload points into whatever buffer cmd_cb handed back, whose lifetime the
+ * existing osdp_pd_command_cb contract already guarantees for that window.
+ *
+ * Refusals are ordinary results: they come back as _SEND with *reply set to
+ * the appropriate osdp_NAK. Only the two cases that cannot be framed as a
+ * reply on this channel get their own outcome — see
+ * osdp_pd_dispatch_outcome_t. */
+osdp_pd_dispatch_outcome_t osdp_pd_internal_dispatch(
+    osdp_pd_t        *pd,
+    osdp_pd_channel_t channel,
+    uint8_t           cmd_code,
+    const uint8_t    *payload,
+    size_t            payload_len,
+    osdp_pd_reply_t  *reply);
+
+/* Pop the head of the poll-response event queue into *reply, with the payload
+ * copied into pd->reply_scratch so it survives the dequeue. Returns false
+ * when the queue is empty or unbound, in which case *reply is untouched and
+ * the caller falls through to the application handler. Defined in pd.c. */
+bool osdp_pd_internal_dequeue_event(osdp_pd_t *pd, osdp_pd_reply_t *reply);
+
 /* Whether the PD has enough Secure Channel configuration to even
  * attempt the handshake. */
 bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd);
 
-/* Build a NAK reply into pd->tx_buf for `cmd` carrying `error_code`,
+/* Build a NAK reply into the bound TX buffer for `cmd` carrying `error_code`,
  * writing the frame length to *out_len. Defined in pd.c (wrapping the
  * static build_nak helper) and shared with the SC handlers in pd_sc.c. */
 osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
@@ -22,11 +95,20 @@ osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
                                          uint8_t             error_code,
                                          size_t             *out_len);
 
+/* Build an arbitrary reply (code + payload) into the bound TX buffer,
+ * mirroring inbound frame's address/sequence/integrity. Shared with the
+ * Secure Channel handler in pd_sc.c so both paths frame replies
+ * identically. */
+osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
+                                           const osdp_frame_t    *cmd,
+                                           const osdp_pd_reply_t *reply,
+                                           size_t                *out_len);
+
 /* Process a SCB-bearing inbound frame: handshake messages produce
- * inline replies (built into pd->tx_buf), operational SCS_15..18
+ * inline replies (built into the bound TX buffer), operational SCS_15..18
  * traffic dispatches into the existing application handler with
  * plaintext (in subsequent commits). Returns the byte count written
- * into pd->tx_buf, or 0 if no reply should be transmitted. */
+ * into the bound TX buffer, or 0 if no reply should be transmitted. */
 size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
                                           const osdp_frame_t *cmd);
 

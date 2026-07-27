@@ -354,9 +354,201 @@ static void test_unwrap_rejects_non_scs_15_through_18(void)
                              pt, sizeof(pt), &pt_len));
 }
 
+/* ---- Known-answer -------------------------------------------------------
+ *
+ * Every other wrap test here is a round-trip, which only proves wrap and
+ * unwrap agree with each other — both could be wrong in the same way and
+ * still pass. These pin the actual wire bytes.
+ *
+ * The vectors were captured from the implementation that encrypted through a
+ * private 256-byte scratch, immediately before it was changed to encrypt
+ * directly into the output buffer, and verified byte-identical across payload
+ * lengths 0/1/15/16/17/31/32/100/200 (every AES-block boundary) plus the
+ * rolling MAC chain. Keeping two of them means any future change to where or
+ * how the ciphertext is produced has to reproduce the same frame, not merely
+ * remain self-consistent. */
+static void test_wrap_scs17_matches_known_bytes(void)
+{
+    /* 16-byte payload: pads to two AES blocks, since spec D.4.5 always adds
+     * at least the 0x80 marker — the case most likely to break under a
+     * padding change. */
+    static const uint8_t kExpected[] = {
+        0xFF, 0x53, 0x05, 0x2E, 0x00, 0x0E, 0x02, 0x17, 0x6B, 0x2F, 0x21,
+        0x69, 0xA4, 0x31, 0x22, 0x31, 0x30, 0xE7, 0x67, 0x1A, 0xFA, 0x47,
+        0x65, 0x3E, 0x07, 0x11, 0xD2, 0x71, 0x1F, 0xFF, 0x4F, 0x93, 0x40,
+        0x91, 0x8C, 0x0F, 0xC3, 0xE8, 0x80, 0xE2, 0x43, 0x80, 0x6E, 0xAA,
+        0x07, 0x25, 0x17,
+    };
+    static const uint8_t kExpectedMac[OSDP_SC_MAC_LEN] = {
+        0x80, 0x6E, 0xAA, 0x07, 0x73, 0x33, 0xAB, 0x37,
+        0xEF, 0x4B, 0x0A, 0x40, 0xAE, 0x67, 0x7A, 0xD4,
+    };
+
+    uint8_t body[16];
+    for (size_t i = 0; i < sizeof(body); i++) {
+        body[i] = (uint8_t)(i * 7u);
+    }
+
+    osdp_sc_session_t s;
+    init_session(&s);
+
+    osdp_frame_t t;
+    (void)memset(&t, 0, sizeof(t));
+    t.address     = 0x05;
+    t.sequence    = 2;
+    t.integrity   = OSDP_INTEGRITY_CRC;
+    t.has_scb     = true;
+    t.scb_length  = OSDP_SCB_MIN_LEN;
+    t.scb_type    = OSDP_SCS_17;
+    t.code        = 0x6B;               /* osdp_TEXT */
+    t.payload     = body;
+    t.payload_len = sizeof(body);
+
+    uint8_t out[128];
+    size_t  n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &s, &t,
+                           out, sizeof(out), &n));
+
+    TEST_ASSERT_EQUAL_size_t(sizeof(kExpected), n);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(kExpected, out, sizeof(kExpected));
+    /* The rolling chain must advance identically too — a wrap that produced
+     * the right bytes but the wrong outbound MAC would desync the next
+     * message instead of failing here. */
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(kExpectedMac, s.last_outbound_mac,
+                                 OSDP_SC_MAC_LEN);
+}
+
+/* An empty payload takes the SCS_17→SCS_15 downgrade path and carries no
+ * ciphertext at all — the branch the in-place encryption skips entirely. */
+static void test_wrap_empty_payload_matches_known_bytes(void)
+{
+    static const uint8_t kExpected[] = {
+        0xFF, 0x53, 0x05, 0x0E, 0x00, 0x0E, 0x02, 0x15, 0x6B, 0x75, 0x67,
+        0x29, 0xA9, 0x3D, 0xDC,
+    };
+
+    osdp_sc_session_t s;
+    init_session(&s);
+
+    osdp_frame_t t;
+    (void)memset(&t, 0, sizeof(t));
+    t.address     = 0x05;
+    t.sequence    = 2;
+    t.integrity   = OSDP_INTEGRITY_CRC;
+    t.has_scb     = true;
+    t.scb_length  = OSDP_SCB_MIN_LEN;
+    t.scb_type    = OSDP_SCS_17;        /* coerced to SCS_15 when empty */
+    t.code        = 0x6B;
+    t.payload_len = 0;
+
+    uint8_t out[64];
+    size_t  n = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &s, &t,
+                           out, sizeof(out), &n));
+
+    TEST_ASSERT_EQUAL_size_t(sizeof(kExpected), n);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(kExpected, out, sizeof(kExpected));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_15, out[OSDP_FRAME_MARK_LEN + 6]);
+}
+
+/* ---- Sizing ---------------------------------------------------------------
+ *
+ * osdp_sc_max_payload tells a caller how much plaintext fits in one packet.
+ * It has to be exactly right in both directions: under-report and every
+ * fragment wastes capacity, over-report and the wrap fails at send time.
+ *
+ * The spec D.4.5 pad rule is the trap — padding always adds at least the
+ * 0x80 marker and then rounds to an AES block, so a 16-byte payload takes 32
+ * bytes of ciphertext. Rather than restate that arithmetic here (which would
+ * only prove the test agrees with itself), each case asks the helper and then
+ * checks the answer against what osdp_sc_wrap_frame actually accepts. */
+static void test_sc_max_payload_is_exactly_what_wrap_accepts(void)
+{
+    static uint8_t body[512];
+    (void)memset(body, 0x5A, sizeof(body));
+
+    /* A spread of capacities, deliberately including values that do not land
+     * on an AES block boundary once framing overhead is removed. */
+    const size_t caps[] = { 32, 48, 55, 64, 100, 128, 200, 333, 512 };
+
+    for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++) {
+        osdp_sc_session_t s;
+        init_session(&s);
+
+        osdp_frame_t f;
+        (void)memset(&f, 0, sizeof(f));
+        f.address    = 0x05;
+        f.sequence   = 1;
+        f.integrity  = OSDP_INTEGRITY_CRC;
+        f.has_scb    = true;
+        f.scb_length = OSDP_SCB_MIN_LEN;
+        f.scb_type   = OSDP_SCS_17;    /* encrypted: padding applies */
+        f.code       = 0x6B;           /* osdp_TEXT */
+
+        size_t max = 0;
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc_max_payload(&f, caps[c], &max));
+        TEST_ASSERT_LESS_THAN_size_t(sizeof(body), max);
+        if (max == 0) {
+            continue;   /* capacity too small for any payload — valid answer */
+        }
+
+        uint8_t out[512];
+        size_t  out_len = 0;
+
+        /* The reported maximum must wrap successfully into that capacity. */
+        osdp_sc_session_t s_max = s;
+        f.payload     = body;
+        f.payload_len = max;
+        TEST_ASSERT_EQUAL(OSDP_OK,
+            osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &s_max, &f,
+                               out, caps[c], &out_len));
+        TEST_ASSERT_LESS_OR_EQUAL_size_t(caps[c], out_len);
+
+        /* One byte more must not. This is where an off-by-one in the pad
+         * rule shows up: max+1 crosses into another 16-byte block. */
+        osdp_sc_session_t s_over = s;
+        f.payload_len = max + 1U;
+        TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+            osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &s_over, &f,
+                               out, caps[c], &out_len));
+    }
+}
+
+/* SCS_15/16 carry the payload in the clear under a MAC — no ciphertext
+ * expansion — so the answer there is the plain framing answer. */
+static void test_sc_max_payload_matches_framing_for_unencrypted_scb(void)
+{
+    osdp_frame_t f;
+    (void)memset(&f, 0, sizeof(f));
+    f.address    = 0x05;
+    f.integrity  = OSDP_INTEGRITY_CRC;
+    f.has_scb    = true;
+    f.scb_length = OSDP_SCB_MIN_LEN;
+    f.scb_type   = OSDP_SCS_15;
+    f.code       = 0x60;
+
+    size_t sc_max = 0, frame_max = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc_max_payload(&f, 128, &sc_max));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_max_payload(&f, 128, &frame_max));
+    TEST_ASSERT_EQUAL_size_t(frame_max, sc_max);
+
+    /* And it is strictly less than the encrypted variant would allow,
+     * confirming the padding deduction is actually being applied there. */
+    f.scb_type = OSDP_SCS_17;
+    size_t enc_max = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc_max_payload(&f, 128, &enc_max));
+    TEST_ASSERT_LESS_THAN_size_t(sc_max, enc_max);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_wrap_scs17_matches_known_bytes);
+    RUN_TEST(test_wrap_empty_payload_matches_known_bytes);
+    RUN_TEST(test_sc_max_payload_is_exactly_what_wrap_accepts);
+    RUN_TEST(test_sc_max_payload_matches_framing_for_unencrypted_scb);
     RUN_TEST(test_wrap_unwrap_scs15_round_trip);
     RUN_TEST(test_wrap_upgrades_scs15_to_scs17_when_payload_nonempty);
     RUN_TEST(test_wrap_upgrades_scs16_to_scs18_when_payload_nonempty);

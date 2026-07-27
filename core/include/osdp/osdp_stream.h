@@ -44,7 +44,19 @@ extern "C" {
  * the middle of a real frame loses at most one frame, not the
  * connection. */
 
+/* Inbound reassembly capacity. Defaults to the spec 5.6 maximum (1440) so the
+ * decoder can resync through any legal frame on the wire, including ones
+ * addressed to other devices. Override at build time
+ * (-DOSDP_STREAM_BUFFER_LEN=..., or CMake target_compile_definitions) when
+ * the deployment's traffic is bounded well below that and the RAM matters —
+ * this array is the single largest field in both osdp_pd_t and osdp_acu_t.
+ *
+ * This is wire-level buffering, distinct from what a role can process: see
+ * OSDP_PD_BUF_LEN / OSDP_ACU_BUF_LEN for the message size a PD or ACU
+ * actually handles and advertises to its peer. */
+#ifndef OSDP_STREAM_BUFFER_LEN
 #define OSDP_STREAM_BUFFER_LEN OSDP_FRAME_MAX_LEN
+#endif
 
 typedef struct osdp_stream {
     uint8_t  buffer[OSDP_STREAM_BUFFER_LEN];

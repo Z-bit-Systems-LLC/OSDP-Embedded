@@ -17,10 +17,26 @@ actually need** — no malloc, no globals, no OS dependencies in the core.
 - **Layer 1 framing** — encode and decode every OSDP frame variant
   (plain, with-SCB, MAC-bearing, encrypted-payload). Round-trips a
   592-frame `libosdp-conformance` Secure Channel capture byte-for-byte.
-- **Per-message codecs** for the v2.2 baseline command/reply set
-  (POLL, ID, CAP, LED, BUZ, OUT, TEXT, COMSET on the ACU side; ACK,
-  NAK, PDID, PDCAP, RAW, KEYPAD, COM on the PD side), plus the SC
-  handshake messages (CHLNG, SCRYPT, CCRYPT, RMAC_I).
+- **Per-message codecs** covering 20 of the 25 commands and 19 of the 21
+  replies in Annex A — the whole v2.2 set except the credential-domain
+  families (biometric, transparent smartcard mode, PIV/crypto-auth).
+  Commands: POLL, ID, CAP, LSTAT, ISTAT, OSTAT, RSTAT, OUT, LED, BUZ,
+  TEXT, COMSET, KEYSET, ACURXSIZE, FILETRANSFER, MFG, ABORT, KEEPACTIVE.
+  Replies: ACK, NAK, PDID, PDCAP, LSTATR, ISTATR, OSTATR, RSTATR, RAW,
+  FMT, KEYPAD, COM, BUSY, FTSTAT, MFGREP, MFGSTATR, MFGERRR. Plus the SC
+  handshake messages (CHLNG, SCRYPT, CCRYPT, RMAC_I). One translation
+  unit per message, so a build links only what it references.
+- **PD protocol mechanics the application no longer has to write**:
+  status providers answering `osdp_LSTAT`/`ISTAT`/`OSTAT`/`RSTAT`, a
+  caller-owned poll-response queue for `osdp_RAW`/`KEYPAD`/`FMT`/`MFGREP`
+  (emptied on a comms loss per spec 7.11/7.12), `osdp_BUSY` with its
+  sequence-0 / outside-the-secure-channel / not-cached rules, multi-part
+  message transport (spec 5.10) with fragmented `osdp_MFG` reassembly,
+  plus library-handled `osdp_ABORT`, `osdp_ACURXSIZE` and
+  `osdp_KEEPACTIVE`. A command handler's return maps onto the spec's
+  Table 47 NAK codes instead of being dropped silently. Working buffers
+  are sized by a build-time constant per role and can be rebound at run
+  time with `osdp_pd_set_buffers()`.
 - **PD-side state machine** (`osdp::pd`): address filtering,
   sequence-number policing with byte-identical retransmit detection,
   online/offline tracking, optional Secure Channel handshake +

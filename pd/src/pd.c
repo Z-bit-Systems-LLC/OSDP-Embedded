@@ -14,7 +14,7 @@
 
 /* ---- Helpers ------------------------------------------------------------*/
 
-/* Build a reply frame in `pd->tx_buf` and return its length. Mirrors
+/* Build a reply frame in the bound TX buffer and return its length. Mirrors
  * the inbound frame's address (with the reply flag set), sequence
  * number, and integrity mode, per spec section 5.9. */
 static osdp_status_t build_reply(osdp_pd_t                *pd,
@@ -37,10 +37,49 @@ static osdp_status_t build_reply(osdp_pd_t                *pd,
     out.code        = reply->code;
     out.payload     = reply->payload;
     out.payload_len = reply->payload_len;
-    return osdp_frame_build(&out, pd->tx_buf, sizeof(pd->tx_buf), out_len);
+    return osdp_frame_build(&out, pd->tx, pd->tx_cap, out_len);
 }
 
-/* Build a NAK reply with the given error code into pd->tx_buf. */
+osdp_status_t osdp_pd_internal_build_busy(osdp_pd_t          *pd,
+                                          const osdp_frame_t *cmd,
+                                          size_t             *out_len)
+{
+    if (pd == NULL || cmd == NULL || out_len == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    /* Spec 7.19 puts three rules on osdp_BUSY, all of them exceptions to how
+     * every other reply is framed, and all three live here so no caller has
+     * to remember them:
+     *
+     *   1. The sequence number is always 0, not the inbound SQN. Mirroring
+     *      the command's SQN — which build_reply does for everything else —
+     *      would be wrong.
+     *   2. It goes out PLAINTEXT even during an established Secure Channel,
+     *      and must not advance the MAC chain. So this builds the frame
+     *      directly instead of routing through osdp_sc_wrap_frame, and it is
+     *      why the SC paths call this rather than framing BUSY themselves.
+     *      osdp_BUSY is one of only three replies (with osdp_NAK 0x01 and
+     *      0x06) the spec permits outside the SCS format.
+     *   3. It must not be cached as the retransmit answer: the ACU repeats
+     *      the command in its original form until it gets something else, so
+     *      replaying a stale BUSY would answer a command the PD is by then
+     *      ready to handle. process_frame honours pd->reply_cacheable. */
+    pd->reply_cacheable = false;
+
+    osdp_frame_t out;
+    (void)memset(&out, 0, sizeof(out));
+    out.address     = cmd->address;   /* mirror, as elsewhere (5.9 Note 2) */
+    out.reply       = true;
+    out.sequence    = 0;              /* rule 1 */
+    out.integrity   = cmd->integrity;
+    out.code        = OSDP_REPLY_BUSY;
+    out.payload     = NULL;
+    out.payload_len = 0;              /* Table 62: DATA omitted */
+    return osdp_frame_build(&out, pd->tx, pd->tx_cap, out_len);
+}
+
+/* Build a NAK reply with the given error code into the bound TX buffer. */
 static osdp_status_t build_nak(osdp_pd_t          *pd,
                                const osdp_frame_t *cmd,
                                uint8_t             error_code,
@@ -151,38 +190,6 @@ void osdp_pd_internal_apply_comset(osdp_pd_t *pd)
         pd->comset_applied_cb(pd->comset_user,
                               pd->comset_new_address, pd->comset_new_baud);
     }
-}
-
-/* Handle a plaintext osdp_COMSET: compute the effective comms parameters,
- * reply osdp_COM at the CURRENT address, and stage the change so it takes
- * effect only after the reply is transmitted (spec 6.13). Returns the
- * reply length in pd->tx_buf, or a NAK on a malformed payload. */
-static size_t handle_comset_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
-{
-    uint8_t  eff_addr = pd->address;
-    uint32_t eff_baud = 0;
-    uint8_t  com_payload[OSDP_COM_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_comset_effective(
-        pd, cmd->payload, cmd->payload_len, &eff_addr, &eff_baud, com_payload);
-    if (s != OSDP_OK) {
-        size_t n = 0;
-        (void)build_nak(pd, cmd, OSDP_NAK_CMD_LENGTH, &n);
-        return n;
-    }
-
-    const osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_COM,
-        .payload     = com_payload,
-        .payload_len = OSDP_COM_PAYLOAD_BYTES,
-    };
-    size_t built = 0;
-    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
-        return 0;
-    }
-    pd->comset_pending     = true;
-    pd->comset_new_address = eff_addr;
-    pd->comset_new_baud    = eff_baud;
-    return built;
 }
 
 osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
@@ -302,37 +309,6 @@ osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
                              OSDP_FTSTAT_PAYLOAD_BYTES, &written);
 }
 
-/* Handle a plaintext osdp_FILETRANSFER: reassemble + evaluate via the shared
- * helper and reply osdp_FTSTAT, or NAK when the frame is undecodable (0x02)
- * or no receiver is registered (0x03). Returns the reply length in
- * pd->tx_buf. */
-static size_t handle_filetransfer_plain(osdp_pd_t *pd, const osdp_frame_t *cmd)
-{
-    uint8_t ftstat_payload[OSDP_FTSTAT_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_filetransfer(
-        pd, cmd->payload, cmd->payload_len, ftstat_payload);
-
-    if (s != OSDP_OK) {
-        const uint8_t err = (s == OSDP_ERR_NOT_SUPPORTED)
-                                ? OSDP_NAK_UNKNOWN_CMD   /* 0x03 */
-                                : OSDP_NAK_CMD_LENGTH;   /* 0x02 */
-        size_t n = 0;
-        (void)build_nak(pd, cmd, err, &n);
-        return n;
-    }
-
-    const osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_FTSTAT,
-        .payload     = ftstat_payload,
-        .payload_len = OSDP_FTSTAT_PAYLOAD_BYTES,
-    };
-    size_t built = 0;
-    if (build_reply(pd, cmd, &reply, &built) != OSDP_OK) {
-        return 0;
-    }
-    return built;
-}
-
 /* Exposed under a stable name (declared in pd_internal.h) so the SC
  * handlers in pd_sc.c can build NAKs without duplicating the helper.
  * Same signature as the static `build_nak` above. */
@@ -342,6 +318,16 @@ osdp_status_t osdp_pd_internal_build_nak(osdp_pd_t          *pd,
                                          size_t             *out_len)
 {
     return build_nak(pd, cmd, error_code, out_len);
+}
+
+/* Shared with the Secure Channel handler so it can frame replies the same way
+ * the plaintext path does. */
+osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
+                                           const osdp_frame_t    *cmd,
+                                           const osdp_pd_reply_t *reply,
+                                           size_t                *out_len)
+{
+    return build_reply(pd, cmd, reply, out_len);
 }
 
 /* Send `len` bytes from `buf` via the bound transport. Short writes
@@ -381,6 +367,11 @@ static void check_offline_timeout(osdp_pd_t *pd)
     if (elapsed > OSDP_PD_OFFLINE_TIMEOUT_MS) {
         pd->online    = false;
         pd->have_last = false;  /* drop SQN cache; ACU will reset SQN */
+        /* Spec 7.11/7.12: "unreported card/keypad data is deleted in case of,
+         * or during, a communication loss." Delivering a credential read
+         * minutes ago to an ACU that has since reconnected would be worse
+         * than losing it — the ACU would act on a stale presentation. */
+        osdp_pd_clear_events(pd);
     }
 }
 
@@ -398,7 +389,7 @@ static bool clear_command_allowed_pre_sc(uint8_t code)
            code == OSDP_CMD_COMSET;
 }
 
-/* Compute the reply for a fresh command into pd->tx_buf and return
+/* Compute the reply for a fresh command into the bound TX buffer and return
  * the byte count (or 0 if the command should produce no reply at all
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
@@ -418,105 +409,74 @@ static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* Clear-text (unsecured, "USC") command: enforce the Secure Channel
-     * policy before touching it. Spec §"Interleaving USC packets during
-     * communication in a SCS is NOT allowed":
+    /* Clear-text (unsecured, "USC") command. A *secure* (SCB-bearing) frame is
+     * handled above and never reaches here, so this is the USC policy.
      *
-     *   - During an established session, ANY clear-text command is a
-     *     violation. Tear the session down and answer osdp_NAK 0x06
-     *     ("Encrypted communication required") in the clear; the ACU then
-     *     re-discovers and re-handshakes. This holds for any established
-     *     session — install (SCBK-D) or operational (SCBK). It replaces the
-     *     older "clear command at SQN 0 silently resets and is processed"
-     *     reconnect shortcut: the ACU now sees an explicit NAK and the
-     *     first post-reset discovery command (osdp_ID/CAP, below) carries
-     *     it back online.
-     *   - With no session up but the PD keyed for full security (an
-     *     operational SCBK is set), a clear-text command that isn't one of
-     *     the discovery/config commands the ACU needs before the handshake
-     *     is likewise refused NAK 0x06 — SC must be established first.
+     * Sequence 0 is the ACU's connection-restart sentinel (spec 5.9): it is
+     * only sent when the link is being (re)started, so any Secure Channel
+     * session the PD still believes in is stale and is dropped — SC1 and SC2
+     * alike — WITHOUT that counting as an interleaving violation. Dropping the
+     * session is all SQN 0 buys, though: the command still has to satisfy the
+     * secure-mode allowlist below. Once a PD is keyed for full security only
+     * the discovery/config commands are ever answered in the clear, whatever
+     * the sequence number; SQN 0 is not an escape hatch around Secure Channel.
      *
-     * A PD with no operational key (clear-only or install-only, no session)
-     * falls through and processes clear-text commands normally. NAK 0x06 is
-     * one of the few replies the spec permits in the clear, so build_nak's
-     * plaintext frame is correct even though a session was just active. */
-    if (pd->sc.session.established) {
-        osdp_sc_session_init(&pd->sc.session);
-        pd->sc.got_chlng = false;
-        size_t n = 0;
-        (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
-        return n;
+     * Sequence != 0 during an established session IS an interleaving violation
+     * (spec D "Interleaving USC packets during communication in a SCS is NOT
+     * allowed"): drop the session and answer osdp_NAK 0x06 immediately, so the
+     * ACU sees the refusal rather than a silently-processed command. */
+    if (cmd->sequence == 0) {
+        if (pd->sc.session.established) {
+            osdp_sc_session_init(&pd->sc.session);
+            pd->sc.got_chlng = false;
+        }
+    } else {
+        if (pd->sc.session.established) {
+            osdp_sc_session_init(&pd->sc.session);
+            pd->sc.got_chlng = false;
+            size_t n = 0;
+            (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
+            return n;
+        }
     }
+
+    /* Secure-mode allowlist, applied at EVERY sequence number including 0.
+     * A PD keyed for full security (an operational SCBK is set — not merely
+     * SCBK-D) answers only the discovery/config
+     * commands the ACU needs to find it and bring SC up: osdp_ID, osdp_CAP,
+     * osdp_COMSET. Everything else is refused osdp_NAK 0x06 until a session
+     * exists. A PD with no operational key (clear-only or install-only) is
+     * not in secure mode and falls through, processing clear-text normally.
+     *
+     * NAK 0x06 is one of the few replies the spec permits in the clear, so
+     * build_nak's plaintext frame is correct even when a session was active a
+     * moment ago. */
     if (pd->sc.scbk_set && !clear_command_allowed_pre_sc(cmd->code)) {
         size_t n = 0;
         (void)build_nak(pd, cmd, OSDP_NAK_ENCRYPTION_REQUIRED, &n);
         return n;
     }
 
-    /* osdp_COMSET is answered by the library, not the application handler:
-     * the reply is osdp_COM (not an app-chosen ACK) and the command mutates
-     * pd->address, which only the state machine owns. The optional COMSET
-     * hooks let the application veto/clamp the values and enact the baud
-     * change once the reply has gone out. */
-    if (cmd->code == OSDP_CMD_COMSET) {
-        return handle_comset_plain(pd, cmd);
-    }
-
-    /* osdp_FILETRANSFER is likewise library-handled: the PD reassembles the
-     * file into the caller's buffer and replies osdp_FTSTAT, so it never
-     * reaches cmd_cb. The application only evaluates the bytes via the
-     * file-receiver callback. */
-    if (cmd->code == OSDP_CMD_FILETRANSFER) {
-        return handle_filetransfer_plain(pd, cmd);
-    }
-
-    osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_ACK,
-        .payload     = NULL,
-        .payload_len = 0,
-    };
-
-    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
-    if (pd->cmd_cb != NULL) {
-        app_status = pd->cmd_cb(pd->cmd_user,
-                                cmd->code,
-                                cmd->payload, cmd->payload_len,
-                                &reply);
-    }
-
-    /* Mirror reader-visible commands (osdp_LED) into the LED bank so the
-     * application's change callback / colour query stay current, whatever
-     * the handler chose to reply. */
-    osdp_pd_internal_observe_command(pd, cmd->code,
-                                     cmd->payload, cmd->payload_len);
-
+    /* Decide the reply. Everything that knows what a command MEANS —
+     * library-handled osdp_COMSET / osdp_FILETRANSFER, the application
+     * handler, the KEYSET hook, reader-state observation — lives in the
+     * shared dispatch (pd_dispatch.c) so the plaintext, SC1 and SC2 paths
+     * cannot drift apart. All that is left here is plaintext framing. */
+    osdp_pd_reply_t reply;
+    const osdp_pd_dispatch_outcome_t outcome =
+        osdp_pd_internal_dispatch(pd, OSDP_PD_CH_PLAIN, cmd->code,
+                                  cmd->payload, cmd->payload_len, &reply);
     size_t built = 0;
-    osdp_status_t br;
-    if (app_status == OSDP_OK) {
-        /* KEYSET hook: if the app ACK'd a KEYSET, apply the new SCBK
-         * before transmitting the ACK. A malformed payload demotes the
-         * ACK to NAK so the ACU sees the failure. The application
-         * doesn't have to know about KEYSET — its existing "ACK
-         * everything I recognise" default works. */
-        if (cmd->code == OSDP_CMD_KEYSET) {
-            const osdp_status_t ks = osdp_pd_internal_apply_keyset(
-                pd, cmd->payload, cmd->payload_len);
-            if (ks != OSDP_OK) {
-                /* Any malformed-but-recognized KEYSET is spec Table 47
-                 * error 0x09 "Unable to process command record". */
-                br = build_nak(pd, cmd, OSDP_NAK_RECORD_INVALID, &built);
-                return (br == OSDP_OK) ? built : 0;
-            }
-        }
-        br = build_reply(pd, cmd, &reply, &built);
-    } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
-        br = build_nak(pd, cmd, OSDP_NAK_UNKNOWN_CMD, &built);
-    } else {
-        /* Internal handler error — drop silently. */
-        return 0;
+    switch (outcome) {
+    case OSDP_PD_DISPATCH_BUSY:
+        return (osdp_pd_internal_build_busy(pd, cmd, &built) == OSDP_OK)
+                   ? built : 0;
+    case OSDP_PD_DISPATCH_DROP:
+        return 0;  /* unrecognised handler error — drop silently */
+    case OSDP_PD_DISPATCH_SEND:
+    default:
+        return (build_reply(pd, cmd, &reply, &built) == OSDP_OK) ? built : 0;
     }
-
-    return (br == OSDP_OK) ? built : 0;
 }
 
 /* Cache the command we just accepted alongside the reply we just
@@ -529,22 +489,24 @@ static void cache_reply(osdp_pd_t          *pd,
                         const osdp_frame_t *cmd,
                         size_t              reply_len)
 {
-    if (reply_len > sizeof(pd->last_reply)) {
-        /* Should be impossible — tx_buf and last_reply are the same
-         * size — but guard anyway. */
-        reply_len = sizeof(pd->last_reply);
+    /* Cache the reply verbatim, but only if it fits. With the default
+     * bindings the reply cache is the same size as the TX buffer so this
+     * never bites; a caller that binds a smaller cache than TX gets no
+     * replay for oversized replies rather than a truncated one — the ACU's
+     * retransmit is then processed fresh, which is always correct. */
+    if (reply_len > 0 && reply_len <= pd->rpl_cache_cap) {
+        (void)memcpy(pd->rpl_cache, pd->tx, reply_len);
+        pd->last_reply_len = reply_len;
+    } else {
+        pd->last_reply_len = 0;
     }
-    if (reply_len > 0) {
-        (void)memcpy(pd->last_reply, pd->tx_buf, reply_len);
-    }
-    pd->last_reply_len = reply_len;
 
     /* Cache the inbound command's wire bytes for retransmit detection.
      * If raw isn't available or is too large, skip caching the cmd —
      * the next frame will then bypass the cache and process fresh. */
     if (cmd->raw != NULL && cmd->raw_len > 0 &&
-        cmd->raw_len <= sizeof(pd->last_cmd)) {
-        (void)memcpy(pd->last_cmd, cmd->raw, cmd->raw_len);
+        cmd->raw_len <= pd->cmd_cache_cap) {
+        (void)memcpy(pd->cmd_cache, cmd->raw, cmd->raw_len);
         pd->last_cmd_len = cmd->raw_len;
     } else {
         pd->last_cmd_len = 0;
@@ -570,7 +532,7 @@ static bool is_retransmit(const osdp_pd_t    *pd,
     if (cmd->raw_len != pd->last_cmd_len) {
         return false;
     }
-    return memcmp(pd->last_cmd, cmd->raw, cmd->raw_len) == 0;
+    return memcmp(pd->cmd_cache, cmd->raw, cmd->raw_len) == 0;
 }
 
 /* Process one accepted command frame: dispatch, build reply, cache,
@@ -579,15 +541,26 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
     if (is_retransmit(pd, cmd)) {
         if (pd->last_reply_len > 0) {
-            send_bytes(pd, pd->last_reply, pd->last_reply_len);
+            send_bytes(pd, pd->rpl_cache, pd->last_reply_len);
         }
         return;
     }
 
+    /* Assume the reply is cacheable; the BUSY builder is the one thing that
+     * clears this, since the ACU repeats a BUSY'd command in its original
+     * form and would otherwise be answered from the cache forever. */
+    pd->reply_cacheable = true;
+
     const size_t built = handle_command_into_tx(pd, cmd);
-    cache_reply(pd, cmd, built);
+    if (pd->reply_cacheable) {
+        cache_reply(pd, cmd, built);
+    } else {
+        /* Not cached, and the previous cache entry must go too: leaving it
+         * would let an unrelated later retransmit match a stale command. */
+        pd->have_last = false;
+    }
     if (built > 0) {
-        send_bytes(pd, pd->tx_buf, built);
+        send_bytes(pd, pd->tx, built);
     }
 
     /* osdp_COMSET: the new comms parameters take effect only AFTER the
@@ -597,6 +570,7 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     if (pd->comset_pending) {
         osdp_pd_internal_apply_comset(pd);
     }
+
 }
 
 /* ---- API ----------------------------------------------------------------*/
@@ -609,6 +583,71 @@ void osdp_pd_init(osdp_pd_t *pd, uint8_t address)
     (void)memset(pd, 0, sizeof(*pd));
     pd->address = (uint8_t)(address & 0x7FU);
     osdp_stream_init(&pd->rx);
+
+    /* Point every working region at its embedded array. From here on the
+     * library only ever goes through these pointers, so osdp_pd_set_buffers
+     * can swap any of them for caller-owned storage without touching another
+     * line of the state machine. */
+    pd->tx            = pd->tx_buf;
+    pd->tx_cap        = sizeof(pd->tx_buf);
+    pd->rx_plain      = pd->rx_plain_buf;
+    pd->rx_plain_cap  = sizeof(pd->rx_plain_buf);
+    pd->rpl_cache     = pd->last_reply;
+    pd->rpl_cache_cap = sizeof(pd->last_reply);
+    pd->cmd_cache     = pd->last_cmd;
+    pd->cmd_cache_cap = sizeof(pd->last_cmd);
+
+    /* Until an ACU sends osdp_ACURXSIZE, assume the conservative default from
+     * spec 6.26 rather than the protocol maximum — over-estimating the peer's
+     * buffer produces replies it silently drops. */
+    pd->acu_rx_size = OSDP_PD_DEFAULT_ACU_RX_SIZE;
+}
+
+osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd, const osdp_pd_buffers_t *bufs)
+{
+    if (pd == NULL || bufs == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    /* Validate every supplied region before applying any of them, so a
+     * rejected call is a no-op rather than a half-applied binding. A NULL
+     * pointer means "leave this region alone", whatever its capacity field
+     * says. */
+    const uint8_t *const ptrs[] = { bufs->tx, bufs->rx_plain,
+                                    bufs->rpl_cache, bufs->cmd_cache };
+    const size_t         caps[] = { bufs->tx_cap, bufs->rx_plain_cap,
+                                    bufs->rpl_cache_cap, bufs->cmd_cache_cap };
+    for (size_t i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); i++) {
+        if (ptrs[i] != NULL && caps[i] < OSDP_PD_BUF_MIN_LEN) {
+            return OSDP_ERR_BUFFER_TOO_SMALL;
+        }
+    }
+
+    if (bufs->tx != NULL) {
+        pd->tx     = bufs->tx;
+        pd->tx_cap = bufs->tx_cap;
+    }
+    if (bufs->rx_plain != NULL) {
+        pd->rx_plain     = bufs->rx_plain;
+        pd->rx_plain_cap = bufs->rx_plain_cap;
+    }
+    /* Rebinding a retransmit cache invalidates what it recorded: the lengths
+     * describe bytes in storage the PD is about to stop reading. Drop the
+     * whole cache entry rather than leave it pointing at a stale mixture. */
+    if (bufs->rpl_cache != NULL) {
+        pd->rpl_cache     = bufs->rpl_cache;
+        pd->rpl_cache_cap = bufs->rpl_cache_cap;
+        pd->last_reply_len = 0;
+        pd->have_last      = false;
+    }
+    if (bufs->cmd_cache != NULL) {
+        pd->cmd_cache     = bufs->cmd_cache;
+        pd->cmd_cache_cap = bufs->cmd_cache_cap;
+        pd->last_cmd_len  = 0;
+        pd->have_last     = false;
+    }
+
+    return OSDP_OK;
 }
 
 void osdp_pd_set_transport(osdp_pd_t *pd,
@@ -628,6 +667,216 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
     }
     pd->cmd_cb   = cb;
     pd->cmd_user = user;
+}
+
+size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return 0;
+    }
+
+    /* Describe the reply this PD would send right now. Only the header
+     * fields matter to the sizing helpers; the payload is what we're
+     * solving for. A reply always mirrors the inbound integrity mode, and
+     * CRC (2 bytes) is both the common case and the conservative one. */
+    osdp_frame_t shape;
+    (void)memset(&shape, 0, sizeof(shape));
+    shape.address   = pd->address;
+    shape.reply     = true;
+    shape.integrity = OSDP_INTEGRITY_CRC;
+
+    size_t        max = 0;
+    osdp_status_t s;
+
+    if (pd->sc.session.established) {
+        shape.has_scb    = true;
+        shape.scb_length = OSDP_SCB_MIN_LEN;
+        shape.scb_type   = OSDP_SCS_18;   /* data-bearing PD→ACU */
+        s = osdp_sc_max_payload(&shape, pd->tx_cap, &max);
+    } else {
+        s = osdp_frame_max_payload(&shape, pd->tx_cap, &max);
+    }
+
+    return (s == OSDP_OK) ? max : 0;
+}
+
+/* ---- Poll-response event queue -----------------------------------------
+ *
+ * Records are laid out back to back from offset 0:
+ *
+ *     [u16 payload_len LE][u8 reply_code][payload bytes]
+ *
+ * Deliberately NOT a wrapping ring. A wrap would split a payload across the
+ * end of the buffer, and the dequeue hands the payload straight to the framer
+ * as a contiguous slice. Compacting on dequeue costs a memmove of whatever is
+ * still queued — bounded by the buffer, and queues here hold a handful of
+ * events between polls ~50 ms apart — in exchange for every record staying in
+ * one piece. */
+
+#define EVENT_HEADER_BYTES 3U   /* u16 length + u8 reply code */
+
+void osdp_pd_set_event_queue(osdp_pd_t *pd, uint8_t *buf, size_t cap)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->event_buf = buf;
+    pd->event_cap = (buf != NULL) ? cap : 0;
+    pd->event_len = 0;   /* rebinding discards whatever was queued */
+}
+
+void osdp_pd_clear_events(osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->event_len = 0;
+}
+
+bool osdp_pd_event_pending(const osdp_pd_t *pd)
+{
+    return pd != NULL && pd->event_len > 0;
+}
+
+osdp_status_t osdp_pd_enqueue_event(osdp_pd_t *pd, uint8_t reply_code,
+                                    const uint8_t *payload, size_t len)
+{
+    if (pd == NULL || pd->event_buf == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (len > 0 && payload == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    /* The length is stored as a u16, so anything larger cannot be recorded
+     * faithfully — reject rather than truncate. */
+    if (len > 0xFFFFU) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    const size_t need = EVENT_HEADER_BYTES + len;
+    if (need > pd->event_cap - pd->event_len) {
+        /* Full. The application decides whether this event mattered — only
+         * it knows whether a dropped card read is recoverable. */
+        return OSDP_ERR_BUFFER_TOO_SMALL;
+    }
+
+    uint8_t *at = &pd->event_buf[pd->event_len];
+    at[0] = (uint8_t)(len & 0xFFU);
+    at[1] = (uint8_t)((len >> 8) & 0xFFU);
+    at[2] = reply_code;
+    if (len > 0) {
+        (void)memcpy(&at[EVENT_HEADER_BYTES], payload, len);
+    }
+    pd->event_len += need;
+    return OSDP_OK;
+}
+
+bool osdp_pd_internal_dequeue_event(osdp_pd_t *pd, osdp_pd_reply_t *reply)
+{
+    if (pd == NULL || reply == NULL || pd->event_buf == NULL ||
+        pd->event_len < EVENT_HEADER_BYTES) {
+        return false;
+    }
+
+    const size_t len = (size_t)pd->event_buf[0] |
+                       ((size_t)pd->event_buf[1] << 8);
+    const uint8_t code   = pd->event_buf[2];
+    const size_t  record = EVENT_HEADER_BYTES + len;
+    if (record > pd->event_len) {
+        /* Corrupt queue — impossible via the public API, but never read past
+         * what we hold. Drop everything rather than emit garbage. */
+        pd->event_len = 0;
+        return false;
+    }
+
+    /* Copy the payload out before compacting: the memmove below is about to
+     * overwrite the bytes it currently sits on. The scratch is also what
+     * every other library-built reply points at, so its lifetime rule (valid
+     * until the caller has framed the reply) already covers this. */
+    if (len > OSDP_PD_REPLY_SCRATCH_LEN) {
+        /* Enqueued larger than we can hand back. Drop this record and report
+         * empty rather than truncate a card number. */
+        (void)memmove(pd->event_buf, &pd->event_buf[record],
+                      pd->event_len - record);
+        pd->event_len -= record;
+        return false;
+    }
+    if (len > 0) {
+        (void)memcpy(pd->reply_scratch, &pd->event_buf[EVENT_HEADER_BYTES],
+                     len);
+    }
+
+    (void)memmove(pd->event_buf, &pd->event_buf[record],
+                  pd->event_len - record);
+    pd->event_len -= record;
+
+    reply->code        = code;
+    reply->payload     = (len > 0) ? pd->reply_scratch : NULL;
+    reply->payload_len = len;
+    return true;
+}
+
+/* ---- Miscellaneous command hooks ---------------------------------------*/
+
+void osdp_pd_set_status_provider(osdp_pd_t *pd,
+                                 const osdp_pd_status_provider_t *p,
+                                 void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    if (p != NULL) {
+        pd->status = *p;
+    } else {
+        (void)memset(&pd->status, 0, sizeof(pd->status));
+    }
+    pd->status_user = user;
+}
+
+void osdp_pd_set_mfg_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
+                              osdp_pd_mfg_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    osdp_mp_reasm_init(&pd->mfg_reasm, buf, cap);
+    pd->mfg_cb   = cb;
+    pd->mfg_user = user;
+    (void)memset(pd->mfg_vendor, 0, sizeof(pd->mfg_vendor));
+}
+
+void osdp_pd_set_abort_handler(osdp_pd_t *pd, osdp_pd_abort_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->abort_cb   = cb;
+    pd->abort_user = user;
+}
+
+void osdp_pd_set_acurxsize_handler(osdp_pd_t *pd, osdp_pd_acurxsize_cb cb,
+                                   void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->acurxsize_cb   = cb;
+    pd->acurxsize_user = user;
+}
+
+uint16_t osdp_pd_acu_rx_size(const osdp_pd_t *pd)
+{
+    return (pd != NULL) ? pd->acu_rx_size : 0;
+}
+
+void osdp_pd_set_keepactive_handler(osdp_pd_t *pd, osdp_pd_keepactive_cb cb,
+                                    void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    pd->keepactive_cb   = cb;
+    pd->keepactive_user = user;
 }
 
 bool osdp_pd_is_online(const osdp_pd_t *pd)
@@ -990,7 +1239,7 @@ void osdp_pd_tick(osdp_pd_t *pd)
                 if (osdp_pd_internal_build_nak(pd, &cmd, OSDP_NAK_BAD_CHECK,
                                                &nak_len) == OSDP_OK &&
                     nak_len > 0) {
-                    send_bytes(pd, pd->tx_buf, nak_len);
+                    send_bytes(pd, pd->tx, nak_len);
                 }
             }
             continue;  /* stream auto-advanced past the bad frame */

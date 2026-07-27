@@ -67,6 +67,8 @@ impl osdp_status_t {
     pub const OSDP_ERR_BAD_CHECKSUM: Self = Self(8);
     pub const OSDP_ERR_BAD_PAYLOAD: Self = Self(9);
     pub const OSDP_ERR_NOT_SUPPORTED: Self = Self(10);
+    /// Not ready; the PD emits osdp_BUSY and the ACU repeats the command.
+    pub const OSDP_ERR_BUSY: Self = Self(11);
 }
 
 // ====================================================================
@@ -164,6 +166,21 @@ extern "C" {
         buf: *mut u8,
         buf_cap: usize,
         written: *mut usize,
+    ) -> osdp_status_t;
+
+    /// Where `osdp_frame_build` will place the payload — lets a caller stage
+    /// bytes directly in the output buffer instead of a scratch array.
+    pub fn osdp_frame_payload_offset(
+        in_: *const osdp_frame_t,
+        out_offset: *mut usize,
+    ) -> osdp_status_t;
+
+    /// Largest payload that fits in `buf_cap` for a frame of this shape.
+    /// The per-fragment budget when splitting a message across packets.
+    pub fn osdp_frame_max_payload(
+        shape: *const osdp_frame_t,
+        buf_cap: usize,
+        out_max_payload: *mut usize,
     ) -> osdp_status_t;
 }
 
@@ -889,6 +906,14 @@ extern "C" {
         out_len: *mut usize,
     ) -> osdp_status_t;
 
+    /// Per-fragment budget under SC1: the plain-framing answer less spec
+    /// D.4.5 padding, which always claims at least one byte.
+    pub fn osdp_sc_max_payload(
+        shape: *const osdp_frame_t,
+        buf_cap: usize,
+        out_max_payload: *mut usize,
+    ) -> osdp_status_t;
+
     pub fn osdp_sc_unwrap_frame(
         crypto: *const osdp_sc_crypto_t,
         session: *mut osdp_sc_session_t,
@@ -910,7 +935,15 @@ pub use pd_ffi::*;
 mod pd_ffi {
     use super::*;
 
-    pub const OSDP_PD_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_PD_BUF_LEN in pd/include/osdp/osdp_pd.h. It sizes every
+     * working buffer embedded in osdp_pd_t, so a build that overrides the C
+     * constant must override this mirror to match — pd_layout_tests catches a
+     * mismatch, but only at run time. */
+    pub const OSDP_PD_BUF_LEN: usize = 512;
+    /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
+     * osdp_pd_t below mirrors the C layout field for field, so a mismatch
+     * silently shifts every field after tx_buf. */
+    pub const OSDP_PD_REPLY_SCRATCH_LEN: usize = 64;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
     pub const OSDP_PD_MAX_BUZZERS: usize = 4;
@@ -1021,6 +1054,60 @@ mod pd_ffi {
         pub key_selector: u8,
     }
 
+    /// Status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT. A NULL member
+    /// leaves that command falling through to the command handler.
+    #[repr(C)]
+    pub struct osdp_pd_status_provider_t {
+        pub local: Option<unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8)>,
+        pub inputs: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+        pub outputs: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+        pub readers: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+    }
+
+    pub type osdp_pd_abort_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void) -> osdp_status_t>;
+    pub type osdp_pd_acurxsize_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, max_size: u16)>;
+    pub type osdp_pd_keepactive_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, time_ms: u16) -> osdp_status_t>;
+
+    /// Mirror of osdp_mp_reasm_t (core/include/osdp/osdp_multipart.h) —
+    /// embedded in osdp_pd_t for multi-part osdp_MFG reassembly.
+    #[repr(C)]
+    pub struct osdp_mp_reasm_t {
+        pub buf: *mut u8,
+        pub cap: usize,
+        pub total: u16,
+        pub received: u16,
+        pub active: bool,
+    }
+
+    pub type osdp_pd_mfg_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            vendor_code: *const u8,
+            data: *const u8,
+            data_len: usize,
+            reply: *mut osdp_pd_reply_t,
+        ) -> osdp_status_t,
+    >;
+
+    /// Caller-owned working storage for the PD's four scratch regions. A NULL
+    /// member means "leave that region on its current binding", so a caller
+    /// can enlarge only the TX path. Mirrors `osdp_pd_buffers_t` in
+    /// `pd/include/osdp/osdp_pd.h`.
+    #[repr(C)]
+    pub struct osdp_pd_buffers_t {
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
+    }
+
     #[repr(C)]
     pub struct osdp_pd_t {
         pub address: u8,
@@ -1028,14 +1115,28 @@ mod pd_ffi {
         pub transport: osdp_pd_transport_t,
         pub cmd_cb: osdp_pd_command_cb,
         pub cmd_user: *mut c_void,
-        pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_PD_BUF_LEN],
+        pub reply_scratch: [u8; OSDP_PD_REPLY_SCRATCH_LEN],
+        pub rx_plain_buf: [u8; OSDP_PD_BUF_LEN],
 
-        pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_reply: [u8; OSDP_PD_BUF_LEN],
         pub last_reply_len: usize,
-        pub last_cmd: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_cmd: [u8; OSDP_PD_BUF_LEN],
         pub last_cmd_len: usize,
         pub last_seq: u8,
         pub have_last: bool,
+
+        /* Active bindings for the four working regions. osdp_pd_init points
+         * these at the embedded arrays above; osdp_pd_set_buffers re-points
+         * them at caller-owned storage. */
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
 
         pub online: bool,
         pub last_comm_ms: u32,
@@ -1065,10 +1166,44 @@ mod pd_ffi {
         pub ft_type: u8,
         pub ft_total: u32,
         pub ft_received: u32,
+
+        /* Status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT. */
+        pub status: osdp_pd_status_provider_t,
+        pub status_user: *mut c_void,
+
+        /* Poll-response event queue (caller-owned storage). */
+        pub event_buf: *mut u8,
+        pub event_cap: usize,
+        pub event_len: usize,
+
+        /* osdp_ACURXSIZE: the peer's declared receive capacity. */
+        pub acu_rx_size: u16,
+        pub acurxsize_cb: osdp_pd_acurxsize_cb,
+        pub acurxsize_user: *mut c_void,
+
+        /* osdp_ABORT / osdp_KEEPACTIVE hooks. */
+        pub abort_cb: osdp_pd_abort_cb,
+        pub abort_user: *mut c_void,
+        pub keepactive_cb: osdp_pd_keepactive_cb,
+        pub keepactive_user: *mut c_void,
+
+        /* Multi-part osdp_MFG reassembly (spec 5.10). */
+        pub mfg_reasm: osdp_mp_reasm_t,
+        pub mfg_cb: osdp_pd_mfg_cb,
+        pub mfg_user: *mut c_void,
+        pub mfg_vendor: [u8; 3],
+
+        /* Cleared for the current tick when the reply must not be cached
+         * as the spec-5.9 retransmit answer (osdp_BUSY only). */
+        pub reply_cacheable: bool,
     }
 
     extern "C" {
         pub fn osdp_pd_init(pd: *mut osdp_pd_t, address: u8);
+        pub fn osdp_pd_set_buffers(
+            pd: *mut osdp_pd_t,
+            bufs: *const osdp_pd_buffers_t,
+        ) -> osdp_status_t;
         pub fn osdp_pd_set_transport(pd: *mut osdp_pd_t, transport: *const osdp_pd_transport_t);
         pub fn osdp_pd_set_command_handler(
             pd: *mut osdp_pd_t,
@@ -1077,6 +1212,9 @@ mod pd_ffi {
         );
         pub fn osdp_pd_tick(pd: *mut osdp_pd_t);
         pub fn osdp_pd_is_online(pd: *const osdp_pd_t) -> bool;
+        /// Largest reply payload the PD can send right now, resolved against
+        /// the bound TX capacity and whichever channel is established.
+        pub fn osdp_pd_max_reply_payload(pd: *const osdp_pd_t) -> usize;
 
         pub fn osdp_pd_set_led_handler(pd: *mut osdp_pd_t, cb: osdp_pd_led_cb, user: *mut c_void);
         pub fn osdp_pd_led_color(pd: *const osdp_pd_t, reader_no: u8, led_no: u8) -> u8;
@@ -1110,6 +1248,7 @@ mod pd_ffi {
         pub fn osdp_pd_set_sc_scbk_d(pd: *mut osdp_pd_t, scbk_d: *const u8);
         pub fn osdp_pd_set_sc_cuid(pd: *mut osdp_pd_t, cuid: *const u8);
         pub fn osdp_pd_sc_established(pd: *const osdp_pd_t) -> bool;
+
     }
 } // mod pd_ffi
 
@@ -1126,7 +1265,9 @@ mod acu_ffi {
 
     pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
-    pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_ACU_BUF_LEN in acu/include/osdp/osdp_acu.h, which
+     * defaults to the spec 5.6 maximum. */
+    pub const OSDP_ACU_BUF_LEN: usize = OSDP_FRAME_MAX_LEN;
     pub const OSDP_ACU_MAX_LEDS: usize = 16;
     pub const OSDP_ACU_MAX_BUZZERS: usize = 8;
 
@@ -1183,6 +1324,8 @@ mod acu_ffi {
         pub sc_cuid: [u8; OSDP_SC_CUID_LEN],
 
         pub sc_session: osdp_sc_session_t,
+
+        // Secure Channel 2 slot state (mirror of the C additions).
     }
 
     #[repr(C)]
@@ -1279,7 +1422,7 @@ mod acu_ffi {
         pub timeout_cb: osdp_acu_timeout_cb,
         pub timeout_user: *mut c_void,
         pub rx: osdp_stream_t,
-        pub tx_buf: [u8; OSDP_ACU_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_ACU_BUF_LEN],
         pub integrity: osdp_integrity_t,
         pub sc_crypto: osdp_sc_crypto_t,
         pub sc_crypto_set: bool,

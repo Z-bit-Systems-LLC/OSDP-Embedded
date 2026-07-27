@@ -75,6 +75,7 @@ fn main() {
         // core: shared (CRC, checksum, framing, streaming)
         "core/src/shared/checksum.c",
         "core/src/shared/crc16.c",
+        "core/src/shared/multipart.c",
         "core/src/shared/frame.c",
         "core/src/shared/stream.c",
         "core/src/shared/led_state.c",
@@ -84,6 +85,14 @@ fn main() {
         "core/src/commands/cmd_cap.c",
         "core/src/commands/cmd_comset.c",
         "core/src/commands/cmd_filetransfer.c",
+        "core/src/commands/cmd_lstat.c",
+        "core/src/commands/cmd_istat.c",
+        "core/src/commands/cmd_ostat.c",
+        "core/src/commands/cmd_rstat.c",
+        "core/src/commands/cmd_acurxsize.c",
+        "core/src/commands/cmd_mfg.c",
+        "core/src/commands/cmd_abort.c",
+        "core/src/commands/cmd_keepactive.c",
         "core/src/commands/cmd_id.c",
         "core/src/commands/cmd_keyset.c",
         "core/src/commands/cmd_led.c",
@@ -94,6 +103,15 @@ fn main() {
         "core/src/replies/reply_ack.c",
         "core/src/replies/reply_com.c",
         "core/src/replies/reply_ftstat.c",
+        "core/src/replies/reply_lstatr.c",
+        "core/src/replies/reply_istatr.c",
+        "core/src/replies/reply_ostatr.c",
+        "core/src/replies/reply_rstatr.c",
+        "core/src/replies/reply_busy.c",
+        "core/src/replies/reply_fmt.c",
+        "core/src/replies/reply_mfgrep.c",
+        "core/src/replies/reply_mfgstatr.c",
+        "core/src/replies/reply_mfgerrr.c",
         "core/src/replies/reply_keypad.c",
         "core/src/replies/reply_nak.c",
         "core/src/replies/reply_pdcap.c",
@@ -118,6 +136,8 @@ fn main() {
 
     if pd_enabled {
         sources.push("pd/src/pd.c");
+        sources.push("pd/src/pd_dispatch.c");
+        sources.push("pd/src/pd_pdcap.c");
         sources.push("pd/src/pd_sc.c");
     }
     if acu_enabled {

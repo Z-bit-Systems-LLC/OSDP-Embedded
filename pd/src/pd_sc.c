@@ -35,8 +35,8 @@ static const uint8_t *select_handshake_key(const osdp_pd_t *pd,
     return NULL;
 }
 
-/* Build a non-MAC handshake reply (SCS_12 or SCS_14) into pd->tx_buf.
- * Used by both CHLNG-handler and SCRYPT-handler. */
+/* Build a non-MAC handshake reply (SCS_12 or SCS_14) into the bound TX
+ * buffer. Used by both CHLNG-handler and SCRYPT-handler. */
 static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
                                            const osdp_frame_t *cmd,
                                            uint8_t             scb_type,
@@ -62,7 +62,7 @@ static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
     reply.code         = reply_code;
     reply.payload      = payload;
     reply.payload_len  = payload_len;
-    return osdp_frame_build(&reply, pd->tx_buf, OSDP_PD_TX_BUF_LEN, out_len);
+    return osdp_frame_build(&reply, pd->tx, pd->tx_cap, out_len);
 }
 
 /* ---- SCS_11: osdp_CHLNG → SCS_12: osdp_CCRYPT ------------------------- */
@@ -234,107 +234,6 @@ static size_t handle_scrypt(osdp_pd_t *pd, const osdp_frame_t *cmd)
     return built;
 }
 
-/* ---- osdp_COMSET under Secure Channel --------------------------------- */
-
-/* Handle an osdp_COMSET carried under an established session. Mirrors the
- * plaintext path in pd.c: compute the effective comms parameters, reply
- * osdp_COM wrapped as SCS_18 (data-bearing), and stage the change so it
- * takes effect only after the reply is transmitted. `plaintext` is the
- * already-unwrapped COMSET payload. */
-static size_t handle_comset_sc(osdp_pd_t          *pd,
-                               const osdp_frame_t *cmd,
-                               const uint8_t      *plaintext,
-                               size_t              plaintext_len)
-{
-    uint8_t  eff_addr = pd->address;
-    uint32_t eff_baud = 0;
-    uint8_t  com_payload[OSDP_COM_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_comset_effective(
-        pd, plaintext, plaintext_len, &eff_addr, &eff_baud, com_payload);
-
-    osdp_frame_t reply_template;
-    (void)memset(&reply_template, 0, sizeof(reply_template));
-    reply_template.address     = pd->address;
-    reply_template.reply       = true;
-    reply_template.sequence    = cmd->sequence;
-    reply_template.integrity   = cmd->integrity;
-    reply_template.has_scb     = true;
-    reply_template.scb_length  = OSDP_SCB_MIN_LEN;
-    reply_template.scb_type    = OSDP_SCS_18;
-
-    uint8_t nak_byte = OSDP_NAK_CMD_LENGTH;
-    if (s != OSDP_OK) {
-        reply_template.code        = OSDP_REPLY_NAK;
-        reply_template.payload     = &nak_byte;
-        reply_template.payload_len = 1;
-    } else {
-        reply_template.code        = OSDP_REPLY_COM;
-        reply_template.payload     = com_payload;
-        reply_template.payload_len = OSDP_COM_PAYLOAD_BYTES;
-    }
-
-    size_t built = 0;
-    if (osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session, &reply_template,
-                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built) != OSDP_OK) {
-        return 0;
-    }
-    /* Stage the address/baud change only on success; process_frame applies
-     * it after this SCS_18 reply is sent. */
-    if (s == OSDP_OK) {
-        pd->comset_pending     = true;
-        pd->comset_new_address = eff_addr;
-        pd->comset_new_baud    = eff_baud;
-    }
-    return built;
-}
-
-/* ---- osdp_FILETRANSFER under Secure Channel --------------------------- */
-
-/* Handle an osdp_FILETRANSFER carried under an established session. Mirrors
- * the plaintext path in pd.c: reassemble + evaluate via the shared helper,
- * then reply osdp_FTSTAT wrapped as SCS_18 (data-bearing), or a wrapped NAK
- * when the frame is undecodable / no receiver is bound. `plaintext` is the
- * already-unwrapped FILETRANSFER payload. */
-static size_t handle_filetransfer_sc(osdp_pd_t          *pd,
-                                     const osdp_frame_t *cmd,
-                                     const uint8_t      *plaintext,
-                                     size_t              plaintext_len)
-{
-    uint8_t ftstat_payload[OSDP_FTSTAT_PAYLOAD_BYTES];
-    const osdp_status_t s = osdp_pd_internal_filetransfer(
-        pd, plaintext, plaintext_len, ftstat_payload);
-
-    osdp_frame_t reply_template;
-    (void)memset(&reply_template, 0, sizeof(reply_template));
-    reply_template.address     = pd->address;
-    reply_template.reply       = true;
-    reply_template.sequence    = cmd->sequence;
-    reply_template.integrity   = cmd->integrity;
-    reply_template.has_scb     = true;
-    reply_template.scb_length  = OSDP_SCB_MIN_LEN;
-    reply_template.scb_type    = OSDP_SCS_18;
-
-    uint8_t nak_byte = OSDP_NAK_CMD_LENGTH;
-    if (s == OSDP_OK) {
-        reply_template.code        = OSDP_REPLY_FTSTAT;
-        reply_template.payload     = ftstat_payload;
-        reply_template.payload_len = OSDP_FTSTAT_PAYLOAD_BYTES;
-    } else {
-        nak_byte = (s == OSDP_ERR_NOT_SUPPORTED) ? OSDP_NAK_UNKNOWN_CMD
-                                                 : OSDP_NAK_CMD_LENGTH;
-        reply_template.code        = OSDP_REPLY_NAK;
-        reply_template.payload     = &nak_byte;
-        reply_template.payload_len = 1;
-    }
-
-    size_t built = 0;
-    if (osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session, &reply_template,
-                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built) != OSDP_OK) {
-        return 0;
-    }
-    return built;
-}
-
 /* ---- SCS_15 / SCS_17: operational traffic ---------------------------- */
 
 static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
@@ -345,12 +244,16 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* Unwrap: verify MAC and (for SCS_17) decrypt the payload. */
-    uint8_t plaintext[OSDP_PD_TX_BUF_LEN];
+    /* Unwrap: verify MAC and (for SCS_17) decrypt the payload. The plaintext
+     * lands in the bound rx_plain region rather than on the stack — a PD that
+     * expects large commands rebinds it without this function growing a
+     * multi-kilobyte frame on a constrained MCU. It is deliberately not the
+     * TX buffer: the reply below may point back into this plaintext while
+     * osdp_sc_wrap_frame is writing the outbound frame. */
     size_t  plaintext_len = 0;
     osdp_status_t s = osdp_sc_unwrap_frame(
         &pd->sc.crypto, &pd->sc.session, cmd,
-        plaintext, sizeof(plaintext), &plaintext_len);
+        pd->rx_plain, pd->rx_plain_cap, &plaintext_len);
     if (s != OSDP_OK) {
         /* MAC mismatch or decrypt failure: silent drop. The ACU will
          * time out and re-issue, which is the protocol's expected
@@ -359,36 +262,26 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return 0;
     }
 
-    /* osdp_COMSET is handled by the library (see the plaintext path in
-     * pd.c): it produces an osdp_COM reply and mutates pd->address, so it
-     * never reaches the application command handler. */
-    if (cmd->code == OSDP_CMD_COMSET) {
-        return handle_comset_sc(pd, cmd, plaintext, plaintext_len);
+    /* Decide the reply via the shared dispatch, exactly as the plaintext and
+     * SC2 paths do — library-handled osdp_COMSET / osdp_FILETRANSFER, the
+     * application handler, the KEYSET hook and reader-state observation all
+     * live there. Only the SCS framing below is specific to this path. */
+    osdp_pd_reply_t reply;
+    const osdp_pd_dispatch_outcome_t outcome =
+        osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC1, cmd->code,
+                                  pd->rx_plain, plaintext_len, &reply);
+    if (outcome == OSDP_PD_DISPATCH_DROP) {
+        return 0;  /* unrecognised handler error — drop */
     }
-
-    /* osdp_FILETRANSFER is likewise library-handled (see the plaintext path
-     * in pd.c): the PD reassembles the file and replies osdp_FTSTAT, so it
-     * never reaches the application command handler. */
-    if (cmd->code == OSDP_CMD_FILETRANSFER) {
-        return handle_filetransfer_sc(pd, cmd, plaintext, plaintext_len);
+    if (outcome == OSDP_PD_DISPATCH_BUSY) {
+        /* Spec 7.19: osdp_BUSY leaves the Secure Channel. It is framed
+         * plaintext at sequence 0 and must not touch the MAC chain, so it
+         * bypasses osdp_sc_wrap_frame entirely — returning here before the
+         * wrap below is what keeps `session` untouched. */
+        size_t busy_len = 0;
+        return (osdp_pd_internal_build_busy(pd, cmd, &busy_len) == OSDP_OK)
+                   ? busy_len : 0;
     }
-
-    /* Dispatch the plaintext payload to the application handler. */
-    osdp_pd_reply_t reply = {
-        .code        = OSDP_REPLY_ACK,
-        .payload     = NULL,
-        .payload_len = 0,
-    };
-    osdp_status_t app_status = OSDP_ERR_NOT_SUPPORTED;
-    if (pd->cmd_cb != NULL) {
-        app_status = pd->cmd_cb(pd->cmd_user, cmd->code,
-                                plaintext, plaintext_len, &reply);
-    }
-
-    /* Mirror reader-visible commands (osdp_LED) into the LED bank, same
-     * as the plaintext path — the application sees identical LED state
-     * whether the command arrived in the clear or under Secure Channel. */
-    osdp_pd_internal_observe_command(pd, cmd->code, plaintext, plaintext_len);
 
     /* Reply SCB type picks the reply-direction encrypted variant
      * (SCS_18). `osdp_sc_wrap_frame` enforces the project-wide
@@ -399,7 +292,13 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * regardless of whether the inbound was SCS_15 or SCS_17. */
     osdp_frame_t reply_template;
     (void)memset(&reply_template, 0, sizeof(reply_template));
-    reply_template.address     = pd->address;
+    /* Mirror the inbound destination address, matching the plaintext path
+     * (spec 5.9 Note 2): a command addressed to the configuration address
+     * 0x7F must be answered at 0x7F | reply-flag, not at the PD's own
+     * address. In practice an established SC session is per-PD so cmd->address
+     * is pd->address here, making this a no-op — but mirroring is what the
+     * spec says and costs nothing, and it keeps all three paths identical. */
+    reply_template.address     = cmd->address;
     reply_template.reply       = true;
     reply_template.sequence    = cmd->sequence;
     reply_template.integrity   = cmd->integrity;
@@ -407,47 +306,14 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     reply_template.scb_length  = OSDP_SCB_MIN_LEN;
     reply_template.scb_type    = OSDP_SCS_18;
 
-    /* Stack storage that lives across the wrap call below; the wrap
-     * routine copies the bytes into the output buffer so the lifetime
-     * is sufficient. */
-    uint8_t nak_byte = OSDP_NAK_UNKNOWN_CMD;
-    if (app_status == OSDP_OK) {
-        /* KEYSET hook: same shape as the plaintext path in pd.c —
-         * if the app ACK'd a KEYSET arriving under SC, apply the
-         * new SCBK before transmitting the ACK. On malformed input
-         * we downgrade the wire reply to a NAK so the ACU sees it.
-         * The live SC session is intentionally NOT torn down — the
-         * rotated key only matters for the next handshake. */
-        if (cmd->code == OSDP_CMD_KEYSET) {
-            const osdp_status_t ks = osdp_pd_internal_apply_keyset(
-                pd, plaintext, plaintext_len);
-            if (ks != OSDP_OK) {
-                /* Any malformed-but-recognized KEYSET is spec Table 47
-                 * error 0x09 "Unable to process command record". */
-                nak_byte = OSDP_NAK_RECORD_INVALID;
-                reply_template.code        = OSDP_REPLY_NAK;
-                reply_template.payload     = &nak_byte;
-                reply_template.payload_len = 1;
-                goto wrap;
-            }
-        }
-        reply_template.code        = reply.code;
-        reply_template.payload     = reply.payload;
-        reply_template.payload_len = reply.payload_len;
-    } else if (app_status == OSDP_ERR_NOT_SUPPORTED) {
-        reply_template.code        = OSDP_REPLY_NAK;
-        reply_template.payload     = &nak_byte;
-        reply_template.payload_len = 1;
-    } else {
-        return 0;  /* internal handler error — drop */
-    }
-
-wrap:;
+    reply_template.code        = reply.code;
+    reply_template.payload     = reply.payload;
+    reply_template.payload_len = reply.payload_len;
 
     size_t built = 0;
     s = osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session,
                            &reply_template,
-                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built);
+                           pd->tx, pd->tx_cap, &built);
     if (s != OSDP_OK) {
         return 0;
     }

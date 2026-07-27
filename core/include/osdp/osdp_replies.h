@@ -286,6 +286,108 @@ osdp_status_t osdp_ftstat_decode(const uint8_t *payload, size_t len,
 osdp_status_t osdp_ftstat_build(const osdp_ftstat_t *in,
                                 uint8_t *buf, size_t buf_cap, size_t *written);
 
+/* ========================================================================
+ * osdp_BUSY (0x79) — empty payload
+ *
+ * Spec 7.19, Table 62: "still working on the previous command, ask again."
+ * Two framing rules attach that this codec cannot express — the sequence
+ * number is always 0, and the reply goes out in the clear even during an
+ * established Secure Channel without disturbing the MAC chain. The PD state
+ * machine owns both, and must also keep osdp_BUSY out of the retransmit
+ * cache, since the ACU repeats the command in its original form.
+ * ====================================================================== */
+
+osdp_status_t osdp_busy_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_busy_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_FMT (0x51) — card data as formatted characters, 3-byte header + ASCII
+ *
+ * Spec 7.11, Table 56. DEPRECATED by the spec; implemented so a Monitor can
+ * decode existing traffic. New PD code should report card data as osdp_RAW.
+ *
+ * Sent as a poll response. Unreported card data is discarded on a
+ * communication loss, so a PD queueing one must drop it when it goes offline.
+ * ====================================================================== */
+
+#define OSDP_FMT_HEADER_BYTES 3U
+
+/* Read direction (Table 56). The spec defines 0x01 as a forward read and
+ * describes 0x02-0x7F as reverse; 0x00 and 0x80-0xFF are reserved. */
+#define OSDP_FMT_DIR_FORWARD 0x01U
+#define OSDP_FMT_DIR_REVERSE 0x02U
+
+typedef struct osdp_fmt {
+    uint8_t        reader_no;
+    uint8_t        direction;    /* OSDP_FMT_DIR_*                          */
+    uint8_t        char_count;
+    const uint8_t *chars;        /* ASCII; NULL when char_count == 0        */
+    size_t         chars_len;    /* must equal char_count                   */
+} osdp_fmt_t;
+
+osdp_status_t osdp_fmt_decode(const uint8_t *payload, size_t len,
+                              osdp_fmt_t *out);
+osdp_status_t osdp_fmt_build(const osdp_fmt_t *in,
+                             uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_MFGREP (0x90) — manufacturer-specific reply
+ *
+ * Spec 7.18, Table 61. Same shape as osdp_MFG: 3-byte Vendor Code then
+ * vendor-defined data. Sent either in response to an osdp_MFG or unprompted
+ * as a poll response.
+ * ====================================================================== */
+
+/* Deliberately duplicated from osdp_commands.h rather than included: the
+ * module split is by message direction, and a reply header that pulled in the
+ * command header would drag every command codec's declarations into every
+ * PD-side translation unit. Three octets is fixed by IEEE MA-L, not by us. */
+#define OSDP_MFGREP_VENDOR_CODE_BYTES 3U
+#define OSDP_MFGREP_HEADER_BYTES      OSDP_MFGREP_VENDOR_CODE_BYTES
+
+typedef struct osdp_mfgrep {
+    uint8_t        vendor_code[OSDP_MFGREP_VENDOR_CODE_BYTES];
+    const uint8_t *data;       /* vendor-defined; NULL when data_len == 0 */
+    size_t         data_len;
+} osdp_mfgrep_t;
+
+osdp_status_t osdp_mfgrep_decode(const uint8_t *payload, size_t len,
+                                 osdp_mfgrep_t *out);
+osdp_status_t osdp_mfgrep_build(const osdp_mfgrep_t *in,
+                                uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_MFGSTATR (0x83) / osdp_MFGERRR (0x84) — one vendor-defined byte each
+ *
+ * Spec 7.23 / 7.24, Tables 66 / 67. BOTH DEPRECATED: the spec states they
+ * "have been found to be incomplete or incorrect" and will be redefined in
+ * OSDP v2.3.0. Implemented so the codes are not silent holes and a Monitor
+ * can decode them; new PD code should not emit them.
+ * ====================================================================== */
+
+#define OSDP_MFGSTATR_PAYLOAD_BYTES 1U
+#define OSDP_MFGERRR_PAYLOAD_BYTES  1U
+
+typedef struct osdp_mfgstatr {
+    uint8_t data;    /* vendor defined */
+} osdp_mfgstatr_t;
+
+typedef struct osdp_mfgerrr {
+    uint8_t data;    /* vendor defined */
+} osdp_mfgerrr_t;
+
+osdp_status_t osdp_mfgstatr_decode(const uint8_t *payload, size_t len,
+                                   osdp_mfgstatr_t *out);
+osdp_status_t osdp_mfgstatr_build(const osdp_mfgstatr_t *in,
+                                  uint8_t *buf, size_t buf_cap,
+                                  size_t *written);
+
+osdp_status_t osdp_mfgerrr_decode(const uint8_t *payload, size_t len,
+                                  osdp_mfgerrr_t *out);
+osdp_status_t osdp_mfgerrr_build(const osdp_mfgerrr_t *in,
+                                 uint8_t *buf, size_t buf_cap,
+                                 size_t *written);
+
 #ifdef __cplusplus
 }
 #endif

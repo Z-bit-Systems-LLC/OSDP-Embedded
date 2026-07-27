@@ -30,7 +30,7 @@ void tearDown(void) {}
 
 /* ---- Mock transport ----------------------------------------------------*/
 
-#define MOCK_BUF_LEN 1024U
+#define MOCK_BUF_LEN 4096U   /* room for a spec-scale SC frame in both directions */
 
 typedef struct mock_transport {
     uint8_t  incoming[MOCK_BUF_LEN];
@@ -1308,7 +1308,12 @@ static void inject_plaintext_command(mock_transport_t *m, uint8_t cmd_code,
     m->incoming_len = built;
 }
 
-static void test_cleartext_sqn0_drops_established_session(void)
+/* Sequence 0 is the ACU's connection-restart sentinel (spec 5.9): the stale
+ * session is dropped without that counting as an interleaving violation. But
+ * dropping the session is ALL it buys — the command still has to satisfy the
+ * secure-mode allowlist, so a restricted command (POLL) is still refused
+ * NAK 0x06. SQN 0 is not an escape hatch around Secure Channel. */
+static void test_cleartext_sqn0_resets_session_but_still_enforces_allowlist(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
@@ -1320,21 +1325,47 @@ static void test_cleartext_sqn0_drops_established_session(void)
     perform_handshake(&pd, &m, /*selector*/ 1, &acu);
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 
-    /* Clear-text POLL during an established session → tear it down. */
+    /* Clear-text POLL at SQN 0 during an established session. */
     m.outgoing_len = 0;
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
 
+    /* Session dropped... */
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
 
-    /* The clear command is refused NAK 0x06 (encryption required), in the
-     * clear (no SCB). */
+    /* ...but POLL is not on the allowlist, so it is still refused. */
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
     TEST_ASSERT_FALSE(reply.has_scb);
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
-    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_ENCRYPTION_REQUIRED, reply.payload[0]);
+}
+
+/* The reconnect the SQN-0 reset exists to serve: a discovery command at
+ * sequence 0 drops the stale session AND is answered, so the ACU is back in
+ * discovery in a single message rather than a NAK/retry round trip. */
+static void test_cleartext_sqn0_discovery_resets_session_and_processes(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, sc_app_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
+
+    m.outgoing_len = 0;
+    inject_plaintext_command(&m, OSDP_CMD_ID, NULL, 0, /*sequence*/ 0);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_FALSE(reply.has_scb);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDID, reply.code);
 }
 
 static void test_cleartext_nonzero_sqn_also_drops_session(void)
@@ -1374,7 +1405,11 @@ static void test_cleartext_restricted_before_sc_naks_encryption_required(void)
     /* PD keyed for full security (operational SCBK), no session yet. A
      * restricted clear-text command (POLL) is refused NAK 0x06 — the ACU
      * must establish SC first. Discovery commands (ID/CAP/COMSET) would
-     * still be answered in the clear; POLL is not one of them. */
+     * still be answered in the clear; POLL is not one of them.
+     *
+     * Deliberately at sequence 0: the restart sentinel drops a stale session
+     * but does NOT exempt the command from this allowlist, so SQN 0 cannot be
+     * used to drive a full-security PD in the clear. */
     TEST_ASSERT_FALSE(osdp_pd_sc_established(&pd));
     inject_plaintext_command(&m, OSDP_CMD_POLL, NULL, 0, /*sequence*/ 0);
     osdp_pd_tick(&pd);
@@ -1470,6 +1505,280 @@ static void test_filetransfer_under_sc_yields_scs_18_ftstat(void)
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 }
 
+/* ---- Caller-supplied buffers on the SC path ---------------------------- */
+
+/* Echoes the decrypted payload straight back. The reply payload IS the
+ * pointer the core handed the handler, which on this path is the PD's
+ * rx_plain region — so this also proves rx_plain and tx are distinct
+ * storage. If they aliased, osdp_sc_wrap_frame would be writing the
+ * outbound frame over the very bytes it is reading as the payload. */
+static osdp_status_t sc_echo_handler(void *user, uint8_t cmd_code,
+                                     const uint8_t *payload,
+                                     size_t payload_len,
+                                     osdp_pd_reply_t *reply)
+{
+    (void)user; (void)cmd_code;
+    reply->code        = OSDP_REPLY_RAW;
+    reply->payload     = payload;
+    reply->payload_len = payload_len;
+    return OSDP_OK;
+}
+
+/* An SCS_17 exchange whose plaintext is larger than any existing SC test
+ * sends, driven entirely through caller-bound tx / rx_plain regions. Proves
+ * the SC path goes through the bindings (it decrypted into the bound
+ * rx_plain, and re-encrypted out of it into the bound tx) and that the two
+ * regions are genuinely distinct storage — the handler hands back the exact
+ * pointer it was given, so any tx/rx_plain overlap corrupts the echo.
+ *
+ * The payload here is modest; the companion
+ * test_sc_payload_past_the_old_scratch_limit_round_trips below covers the
+ * large case. */
+static void test_bound_buffers_carry_a_large_sc_exchange(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    static uint8_t tx[OSDP_FRAME_MAX_LEN];
+    static uint8_t rx_plain[OSDP_FRAME_MAX_LEN];
+    const osdp_pd_buffers_t bufs = {
+        .tx = tx, .tx_cap = sizeof(tx),
+        .rx_plain = rx_plain, .rx_plain_cap = sizeof(rx_plain),
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
+    osdp_pd_set_command_handler(&pd, sc_echo_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    static uint8_t big[200];
+    for (size_t i = 0; i < sizeof(big); i++) {
+        big[i] = (uint8_t)((i * 7U) & 0xFFU);
+    }
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_TEXT;
+    cmd_template.payload     = big;
+    cmd_template.payload_len = sizeof(big);
+
+    static uint8_t cmd_wire[OSDP_FRAME_MAX_LEN];
+    size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(MOCK_BUF_LEN, cmd_wire_len);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+
+    static uint8_t plain[OSDP_FRAME_MAX_LEN];
+    size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+    /* Every byte round-tripped: decrypted into rx_plain, handed to the app,
+     * re-encrypted out of rx_plain into tx, and back. */
+    TEST_ASSERT_EQUAL_size_t(sizeof(big), plain_len);
+    TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
+}
+
+/* Secure Channel message size is bounded by the caller's buffer, not by any
+ * fixed internal array.
+ *
+ * osdp_sc_wrap_frame used to encrypt through a 256-byte stack scratch, which
+ * capped every SC message there however much output capacity was supplied —
+ * so a PD could advertise a 512-byte receive buffer in PDCAP and then fail to
+ * produce anything over ~240 under SC. It now encrypts directly into the
+ * output at the offset osdp_frame_payload_offset reports.
+ *
+ * 600 bytes is chosen to sit well past the old ceiling: if the scratch ever
+ * comes back, this fails immediately. */
+static void test_sc_payload_past_the_old_scratch_limit_round_trips(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    /* The PD needs room for a 600-byte plaintext in both directions. */
+    static uint8_t tx[OSDP_FRAME_MAX_LEN];
+    static uint8_t rx_plain[OSDP_FRAME_MAX_LEN];
+    const osdp_pd_buffers_t bufs = {
+        .tx = tx, .tx_cap = sizeof(tx),
+        .rx_plain = rx_plain, .rx_plain_cap = sizeof(rx_plain),
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+    osdp_pd_set_command_handler(&pd, sc_echo_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    static uint8_t big[600];
+    for (size_t i = 0; i < sizeof(big); i++) {
+        big[i] = (uint8_t)((i * 31U) & 0xFFU);
+    }
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_TEXT;
+    cmd_template.payload     = big;
+    cmd_template.payload_len = sizeof(big);
+
+    static uint8_t cmd_wire[OSDP_FRAME_MAX_LEN];
+    size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+
+    mock_reset_incoming(&m);
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(MOCK_BUF_LEN, cmd_wire_len);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+
+    static uint8_t plain[OSDP_FRAME_MAX_LEN];
+    size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+    /* All 600 bytes survived encrypt-in-place on the way out and
+     * decrypt-into-rx_plain on the way in, twice (command and reply). */
+    TEST_ASSERT_EQUAL_size_t(sizeof(big), plain_len);
+    TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
+}
+
+/* ---- osdp_BUSY under an established Secure Channel ---------------------
+ *
+ * Spec 7.19 makes osdp_BUSY one of only three replies allowed outside the
+ * SCS packet format. The subtle part is not that it goes out plaintext — it
+ * is that it must leave the rolling MAC chain untouched, because the ACU's
+ * next SCS_17 will be MACed against the chain state from BEFORE the BUSY.
+ * Advancing it would desync the session and the ACU would tear it down.
+ */
+
+static osdp_status_t busy_then_ok_handler(void *user, uint8_t cmd_code,
+                                          const uint8_t *payload,
+                                          size_t payload_len,
+                                          osdp_pd_reply_t *reply)
+{
+    (void)cmd_code; (void)payload; (void)payload_len;
+    int *busy_left = (int *)user;
+    reply->code        = OSDP_REPLY_ACK;
+    reply->payload     = NULL;
+    reply->payload_len = 0;
+    if (*busy_left > 0) {
+        (*busy_left)--;
+        return OSDP_ERR_BUSY;
+    }
+    return OSDP_OK;
+}
+
+static void test_busy_under_sc_is_plaintext_and_preserves_the_mac_chain(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    int busy_left = 1;
+    osdp_pd_set_command_handler(&pd, busy_then_ok_handler, &busy_left);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* Snapshot the ACU's chain state so we can prove the PD did not move
+     * its own copy: the two must still agree after the BUSY. */
+    const osdp_sc_session_t acu_before = acu;
+
+    osdp_frame_t poll;
+    (void)memset(&poll, 0, sizeof(poll));
+    poll.address    = 0x05;
+    poll.integrity  = OSDP_INTEGRITY_CRC;
+    poll.sequence   = 2;
+    poll.has_scb    = true;
+    poll.scb_length = OSDP_SCB_MIN_LEN;
+    poll.scb_type   = OSDP_SCS_15;
+    poll.code       = OSDP_CMD_POLL;
+
+    uint8_t wire[64];
+    size_t  wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll,
+                           wire, sizeof(wire), &wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, wire, wire_len);
+    m.incoming_len = wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t busy;
+    decode_first_outgoing(&m, &busy);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_BUSY, busy.code);
+    /* Plaintext: no security block at all, despite an established session. */
+    TEST_ASSERT_FALSE(busy.has_scb);
+    TEST_ASSERT_EQUAL_UINT8(0, busy.sequence);          /* spec 7.19 */
+    TEST_ASSERT_EQUAL_size_t(0, busy.payload_len);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));      /* session survives */
+
+    /* The decisive part: the ACU, whose chain state never advanced, sends its
+     * next secure command against the SAME chain. If the PD had advanced its
+     * own last_inbound_mac while emitting the BUSY, this would fail to
+     * verify and be dropped. */
+    acu = acu_before;
+    poll.sequence = 3;
+    wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll,
+                           wire, sizeof(wire), &wire_len));
+    mock_reset_incoming(&m);
+    m.outgoing_len = 0;
+    (void)memcpy(m.incoming, wire, wire_len);
+    m.incoming_len = wire_len;
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t ack;
+    decode_first_outgoing(&m, &ack);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, ack.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, ack.code);
+
+    /* And it unwraps cleanly on the ACU side, which is the real proof the
+     * chains are still in lockstep. */
+    uint8_t plain[64];
+    size_t  plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &ack,
+                             plain, sizeof(plain), &plain_len));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1499,8 +1808,14 @@ int main(void)
     RUN_TEST(test_comset_under_sc_reports_com_and_moves_address);
     /* File transfer under SC. */
     RUN_TEST(test_filetransfer_under_sc_yields_scs_18_ftstat);
+
+    RUN_TEST(test_bound_buffers_carry_a_large_sc_exchange);
+    RUN_TEST(test_sc_payload_past_the_old_scratch_limit_round_trips);
+
+    RUN_TEST(test_busy_under_sc_is_plaintext_and_preserves_the_mac_chain);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
-    RUN_TEST(test_cleartext_sqn0_drops_established_session);
+    RUN_TEST(test_cleartext_sqn0_resets_session_but_still_enforces_allowlist);
+    RUN_TEST(test_cleartext_sqn0_discovery_resets_session_and_processes);
     RUN_TEST(test_cleartext_nonzero_sqn_also_drops_session);
     RUN_TEST(test_cleartext_restricted_before_sc_naks_encryption_required);
     return UNITY_END();

@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Z-bit Systems, LLC
+
+#include "osdp/osdp_replies.h"
+
+/* osdp_MFGERRR (0x84) — spec 7.24, Table 67. One vendor-defined byte.
+ *
+ * **Deprecated.** The spec states outright that this reply "has been found to
+ * be incomplete or incorrect" and that command 0x84 will be redefined in
+ * OSDP v2.3.0. It is implemented so a Monitor can decode existing traffic and
+ * so the reply code is not a silent hole; new PD code should not emit it.
+ *
+ * Sent when there is a error condition requiring a manufacturer-specific response.
+ * The single byte carries no spec-defined meaning — it is whatever the vendor
+ * assigns, which is precisely why the definition is considered incomplete. */
+
+osdp_status_t osdp_mfgerrr_decode(const uint8_t *payload, size_t len,
+                              osdp_mfgerrr_t *out)
+{
+    if (out == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (len != OSDP_MFGERRR_PAYLOAD_BYTES || payload == NULL) {
+        return OSDP_ERR_BAD_PAYLOAD;
+    }
+    out->data = payload[0];
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_mfgerrr_build(const osdp_mfgerrr_t *in,
+                             uint8_t *buf, size_t buf_cap, size_t *written)
+{
+    if (in == NULL || buf == NULL || written == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    *written = 0;
+    if (buf_cap < OSDP_MFGERRR_PAYLOAD_BYTES) {
+        return OSDP_ERR_BUFFER_TOO_SMALL;
+    }
+    buf[0] = in->data;
+    *written = OSDP_MFGERRR_PAYLOAD_BYTES;
+    return OSDP_OK;
+}
