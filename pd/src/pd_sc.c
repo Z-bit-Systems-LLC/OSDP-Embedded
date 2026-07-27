@@ -267,10 +267,20 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * application handler, the KEYSET hook and reader-state observation all
      * live there. Only the SCS framing below is specific to this path. */
     osdp_pd_reply_t reply;
-    if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC1, cmd->code,
-                                  pd->rx_plain, plaintext_len,
-                                  &reply) != OSDP_OK) {
-        return 0;  /* internal handler error — drop */
+    const osdp_pd_dispatch_outcome_t outcome =
+        osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC1, cmd->code,
+                                  pd->rx_plain, plaintext_len, &reply);
+    if (outcome == OSDP_PD_DISPATCH_DROP) {
+        return 0;  /* unrecognised handler error — drop */
+    }
+    if (outcome == OSDP_PD_DISPATCH_BUSY) {
+        /* Spec 7.19: osdp_BUSY leaves the Secure Channel. It is framed
+         * plaintext at sequence 0 and must not touch the MAC chain, so it
+         * bypasses osdp_sc_wrap_frame entirely — returning here before the
+         * wrap below is what keeps `session` untouched. */
+        size_t busy_len = 0;
+        return (osdp_pd_internal_build_busy(pd, cmd, &busy_len) == OSDP_OK)
+                   ? busy_len : 0;
     }
 
     /* Reply SCB type picks the reply-direction encrypted variant

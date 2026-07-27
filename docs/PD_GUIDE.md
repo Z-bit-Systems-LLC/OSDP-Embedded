@@ -415,23 +415,32 @@ OSDP is strictly master-slave: a PD **never** transmits spontaneously. So
 anything the device wants to tell the ACU — a card was presented (`RAW`),
 a key was pressed (`KEYPAD`), tamper/power changed (`LSTATR`) — has to
 wait for the next `OSDP_CMD_POLL` and be returned *in place of* the usual
-`ACK`. The natural implementation is an application-side FIFO that your
-POLL handler drains one entry per poll:
+`ACK`.
+
+The library has a queue for exactly this. Bind caller-owned storage once, and
+enqueue from wherever the card read or keypress is actually detected:
 
 ```c
-case OSDP_CMD_POLL: {
-    event_t ev;
-    if (event_queue_pop_fresh(&app->events, now_ms, &ev)) {
-        reply->code        = ev.code;       /* RAW / KEYPAD / LSTATR … */
-        reply->payload     = ev.payload;
-        reply->payload_len = ev.payload_len;
-    } else {
-        reply->code = OSDP_REPLY_ACK;       /* nothing pending */
-        reply->payload = NULL; reply->payload_len = 0;
-    }
-    return OSDP_OK;
+static uint8_t event_queue[512];
+osdp_pd_set_event_queue(&pd, event_queue, sizeof(event_queue));
+
+/* ... in your card-reader ISR or polling loop ... */
+uint8_t body[16];
+size_t  len = 0;
+osdp_raw_build(&card, body, sizeof(body), &len);
+if (osdp_pd_enqueue_event(&pd, OSDP_REPLY_RAW, body, len)
+        == OSDP_ERR_BUFFER_TOO_SMALL) {
+    /* Queue full. Only you know whether this read mattered. */
 }
 ```
+
+The PD answers the next `osdp_POLL` with the head of the queue instead of
+calling your command handler; an empty queue falls through to `cmd_cb`
+unchanged, so adding this does not disturb an existing handler. Records are
+FIFO, and `osdp_pd_event_pending` tells you whether anything is waiting.
+
+You can still do it by hand in your POLL handler if you prefer — the queue is
+opt-in — but the library version already implements the discard rule below.
 
 ### Stale events must be discarded, not replayed
 
@@ -442,13 +451,18 @@ entries live forever, an ACU that stopped polling and reconnected later
 would receive a **stale** card-read and could grant access for a
 credential presented minutes ago — a replay risk.
 
-So stamp each event with the time it was enqueued and **drop it once it
-ages past a short freshness window** (the reference MCP PD uses a 2 s TTL,
-matching its "actively polling" definition). A queued read is delivered
-promptly while the link is actively polled, or discarded — reported on the
-next poll or not at all. Prune from the front of the FIFO on each POLL;
-with a uniform TTL, once you reach a fresh entry the rest are fresher
-still.
+The library queue implements the spec's own version of this rule: per spec
+7.11/7.12 "unreported data is deleted in case of, or during, a communication
+loss", so the whole queue is discarded on the offline transition. An ACU that
+stopped polling and reconnected never receives what was queued before the
+outage.
+
+That covers the outage case but not a *slow* link. If your deployment needs a
+tighter bound, stamp each event with the time it was enqueued and **drop it
+once it ages past a short freshness window** before calling
+`osdp_pd_enqueue_event` (the reference MCP PD uses a 2 s TTL, matching its
+"actively polling" definition), or call `osdp_pd_clear_events` yourself when
+you decide what is queued has gone stale.
 
 ### Exception: status reports reflect current state
 
@@ -465,6 +479,133 @@ initialization (the first poll after the PD comes up), then reflects
 steady state thereafter. Don't apply the credential-style TTL to it —
 losing the power-on indication to an expiry timer would hide a genuine
 device-state change.
+
+Because those four are queries about current state, they get their own
+mechanism — providers, not the queue. See the next section.
+
+---
+
+## Status reports — `osdp_pd_set_status_provider`
+
+`osdp_LSTAT` / `osdp_ISTAT` / `osdp_OSTAT` / `osdp_RSTAT` ask the PD to report
+device state. The reply layout is fixed by the spec, so the library builds it;
+you supply only the values:
+
+```c
+static void my_local(void *user, uint8_t *tamper, uint8_t *power)
+{
+    app_t *app = user;
+    *tamper = app->tamper_open ? OSDP_LSTATR_TAMPER : OSDP_LSTATR_NORMAL;
+    *power  = app->on_battery  ? OSDP_LSTATR_POWER_FAILURE
+                               : OSDP_LSTATR_NORMAL;
+}
+
+static size_t my_inputs(void *user, uint8_t *out, size_t cap)
+{
+    app_t *app = user;
+    size_t n = (app->input_count < cap) ? app->input_count : cap;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = app->inputs[i] ? OSDP_ISTATR_ACTIVE : OSDP_ISTATR_INACTIVE;
+    }
+    return n;                       /* how many you actually wrote */
+}
+
+static const osdp_pd_status_provider_t provider = {
+    .local  = my_local,
+    .inputs = my_inputs,
+    /* .outputs and .readers left NULL — see below */
+};
+osdp_pd_set_status_provider(&pd, &provider, app);
+```
+
+Three things worth knowing:
+
+- **Members are independent.** A NULL member leaves that one command falling
+  through to your `cmd_cb`. Above, `osdp_LSTAT` and `osdp_ISTAT` are answered
+  by the library while `osdp_OSTAT` and `osdp_RSTAT` still reach your handler.
+  With no provider bound at all, nothing changes — this is purely additive.
+- **`cap` is `OSDP_PD_REPLY_SCRATCH_LEN`** (64 by default, overridable). Write
+  at most that many and return the count; a return larger than `cap` is
+  clamped rather than trusted, so an off-by-one in your provider cannot make
+  the PD read past the buffer it handed you.
+- **Returning 0 is legal** — a PD with no inputs genuinely has nothing to
+  report, and an empty `osdp_ISTATR` is the correct answer.
+
+---
+
+## Saying "not yet" — `OSDP_ERR_BUSY`
+
+When a command is valid but the answer is not available within the ACU's
+200 ms reply window, return `OSDP_ERR_BUSY` and the PD sends `osdp_BUSY`
+(spec 7.19). The ACU repeats the command unchanged until it gets something
+else:
+
+```c
+case OSDP_CMD_MFG:
+    if (!app->measurement_ready) {
+        return OSDP_ERR_BUSY;       /* ask me again shortly */
+    }
+    ...
+```
+
+The library handles the three awkward parts for you: the reply goes out at
+sequence 0, in the clear even during an established Secure Channel (without
+disturbing the MAC chain), and is not cached as the retransmit answer — so the
+repeat gets processed fresh rather than replayed.
+
+Use `osdp_ACK` instead when the data will simply arrive on a later poll: the
+spec's rule is that `osdp_BUSY` is for when a *specific non-ACK response* is
+required and cannot be produced in time.
+
+---
+
+## Abort, receive size, and keep-active
+
+Three more commands the library handles for you:
+
+- **`osdp_ABORT`** cancels any in-flight file transfer before your optional
+  `osdp_pd_set_abort_handler` hook runs. Return non-OK from the hook if you
+  genuinely cannot stop — a firmware write past the point of no return — and
+  the PD sends NAK 0x03 as the spec directs.
+- **`osdp_ACURXSIZE`** is stored for you; read it with
+  `osdp_pd_acu_rx_size(&pd)`. This is the **ACU's** limit on what it can
+  receive, so the real budget for a reply is the smaller of it and
+  `osdp_pd_max_reply_payload(&pd)`, which is yours.
+- **`osdp_KEEPACTIVE`** needs `osdp_pd_set_keepactive_handler`. Without one
+  the PD NAKs 0x03 rather than ACK a reader extension it cannot perform.
+
+---
+
+## Manufacturer-specific messages — `osdp_MFG` → `osdp_MFGREP`
+
+Not intercepted, deliberately: the content is yours to define. Decode the
+request, check the vendor code is actually yours, and build the reply body:
+
+```c
+case OSDP_CMD_MFG: {
+    osdp_mfg_cmd_t req;
+    if (osdp_mfg_decode(payload, payload_len, &req) != OSDP_OK) {
+        return OSDP_ERR_BAD_PAYLOAD;              /* -> NAK 0x02 */
+    }
+    if (memcmp(req.vendor_code, MY_VENDOR, 3) != 0) {
+        return OSDP_ERR_INVALID_ARG;              /* -> NAK 0x09 */
+    }
+    osdp_mfgrep_t rep = { .data = answer, .data_len = sizeof(answer) };
+    memcpy(rep.vendor_code, MY_VENDOR, 3);
+    size_t built = 0;
+    if (osdp_mfgrep_build(&rep, app->scratch, sizeof(app->scratch),
+                          &built) != OSDP_OK) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    reply->code        = OSDP_REPLY_MFGREP;
+    reply->payload     = app->scratch;
+    reply->payload_len = built;
+    return OSDP_OK;
+}
+```
+
+`osdp_MFGREP` may also be sent unprompted as a poll response — enqueue it with
+`osdp_pd_enqueue_event` like any other event.
 
 ---
 

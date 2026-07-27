@@ -1676,6 +1676,109 @@ static void test_sc_payload_past_the_old_scratch_limit_round_trips(void)
     TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
 }
 
+/* ---- osdp_BUSY under an established Secure Channel ---------------------
+ *
+ * Spec 7.19 makes osdp_BUSY one of only three replies allowed outside the
+ * SCS packet format. The subtle part is not that it goes out plaintext — it
+ * is that it must leave the rolling MAC chain untouched, because the ACU's
+ * next SCS_17 will be MACed against the chain state from BEFORE the BUSY.
+ * Advancing it would desync the session and the ACU would tear it down.
+ */
+
+static osdp_status_t busy_then_ok_handler(void *user, uint8_t cmd_code,
+                                          const uint8_t *payload,
+                                          size_t payload_len,
+                                          osdp_pd_reply_t *reply)
+{
+    (void)cmd_code; (void)payload; (void)payload_len;
+    int *busy_left = (int *)user;
+    reply->code        = OSDP_REPLY_ACK;
+    reply->payload     = NULL;
+    reply->payload_len = 0;
+    if (*busy_left > 0) {
+        (*busy_left)--;
+        return OSDP_ERR_BUSY;
+    }
+    return OSDP_OK;
+}
+
+static void test_busy_under_sc_is_plaintext_and_preserves_the_mac_chain(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    int busy_left = 1;
+    osdp_pd_set_command_handler(&pd, busy_then_ok_handler, &busy_left);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    /* Snapshot the ACU's chain state so we can prove the PD did not move
+     * its own copy: the two must still agree after the BUSY. */
+    const osdp_sc_session_t acu_before = acu;
+
+    osdp_frame_t poll;
+    (void)memset(&poll, 0, sizeof(poll));
+    poll.address    = 0x05;
+    poll.integrity  = OSDP_INTEGRITY_CRC;
+    poll.sequence   = 2;
+    poll.has_scb    = true;
+    poll.scb_length = OSDP_SCB_MIN_LEN;
+    poll.scb_type   = OSDP_SCS_15;
+    poll.code       = OSDP_CMD_POLL;
+
+    uint8_t wire[64];
+    size_t  wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll,
+                           wire, sizeof(wire), &wire_len));
+    mock_reset_incoming(&m);
+    (void)memcpy(m.incoming, wire, wire_len);
+    m.incoming_len = wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t busy;
+    decode_first_outgoing(&m, &busy);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_BUSY, busy.code);
+    /* Plaintext: no security block at all, despite an established session. */
+    TEST_ASSERT_FALSE(busy.has_scb);
+    TEST_ASSERT_EQUAL_UINT8(0, busy.sequence);          /* spec 7.19 */
+    TEST_ASSERT_EQUAL_size_t(0, busy.payload_len);
+    TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));      /* session survives */
+
+    /* The decisive part: the ACU, whose chain state never advanced, sends its
+     * next secure command against the SAME chain. If the PD had advanced its
+     * own last_inbound_mac while emitting the BUSY, this would fail to
+     * verify and be dropped. */
+    acu = acu_before;
+    poll.sequence = 3;
+    wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &poll,
+                           wire, sizeof(wire), &wire_len));
+    mock_reset_incoming(&m);
+    m.outgoing_len = 0;
+    (void)memcpy(m.incoming, wire, wire_len);
+    m.incoming_len = wire_len;
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t ack;
+    decode_first_outgoing(&m, &ack);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_16, ack.scb_type);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, ack.code);
+
+    /* And it unwraps cleanly on the ACU side, which is the real proof the
+     * chains are still in lockstep. */
+    uint8_t plain[64];
+    size_t  plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &ack,
+                             plain, sizeof(plain), &plain_len));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1708,6 +1811,8 @@ int main(void)
 
     RUN_TEST(test_bound_buffers_carry_a_large_sc_exchange);
     RUN_TEST(test_sc_payload_past_the_old_scratch_limit_round_trips);
+
+    RUN_TEST(test_busy_under_sc_is_plaintext_and_preserves_the_mac_chain);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_resets_session_but_still_enforces_allowlist);
     RUN_TEST(test_cleartext_sqn0_discovery_resets_session_and_processes);

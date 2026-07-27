@@ -67,6 +67,8 @@ impl osdp_status_t {
     pub const OSDP_ERR_BAD_CHECKSUM: Self = Self(8);
     pub const OSDP_ERR_BAD_PAYLOAD: Self = Self(9);
     pub const OSDP_ERR_NOT_SUPPORTED: Self = Self(10);
+    /// Not ready; the PD emits osdp_BUSY and the ACU repeats the command.
+    pub const OSDP_ERR_BUSY: Self = Self(11);
 }
 
 // ====================================================================
@@ -1030,7 +1032,7 @@ mod pd_ffi {
     /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
      * osdp_pd_t below mirrors the C layout field for field, so a mismatch
      * silently shifts every field after tx_buf. */
-    pub const OSDP_PD_REPLY_SCRATCH_LEN: usize = 32;
+    pub const OSDP_PD_REPLY_SCRATCH_LEN: usize = 64;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
     pub const OSDP_PD_MAX_BUZZERS: usize = 4;
@@ -1155,6 +1157,23 @@ mod pd_ffi {
         pub rnd_b: [u8; OSDP_SC2_RND_LEN],
     }
 
+    /// Status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT. A NULL member
+    /// leaves that command falling through to the command handler.
+    #[repr(C)]
+    pub struct osdp_pd_status_provider_t {
+        pub local: Option<unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8)>,
+        pub inputs: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+        pub outputs: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+        pub readers: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
+    }
+
+    pub type osdp_pd_abort_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void) -> osdp_status_t>;
+    pub type osdp_pd_acurxsize_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, max_size: u16)>;
+    pub type osdp_pd_keepactive_cb =
+        Option<unsafe extern "C" fn(user: *mut c_void, time_ms: u16) -> osdp_status_t>;
+
     /// Caller-owned working storage for the PD's four scratch regions. A NULL
     /// member means "leave that region on its current binding", so a caller
     /// can enlarge only the TX path. Mirrors `osdp_pd_buffers_t` in
@@ -1234,6 +1253,30 @@ mod pd_ffi {
 
         // Opt-in SC2 asymmetric-pairing driver (osdp::pd_pair). Opaque here;
         // Rust does not expose pairing yet (that is a later phase), so this is
+        /* Status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT. */
+        pub status: osdp_pd_status_provider_t,
+        pub status_user: *mut c_void,
+
+        /* Poll-response event queue (caller-owned storage). */
+        pub event_buf: *mut u8,
+        pub event_cap: usize,
+        pub event_len: usize,
+
+        /* osdp_ACURXSIZE: the peer's declared receive capacity. */
+        pub acu_rx_size: u16,
+        pub acurxsize_cb: osdp_pd_acurxsize_cb,
+        pub acurxsize_user: *mut c_void,
+
+        /* osdp_ABORT / osdp_KEEPACTIVE hooks. */
+        pub abort_cb: osdp_pd_abort_cb,
+        pub abort_user: *mut c_void,
+        pub keepactive_cb: osdp_pd_keepactive_cb,
+        pub keepactive_user: *mut c_void,
+
+        /* Cleared for the current tick when the reply must not be cached
+         * as the spec-5.9 retransmit answer (osdp_BUSY only). */
+        pub reply_cacheable: bool,
+
         // always null in Rust-driven PDs. Mirrors the trailing `void *pair`
         // field added to osdp_pd_t — required so the struct size matches the C
         // side even though the pairing API is not bound.

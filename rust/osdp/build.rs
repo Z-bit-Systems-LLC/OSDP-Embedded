@@ -101,6 +101,10 @@ fn main() {
         // core: per-message reply codecs
         "core/src/replies/reply_ack.c",
         "core/src/replies/reply_com.c",
+        "core/src/replies/reply_lstatr.c",
+        "core/src/replies/reply_istatr.c",
+        "core/src/replies/reply_ostatr.c",
+        "core/src/replies/reply_rstatr.c",
         "core/src/replies/reply_ftstat.c",
         "core/src/replies/reply_keypad.c",
         "core/src/replies/reply_nak.c",

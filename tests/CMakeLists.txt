@@ -94,6 +94,18 @@ target_link_libraries(test_pd_buffers PRIVATE
     osdp_core osdp_messages osdp_pd unity)
 add_test(NAME test_pd_buffers COMMAND test_pd_buffers)
 
+# Status providers (osdp_LSTAT / ISTAT / OSTAT / RSTAT).
+add_executable(test_pd_status test_pd_status.c)
+target_link_libraries(test_pd_status PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_status COMMAND test_pd_status)
+
+# Poll-response event queue, osdp_BUSY, and the Table 47 NAK mapping.
+add_executable(test_pd_events test_pd_events.c)
+target_link_libraries(test_pd_events PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_events COMMAND test_pd_events)
+
 # ACU-side tests need the osdp_acu library in addition to the core.
 add_executable(test_acu test_acu.c)
 target_link_libraries(test_acu PRIVATE
