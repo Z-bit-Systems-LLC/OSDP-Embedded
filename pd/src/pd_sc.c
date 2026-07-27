@@ -35,8 +35,8 @@ static const uint8_t *select_handshake_key(const osdp_pd_t *pd,
     return NULL;
 }
 
-/* Build a non-MAC handshake reply (SCS_12 or SCS_14) into pd->tx_buf.
- * Used by both CHLNG-handler and SCRYPT-handler. */
+/* Build a non-MAC handshake reply (SCS_12 or SCS_14) into the bound TX
+ * buffer. Used by both CHLNG-handler and SCRYPT-handler. */
 static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
                                            const osdp_frame_t *cmd,
                                            uint8_t             scb_type,
@@ -62,7 +62,7 @@ static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
     reply.code         = reply_code;
     reply.payload      = payload;
     reply.payload_len  = payload_len;
-    return osdp_frame_build(&reply, pd->tx_buf, OSDP_PD_TX_BUF_LEN, out_len);
+    return osdp_frame_build(&reply, pd->tx, pd->tx_cap, out_len);
 }
 
 /* ---- SCS_11: osdp_CHLNG → SCS_12: osdp_CCRYPT ------------------------- */
@@ -244,12 +244,16 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* Unwrap: verify MAC and (for SCS_17) decrypt the payload. */
-    uint8_t plaintext[OSDP_PD_TX_BUF_LEN];
+    /* Unwrap: verify MAC and (for SCS_17) decrypt the payload. The plaintext
+     * lands in the bound rx_plain region rather than on the stack — a PD that
+     * expects large commands rebinds it without this function growing a
+     * multi-kilobyte frame on a constrained MCU. It is deliberately not the
+     * TX buffer: the reply below may point back into this plaintext while
+     * osdp_sc_wrap_frame is writing the outbound frame. */
     size_t  plaintext_len = 0;
     osdp_status_t s = osdp_sc_unwrap_frame(
         &pd->sc.crypto, &pd->sc.session, cmd,
-        plaintext, sizeof(plaintext), &plaintext_len);
+        pd->rx_plain, pd->rx_plain_cap, &plaintext_len);
     if (s != OSDP_OK) {
         /* MAC mismatch or decrypt failure: silent drop. The ACU will
          * time out and re-issue, which is the protocol's expected
@@ -264,7 +268,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * live there. Only the SCS framing below is specific to this path. */
     osdp_pd_reply_t reply;
     if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC1, cmd->code,
-                                  plaintext, plaintext_len,
+                                  pd->rx_plain, plaintext_len,
                                   &reply) != OSDP_OK) {
         return 0;  /* internal handler error — drop */
     }
@@ -299,7 +303,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     size_t built = 0;
     s = osdp_sc_wrap_frame(&pd->sc.crypto, &pd->sc.session,
                            &reply_template,
-                           pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built);
+                           pd->tx, pd->tx_cap, &built);
     if (s != OSDP_OK) {
         return 0;
     }

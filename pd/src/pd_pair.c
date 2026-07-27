@@ -50,7 +50,7 @@ static size_t emit_nak(osdp_pd_t *pd, const osdp_frame_t *cmd, uint8_t err)
     return (osdp_pd_internal_build_nak(pd, cmd, err, &n) == OSDP_OK) ? n : 0;
 }
 
-/* Frame one fragment descriptor as an osdp_PAIRR reply into pd->tx_buf. */
+/* Frame one fragment descriptor as an osdp_PAIRR reply into the TX buffer. */
 static size_t emit_pairr(osdp_pd_t *pd, const osdp_frame_t *cmd,
                          const osdp_pair_fragment_t *frag)
 {

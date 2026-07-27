@@ -359,10 +359,17 @@ typedef struct osdp_pd_buz_slot {
     osdp_buz_t state;
 } osdp_pd_buz_slot_t;
 
-/* Outbound TX scratch sized for any baseline reply. Bumped in later
- * iterations if/when extended replies (file transfer chunks, biometric
- * templates) become first-class. */
+/* Default size of the PD's built-in working buffers. Sized for any baseline
+ * reply; a PD that needs more (multi-part fragments, biometric templates, a
+ * spec-maximum 1440-byte message) binds larger caller-owned storage with
+ * osdp_pd_set_buffers instead of paying for it in every osdp_pd_t. */
 #define OSDP_PD_TX_BUF_LEN 256U
+
+/* Smallest buffer that can ever hold a complete frame: header + code + CRC
+ * (spec 5.6). osdp_pd_set_buffers rejects anything below this so a mis-sized
+ * binding fails loudly at configuration time rather than silently truncating
+ * every reply at run time. */
+#define OSDP_PD_BUF_MIN_LEN OSDP_FRAME_MIN_LEN_CRC
 
 /* Scratch for reply payloads the LIBRARY builds (as opposed to those the
  * application hands back from its command handler). The unified command
@@ -432,6 +439,37 @@ typedef struct osdp_pd_sc2 {
     uint8_t                rnd_b[OSDP_SC2_RND_LEN];
 } osdp_pd_sc2_t;
 
+/* ---- Caller-owned working storage --------------------------------------
+ *
+ * The PD needs four scratch regions, all sized OSDP_PD_TX_BUF_LEN by default
+ * and embedded directly in osdp_pd_t so a PD works with no configuration at
+ * all. Bind bigger (or smaller, or shared) caller-owned storage with
+ * osdp_pd_set_buffers when the defaults don't fit:
+ *
+ *   tx        — the outbound frame under construction, and the bytes handed
+ *               to transport.write(). Must hold the largest reply the PD
+ *               will ever send, framed: payload + header + CRC (+ security
+ *               block, MAC and cipher padding under SC/SC2).
+ *   rx_plain  — the decrypted plaintext of an inbound SCS_17 / SCS_27
+ *               command. Only used on the Secure Channel paths; a clear-text
+ *               PD may point it at a 8-byte stub. Must not alias `tx`.
+ *   rpl_cache — a verbatim copy of the last reply sent, replayed on a
+ *               byte-identical retransmit (spec 5.9). Sized like `tx`; a
+ *               reply too big to cache is simply not cached, and the next
+ *               retransmit is processed fresh instead of replayed.
+ *   cmd_cache — the last accepted command's wire bytes, the discriminator
+ *               that identifies a retransmit. Sized for the largest command
+ *               the ACU will send.
+ *
+ * Regions may not overlap; the library does not check for aliasing beyond
+ * the tx/rx_plain pair it depends on, so keep them distinct. */
+typedef struct osdp_pd_buffers {
+    uint8_t *tx;         size_t tx_cap;
+    uint8_t *rx_plain;   size_t rx_plain_cap;
+    uint8_t *rpl_cache;  size_t rpl_cache_cap;
+    uint8_t *cmd_cache;  size_t cmd_cache_cap;
+} osdp_pd_buffers_t;
+
 typedef struct osdp_pd {
     uint8_t                    address;     /* this PD's 7-bit addr  */
     osdp_stream_t              rx;          /* inbound byte buffer   */
@@ -445,6 +483,12 @@ typedef struct osdp_pd {
      * point in here, so it must outlive that call — hence a context field
      * rather than a local in the dispatch function. */
     uint8_t                    reply_scratch[OSDP_PD_REPLY_SCRATCH_LEN];
+
+    /* Working buffer for the plaintext of an inbound Secure Channel command
+     * (SCS_17 / SCS_27 decrypt output). Must NOT alias the TX buffer: the
+     * reply the application hands back may point into this plaintext, and the
+     * SC wrap then reads it while writing the outbound frame. */
+    uint8_t                    rx_plain_buf[OSDP_PD_TX_BUF_LEN];
 
     /* Sequence-number policing cache (spec 5.9 Table 2). When a
      * retransmit arrives — defined by the spec as a frame BYTE-
@@ -463,6 +507,20 @@ typedef struct osdp_pd {
     size_t                     last_cmd_len;
     uint8_t                    last_seq;     /* 0..3 */
     bool                       have_last;
+
+    /* Active bindings for the four working regions above. osdp_pd_init points
+     * each at its embedded array; osdp_pd_set_buffers re-points any subset at
+     * caller-owned storage. Every internal user goes through these — never
+     * through the arrays or sizeof() — so a rebound region takes effect
+     * everywhere at once. */
+    uint8_t                   *tx;
+    size_t                     tx_cap;
+    uint8_t                   *rx_plain;
+    size_t                     rx_plain_cap;
+    uint8_t                   *rpl_cache;
+    size_t                     rpl_cache_cap;
+    uint8_t                   *cmd_cache;
+    size_t                     cmd_cache_cap;
 
     /* Online/offline tracking (spec 5.7). `online` flips false when
      * `now_ms - last_comm_ms` exceeds OSDP_PD_OFFLINE_TIMEOUT_MS, and
@@ -530,6 +588,25 @@ void osdp_pd_init(osdp_pd_t *pd, uint8_t address);
  * the source may be on the stack or read-only. */
 void osdp_pd_set_transport(osdp_pd_t *pd,
                            const osdp_pd_transport_t *transport);
+
+/* Re-point any subset of the PD's four working regions at caller-owned
+ * storage (see osdp_pd_buffers_t). Optional: a PD that never calls this uses
+ * its embedded OSDP_PD_TX_BUF_LEN arrays and behaves exactly as before.
+ *
+ * A member left NULL (with any capacity) keeps that region's current binding,
+ * so callers can enlarge just the TX path and leave the rest alone. The
+ * buffers are borrowed, not copied — they must stay valid for as long as the
+ * PD is in use, and must not overlap each other.
+ *
+ * Returns OSDP_ERR_INVALID_ARG for a NULL pd/bufs, and OSDP_ERR_BUFFER_TOO_SMALL
+ * if any supplied region is under OSDP_PD_BUF_MIN_LEN — no binding is applied
+ * in either case, so a rejected call leaves the PD on its previous buffers.
+ * Safe to call at any time; rebinding either retransmit cache also clears it,
+ * since its recorded lengths describe bytes in storage the PD has just
+ * stopped reading. Clearing costs at most one replayed retransmit — the next
+ * repeat of that command is processed fresh, which is always correct. */
+osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd,
+                                  const osdp_pd_buffers_t *bufs);
 
 /* Bind the application's command handler. May be called with cb=NULL
  * to detach (every command will then NAK with code 0x03). */

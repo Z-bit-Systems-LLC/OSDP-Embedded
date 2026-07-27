@@ -145,6 +145,38 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
 
+## PD working buffers
+
+`osdp_pd_t` embeds four `OSDP_PD_TX_BUF_LEN` (256-byte) scratch arrays and a
+PD works with no configuration at all. `osdp_pd_set_buffers(pd, &bufs)` rebinds
+any subset at caller-owned storage (`osdp_pd_buffers_t`; a NULL member leaves
+that region alone, an undersized one returns `OSDP_ERR_BUFFER_TOO_SMALL` and
+applies nothing):
+
+- **`tx`** — the outbound frame under construction and the bytes handed to
+  `transport.write()`.
+- **`rx_plain`** — the decrypted plaintext of an inbound SCS_17 / SCS_27
+  command. Was a stack array in `pd_sc.c` / `pd_sc2.c`. **Must not alias
+  `tx`**: the reply an application returns may point into this plaintext, and
+  the SC wrap then reads it while writing the outbound frame.
+- **`rpl_cache` / `cmd_cache`** — the spec-5.9 retransmit caches. Rebinding
+  either clears it, since the recorded lengths describe bytes the PD has just
+  stopped reading; the cost is one non-replayed retransmit, processed fresh.
+
+Every internal user goes through the `pd->tx` / `pd->tx_cap` pointers, never
+the arrays or `sizeof()` — a path that reaches for `pd->tx_buf` directly keeps
+passing field-inspection tests while writing to the wrong memory.
+
+**Known ceiling this does NOT lift:** `osdp_sc_wrap_frame` encrypts into a
+fixed 256-byte *stack* scratch (`OSDP_SC_WRAP_SCRATCH_LEN`,
+`core/src/sc/wrap.c`), and `osdp_sc2_unwrap_frame` has the same
+(`OSDP_SC2_UNWRAP_SCRATCH_LEN`, `core/src/sc2/wrap.c`). So Secure Channel
+payloads still cap near 256 bytes however much TX capacity is bound. Lifting
+it means giving those functions caller-supplied scratch — a core public API
+change. `tests/test_pd_sc.c::test_sc_payload_over_the_wrap_scratch_is_refused`
+pins the current behaviour so it fails loudly when that changes. Multi-part
+message support will need it lifted first.
+
 ## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
 
 Most commands flow to the application's `osdp_pd_command_cb`, which chooses
@@ -412,6 +444,15 @@ that differ from SC1:
   (`osdp_pd_t` / `osdp_acu_t`) REQUIRES updating both `rust/osdp/src/sys.rs`
   (the `#[repr(C)]` mirror — a stale one is silent heap corruption at
   runtime) and the C source list in `rust/osdp/build.rs`.
+  `rust/osdp/src/pd_layout_tests.rs` now guards the `osdp_pd_t` half of
+  that: `osdp_pd_init` writes *self-referential* pointers (each buffer
+  binding points at an embedded array in the same struct), so the test
+  compares C-computed addresses against Rust-computed ones and fails when
+  the layouts disagree. It lives in `src/` rather than `tests/` because
+  `sys` is `pub(crate)`. It covers the struct up to the buffer bindings,
+  not the tail — a mirror that is *too small* still corrupts the heap
+  before any assertion runs (verified: the C `memset` in `osdp_pd_init`
+  overruns the Rust `Box`), so keep adding fields to both sides in step.
 
 ## Out of scope (do not introduce without explicit user approval)
 

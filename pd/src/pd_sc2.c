@@ -31,7 +31,7 @@ bool osdp_pd_internal_sc2_configured(const osdp_pd_t *pd)
     return pd->sc2.scbk_set;
 }
 
-/* Build a handshake reply (SCS_22 or SCS_24) into pd->tx_buf. The SCB
+/* Build a handshake reply (SCS_22 or SCS_24) into the bound TX buffer. The SCB
  * carries a single data byte: the version selector (0x02) for CCRYPT,
  * or the status byte for RMAC_I. */
 static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
@@ -57,7 +57,7 @@ static osdp_status_t build_handshake_reply(osdp_pd_t          *pd,
     reply.code         = reply_code;
     reply.payload      = payload;
     reply.payload_len  = payload_len;
-    return osdp_frame_build(&reply, pd->tx_buf, OSDP_PD_TX_BUF_LEN, out_len);
+    return osdp_frame_build(&reply, pd->tx, pd->tx_cap, out_len);
 }
 
 /* Apply an SC2 KEYSET (KeyType 0x02, 32-byte AES-256 SCBK) arriving
@@ -235,13 +235,14 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
         return n;
     }
 
-    /* Unwrap: verify the GCM tag and (for SCS_27) decrypt code||data. */
+    /* Unwrap: verify the GCM tag and (for SCS_27) decrypt code||data. As on
+     * the SC1 path the plaintext goes to the bound rx_plain region, kept
+     * distinct from the TX buffer the reply is framed into. */
     uint8_t cmd_code = 0;
-    uint8_t plaintext[OSDP_PD_TX_BUF_LEN];
     size_t  plaintext_len = 0;
     osdp_status_t s = osdp_sc2_unwrap_frame(
         &pd->sc2.crypto, &pd->sc2.session, cmd,
-        &cmd_code, plaintext, sizeof(plaintext), &plaintext_len);
+        &cmd_code, pd->rx_plain, pd->rx_plain_cap, &plaintext_len);
     if (s != OSDP_OK) {
         /* Tag mismatch / decrypt failure: silent drop, let the ACU
          * time out and recover (annex Error Recovery). */
@@ -256,7 +257,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * this path. */
     osdp_pd_reply_t reply;
     if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC2, cmd_code,
-                                  plaintext, plaintext_len,
+                                  pd->rx_plain, plaintext_len,
                                   &reply) != OSDP_OK) {
         return 0;  /* internal handler error — drop */
     }
@@ -281,7 +282,7 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
     size_t built = 0;
     s = osdp_sc2_wrap_frame(&pd->sc2.crypto, &pd->sc2.session,
                             &reply_template,
-                            pd->tx_buf, OSDP_PD_TX_BUF_LEN, &built);
+                            pd->tx, pd->tx_cap, &built);
     if (s != OSDP_OK) {
         return 0;
     }

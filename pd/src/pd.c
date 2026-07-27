@@ -14,7 +14,7 @@
 
 /* ---- Helpers ------------------------------------------------------------*/
 
-/* Build a reply frame in `pd->tx_buf` and return its length. Mirrors
+/* Build a reply frame in the bound TX buffer and return its length. Mirrors
  * the inbound frame's address (with the reply flag set), sequence
  * number, and integrity mode, per spec section 5.9. */
 static osdp_status_t build_reply(osdp_pd_t                *pd,
@@ -37,10 +37,10 @@ static osdp_status_t build_reply(osdp_pd_t                *pd,
     out.code        = reply->code;
     out.payload     = reply->payload;
     out.payload_len = reply->payload_len;
-    return osdp_frame_build(&out, pd->tx_buf, sizeof(pd->tx_buf), out_len);
+    return osdp_frame_build(&out, pd->tx, pd->tx_cap, out_len);
 }
 
-/* Build a NAK reply with the given error code into pd->tx_buf. */
+/* Build a NAK reply with the given error code into the bound TX buffer. */
 static osdp_status_t build_nak(osdp_pd_t          *pd,
                                const osdp_frame_t *cmd,
                                uint8_t             error_code,
@@ -344,7 +344,7 @@ static bool clear_command_allowed_pre_sc(uint8_t code)
            code == OSDP_CMD_COMSET;
 }
 
-/* Compute the reply for a fresh command into pd->tx_buf and return
+/* Compute the reply for a fresh command into the bound TX buffer and return
  * the byte count (or 0 if the command should produce no reply at all
  * — e.g. an internal handler error). */
 static size_t handle_command_into_tx(osdp_pd_t *pd, const osdp_frame_t *cmd)
@@ -478,22 +478,24 @@ static void cache_reply(osdp_pd_t          *pd,
                         const osdp_frame_t *cmd,
                         size_t              reply_len)
 {
-    if (reply_len > sizeof(pd->last_reply)) {
-        /* Should be impossible — tx_buf and last_reply are the same
-         * size — but guard anyway. */
-        reply_len = sizeof(pd->last_reply);
+    /* Cache the reply verbatim, but only if it fits. With the default
+     * bindings the reply cache is the same size as the TX buffer so this
+     * never bites; a caller that binds a smaller cache than TX gets no
+     * replay for oversized replies rather than a truncated one — the ACU's
+     * retransmit is then processed fresh, which is always correct. */
+    if (reply_len > 0 && reply_len <= pd->rpl_cache_cap) {
+        (void)memcpy(pd->rpl_cache, pd->tx, reply_len);
+        pd->last_reply_len = reply_len;
+    } else {
+        pd->last_reply_len = 0;
     }
-    if (reply_len > 0) {
-        (void)memcpy(pd->last_reply, pd->tx_buf, reply_len);
-    }
-    pd->last_reply_len = reply_len;
 
     /* Cache the inbound command's wire bytes for retransmit detection.
      * If raw isn't available or is too large, skip caching the cmd —
      * the next frame will then bypass the cache and process fresh. */
     if (cmd->raw != NULL && cmd->raw_len > 0 &&
-        cmd->raw_len <= sizeof(pd->last_cmd)) {
-        (void)memcpy(pd->last_cmd, cmd->raw, cmd->raw_len);
+        cmd->raw_len <= pd->cmd_cache_cap) {
+        (void)memcpy(pd->cmd_cache, cmd->raw, cmd->raw_len);
         pd->last_cmd_len = cmd->raw_len;
     } else {
         pd->last_cmd_len = 0;
@@ -519,7 +521,7 @@ static bool is_retransmit(const osdp_pd_t    *pd,
     if (cmd->raw_len != pd->last_cmd_len) {
         return false;
     }
-    return memcmp(pd->last_cmd, cmd->raw, cmd->raw_len) == 0;
+    return memcmp(pd->cmd_cache, cmd->raw, cmd->raw_len) == 0;
 }
 
 /* Process one accepted command frame: dispatch, build reply, cache,
@@ -528,7 +530,7 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
 {
     if (is_retransmit(pd, cmd)) {
         if (pd->last_reply_len > 0) {
-            send_bytes(pd, pd->last_reply, pd->last_reply_len);
+            send_bytes(pd, pd->rpl_cache, pd->last_reply_len);
         }
         return;
     }
@@ -536,7 +538,7 @@ static void process_frame(osdp_pd_t *pd, const osdp_frame_t *cmd)
     const size_t built = handle_command_into_tx(pd, cmd);
     cache_reply(pd, cmd, built);
     if (built > 0) {
-        send_bytes(pd, pd->tx_buf, built);
+        send_bytes(pd, pd->tx, built);
     }
 
     /* osdp_COMSET: the new comms parameters take effect only AFTER the
@@ -566,6 +568,66 @@ void osdp_pd_init(osdp_pd_t *pd, uint8_t address)
     (void)memset(pd, 0, sizeof(*pd));
     pd->address = (uint8_t)(address & 0x7FU);
     osdp_stream_init(&pd->rx);
+
+    /* Point every working region at its embedded array. From here on the
+     * library only ever goes through these pointers, so osdp_pd_set_buffers
+     * can swap any of them for caller-owned storage without touching another
+     * line of the state machine. */
+    pd->tx            = pd->tx_buf;
+    pd->tx_cap        = sizeof(pd->tx_buf);
+    pd->rx_plain      = pd->rx_plain_buf;
+    pd->rx_plain_cap  = sizeof(pd->rx_plain_buf);
+    pd->rpl_cache     = pd->last_reply;
+    pd->rpl_cache_cap = sizeof(pd->last_reply);
+    pd->cmd_cache     = pd->last_cmd;
+    pd->cmd_cache_cap = sizeof(pd->last_cmd);
+}
+
+osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd, const osdp_pd_buffers_t *bufs)
+{
+    if (pd == NULL || bufs == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    /* Validate every supplied region before applying any of them, so a
+     * rejected call is a no-op rather than a half-applied binding. A NULL
+     * pointer means "leave this region alone", whatever its capacity field
+     * says. */
+    const uint8_t *const ptrs[] = { bufs->tx, bufs->rx_plain,
+                                    bufs->rpl_cache, bufs->cmd_cache };
+    const size_t         caps[] = { bufs->tx_cap, bufs->rx_plain_cap,
+                                    bufs->rpl_cache_cap, bufs->cmd_cache_cap };
+    for (size_t i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); i++) {
+        if (ptrs[i] != NULL && caps[i] < OSDP_PD_BUF_MIN_LEN) {
+            return OSDP_ERR_BUFFER_TOO_SMALL;
+        }
+    }
+
+    if (bufs->tx != NULL) {
+        pd->tx     = bufs->tx;
+        pd->tx_cap = bufs->tx_cap;
+    }
+    if (bufs->rx_plain != NULL) {
+        pd->rx_plain     = bufs->rx_plain;
+        pd->rx_plain_cap = bufs->rx_plain_cap;
+    }
+    /* Rebinding a retransmit cache invalidates what it recorded: the lengths
+     * describe bytes in storage the PD is about to stop reading. Drop the
+     * whole cache entry rather than leave it pointing at a stale mixture. */
+    if (bufs->rpl_cache != NULL) {
+        pd->rpl_cache     = bufs->rpl_cache;
+        pd->rpl_cache_cap = bufs->rpl_cache_cap;
+        pd->last_reply_len = 0;
+        pd->have_last      = false;
+    }
+    if (bufs->cmd_cache != NULL) {
+        pd->cmd_cache     = bufs->cmd_cache;
+        pd->cmd_cache_cap = bufs->cmd_cache_cap;
+        pd->last_cmd_len  = 0;
+        pd->have_last     = false;
+    }
+
+    return OSDP_OK;
 }
 
 void osdp_pd_set_transport(osdp_pd_t *pd,
@@ -989,7 +1051,7 @@ void osdp_pd_tick(osdp_pd_t *pd)
                 if (osdp_pd_internal_build_nak(pd, &cmd, OSDP_NAK_BAD_CHECK,
                                                &nak_len) == OSDP_OK &&
                     nak_len > 0) {
-                    send_bytes(pd, pd->tx_buf, nak_len);
+                    send_bytes(pd, pd->tx, nak_len);
                 }
             }
             continue;  /* stream auto-advanced past the bad frame */

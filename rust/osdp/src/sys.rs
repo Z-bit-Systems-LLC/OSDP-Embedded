@@ -1128,6 +1128,22 @@ mod pd_ffi {
         pub rnd_b: [u8; OSDP_SC2_RND_LEN],
     }
 
+    /// Caller-owned working storage for the PD's four scratch regions. A NULL
+    /// member means "leave that region on its current binding", so a caller
+    /// can enlarge only the TX path. Mirrors `osdp_pd_buffers_t` in
+    /// `pd/include/osdp/osdp_pd.h`.
+    #[repr(C)]
+    pub struct osdp_pd_buffers_t {
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
+    }
+
     #[repr(C)]
     pub struct osdp_pd_t {
         pub address: u8,
@@ -1137,6 +1153,7 @@ mod pd_ffi {
         pub cmd_user: *mut c_void,
         pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
         pub reply_scratch: [u8; OSDP_PD_REPLY_SCRATCH_LEN],
+        pub rx_plain_buf: [u8; OSDP_PD_TX_BUF_LEN],
 
         pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
         pub last_reply_len: usize,
@@ -1144,6 +1161,18 @@ mod pd_ffi {
         pub last_cmd_len: usize,
         pub last_seq: u8,
         pub have_last: bool,
+
+        /* Active bindings for the four working regions. osdp_pd_init points
+         * these at the embedded arrays above; osdp_pd_set_buffers re-points
+         * them at caller-owned storage. */
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
 
         pub online: bool,
         pub last_comm_ms: u32,
@@ -1186,6 +1215,10 @@ mod pd_ffi {
 
     extern "C" {
         pub fn osdp_pd_init(pd: *mut osdp_pd_t, address: u8);
+        pub fn osdp_pd_set_buffers(
+            pd: *mut osdp_pd_t,
+            bufs: *const osdp_pd_buffers_t,
+        ) -> osdp_status_t;
         pub fn osdp_pd_set_transport(pd: *mut osdp_pd_t, transport: *const osdp_pd_transport_t);
         pub fn osdp_pd_set_command_handler(
             pd: *mut osdp_pd_t,

@@ -88,6 +88,12 @@ target_link_libraries(test_pd PRIVATE
     osdp_core osdp_messages osdp_pd unity)
 add_test(NAME test_pd COMMAND test_pd)
 
+# Caller-supplied working buffers (osdp_pd_set_buffers).
+add_executable(test_pd_buffers test_pd_buffers.c)
+target_link_libraries(test_pd_buffers PRIVATE
+    osdp_core osdp_messages osdp_pd unity)
+add_test(NAME test_pd_buffers COMMAND test_pd_buffers)
+
 # ACU-side tests need the osdp_acu library in addition to the core.
 add_executable(test_acu test_acu.c)
 target_link_libraries(test_acu PRIVATE
