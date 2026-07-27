@@ -10,7 +10,7 @@
 /* Internal scratch sized to match the PD/ACU TX buffer. Holds the
  * encrypted payload between the encrypt step and the frame build for
  * SCS_17/18 frames. 256 bytes is enough for the baseline message set
- * even after worst-case padding; can grow alongside OSDP_PD_TX_BUF_LEN
+ * even after worst-case padding; can grow alongside OSDP_PD_BUF_LEN
  * if extended message types arrive. */
 #define OSDP_SC_WRAP_SCRATCH_LEN 256U
 

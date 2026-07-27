@@ -100,7 +100,7 @@ typedef struct app_state {
     int                  verbose;
 
     /* Scratch for build_* outputs returned to the PD via reply.payload. */
-    uint8_t              scratch[OSDP_PD_TX_BUF_LEN];
+    uint8_t              scratch[OSDP_PD_BUF_LEN];
 
     /* Running total of file bytes streamed in (for the -v progress log). */
     uint32_t             file_received;

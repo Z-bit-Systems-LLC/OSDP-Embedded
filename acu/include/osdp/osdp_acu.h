@@ -120,8 +120,16 @@ extern "C" {
  * perspective right now?". */
 #define OSDP_ACU_OFFLINE_TIMEOUT_MS  8000U
 
-/* TX scratch sized for any baseline command payload + framing overhead. */
-#define OSDP_ACU_TX_BUF_LEN          256U
+/* The ACU's maximum message size, and the size of its working buffers.
+ * Overridable at build time, exactly like the PD's OSDP_PD_BUF_LEN.
+ *
+ * This is also the value the application should declare in osdp_ACURXSIZE
+ * (spec Table 28) to tell each PD how large a reply it may return — the ACU's
+ * counterpart to the PD advertising PDCAP function code 10. Same constant
+ * sizing the buffer and declaring the limit means the two cannot diverge. */
+#ifndef OSDP_ACU_BUF_LEN
+#define OSDP_ACU_BUF_LEN             256U
+#endif
 
 /* ---- Transport HAL ------------------------------------------------------*/
 
@@ -333,7 +341,7 @@ typedef struct osdp_acu {
     osdp_acu_timeout_cb         timeout_cb;
     void                       *timeout_user;
     osdp_stream_t               rx;
-    uint8_t                     tx_buf[OSDP_ACU_TX_BUF_LEN];
+    uint8_t                     tx_buf[OSDP_ACU_BUF_LEN];
     osdp_integrity_t            integrity; /* CRC by default; CKSUM legacy */
 
     /* Secure Channel HAL — one shared crypto vtable across all PD slots.

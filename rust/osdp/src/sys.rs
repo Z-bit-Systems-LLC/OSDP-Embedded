@@ -999,7 +999,11 @@ pub use pd_ffi::*;
 mod pd_ffi {
     use super::*;
 
-    pub const OSDP_PD_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_PD_BUF_LEN in pd/include/osdp/osdp_pd.h. It sizes every
+     * working buffer embedded in osdp_pd_t, so a build that overrides the C
+     * constant must override this mirror to match — pd_layout_tests catches a
+     * mismatch, but only at run time. */
+    pub const OSDP_PD_BUF_LEN: usize = 256;
     /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
      * osdp_pd_t below mirrors the C layout field for field, so a mismatch
      * silently shifts every field after tx_buf. */
@@ -1151,13 +1155,13 @@ mod pd_ffi {
         pub transport: osdp_pd_transport_t,
         pub cmd_cb: osdp_pd_command_cb,
         pub cmd_user: *mut c_void,
-        pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_PD_BUF_LEN],
         pub reply_scratch: [u8; OSDP_PD_REPLY_SCRATCH_LEN],
-        pub rx_plain_buf: [u8; OSDP_PD_TX_BUF_LEN],
+        pub rx_plain_buf: [u8; OSDP_PD_BUF_LEN],
 
-        pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_reply: [u8; OSDP_PD_BUF_LEN],
         pub last_reply_len: usize,
-        pub last_cmd: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_cmd: [u8; OSDP_PD_BUF_LEN],
         pub last_cmd_len: usize,
         pub last_seq: u8,
         pub have_last: bool,
@@ -1281,7 +1285,7 @@ mod acu_ffi {
 
     pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
-    pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
+    pub const OSDP_ACU_BUF_LEN: usize = 256;
     pub const OSDP_ACU_MAX_LEDS: usize = 16;
     pub const OSDP_ACU_MAX_BUZZERS: usize = 8;
 
@@ -1443,7 +1447,7 @@ mod acu_ffi {
         pub timeout_cb: osdp_acu_timeout_cb,
         pub timeout_user: *mut c_void,
         pub rx: osdp_stream_t,
-        pub tx_buf: [u8; OSDP_ACU_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_ACU_BUF_LEN],
         pub integrity: osdp_integrity_t,
         pub sc_crypto: osdp_sc_crypto_t,
         pub sc_crypto_set: bool,

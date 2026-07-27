@@ -145,13 +145,31 @@ osdp_status_t osdp_led_build(const osdp_led_t *in,
 Both functions live in `core/src/commands/cmd_led.c`. If an application
 references only one of them, the other gets GC'd.
 
-## PD working buffers
+## Buffer sizing and working buffers
 
-`osdp_pd_t` embeds four `OSDP_PD_TX_BUF_LEN` (256-byte) scratch arrays and a
-PD works with no configuration at all. `osdp_pd_set_buffers(pd, &bufs)` rebinds
-any subset at caller-owned storage (`osdp_pd_buffers_t`; a NULL member leaves
-that region alone, an undersized one returns `OSDP_ERR_BUFFER_TOO_SMALL` and
-applies nothing):
+**One constant per role.** `OSDP_PD_BUF_LEN` and `OSDP_ACU_BUF_LEN` (both
+256 by default, both `#ifndef`-guarded so a build can override with `-D` or
+CMake `target_compile_definitions`) size every working buffer in `osdp_pd_t` /
+`osdp_acu_t`. A device is a PD or an ACU, rarely both, so one knob per role is
+enough — the roles are deliberately independent rather than sharing a value.
+
+The same constant is what the role should advertise to its peer: the PD's
+**PDCAP function code 10** ("Receive BufferSize", spec B.11) and the ACU's
+**`osdp_ACURXSIZE`** (spec Table 28). Deriving the advertised capability from
+the constant that sizes the buffers means a device cannot promise its peer
+more than it can hold. (Neither is wired up yet — the `osdp_ACURXSIZE` codec
+lands in Phase 3 and PDCAP is still entirely app-supplied.)
+
+`OSDP_STREAM_BUFFER_LEN` (1440 = spec max) is separate and also overridable.
+It is *wire-level* reassembly — big enough to resync through any legal frame,
+including traffic addressed to other devices — as distinct from the message
+size a role actually processes.
+
+`osdp_pd_set_buffers(pd, &bufs)` then rebinds any subset at caller-owned
+storage at run time (`osdp_pd_buffers_t`; a NULL member leaves that region
+alone, an undersized one returns `OSDP_ERR_BUFFER_TOO_SMALL` and applies
+nothing). Use the constant to set what every PD context costs; use the setter
+when one particular PD needs something different.
 
 - **`tx`** — the outbound frame under construction and the bytes handed to
   `transport.write()`.
@@ -167,8 +185,9 @@ Every internal user goes through the `pd->tx` / `pd->tx_cap` pointers, never
 the arrays or `sizeof()` — a path that reaches for `pd->tx_buf` directly keeps
 passing field-inspection tests while writing to the wrong memory.
 
-**Known ceiling this does NOT lift:** `osdp_sc_wrap_frame` encrypts into a
-fixed 256-byte *stack* scratch (`OSDP_SC_WRAP_SCRATCH_LEN`,
+**Known ceiling neither the constant nor the setter lifts:**
+`osdp_sc_wrap_frame` encrypts into a fixed 256-byte *stack* scratch
+(`OSDP_SC_WRAP_SCRATCH_LEN`,
 `core/src/sc/wrap.c`), and `osdp_sc2_unwrap_frame` has the same
 (`OSDP_SC2_UNWRAP_SCRATCH_LEN`, `core/src/sc2/wrap.c`). So Secure Channel
 payloads still cap near 256 bytes however much TX capacity is bound. Lifting

@@ -3,7 +3,7 @@
 
 /* osdp_pd_set_buffers — binding caller-owned working storage.
  *
- * The PD ships with four embedded OSDP_PD_TX_BUF_LEN arrays and works with no
+ * The PD ships with four embedded OSDP_PD_BUF_LEN arrays and works with no
  * configuration at all. osdp_pd_set_buffers lets an application swap any
  * subset for its own storage: a 1440-byte TX path for spec-maximum messages,
  * a shared pool, or (on the other end) a stripped-down PD that never uses
@@ -113,8 +113,9 @@ static void decode_first_outgoing(const mock_transport_t *m, osdp_frame_t *out)
 /* ---- Application handlers ----------------------------------------------*/
 
 /* Answers osdp_POLL with an osdp_RAW carrying `big_payload_len` bytes of a
- * recognizable ramp — far more than the default 256-byte TX buffer can frame,
- * so the reply only reaches the wire if a larger TX region is bound. */
+ * recognizable ramp. Tests set the length, then bind a TX region either large
+ * enough to frame it or deliberately too small, and compare what reaches the
+ * wire. */
 static size_t  big_payload_len;
 static uint8_t big_payload[1200];
 
@@ -173,6 +174,25 @@ static void fill_ramp(uint8_t *buf, size_t len)
 
 /* ---- Defaults ----------------------------------------------------------*/
 
+/* OSDP_PD_BUF_LEN is the PD's one sizing knob and is build-overridable. This
+ * test pins the relationships rather than the values, so a build that sets
+ * -DOSDP_PD_BUF_LEN=64 still passes while a build where the constant has
+ * drifted out of correspondence with the actual arrays does not.
+ *
+ * The correspondence matters beyond the arrays: the same constant is what an
+ * application reports as PDCAP function code 10, so if it ever stopped
+ * describing the real buffers the PD would be advertising a receive capacity
+ * it doesn't have. */
+static void test_sizing_constant_matches_the_embedded_arrays(void)
+{
+    osdp_pd_t pd;
+
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, sizeof(pd.tx_buf));
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, sizeof(pd.rx_plain_buf));
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, sizeof(pd.last_reply));
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, sizeof(pd.last_cmd));
+}
+
 static void test_init_binds_every_region_to_its_embedded_array(void)
 {
     osdp_pd_t pd;
@@ -186,27 +206,42 @@ static void test_init_binds_every_region_to_its_embedded_array(void)
     TEST_ASSERT_EQUAL_PTR(pd.last_reply,   pd.rpl_cache);
     TEST_ASSERT_EQUAL_PTR(pd.last_cmd,     pd.cmd_cache);
 
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.tx_cap);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.rx_plain_cap);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.rpl_cache_cap);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.cmd_cache_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN,   pd.tx_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, pd.rx_plain_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN,   pd.rpl_cache_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN,   pd.cmd_cache_cap);
 }
 
-/* The regression this whole phase exists to prevent: the default TX buffer
- * cannot frame a spec-scale reply, and before the bindings there was no way
- * to fix that short of editing the header and rebuilding the library. */
-static void test_reply_too_large_for_the_default_tx_buffer_is_dropped(void)
+/* ---- TX capacity is whatever is bound ---------------------------------*/
+
+/* These two are each other's control: identical command, identical handler,
+ * identical reply — only the bound TX capacity differs. Together they show
+ * that TX capacity is genuinely the binding and not the embedded array.
+ *
+ * Both bind explicitly rather than leaning on the default, so the pair holds
+ * at any -DOSDP_PD_BUF_LEN. An earlier version asserted "1000 bytes doesn't
+ * fit the default 256" and duly broke the first time the constant was
+ * overridden to 1024. */
+#define TEST_REPLY_LEN   200U
+#define TEST_TX_TOO_SMALL 64U
+
+static void test_reply_too_large_for_the_bound_tx_buffer_is_dropped(void)
 {
     mock_transport_t    m;
     osdp_pd_transport_t t;
     osdp_pd_t           pd;
+    static uint8_t      tx[TEST_TX_TOO_SMALL];
 
     mock_init(&m, &t);
     osdp_pd_init(&pd, 0x05);
+
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
     osdp_pd_set_transport(&pd, &t);
     osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
 
-    big_payload_len = 1000;
+    big_payload_len = TEST_REPLY_LEN;
     fill_ramp(big_payload, big_payload_len);
 
     inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
@@ -217,9 +252,7 @@ static void test_reply_too_large_for_the_default_tx_buffer_is_dropped(void)
     TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
 }
 
-/* ---- Binding a larger TX region ---------------------------------------*/
-
-static void test_bound_tx_buffer_carries_a_reply_the_default_cannot(void)
+static void test_bound_tx_buffer_carries_a_reply_a_smaller_one_cannot(void)
 {
     mock_transport_t    m;
     osdp_pd_transport_t t;
@@ -235,14 +268,12 @@ static void test_bound_tx_buffer_carries_a_reply_the_default_cannot(void)
     osdp_pd_set_transport(&pd, &t);
     osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
 
-    big_payload_len = 1000;
+    big_payload_len = TEST_REPLY_LEN;
     fill_ramp(big_payload, big_payload_len);
 
     inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
     osdp_pd_tick(&pd);
 
-    /* Same command, same handler, same everything except the bound TX —
-     * and now the 1000-byte osdp_RAW reaches the wire intact. */
     osdp_frame_t reply;
     decode_first_outgoing(&m, &reply);
     TEST_ASSERT_TRUE(reply.reply);
@@ -361,7 +392,7 @@ static void test_null_member_leaves_its_region_alone(void)
     /* The three regions the caller said nothing about keep their bindings. */
     TEST_ASSERT_EQUAL_PTR(default_rx_plain,  pd.rx_plain);
     TEST_ASSERT_EQUAL_PTR(default_rpl_cache, pd.rpl_cache);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.rx_plain_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, pd.rx_plain_cap);
 }
 
 static void test_undersized_region_is_rejected_and_nothing_is_applied(void)
@@ -384,7 +415,7 @@ static void test_undersized_region_is_rejected_and_nothing_is_applied(void)
                       osdp_pd_set_buffers(&pd, &bufs));
 
     TEST_ASSERT_EQUAL_PTR(default_tx, pd.tx);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.tx_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, pd.tx_cap);
 }
 
 static void test_null_arguments_are_rejected(void)
@@ -408,7 +439,7 @@ static void test_all_null_members_is_a_successful_no_op(void)
     osdp_pd_init(&pd, 0x05);
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
     TEST_ASSERT_EQUAL_PTR(pd.tx_buf, pd.tx);
-    TEST_ASSERT_EQUAL_size_t(OSDP_PD_TX_BUF_LEN, pd.tx_cap);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_BUF_LEN, pd.tx_cap);
 }
 
 /* ---- Aliasing -----------------------------------------------------------*/
@@ -452,9 +483,10 @@ static void test_reply_pointing_at_the_inbound_payload_survives_framing(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_sizing_constant_matches_the_embedded_arrays);
     RUN_TEST(test_init_binds_every_region_to_its_embedded_array);
-    RUN_TEST(test_reply_too_large_for_the_default_tx_buffer_is_dropped);
-    RUN_TEST(test_bound_tx_buffer_carries_a_reply_the_default_cannot);
+    RUN_TEST(test_reply_too_large_for_the_bound_tx_buffer_is_dropped);
+    RUN_TEST(test_bound_tx_buffer_carries_a_reply_a_smaller_one_cannot);
     RUN_TEST(test_retransmit_replays_from_bound_caches);
     RUN_TEST(test_rebinding_a_cache_clears_it);
     RUN_TEST(test_null_member_leaves_its_region_alone);

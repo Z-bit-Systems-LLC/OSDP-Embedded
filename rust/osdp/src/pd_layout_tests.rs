@@ -70,11 +70,11 @@ fn init_binds_every_buffer_to_its_own_embedded_array() {
 fn init_binds_every_capacity_to_its_array_length() {
     with_initialised_pd(|pd| {
         // Capacities come from `sizeof()` on the C side. If the mirror's
-        // OSDP_PD_TX_BUF_LEN disagreed with the header's, these would differ.
-        assert_eq!(pd.tx_cap, sys::OSDP_PD_TX_BUF_LEN);
-        assert_eq!(pd.rx_plain_cap, sys::OSDP_PD_TX_BUF_LEN);
-        assert_eq!(pd.rpl_cache_cap, sys::OSDP_PD_TX_BUF_LEN);
-        assert_eq!(pd.cmd_cache_cap, sys::OSDP_PD_TX_BUF_LEN);
+        // OSDP_PD_BUF_LEN disagreed with the header's, these would differ.
+        assert_eq!(pd.tx_cap, sys::OSDP_PD_BUF_LEN);
+        assert_eq!(pd.rx_plain_cap, sys::OSDP_PD_BUF_LEN);
+        assert_eq!(pd.rpl_cache_cap, sys::OSDP_PD_BUF_LEN);
+        assert_eq!(pd.cmd_cache_cap, sys::OSDP_PD_BUF_LEN);
     });
 }
 
@@ -118,7 +118,7 @@ fn set_buffers_rebinds_only_what_it_is_given() {
         pd.rx_plain, default_rx_plain,
         "a NULL member must leave its region on the previous binding"
     );
-    assert_eq!(pd.rx_plain_cap, sys::OSDP_PD_TX_BUF_LEN);
+    assert_eq!(pd.rx_plain_cap, sys::OSDP_PD_BUF_LEN);
 }
 
 #[test]
@@ -148,5 +148,5 @@ fn set_buffers_rejects_an_undersized_region_without_applying_anything() {
         pd.tx, default_tx,
         "a rejected set_buffers must leave every region on its previous binding"
     );
-    assert_eq!(pd.tx_cap, sys::OSDP_PD_TX_BUF_LEN);
+    assert_eq!(pd.tx_cap, sys::OSDP_PD_BUF_LEN);
 }

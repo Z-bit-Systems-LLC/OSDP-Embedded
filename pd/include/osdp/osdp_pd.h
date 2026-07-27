@@ -359,11 +359,27 @@ typedef struct osdp_pd_buz_slot {
     osdp_buz_t state;
 } osdp_pd_buz_slot_t;
 
-/* Default size of the PD's built-in working buffers. Sized for any baseline
- * reply; a PD that needs more (multi-part fragments, biometric templates, a
- * spec-maximum 1440-byte message) binds larger caller-owned storage with
- * osdp_pd_set_buffers instead of paying for it in every osdp_pd_t. */
-#define OSDP_PD_TX_BUF_LEN 256U
+/* The PD's maximum message size, and the size of every working buffer
+ * embedded in osdp_pd_t: the outbound frame, the Secure Channel plaintext
+ * scratch, and the two spec-5.9 retransmit caches.
+ *
+ * Override at build time (-DOSDP_PD_BUF_LEN=..., or CMake
+ * target_compile_definitions) to trade RAM against the largest message the
+ * PD can handle. This one number is also what the application should report
+ * as PDCAP function code 10 ("Receive BufferSize", spec B.11) — deriving the
+ * advertised capability from the same constant that sizes the buffers means
+ * a PD cannot promise the ACU more than it can actually hold.
+ *
+ * A device is a PD or an ACU, rarely both; the ACU has its own
+ * OSDP_ACU_BUF_LEN, which is the value it declares in osdp_ACURXSIZE.
+ *
+ * Independently of this, osdp_pd_set_buffers rebinds the working regions at
+ * caller-owned storage at run time — use the constant to set what every PD
+ * context costs, and the setter when one particular PD needs something
+ * different. */
+#ifndef OSDP_PD_BUF_LEN
+#define OSDP_PD_BUF_LEN 256U
+#endif
 
 /* Smallest buffer that can ever hold a complete frame: header + code + CRC
  * (spec 5.6). osdp_pd_set_buffers rejects anything below this so a mis-sized
@@ -441,7 +457,7 @@ typedef struct osdp_pd_sc2 {
 
 /* ---- Caller-owned working storage --------------------------------------
  *
- * The PD needs four scratch regions, all sized OSDP_PD_TX_BUF_LEN by default
+ * The PD needs four scratch regions, all sized OSDP_PD_BUF_LEN by default
  * and embedded directly in osdp_pd_t so a PD works with no configuration at
  * all. Bind bigger (or smaller, or shared) caller-owned storage with
  * osdp_pd_set_buffers when the defaults don't fit:
@@ -476,7 +492,7 @@ typedef struct osdp_pd {
     osdp_pd_transport_t        transport;   /* I/O callbacks         */
     osdp_pd_command_cb         cmd_cb;      /* app command handler   */
     void                      *cmd_user;
-    uint8_t                    tx_buf[OSDP_PD_TX_BUF_LEN];
+    uint8_t                    tx_buf[OSDP_PD_BUF_LEN];
 
     /* Payload scratch for library-built replies (osdp_COM, osdp_FTSTAT,
      * osdp_NAK, ...). osdp_pd_internal_dispatch returns a reply that may
@@ -488,7 +504,7 @@ typedef struct osdp_pd {
      * (SCS_17 / SCS_27 decrypt output). Must NOT alias the TX buffer: the
      * reply the application hands back may point into this plaintext, and the
      * SC wrap then reads it while writing the outbound frame. */
-    uint8_t                    rx_plain_buf[OSDP_PD_TX_BUF_LEN];
+    uint8_t                    rx_plain_buf[OSDP_PD_BUF_LEN];
 
     /* Sequence-number policing cache (spec 5.9 Table 2). When a
      * retransmit arrives — defined by the spec as a frame BYTE-
@@ -501,9 +517,9 @@ typedef struct osdp_pd {
      * failure) can re-use the same SQN for a NEW command. We
      * therefore also cache the previous command's wire bytes and
      * memcmp them on every incoming frame. */
-    uint8_t                    last_reply[OSDP_PD_TX_BUF_LEN];
+    uint8_t                    last_reply[OSDP_PD_BUF_LEN];
     size_t                     last_reply_len;
-    uint8_t                    last_cmd  [OSDP_PD_TX_BUF_LEN];
+    uint8_t                    last_cmd  [OSDP_PD_BUF_LEN];
     size_t                     last_cmd_len;
     uint8_t                    last_seq;     /* 0..3 */
     bool                       have_last;
@@ -591,7 +607,7 @@ void osdp_pd_set_transport(osdp_pd_t *pd,
 
 /* Re-point any subset of the PD's four working regions at caller-owned
  * storage (see osdp_pd_buffers_t). Optional: a PD that never calls this uses
- * its embedded OSDP_PD_TX_BUF_LEN arrays and behaves exactly as before.
+ * its embedded OSDP_PD_BUF_LEN arrays and behaves exactly as before.
  *
  * A member left NULL (with any capacity) keeps that region's current binding,
  * so callers can enlarge just the TX path and leave the rest alone. The
