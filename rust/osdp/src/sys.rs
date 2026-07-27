@@ -911,6 +911,10 @@ mod pd_ffi {
     use super::*;
 
     pub const OSDP_PD_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
+     * osdp_pd_t below mirrors the C layout field for field, so a mismatch
+     * silently shifts every field after tx_buf. */
+    pub const OSDP_PD_REPLY_SCRATCH_LEN: usize = 32;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
     pub const OSDP_PD_MAX_BUZZERS: usize = 4;
@@ -1029,6 +1033,7 @@ mod pd_ffi {
         pub cmd_cb: osdp_pd_command_cb,
         pub cmd_user: *mut c_void,
         pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
+        pub reply_scratch: [u8; OSDP_PD_REPLY_SCRATCH_LEN],
 
         pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
         pub last_reply_len: usize,

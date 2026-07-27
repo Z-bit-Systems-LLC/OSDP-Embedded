@@ -10,6 +10,45 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_pd.h"
 
+/* Which channel an accepted command arrived on. The unified dispatch is
+ * otherwise channel-agnostic; this only selects the KEYSET variant, because
+ * a future Secure Channel version rotating a different key size needs to be
+ * told apart from SC1's 16-byte AES-128 SCBK (key_type 0x01). A plaintext
+ * KEYSET rotates the SC1 key, which is what the pre-refactor code did. */
+typedef enum osdp_pd_channel {
+    OSDP_PD_CH_PLAIN = 0,
+    OSDP_PD_CH_SC1
+} osdp_pd_channel_t;
+
+/* Decide the reply for ONE accepted command, whatever channel carried it.
+ *
+ * This is the single place that knows what a command *means*: which commands
+ * the library handles itself (osdp_COMSET, osdp_FILETRANSFER), when to call
+ * the application handler, the KEYSET hook, and the reader-state observation.
+ * It knows nothing about framing, Secure Channel wrapping, or the SQN cache —
+ * each caller frames the result its own way (plaintext build_reply, Secure
+ * Channel osdp_sc_wrap_frame), which is the ONLY thing that legitimately
+ * differs between the paths.
+ *
+ * `payload` is always plaintext: the SC callers unwrap before calling.
+ *
+ * On OSDP_OK, *reply holds the code and payload to send. A library-built
+ * payload points into pd->reply_scratch, so it stays valid until the caller
+ * has framed it (and until the next dispatch call). An application-supplied
+ * payload points into whatever buffer cmd_cb handed back, whose lifetime the
+ * existing osdp_pd_command_cb contract already guarantees for that window.
+ *
+ * Returns OSDP_ERR_INVALID_ARG when the command should produce NO reply at
+ * all (an internal application-handler error); the caller drops it. Every
+ * other outcome — including refusals — comes back as OSDP_OK with *reply set
+ * to the appropriate osdp_NAK. */
+osdp_status_t osdp_pd_internal_dispatch(osdp_pd_t        *pd,
+                                        osdp_pd_channel_t channel,
+                                        uint8_t           cmd_code,
+                                        const uint8_t    *payload,
+                                        size_t            payload_len,
+                                        osdp_pd_reply_t  *reply);
+
 /* Whether the PD has enough Secure Channel configuration to even
  * attempt the handshake. */
 bool osdp_pd_internal_sc_configured(const osdp_pd_t *pd);
