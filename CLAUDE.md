@@ -185,16 +185,41 @@ Every internal user goes through the `pd->tx` / `pd->tx_cap` pointers, never
 the arrays or `sizeof()` — a path that reaches for `pd->tx_buf` directly keeps
 passing field-inspection tests while writing to the wrong memory.
 
-**Known ceiling neither the constant nor the setter lifts:**
-`osdp_sc_wrap_frame` encrypts into a fixed 256-byte *stack* scratch
-(`OSDP_SC_WRAP_SCRATCH_LEN`,
-`core/src/sc/wrap.c`), and `osdp_sc2_unwrap_frame` has the same
-(`OSDP_SC2_UNWRAP_SCRATCH_LEN`, `core/src/sc2/wrap.c`). So Secure Channel
-payloads still cap near 256 bytes however much TX capacity is bound. Lifting
-it means giving those functions caller-supplied scratch — a core public API
-change. `tests/test_pd_sc.c::test_sc_payload_over_the_wrap_scratch_is_refused`
-pins the current behaviour so it fails loudly when that changes. Multi-part
-message support will need it lifted first.
+**No fixed internal ceilings on the Secure Channel paths.**
+`osdp_sc_wrap_frame` and `osdp_sc2_unwrap_frame` used to route the
+ciphertext through 256-byte *stack* scratch arrays, which capped every SC
+message there no matter how much capacity the caller supplied. Both now work
+directly in the caller's buffer, so SC message size is bounded by the bound
+buffers alone:
+
+- **SC1 wrap** encrypts into the ciphertext's final position in `out_buf`,
+  located via `osdp_frame_payload_offset`. `osdp_frame_build` detects a
+  payload pointer that already equals its destination and skips the copy —
+  self-`memcpy` is UB, so this is a check, not a coincidence.
+  `osdp_sc_encrypt_payload` already documented that its plaintext may alias
+  its ciphertext.
+- **SC2 unwrap** decrypts into the caller's buffer and `memmove`s the data
+  down over the code byte. Consequence: `plain_cap` must hold `code || data`,
+  i.e. **one byte more than the payload**. Pinned by
+  `test_sc2_unwrap_needs_one_byte_more_than_the_payload`.
+
+Raising the constants instead was rejected (1440 bytes of stack per wrap call
+on an MCU), as was caller-supplied scratch (it would need a *fifth* PD
+region, since neither `tx` nor `rx_plain` is free at that moment).
+
+**Sizing helpers — use these instead of deriving overhead by hand:**
+
+| Function | Answers |
+| --- | --- |
+| `osdp_frame_max_payload(shape, cap, *out)` | largest payload for plain framing |
+| `osdp_sc_max_payload(...)` | same, less spec D.4.5 padding (always ≥1 byte, then rounds to an AES block) |
+| `osdp_sc2_max_payload(...)` | same as plain framing — GCM does not expand |
+| `osdp_pd_max_reply_payload(pd)` | what this PD can send *right now*, resolved against bound TX capacity and the live channel |
+
+Each takes a frame *shape* (header fields only). Every one of their tests
+checks the answer against what `build`/`wrap` actually accepts — reported
+maximum must succeed, one more byte must fail — rather than restating the
+arithmetic, so the helpers cannot drift from the code they describe.
 
 ## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
 

@@ -138,6 +138,19 @@ path than the rest, or when the storage should live in a specific memory
 region. The constants set what every context costs; the setter handles the
 exception.
 
+Message size is bounded by these buffers and nothing else: the Secure Channel
+wrap/unwrap paths work directly in the caller's storage rather than through
+fixed internal scratch, so a larger buffer really does mean larger messages.
+To find the per-packet budget — before splitting a response across polls —
+ask rather than deriving the framing and padding overhead by hand:
+
+```c
+size_t budget = osdp_pd_max_reply_payload(&pd);   /* live TX capacity + channel */
+```
+
+with `osdp_frame_max_payload` / `osdp_sc_max_payload` / `osdp_sc2_max_payload`
+underneath for non-PD callers.
+
 Secure Channel is opt-in: a PD or ACU application that doesn't bind a
 crypto vtable + key material via the `osdp_*_set_sc_*` (SC1) or
 `osdp_*_set_sc2_*` (SC2) API behaves exactly like the insecure build,

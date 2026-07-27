@@ -172,6 +172,110 @@ osdp_status_t osdp_frame_decode(const uint8_t *buf, size_t len,
 
 /* ---- Builder ------------------------------------------------------------*/
 
+/* Validate the SCB fields of a build template and report the total number of
+ * SCB bytes the frame will carry. Shared by osdp_frame_build and
+ * osdp_frame_payload_offset so the two can never disagree about the layout —
+ * which matters, because a caller staging its payload at the offset the
+ * latter reports would silently corrupt the frame if they drifted apart. */
+static osdp_status_t frame_scb_total(const osdp_frame_t *in, size_t *out_total)
+{
+    *out_total = 0;
+    if (!in->has_scb) {
+        return OSDP_OK;
+    }
+    if (in->scb_length < OSDP_SCB_MIN_LEN) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    const size_t expected_data_len = (size_t)in->scb_length - OSDP_SCB_MIN_LEN;
+    if (in->scb_data_len != expected_data_len) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    if (in->scb_data_len > 0 && in->scb_data == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    *out_total = in->scb_length;
+    return OSDP_OK;
+}
+
+/* Every byte a built frame spends on something other than the payload:
+ * marking, header, security block, code byte, MAC/tag, integrity. `*out_total`
+ * counts from the start of the output buffer (so it includes the marking
+ * byte); `*out_frame_only` excludes it, which is what the spec 5.6 length
+ * limit and the LEN field are measured against. */
+static osdp_status_t frame_overhead(const osdp_frame_t *in,
+                                    size_t *out_total,
+                                    size_t *out_frame_only)
+{
+    size_t scb_total = 0;
+    const osdp_status_t s = frame_scb_total(in, &scb_total);
+    if (s != OSDP_OK) {
+        return s;
+    }
+    const size_t mac_total =
+        in->has_scb ? osdp_scb_mac_len(in->scb_type) : 0u;
+    const size_t integrity_size =
+        (in->integrity == OSDP_INTEGRITY_CRC) ? 2u : 1u;
+
+    *out_frame_only = OSDP_FRAME_HEADER_LEN + scb_total + 1u +
+                      mac_total + integrity_size;
+    *out_total      = OSDP_FRAME_MARK_LEN + *out_frame_only;
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_frame_max_payload(const osdp_frame_t *shape,
+                                     size_t buf_cap,
+                                     size_t *out_max_payload)
+{
+    if (shape == NULL || out_max_payload == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    *out_max_payload = 0;
+
+    size_t overhead = 0, frame_overhead_only = 0;
+    const osdp_status_t s =
+        frame_overhead(shape, &overhead, &frame_overhead_only);
+    if (s != OSDP_OK) {
+        return s;
+    }
+
+    /* Two independent ceilings: the caller's buffer, and the protocol. A
+     * buffer too small for even an empty frame yields 0 rather than an
+     * error — "nothing fits" is a real answer a fragmenter can act on. */
+    if (buf_cap <= overhead) {
+        return OSDP_OK;
+    }
+    size_t max = buf_cap - overhead;
+
+    if (frame_overhead_only < OSDP_FRAME_MAX_LEN) {
+        const size_t spec_max = OSDP_FRAME_MAX_LEN - frame_overhead_only;
+        if (spec_max < max) {
+            max = spec_max;
+        }
+    } else {
+        max = 0;
+    }
+
+    *out_max_payload = max;
+    return OSDP_OK;
+}
+
+osdp_status_t osdp_frame_payload_offset(const osdp_frame_t *in,
+                                        size_t *out_offset)
+{
+    if (in == NULL || out_offset == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    size_t scb_total = 0;
+    const osdp_status_t s = frame_scb_total(in, &scb_total);
+    if (s != OSDP_OK) {
+        return s;
+    }
+    /* Mirrors the write order in osdp_frame_build: marking byte(s), then the
+     * SOM-aligned header, then the SCB, then the code byte, then the payload. */
+    *out_offset = OSDP_FRAME_MARK_LEN + OSDP_FRAME_HEADER_LEN + scb_total + 1u;
+    return OSDP_OK;
+}
+
 osdp_status_t osdp_frame_build(const osdp_frame_t *in,
                                uint8_t *buf, size_t buf_cap,
                                size_t *written)
@@ -194,19 +298,11 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
 
     /* Validate SCB consistency. */
     size_t scb_total = 0;
-    if (in->has_scb) {
-        if (in->scb_length < OSDP_SCB_MIN_LEN) {
-            return OSDP_ERR_INVALID_ARG;
+    {
+        const osdp_status_t s = frame_scb_total(in, &scb_total);
+        if (s != OSDP_OK) {
+            return s;
         }
-        const size_t expected_data_len =
-            (size_t)in->scb_length - OSDP_SCB_MIN_LEN;
-        if (in->scb_data_len != expected_data_len) {
-            return OSDP_ERR_INVALID_ARG;
-        }
-        if (in->scb_data_len > 0 && in->scb_data == NULL) {
-            return OSDP_ERR_INVALID_ARG;
-        }
-        scb_total = in->scb_length;
     }
 
     if (in->payload_len > 0 && in->payload == NULL) {
@@ -281,10 +377,20 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
         }
     }
 
-    /* Code + payload. */
+    /* Code + payload.
+     *
+     * The payload may already be sitting exactly where it belongs: a caller
+     * that produced it in place (see osdp_frame_payload_offset — this is how
+     * osdp_sc_wrap_frame encrypts straight into the output buffer instead of
+     * through a fixed-size scratch array) hands us a template whose payload
+     * pointer IS &f[off]. Copying a buffer onto itself with memcpy is
+     * undefined behaviour — its parameters are restrict-qualified — so detect
+     * the case and skip the copy rather than relying on it happening to work. */
     f[off++] = in->code;
     if (in->payload_len > 0) {
-        (void)memcpy(&f[off], in->payload, in->payload_len);
+        if (in->payload != &f[off]) {
+            (void)memcpy(&f[off], in->payload, in->payload_len);
+        }
         off += in->payload_len;
     }
 

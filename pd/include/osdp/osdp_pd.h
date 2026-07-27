@@ -629,6 +629,22 @@ osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd,
 void osdp_pd_set_command_handler(osdp_pd_t *pd,
                                  osdp_pd_command_cb cb, void *user);
 
+/* Largest reply payload this PD can transmit right now, in bytes.
+ *
+ * Answers the question an application has to answer before splitting a large
+ * response across several polls: how much fits in one packet. It resolves
+ * against the PD's *live* state — the currently bound TX capacity, and which
+ * channel is actually established — so the number shrinks automatically once
+ * Secure Channel comes up and its framing and padding start costing bytes.
+ * Deriving it by hand means re-deriving it every time a security block, a
+ * MAC, or a pad rule changes.
+ *
+ * Returns 0 for a NULL pd, or if the bound TX buffer cannot hold even an
+ * empty reply. The value is a ceiling for a single message: honouring an
+ * `osdp_ACURXSIZE` the ACU has declared is a separate constraint on top,
+ * since that is the *peer's* limit rather than this PD's. */
+size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd);
+
 /* Pump the PD state machine: read available bytes, process any complete
  * frames addressed to this PD or to the broadcast, dispatch to the
  * command handler, and send any reply. Idempotent and non-blocking;

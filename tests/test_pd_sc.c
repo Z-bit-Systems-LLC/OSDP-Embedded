@@ -1531,11 +1531,9 @@ static osdp_status_t sc_echo_handler(void *user, uint8_t cmd_code,
  * regions are genuinely distinct storage — the handler hands back the exact
  * pointer it was given, so any tx/rx_plain overlap corrupts the echo.
  *
- * The payload deliberately stays under 256 bytes. Binding larger PD buffers
- * does NOT currently raise the Secure Channel ceiling, because
- * osdp_sc_wrap_frame keeps its own fixed 256-byte stack scratch for the
- * ciphertext (core/src/sc/wrap.c) — see
- * test_sc_payload_over_the_wrap_scratch_is_refused below. */
+ * The payload here is modest; the companion
+ * test_sc_payload_past_the_old_scratch_limit_round_trips below covers the
+ * large case. */
 static void test_bound_buffers_carry_a_large_sc_exchange(void)
 {
     mock_transport_t m;
@@ -1601,29 +1599,41 @@ static void test_bound_buffers_carry_a_large_sc_exchange(void)
     TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
 }
 
-/* Documents the Secure Channel payload ceiling, which osdp_pd_set_buffers
- * does NOT lift: osdp_sc_wrap_frame encrypts into a fixed 256-byte stack
- * scratch (OSDP_SC_WRAP_SCRATCH_LEN in core/src/sc/wrap.c), so a payload
- * that pads past it is refused however much TX capacity the caller bound.
- * osdp_sc2_unwrap_frame has the same fixed scratch on the SC2 side.
+/* Secure Channel message size is bounded by the caller's buffer, not by any
+ * fixed internal array.
  *
- * This is a real limit on large messages under SC, and lifting it means
- * changing the osdp_sc_wrap_frame signature to take caller-supplied scratch
- * — a core public API change, deliberately not made here. This test exists
- * so the ceiling is visible and fails loudly the day it moves, rather than
- * being rediscovered from a mysterious BUFFER_TOO_SMALL. */
-static void test_sc_payload_over_the_wrap_scratch_is_refused(void)
+ * osdp_sc_wrap_frame used to encrypt through a 256-byte stack scratch, which
+ * capped every SC message there however much output capacity was supplied —
+ * so a PD could advertise a 512-byte receive buffer in PDCAP and then fail to
+ * produce anything over ~240 under SC. It now encrypts directly into the
+ * output at the offset osdp_frame_payload_offset reports.
+ *
+ * 600 bytes is chosen to sit well past the old ceiling: if the scratch ever
+ * comes back, this fails immediately. */
+static void test_sc_payload_past_the_old_scratch_limit_round_trips(void)
 {
     mock_transport_t m;
     osdp_pd_transport_t t;
     osdp_pd_t pd;
     configure_pd_sc(&pd, &m, &t);
 
+    /* The PD needs room for a 600-byte plaintext in both directions. */
+    static uint8_t tx[OSDP_FRAME_MAX_LEN];
+    static uint8_t rx_plain[OSDP_FRAME_MAX_LEN];
+    const osdp_pd_buffers_t bufs = {
+        .tx = tx, .tx_cap = sizeof(tx),
+        .rx_plain = rx_plain, .rx_plain_cap = sizeof(rx_plain),
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+    osdp_pd_set_command_handler(&pd, sc_echo_handler, NULL);
+
     osdp_sc_session_t acu;
     perform_handshake(&pd, &m, /*selector*/ 1, &acu);
 
     static uint8_t big[600];
-    (void)memset(big, 0xA5, sizeof(big));
+    for (size_t i = 0; i < sizeof(big); i++) {
+        big[i] = (uint8_t)((i * 31U) & 0xFFU);
+    }
 
     osdp_frame_t cmd_template;
     (void)memset(&cmd_template, 0, sizeof(cmd_template));
@@ -1637,13 +1647,33 @@ static void test_sc_payload_over_the_wrap_scratch_is_refused(void)
     cmd_template.payload     = big;
     cmd_template.payload_len = sizeof(big);
 
-    /* Ample output capacity — the refusal comes from the internal scratch,
-     * not from out_cap. */
     static uint8_t cmd_wire[OSDP_FRAME_MAX_LEN];
     size_t cmd_wire_len = 0;
-    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+    TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
                            cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+
+    mock_reset_incoming(&m);
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(MOCK_BUF_LEN, cmd_wire_len);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+
+    static uint8_t plain[OSDP_FRAME_MAX_LEN];
+    size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+    /* All 600 bytes survived encrypt-in-place on the way out and
+     * decrypt-into-rx_plain on the way in, twice (command and reply). */
+    TEST_ASSERT_EQUAL_size_t(sizeof(big), plain_len);
+    TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
 }
 
 int main(void)
@@ -1677,7 +1707,7 @@ int main(void)
     RUN_TEST(test_filetransfer_under_sc_yields_scs_18_ftstat);
 
     RUN_TEST(test_bound_buffers_carry_a_large_sc_exchange);
-    RUN_TEST(test_sc_payload_over_the_wrap_scratch_is_refused);
+    RUN_TEST(test_sc_payload_past_the_old_scratch_limit_round_trips);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_resets_session_but_still_enforces_allowlist);
     RUN_TEST(test_cleartext_sqn0_discovery_resets_session_and_processes);

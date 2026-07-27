@@ -184,6 +184,13 @@ osdp_status_t osdp_sc2_wrap_frame(
  * (`*plain_len` receives that data length, which may be 0). For
  * SCS_25/26 this simply reproduces the frame's own code+payload.
  *
+ * For the encrypted types (SCS_27/28) `plain_cap` must hold `code || data`,
+ * i.e. **one byte more than the data** the caller receives: GCM recovers
+ * both as a single unit, and decrypting straight into the caller's buffer is
+ * what removes the fixed size ceiling a private scratch array would impose.
+ * The data is then shifted down over the code byte. Use
+ * osdp_sc2_max_payload to size the buffer rather than working this out.
+ *
  * On success, increments session->counter. */
 osdp_status_t osdp_sc2_unwrap_frame(
     const osdp_sc2_crypto_t *crypto,
@@ -193,6 +200,20 @@ osdp_status_t osdp_sc2_unwrap_frame(
     uint8_t                 *plaintext_out,
     size_t                   plain_cap,
     size_t                  *plain_len);
+
+/* Largest data payload osdp_sc2_wrap_frame will fit into `buf_cap`, for a
+ * frame shaped like `*shape`. Counterpart to osdp_sc_max_payload.
+ *
+ * Unlike SC1 there is no ciphertext expansion to subtract — AES-GCM is a
+ * stream cipher, and the code byte it also covers is already frame overhead —
+ * so this equals the plain-framing answer. It exists so a caller can ask the
+ * same question of every channel without special-casing which one is active.
+ *
+ * A RECEIVE buffer needs one byte more than this (`plain_cap >= max + 1`);
+ * see osdp_sc2_unwrap_frame for why. */
+osdp_status_t osdp_sc2_max_payload(const osdp_frame_t *shape,
+                                   size_t buf_cap,
+                                   size_t *out_max_payload);
 
 #ifdef __cplusplus
 }

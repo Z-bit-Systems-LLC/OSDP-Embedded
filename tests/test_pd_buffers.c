@@ -480,9 +480,94 @@ static void test_reply_pointing_at_the_inbound_payload_survives_framing(void)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(sent, reply.payload, sizeof(sent));
 }
 
+/* ---- Reply sizing -------------------------------------------------------*/
+
+/* osdp_pd_max_reply_payload answers "how much fits in one packet", which is
+ * the question a caller must answer before splitting a response across polls.
+ * Checked against reality rather than against restated arithmetic: ask for
+ * the maximum, have the handler return exactly that many bytes, and confirm
+ * the frame reaches the wire intact — then one more byte and confirm it does
+ * not. */
+static void test_max_reply_payload_is_what_actually_fits(void)
+{
+    static uint8_t tx[300];
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
+    const size_t max = osdp_pd_max_reply_payload(&pd);
+    TEST_ASSERT_GREATER_THAN_size_t(0, max);
+    TEST_ASSERT_LESS_THAN_size_t(sizeof(tx), max);
+    TEST_ASSERT_LESS_THAN_size_t(sizeof(big_payload), max);
+
+    /* Exactly `max` bytes must reach the wire. */
+    {
+        mock_transport_t    m;
+        osdp_pd_transport_t t;
+        mock_init(&m, &t);
+        osdp_pd_set_transport(&pd, &t);
+        osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+        big_payload_len = max;
+        fill_ramp(big_payload, big_payload_len);
+
+        inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+        osdp_pd_tick(&pd);
+
+        osdp_frame_t reply;
+        decode_first_outgoing(&m, &reply);
+        TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+        TEST_ASSERT_EQUAL_size_t(max, reply.payload_len);
+    }
+
+    /* One more must not — otherwise the helper under-reports and every
+     * fragment would waste a byte of capacity. */
+    {
+        mock_transport_t    m;
+        osdp_pd_transport_t t;
+        mock_init(&m, &t);
+        osdp_pd_init(&pd, 0x05);
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+        osdp_pd_set_transport(&pd, &t);
+        osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+        big_payload_len = max + 1U;
+        fill_ramp(big_payload, big_payload_len);
+
+        inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+        osdp_pd_tick(&pd);
+        TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+    }
+}
+
+/* The answer tracks the bound capacity, so rebinding changes it — the whole
+ * point of resolving against live state instead of a constant. */
+static void test_max_reply_payload_follows_the_bound_capacity(void)
+{
+    static uint8_t small[64], large[OSDP_FRAME_MAX_LEN];
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    const osdp_pd_buffers_t small_bufs = { .tx = small, .tx_cap = sizeof(small) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &small_bufs));
+    const size_t with_small = osdp_pd_max_reply_payload(&pd);
+
+    const osdp_pd_buffers_t large_bufs = { .tx = large, .tx_cap = sizeof(large) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &large_bufs));
+    const size_t with_large = osdp_pd_max_reply_payload(&pd);
+
+    TEST_ASSERT_GREATER_THAN_size_t(with_small, with_large);
+    TEST_ASSERT_EQUAL_size_t(0, osdp_pd_max_reply_payload(NULL));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_max_reply_payload_is_what_actually_fits);
+    RUN_TEST(test_max_reply_payload_follows_the_bound_capacity);
     RUN_TEST(test_sizing_constant_matches_the_embedded_arrays);
     RUN_TEST(test_init_binds_every_region_to_its_embedded_array);
     RUN_TEST(test_reply_too_large_for_the_bound_tx_buffer_is_dropped);

@@ -29,14 +29,30 @@
  *   empty GCM plaintext, so the tag authenticates them without
  *   encryption. Production traffic uses SCS_27/28. */
 
-/* Scratch for the recovered plaintext during unwrap; sized to the
- * baseline message set. */
-#define OSDP_SC2_UNWRAP_SCRATCH_LEN 256U
-
 static size_t header_aad_len(const osdp_frame_t *f)
 {
     /* All bytes from SOM through the end of the SCB. */
     return OSDP_FRAME_HEADER_LEN + (size_t)f->scb_length;
+}
+
+osdp_status_t osdp_sc2_max_payload(const osdp_frame_t *shape,
+                                   size_t buf_cap,
+                                   size_t *out_max_payload)
+{
+    if (shape == NULL || out_max_payload == NULL) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    size_t framed = 0;
+    const osdp_status_t s = osdp_frame_max_payload(shape, buf_cap, &framed);
+    if (s != OSDP_OK) {
+        return s;
+    }
+    /* AES-GCM is a stream cipher: the ciphertext is exactly as long as the
+     * plaintext, so SC2 costs nothing over plain framing. The code byte the
+     * GCM unit also covers is already counted as frame overhead — encrypting
+     * it in place does not lengthen the frame. */
+    *out_max_payload = framed;
+    return OSDP_OK;
 }
 
 osdp_status_t osdp_sc2_wrap_frame(
@@ -181,26 +197,32 @@ osdp_status_t osdp_sc2_unwrap_frame(
     const uint8_t *data   = &frame->raw[aad_len];
 
     if (encrypted) {
-        if (frame->payload_len > plain_cap) {
-            return OSDP_ERR_BUFFER_TOO_SMALL;
-        }
-        /* Decrypt code||data into a scratch, verifying the tag over the
-         * 7-byte header AAD. */
-        uint8_t scratch[OSDP_SC2_UNWRAP_SCRATCH_LEN];
-        if (data_len > sizeof(scratch)) {
+        /* GCM decrypts code||data as one unit, so the recovered plaintext is
+         * one byte longer than the data the caller ends up with. Decrypt
+         * directly into the caller's buffer and shift the data down over the
+         * code byte, rather than staging through a fixed scratch array — a
+         * scratch would cap every SC2 message at its size regardless of the
+         * caller's capacity, and sizing it for the spec maximum would put
+         * 1440 bytes on the stack of every unwrap.
+         *
+         * The cost is that `plain_cap` must hold code||data, i.e. one byte
+         * more than the payload. That is documented on the prototype. */
+        if (plaintext_out == NULL || data_len > plain_cap) {
             return OSDP_ERR_BUFFER_TOO_SMALL;
         }
         s = crypto->aes256_gcm_decrypt(
             crypto->user, session->keys.s_enc, nonce,
             frame->raw, aad_len,
             data, data_len,
-            frame->mac, scratch);
+            frame->mac, plaintext_out);
         if (s != OSDP_OK) {
             return s;   /* OSDP_ERR_BAD_CRC on tag mismatch */
         }
-        *code_out = scratch[0];
-        if (frame->payload_len > 0 && plaintext_out != NULL) {
-            (void)memcpy(plaintext_out, &scratch[1], frame->payload_len);
+        *code_out = plaintext_out[0];
+        if (frame->payload_len > 0) {
+            /* Overlapping by construction — memmove, never memcpy. */
+            (void)memmove(plaintext_out, &plaintext_out[1],
+                          frame->payload_len);
         }
         *plain_len = frame->payload_len;
     } else {

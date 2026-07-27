@@ -217,6 +217,50 @@ osdp_status_t osdp_frame_build(const osdp_frame_t *in,
                                uint8_t *buf, size_t buf_cap,
                                size_t *written);
 
+/* Byte offset, within the buffer handed to osdp_frame_build, at which that
+ * function will place the payload of a frame shaped like `*in`. Depends only
+ * on the header fields (marking, header length, SCB presence and length, the
+ * code byte) — `in->payload` and `in->payload_len` are not read.
+ *
+ * This exists so a caller can produce the payload *directly into its final
+ * position* in the output buffer and then hand osdp_frame_build a template
+ * whose `payload` already points there, instead of staging the bytes in a
+ * separate scratch buffer that has to be sized for the largest message the
+ * device will ever send. osdp_frame_build detects that case and skips the
+ * copy. `osdp_sc_wrap_frame` uses this to encrypt straight into the output,
+ * which is what lets a Secure Channel message be as large as the caller's
+ * buffer rather than as large as a fixed internal array.
+ *
+ * Returns OSDP_ERR_INVALID_ARG for a NULL argument or an inconsistent SCB
+ * (the same validation osdp_frame_build applies), so a caller that gets
+ * OSDP_OK here can rely on the offset it was given. */
+osdp_status_t osdp_frame_payload_offset(const osdp_frame_t *in,
+                                        size_t *out_offset);
+
+/* Largest `payload_len` that osdp_frame_build will accept into `buf_cap`
+ * bytes for a frame shaped like `*shape`, also honouring the spec 5.6
+ * maximum frame length. As with osdp_frame_payload_offset, only the header
+ * fields of `*shape` are read — set `has_scb`, `scb_length`, `scb_type` and
+ * `integrity` to what the real frame will carry and leave `payload` alone.
+ *
+ * This is the sizing question a sender has to answer before it can split a
+ * message across packets: subtract framing overhead (marking byte, header,
+ * security block, code byte, MAC/tag, CRC or checksum) from the capacity it
+ * actually has, and what remains is one fragment. Guessing the overhead is
+ * how off-by-a-few-bytes truncation bugs happen, so ask instead.
+ *
+ * `*out_max_payload` is 0 when the buffer cannot even hold an empty frame —
+ * that is a valid answer, not an error. OSDP_ERR_INVALID_ARG is returned only
+ * for a NULL argument or an inconsistent SCB.
+ *
+ * Under Secure Channel the answer is smaller still, because the ciphertext
+ * carries padding (SC1) or an encrypted code byte (SC2). Use
+ * osdp_sc_max_payload / osdp_sc2_max_payload for those; each accounts for
+ * its own transform on top of this. */
+osdp_status_t osdp_frame_max_payload(const osdp_frame_t *shape,
+                                     size_t buf_cap,
+                                     size_t *out_max_payload);
+
 #ifdef __cplusplus
 }
 #endif

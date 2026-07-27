@@ -165,6 +165,21 @@ extern "C" {
         buf_cap: usize,
         written: *mut usize,
     ) -> osdp_status_t;
+
+    /// Where `osdp_frame_build` will place the payload — lets a caller stage
+    /// bytes directly in the output buffer instead of a scratch array.
+    pub fn osdp_frame_payload_offset(
+        in_: *const osdp_frame_t,
+        out_offset: *mut usize,
+    ) -> osdp_status_t;
+
+    /// Largest payload that fits in `buf_cap` for a frame of this shape.
+    /// The per-fragment budget when splitting a message across packets.
+    pub fn osdp_frame_max_payload(
+        shape: *const osdp_frame_t,
+        buf_cap: usize,
+        out_max_payload: *mut usize,
+    ) -> osdp_status_t;
 }
 
 // ====================================================================
@@ -889,6 +904,14 @@ extern "C" {
         out_len: *mut usize,
     ) -> osdp_status_t;
 
+    /// Per-fragment budget under SC1: the plain-framing answer less spec
+    /// D.4.5 padding, which always claims at least one byte.
+    pub fn osdp_sc_max_payload(
+        shape: *const osdp_frame_t,
+        buf_cap: usize,
+        out_max_payload: *mut usize,
+    ) -> osdp_status_t;
+
     pub fn osdp_sc_unwrap_frame(
         crypto: *const osdp_sc_crypto_t,
         session: *mut osdp_sc_session_t,
@@ -1231,6 +1254,9 @@ mod pd_ffi {
         );
         pub fn osdp_pd_tick(pd: *mut osdp_pd_t);
         pub fn osdp_pd_is_online(pd: *const osdp_pd_t) -> bool;
+        /// Largest reply payload the PD can send right now, resolved against
+        /// the bound TX capacity and whichever channel is established.
+        pub fn osdp_pd_max_reply_payload(pd: *const osdp_pd_t) -> usize;
 
         pub fn osdp_pd_set_led_handler(pd: *mut osdp_pd_t, cb: osdp_pd_led_cb, user: *mut c_void);
         pub fn osdp_pd_led_color(pd: *const osdp_pd_t, reader_no: u8, led_no: u8) -> u8;

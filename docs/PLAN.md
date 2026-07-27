@@ -581,11 +581,20 @@ validation at the end of the plan.
   `rust/osdp/src/pd_layout_tests.rs`, a real guard on the hand-maintained
   `osdp_pd_t` mirror: `osdp_pd_init` writes self-referential pointers, so
   C-computed addresses can be compared against Rust-computed ones.
-  **Known limitation:** `osdp_sc_wrap_frame` / `osdp_sc2_unwrap_frame` keep
-  fixed 256-byte stack scratches, so Secure Channel payloads still cap near
-  256 whatever is bound. Pinned by
-  `test_sc_payload_over_the_wrap_scratch_is_refused`; Phase 6 needs it
-  lifted, which means caller-supplied scratch on those core functions.
+  Also removed the fixed 256-byte stack scratches in `osdp_sc_wrap_frame`
+  and `osdp_sc2_unwrap_frame`, which had capped every Secure Channel message
+  there regardless of the buffers bound — so a PD could advertise 512 in
+  PDCAP and then fail to produce anything over ~240 under SC. Both now work
+  directly in the caller's buffer: SC1 encrypts into the ciphertext's final
+  position (`osdp_frame_payload_offset`, new; `osdp_frame_build` skips the
+  copy when the payload already equals its destination), SC2 decrypts into
+  the caller's buffer and shifts the data over the code byte (so `plain_cap`
+  now needs payload + 1). No API break and no extra memory — caller-supplied
+  scratch would have needed a fifth PD region. Adds the sizing helpers a
+  fragmenter needs: `osdp_frame_max_payload`, `osdp_sc_max_payload`,
+  `osdp_sc2_max_payload`, and `osdp_pd_max_reply_payload`, each tested
+  against what `build`/`wrap` actually accepts rather than against restated
+  arithmetic. **Phase 6's multi-part transport is now unblocked.**
 - ☐ **Phase 3: Missing codecs.** 8 commands (LSTAT, ISTAT, OSTAT, RSTAT,
   ACURXSIZE, MFG, ABORT, KEEPACTIVE) and 5 replies (FMT, BUSY, MFGREP,
   MFGSTATR, MFGERRR), one TU each, plus `dispatch_classify.c` entries.
@@ -600,7 +609,9 @@ validation at the end of the plan.
 - ☐ **Phase 6: Multi-part transport (spec 5.10).** Generalize SC2's existing
   `core/src/pair/fragment.c` + `multipart.c` (whose header is already
   byte-identical to spec Table 4) into `core/src/shared/`, add the 5.10.2
-  rules, and add outbound fragmentation bounded by `acu_rx_size`.
+  rules, and add outbound fragmentation bounded by `acu_rx_size`. The
+  per-fragment budget comes from `osdp_pd_max_reply_payload` (Phase 2), so
+  the fragmenter never re-derives framing overhead itself.
 - ☐ **Phase 7–8: Tests and docs.** Consolidated test inventory; CLAUDE.md,
   PLAN.md, PD_GUIDE.md.
 - ☐ **Phase 9: Rust + MCP follow-up.** Wrappers for the new codecs, bindings

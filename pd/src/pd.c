@@ -7,6 +7,7 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
+#include "osdp/osdp_sc2.h"
 
 #include "pd_internal.h"
 
@@ -647,6 +648,42 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
     }
     pd->cmd_cb   = cb;
     pd->cmd_user = user;
+}
+
+size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return 0;
+    }
+
+    /* Describe the reply this PD would send right now. Only the header
+     * fields matter to the sizing helpers; the payload is what we're
+     * solving for. A reply always mirrors the inbound integrity mode, and
+     * CRC (2 bytes) is both the common case and the conservative one. */
+    osdp_frame_t shape;
+    (void)memset(&shape, 0, sizeof(shape));
+    shape.address   = pd->address;
+    shape.reply     = true;
+    shape.integrity = OSDP_INTEGRITY_CRC;
+
+    size_t        max = 0;
+    osdp_status_t s;
+
+    if (pd->sc2.session.established) {
+        shape.has_scb    = true;
+        shape.scb_length = OSDP_SCB_MIN_LEN;
+        shape.scb_type   = OSDP_SCS_28;   /* data-bearing PD→ACU */
+        s = osdp_sc2_max_payload(&shape, pd->tx_cap, &max);
+    } else if (pd->sc.session.established) {
+        shape.has_scb    = true;
+        shape.scb_length = OSDP_SCB_MIN_LEN;
+        shape.scb_type   = OSDP_SCS_18;   /* data-bearing PD→ACU */
+        s = osdp_sc_max_payload(&shape, pd->tx_cap, &max);
+    } else {
+        s = osdp_frame_max_payload(&shape, pd->tx_cap, &max);
+    }
+
+    return (s == OSDP_OK) ? max : 0;
 }
 
 bool osdp_pd_is_online(const osdp_pd_t *pd)

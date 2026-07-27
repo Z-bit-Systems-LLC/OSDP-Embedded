@@ -126,6 +126,41 @@ if (osdp_pd_set_buffers(&pd, &bufs) != OSDP_OK) { /* too small */ }
 A PD that never calls this uses its embedded arrays and behaves exactly as
 if the API didn't exist.
 
+### How much fits in one reply — `osdp_pd_max_reply_payload`
+
+When a response is too big for one packet you have to split it across polls,
+and that means knowing the per-packet budget. Don't compute it: framing
+overhead is a marking byte, a 5-byte header, possibly a security block, the
+code byte, possibly a 4- or 16-byte MAC, and 1 or 2 integrity bytes — and
+under SC1 the payload is then padded up to an AES block with *always at least
+one* pad byte, so a 16-byte payload costs 32.
+
+```c
+const size_t budget = osdp_pd_max_reply_payload(&pd);
+```
+
+It resolves against live state — the currently bound TX capacity and which
+channel is actually established — so the number drops on its own the moment
+Secure Channel comes up:
+
+| PD state (512-byte TX bound) | `osdp_pd_max_reply_payload` |
+| ---------------------------- | ---------------------------- |
+| clear text                   | largest, framing overhead only |
+| SC1 established              | smaller — security block, 4-byte MAC, and CBC padding |
+| SC2 established              | smaller — security block and 16-byte GCM tag (no padding; GCM doesn't expand) |
+
+Returns 0 for a NULL PD or a TX buffer too small for any reply at all — a
+usable answer, not an error.
+
+One caveat: this is *your* limit. If the ACU has sent `osdp_ACURXSIZE`, its
+declared size is a separate ceiling on top, and the real budget is the
+smaller of the two.
+
+The core primitives underneath are available too, if you are sizing something
+other than a PD reply — `osdp_frame_max_payload` for plain framing,
+`osdp_sc_max_payload` and `osdp_sc2_max_payload` for the two Secure Channel
+variants. Each takes a frame *shape* (header fields only, payload ignored).
+
 ---
 
 ## Getting started

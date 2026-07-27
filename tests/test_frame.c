@@ -888,6 +888,198 @@ static void test_build_decode_build_is_symmetric(void)
     }
 }
 
+/* ---- Payload placement and sizing ---------------------------------------
+ *
+ * osdp_frame_payload_offset and osdp_frame_max_payload both restate part of
+ * osdp_frame_build's layout arithmetic, which makes them exactly the kind of
+ * helper that rots: a change to framing that misses one of them is silent
+ * corruption (offset) or silent truncation (max payload).
+ *
+ * So none of these tests hard-code an expected number. Each one asks the
+ * helper, then checks the answer against what osdp_frame_build actually does.
+ * If the two ever disagree, the test fails without anyone having to remember
+ * to update a constant. */
+
+/* Fill in a frame template with the given shape; payload left unset. */
+static void shape_frame(osdp_frame_t *f, bool has_scb, uint8_t scb_type,
+                        osdp_integrity_t integrity)
+{
+    (void)memset(f, 0, sizeof(*f));
+    f->address   = 0x05;
+    f->sequence  = 1;
+    f->integrity = integrity;
+    f->code      = 0x60U;   /* osdp_POLL; test_frame stays free of codec headers */
+    if (has_scb) {
+        f->has_scb    = true;
+        f->scb_length = OSDP_SCB_MIN_LEN;
+        f->scb_type   = scb_type;
+    }
+}
+
+static void test_payload_offset_matches_where_build_puts_the_payload(void)
+{
+    /* A recognizable payload, then locate it in the built frame and compare
+     * against what the helper predicted. */
+    static const uint8_t marker[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+    /* No SCB, and an SCB-bearing handshake frame (SCS_11 carries no MAC, so
+     * it can be built without one) — the two layouts the offset must span. */
+    const uint8_t scb_types[] = { 0x00, OSDP_SCS_11 };
+    for (size_t i = 0; i < sizeof(scb_types) / sizeof(scb_types[0]); i++) {
+        const bool has_scb = (scb_types[i] != 0x00);
+
+        osdp_frame_t f;
+        shape_frame(&f, has_scb, scb_types[i], OSDP_INTEGRITY_CRC);
+        f.payload     = marker;
+        f.payload_len = sizeof(marker);
+
+        size_t predicted = 0;
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_payload_offset(&f, &predicted));
+
+        uint8_t buf[64];
+        size_t  written = 0;
+        TEST_ASSERT_EQUAL(OSDP_OK,
+                          osdp_frame_build(&f, buf, sizeof(buf), &written));
+
+        TEST_ASSERT_GREATER_THAN_size_t(predicted + sizeof(marker), written);
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(marker, &buf[predicted], sizeof(marker));
+    }
+}
+
+static void test_payload_offset_rejects_bad_arguments(void)
+{
+    osdp_frame_t f;
+    size_t       off = 0;
+
+    shape_frame(&f, false, 0x00, OSDP_INTEGRITY_CRC);
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_payload_offset(NULL, &off));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_payload_offset(&f, NULL));
+
+    /* Inconsistent SCB: same validation osdp_frame_build applies, so a
+     * caller that got OSDP_OK can trust the offset it was handed. */
+    shape_frame(&f, true, OSDP_SCS_11, OSDP_INTEGRITY_CRC);
+    f.scb_length   = OSDP_SCB_MIN_LEN + 2U;   /* claims 2 data bytes... */
+    f.scb_data_len = 0;                       /* ...but supplies none    */
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_frame_payload_offset(&f, &off));
+}
+
+/* The in-place build path osdp_sc_wrap_frame depends on: stage the payload
+ * at the reported offset inside the output buffer, hand build a template
+ * pointing there, and get a correct frame rather than a self-memcpy. */
+static void test_build_accepts_a_payload_already_in_place(void)
+{
+    osdp_frame_t f;
+    shape_frame(&f, false, 0x00, OSDP_INTEGRITY_CRC);
+
+    uint8_t buf[64];
+    (void)memset(buf, 0, sizeof(buf));
+
+    size_t off = 0;
+    f.payload_len = 5;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_payload_offset(&f, &off));
+
+    /* Write the payload straight into its final position. */
+    static const uint8_t body[5] = { 1, 2, 3, 4, 5 };
+    (void)memcpy(&buf[off], body, sizeof(body));
+    f.payload = &buf[off];
+
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_build(&f, buf, sizeof(buf), &written));
+
+    /* Decoding must yield the payload intact and a valid CRC — proving the
+     * skipped copy left the right bytes and the integrity covers them. */
+    osdp_frame_t out;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_decode(buf + OSDP_FRAME_MARK_LEN,
+                                        written - OSDP_FRAME_MARK_LEN, &out));
+    TEST_ASSERT_EQUAL_size_t(sizeof(body), out.payload_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(body, out.payload, sizeof(body));
+}
+
+/* The sizing contract, checked against reality in both directions: the
+ * reported maximum must build, and one byte more must not. */
+static void test_max_payload_is_exactly_what_build_accepts(void)
+{
+    static uint8_t body[256];
+    (void)memset(body, 0xA5, sizeof(body));
+
+    const size_t caps[] = { 32, 64, 100, 200 };
+    const osdp_integrity_t modes[] = { OSDP_INTEGRITY_CRC,
+                                       OSDP_INTEGRITY_CHECKSUM };
+
+    for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++) {
+        for (size_t mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
+            osdp_frame_t f;
+            shape_frame(&f, false, 0x00, modes[mi]);
+
+            size_t max = 0;
+            TEST_ASSERT_EQUAL(OSDP_OK,
+                              osdp_frame_max_payload(&f, caps[c], &max));
+            TEST_ASSERT_LESS_THAN_size_t(sizeof(body), max);
+
+            uint8_t buf[256];
+            size_t  written = 0;
+
+            /* Exactly the reported maximum must fit. */
+            f.payload     = body;
+            f.payload_len = max;
+            TEST_ASSERT_EQUAL(OSDP_OK,
+                              osdp_frame_build(&f, buf, caps[c], &written));
+            TEST_ASSERT_LESS_OR_EQUAL_size_t(caps[c], written);
+
+            /* One more must not — otherwise the helper is under-reporting
+             * and a fragmenter would waste capacity on every packet. */
+            f.payload_len = max + 1U;
+            TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                              osdp_frame_build(&f, buf, caps[c], &written));
+        }
+    }
+}
+
+/* With a huge buffer the protocol, not the buffer, is the binding limit. */
+static void test_max_payload_honours_the_spec_frame_limit(void)
+{
+    osdp_frame_t f;
+    shape_frame(&f, false, 0x00, OSDP_INTEGRITY_CRC);
+
+    size_t max = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_max_payload(&f, 100000U, &max));
+    TEST_ASSERT_LESS_THAN_size_t(OSDP_FRAME_MAX_LEN, max);
+
+    static uint8_t body[OSDP_FRAME_MAX_LEN];
+    static uint8_t buf [OSDP_FRAME_MAX_LEN + 16U];
+    (void)memset(body, 0x5A, sizeof(body));
+
+    f.payload     = body;
+    f.payload_len = max;
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_build(&f, buf, sizeof(buf), &written));
+
+    f.payload_len = max + 1U;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,   /* over the spec 5.6 maximum */
+                      osdp_frame_build(&f, buf, sizeof(buf), &written));
+}
+
+/* "Nothing fits" is an answer, not an error — a fragmenter can act on 0. */
+static void test_max_payload_reports_zero_for_a_hopeless_buffer(void)
+{
+    osdp_frame_t f;
+    shape_frame(&f, false, 0x00, OSDP_INTEGRITY_CRC);
+
+    size_t max = 12345;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_max_payload(&f, 4, &max));
+    TEST_ASSERT_EQUAL_size_t(0, max);
+
+    max = 12345;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_max_payload(&f, 0, &max));
+    TEST_ASSERT_EQUAL_size_t(0, max);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -933,6 +1125,13 @@ int main(void)
     RUN_TEST(test_decode_scs_28_minimal_ciphertext);
     RUN_TEST(test_decode_rejects_scs_27_shorter_than_tag);
     RUN_TEST(test_build_rejects_wrong_tag_len_for_scs_27);
+    /* Payload placement + sizing helpers — see definitions above main(). */
+    RUN_TEST(test_payload_offset_matches_where_build_puts_the_payload);
+    RUN_TEST(test_payload_offset_rejects_bad_arguments);
+    RUN_TEST(test_build_accepts_a_payload_already_in_place);
+    RUN_TEST(test_max_payload_is_exactly_what_build_accepts);
+    RUN_TEST(test_max_payload_honours_the_spec_frame_limit);
+    RUN_TEST(test_max_payload_reports_zero_for_a_hopeless_buffer);
     /* Symmetry. */
     RUN_TEST(test_build_decode_build_is_symmetric);
     return UNITY_END();
