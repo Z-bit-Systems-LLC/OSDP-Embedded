@@ -485,6 +485,53 @@ mechanism — providers, not the queue. See the next section.
 
 ---
 
+## Sanity-check your PDCAP — `osdp_pd_check_pdcap`
+
+PDCAP is a set of promises, and the ACU acts on them: told the PD accepts
+1440-byte messages, it will send them. Over-advertising doesn't fail loudly —
+the PD drops frames the ACU believes were delivered, and you see it weeks
+later as unexplained retries.
+
+Call this once at start-up with the same records your handler returns for
+`osdp_CAP`:
+
+```c
+size_t bad = 0;
+osdp_status_t s = osdp_pd_check_pdcap(&pd, my_caps, my_cap_count, &bad);
+if (s != OSDP_OK) {
+    log("PDCAP record %zu (function code %u) is inconsistent: %d",
+        bad, my_caps[bad].function_code, (int)s);
+}
+```
+
+It only checks the three records describing the *library's* limits — how many
+inputs your device has is your business, not something it can know:
+
+| Record | Flagged when |
+| --- | --- |
+| fn 9 Communication Security | claims AES128 but no crypto vtable and key are bound → `OSDP_ERR_NOT_SUPPORTED` |
+| fn 10 Receive BufferSize | exceeds the stream buffer, or — with SC configured — implies a plaintext larger than your bound `rx_plain` → `OSDP_ERR_BUFFER_TOO_SMALL` |
+| fn 11 Largest Combined Message Size | non-zero, while multi-part messages are unimplemented → `OSDP_ERR_NOT_SUPPORTED` |
+
+The second half of the fn 10 check is the one worth knowing about: a message
+that fits the wire can still be too large to *decrypt*, because SC plaintext
+lands in `rx_plain`. The frame arrives cleanly and then fails to unwrap, which
+looks like a MAC failure and isn't.
+
+**Watch the encoding.** Function codes 10 and 11 carry a 16-bit size as
+LSB-then-MSB across the two bytes named "compliance level" and "number of"
+everywhere else in Annex B. Filling them in as their names suggest is exactly
+the mistake this checker catches:
+
+```c
+size_record(10, 512)  /* -> compliance_level = 0x00, num_objects = 0x02 */
+```
+
+Purely advisory: it changes no wire behaviour, nothing calls it for you, and a
+PD that never calls it doesn't link it.
+
+---
+
 ## Status reports — `osdp_pd_set_status_provider`
 
 `osdp_LSTAT` / `osdp_ISTAT` / `osdp_OSTAT` / `osdp_RSTAT` ask the PD to report

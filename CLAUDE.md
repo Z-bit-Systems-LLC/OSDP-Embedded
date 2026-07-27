@@ -270,6 +270,28 @@ three rules on it, all exceptions, all centralised in
 pins rule 2 by having the ACU send its next SCS_15 against the pre-BUSY chain
 state and unwrap the reply cleanly.
 
+## PDCAP consistency (advisory)
+
+`osdp_pd_check_pdcap` validates an application's capability records against
+what the library can honour. Own TU, so an application that never calls it
+does not link it; no wire behaviour, nothing calls it automatically.
+
+Only three records are checked — the ones describing the *library's* limits,
+since the rest describe the device and only the application knows those:
+function code 9 claiming AES128 with no crypto vtable/key bound; function
+code 10 exceeding `OSDP_STREAM_BUFFER_LEN`, or (with SC configured) implying
+a plaintext larger than the bound `rx_plain`; function code 11 non-zero while
+multi-part is unimplemented. Returns the offending record's index.
+
+The fn-10-under-SC half is the non-obvious one: a message that fits the wire
+can still be too large to *decrypt*, because SC plaintext lands in
+`rx_plain`. The frame arrives cleanly and then fails to unwrap, which reads
+as a MAC failure and isn't.
+
+**Codes 10 and 11 encode a 16-bit size as LSB-then-MSB** across the two bytes
+Annex B names "compliance level" and "number of" everywhere else. Filling them
+in as the names suggest is precisely the mistake this checker exists to catch.
+
 ## PD status providers and the poll-response event queue
 
 **Status providers** (`osdp_pd_set_status_provider`) answer osdp_LSTAT /

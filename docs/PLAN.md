@@ -628,8 +628,23 @@ validation at the end of the plan.
     for the status reports desynced the Rust mirror and the Phase 2 layout
     guard caught it as STATUS_HEAP_CORRUPTION on the first `cargo test` —
     working as intended.
-- ☐ **Phase 5: PDCAP consistency.** Advisory `osdp_pd_check_pdcap` catching
-  an advertised Receive BufferSize the PD cannot honour.
+- ☑ **Phase 5: PDCAP consistency.** `osdp_pd_check_pdcap` (own TU, so an
+  application that never calls it does not link it) validates the three
+  records whose truth the library actually knows — the rest describe the
+  device, not the library: function code 9 claiming AES128 with no crypto
+  vtable or key bound; function code 10 exceeding the stream buffer, or
+  (with SC configured) implying a plaintext larger than the bound rx_plain,
+  which is the case a clear-text reading misses because the frame arrives
+  fine and then fails to unwrap; function code 11 non-zero while multi-part
+  is unimplemented. Reports the offending record's index, changes no wire
+  behaviour, and nothing calls it automatically. Codes 10 and 11 carry a
+  16-bit size as LSB-then-MSB across the two bytes whose names say
+  otherwise, which the helper documents because misreading them is the
+  mistake it exists to catch. The override build again earned its keep: two
+  tests had assumed relationships between OSDP_PD_BUF_LEN and
+  OSDP_STREAM_BUFFER_LEN that hold at the defaults and not under
+  -DOSDP_PD_BUF_LEN=1024 -DOSDP_STREAM_BUFFER_LEN=800; both now bind their
+  own buffers instead.
 - ☐ **Phase 6: Multi-part transport (spec 5.10).** Generalize SC2's existing
   `core/src/pair/fragment.c` + `multipart.c` (whose header is already
   byte-identical to spec Table 4) into `core/src/shared/`, add the 5.10.2

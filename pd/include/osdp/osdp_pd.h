@@ -7,6 +7,7 @@
 #include "osdp/osdp_buz_state.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_led_state.h"
+#include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc2.h"
 #include "osdp/osdp_sc2_crypto.h"
@@ -842,6 +843,43 @@ void osdp_pd_set_file_stream(osdp_pd_t *pd, osdp_pd_file_cb cb, void *user);
 void osdp_pd_set_status_provider(osdp_pd_t *pd,
                                  const osdp_pd_status_provider_t *p,
                                  void *user);
+
+/* ---- PDCAP consistency (advisory) --------------------------------------*/
+
+/* Check an application's osdp_PDCAP records against what this PD can
+ * actually honour. Call it once at start-up with the same records the
+ * command handler will return for osdp_CAP.
+ *
+ * PDCAP is a set of promises the ACU acts on — spec §6 has it bound osdp_LED
+ * record counts by function code 10, and an ACU told the PD accepts
+ * 1440-byte messages will send them. Over-advertising does not fail loudly;
+ * the PD drops frames the ACU believes were delivered, and it surfaces later
+ * as unexplained retries.
+ *
+ * Only the records describing the LIBRARY's limits are checked, because they
+ * are the only ones whose truth the library knows — how many inputs the
+ * device has is the application's business:
+ *
+ *   fn 9  Communication Security   claims AES128 with no crypto vtable and
+ *                                  key bound  -> OSDP_ERR_NOT_SUPPORTED
+ *   fn 10 Receive BufferSize       exceeds the stream buffer, or (with SC
+ *                                  configured) implies a plaintext larger
+ *                                  than the bound rx_plain region
+ *                                  -> OSDP_ERR_BUFFER_TOO_SMALL
+ *   fn 11 Largest Combined Msg     non-zero while multi-part messages are
+ *                                  unimplemented -> OSDP_ERR_NOT_SUPPORTED
+ *
+ * Returns OSDP_OK when nothing is inconsistent. On any other result
+ * `*bad_index` (when non-NULL) receives the index of the first offending
+ * record, so the caller can report which one rather than just that
+ * something is wrong.
+ *
+ * Purely advisory: no wire behaviour changes, nothing calls this
+ * automatically, and a PD that never calls it does not link it. */
+osdp_status_t osdp_pd_check_pdcap(const osdp_pd_t           *pd,
+                                  const osdp_pdcap_record_t *records,
+                                  size_t                     count,
+                                  size_t                    *bad_index);
 
 /* ---- Poll-response events ----------------------------------------------
  *
