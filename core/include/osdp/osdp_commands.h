@@ -294,6 +294,108 @@ osdp_status_t osdp_filetransfer_build(const osdp_filetransfer_cmd_t *in,
                                       uint8_t *buf, size_t buf_cap,
                                       size_t *written);
 
+/* ========================================================================
+ * Status report requests — all empty payload
+ *
+ * osdp_LSTAT (0x64) local     -> osdp_LSTATR   (spec 6.5, Table 9)
+ * osdp_ISTAT (0x65) inputs    -> osdp_ISTATR   (spec 6.6, Table 10)
+ * osdp_OSTAT (0x66) outputs   -> osdp_OSTATR   (spec 6.7, Table 11)
+ * osdp_RSTAT (0x67) readers   -> osdp_RSTATR   (spec 6.8, Table 12)
+ * ====================================================================== */
+
+osdp_status_t osdp_lstat_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_lstat_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+osdp_status_t osdp_istat_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_istat_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+osdp_status_t osdp_ostat_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_ostat_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+osdp_status_t osdp_rstat_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_rstat_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_ACURXSIZE (0x7B) — ACU receive capacity, 2 bytes (16-bit LE)
+ *
+ * Spec 6.20, Table 28. Bounds what the PD may SEND — the mirror of the PD
+ * advertising PDCAP function code 10. A PD honouring it caps outbound
+ * messages at the lesser of this and its own transmit capacity
+ * (osdp_pd_max_reply_payload).
+ * ====================================================================== */
+
+#define OSDP_ACURXSIZE_PAYLOAD_BYTES 2U
+
+typedef struct osdp_acurxsize_cmd {
+    uint16_t max_size;    /* ACURX_BUFSIZE, 16-bit LE on the wire */
+} osdp_acurxsize_cmd_t;
+
+osdp_status_t osdp_acurxsize_decode(const uint8_t *payload, size_t len,
+                                    osdp_acurxsize_cmd_t *out);
+osdp_status_t osdp_acurxsize_build(const osdp_acurxsize_cmd_t *in,
+                                   uint8_t *buf, size_t buf_cap,
+                                   size_t *written);
+
+/* ========================================================================
+ * osdp_MFG (0x80) — manufacturer-specific command
+ *
+ * Spec 6.19, Table 27: a 3-byte Vendor Code (the manufacturer's IEEE MA-L,
+ * the same 24 bits it uses for Ethernet MAC addresses) followed by
+ * vendor-defined data of any length, including none.
+ *
+ * The vendor code is a byte array rather than a uint32 because the spec
+ * describes it as three octets in transmission order and never assigns it an
+ * endianness. Convention puts a vendor command selector in the first data
+ * byte, but the spec defines no such field, so the codec does not split it
+ * out.
+ *
+ * A PD may answer with osdp_ACK, osdp_NAK, or osdp_MFGREP.
+ * ====================================================================== */
+
+#define OSDP_MFG_VENDOR_CODE_BYTES 3U
+#define OSDP_MFG_HEADER_BYTES      OSDP_MFG_VENDOR_CODE_BYTES
+
+typedef struct osdp_mfg_cmd {
+    uint8_t        vendor_code[OSDP_MFG_VENDOR_CODE_BYTES];
+    const uint8_t *data;       /* vendor-defined; NULL when data_len == 0 */
+    size_t         data_len;
+} osdp_mfg_cmd_t;
+
+osdp_status_t osdp_mfg_decode(const uint8_t *payload, size_t len,
+                              osdp_mfg_cmd_t *out);
+osdp_status_t osdp_mfg_build(const osdp_mfg_cmd_t *in,
+                             uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_ABORT (0xA2) — abort current operation, empty payload
+ *
+ * Spec 6.22, Table 30. Terminates any multi-part message or file transfer in
+ * progress. osdp_ACK when cancelled; osdp_NAK when the PD cannot comply.
+ * ====================================================================== */
+
+osdp_status_t osdp_abort_decode(const uint8_t *payload, size_t len);
+osdp_status_t osdp_abort_build(uint8_t *buf, size_t buf_cap, size_t *written);
+
+/* ========================================================================
+ * osdp_KEEPACTIVE (0xA7) — keep reader active, 2 bytes (16-bit LE ms)
+ *
+ * Spec 6.21, Table 29. Holds reader operations open for the given time so
+ * communication with a credential still in the field is not dropped. A time
+ * of 0 cancels a previous extension and is a legal value.
+ * ====================================================================== */
+
+#define OSDP_KEEPACTIVE_PAYLOAD_BYTES 2U
+
+typedef struct osdp_keepactive_cmd {
+    uint16_t time_ms;     /* milliseconds, 16-bit LE on the wire */
+} osdp_keepactive_cmd_t;
+
+osdp_status_t osdp_keepactive_decode(const uint8_t *payload, size_t len,
+                                     osdp_keepactive_cmd_t *out);
+osdp_status_t osdp_keepactive_build(const osdp_keepactive_cmd_t *in,
+                                    uint8_t *buf, size_t buf_cap,
+                                    size_t *written);
+
 #ifdef __cplusplus
 }
 #endif
