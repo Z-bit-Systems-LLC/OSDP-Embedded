@@ -31,7 +31,10 @@ channel):
   Bad-checksum/CRC commands addressed to the PD are answered `NAK 0x01`
   (not dropped); clear-text commands are refused `NAK 0x06` once secure
   operation is expected (during a session, or before one on a
-  full-security PD).
+  full-security PD). One dispatch path decides every command, so a
+  library-handled command behaves identically in the clear, under SC1,
+  and under SC2. Working buffers are sized by a build-time constant and
+  can be rebound at run time with `osdp_pd_set_buffers()`.
 - **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
   per-PD SQN, reply/timeout callbacks, optional SC1 or SC2 handshake
   (fire-and-forget) and operational traffic with automatic session-loss
@@ -97,6 +100,43 @@ A PD or ACU application calls per-message codec functions directly
 (`osdp_led_decode`, `osdp_pdid_build`, etc.) and lets the linker garbage-collect
 everything it doesn't reference. A Monitor links `osdp::dispatch` to decode
 arbitrary traffic without writing its own switch.
+
+### Memory footprint
+
+No allocation anywhere: every buffer is either embedded in the caller's
+context struct or bound by the caller. Two build-time constants set what a
+context costs, one per role, and both are `#ifndef`-guarded so a build can
+override them with `-D` or CMake `target_compile_definitions`:
+
+| Constant                 | Default | Sizes                                                    |
+| ------------------------ | ------- | -------------------------------------------------------- |
+| `OSDP_PD_BUF_LEN`        | 512     | the PD's outbound frame, Secure Channel plaintext scratch, and the two retransmit caches |
+| `OSDP_ACU_BUF_LEN`       | 1440    | the ACU's outbound frame                                  |
+| `OSDP_STREAM_BUFFER_LEN` | 1440    | inbound wire-level reassembly, in both roles              |
+
+```
+sizeof(osdp_pd_t)  = 4448 bytes
+sizeof(osdp_acu_t) = 3704 bytes    (+ a caller-allocated slot array per PD)
+```
+
+The roles default differently on purpose. A PD is the constrained end, so
+512 leaves headroom over the baseline message set without committing an MCU
+to the protocol maximum. An ACU is normally a host or controller, and it is
+the side that receives whatever any PD on the bus chooses to send — sizing it
+below the 1440-byte maximum would make the controller the bottleneck.
+
+`OSDP_STREAM_BUFFER_LEN` is deliberately separate: it is wire-level
+buffering, large enough for the decoder to resync through any legal frame
+including traffic addressed to *other* devices, which is a different question
+from how large a message the role itself handles. It is also the single
+biggest field in both contexts, so it is the first knob worth turning on a
+tight target.
+
+A PD can also rebind its working buffers at run time with
+`osdp_pd_set_buffers()` — useful when one PD in a system needs a larger TX
+path than the rest, or when the storage should live in a specific memory
+region. The constants set what every context costs; the setter handles the
+exception.
 
 Secure Channel is opt-in: a PD or ACU application that doesn't bind a
 crypto vtable + key material via the `osdp_*_set_sc_*` (SC1) or

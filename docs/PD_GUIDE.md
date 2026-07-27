@@ -53,6 +53,81 @@ you use it:
 
 ---
 
+## Sizing the PD — `OSDP_PD_BUF_LEN` and `osdp_pd_set_buffers`
+
+`osdp_pd_t` is about **4.4 KB** at the defaults. Two build-time constants
+account for nearly all of it, and both are `#ifndef`-guarded so you can
+override them from your build without touching the headers:
+
+| Constant                 | Default | What it sizes                                                                                   |
+| ------------------------ | ------- | ----------------------------------------------------------------------------------------------- |
+| `OSDP_PD_BUF_LEN`        | 512     | four regions: the outbound frame, the Secure Channel plaintext scratch, and the two retransmit caches |
+| `OSDP_STREAM_BUFFER_LEN` | 1440    | inbound wire-level reassembly                                                                     |
+
+```cmake
+target_compile_definitions(my_pd_firmware PRIVATE
+    OSDP_PD_BUF_LEN=256          # 4 x 256 instead of 4 x 512
+    OSDP_STREAM_BUFFER_LEN=300)  # only if you control both ends of the bus
+```
+
+Two things to know before you shrink either.
+
+**`OSDP_PD_BUF_LEN` is also what you should advertise.** PDCAP function code
+10 ("Receive BufferSize", spec B.11) tells the ACU how large a message it may
+send you, and the ACU acts on it — spec §6 bounds `osdp_LED` record counts by
+it. Deriving the advertised number from the same constant that sizes the
+buffers is how you keep the two from drifting:
+
+```c
+static const osdp_pdcap_record_t caps[] = {
+    /* ... */
+    { .function_code    = 10,                                  /* Receive BufferSize */
+      .compliance_level = (uint8_t)(OSDP_PD_BUF_LEN & 0xFFU),  /* LSB */
+      .num_objects      = (uint8_t)(OSDP_PD_BUF_LEN >> 8) },   /* MSB */
+};
+```
+
+(Function code 10 is the one PDCAP record whose two trailing bytes are not a
+compliance level and an object count — spec B.11 uses them as the LSB and MSB
+of a 16-bit size.)
+
+**`OSDP_STREAM_BUFFER_LEN` is not the same question.** It is wire-level
+buffering, and the decoder resyncs through frames addressed to *other*
+devices on the bus, not just yours. Shrinking it below the largest frame any
+device on that bus sends costs you resync speed, not just your own messages.
+Leave it at the spec maximum unless you control every device on the wire.
+
+### Rebinding at run time
+
+If one PD in your system needs a different footprint from the rest, or the
+storage has to live in a particular memory region, bind it instead of moving
+the constant:
+
+```c
+static uint8_t big_tx[1440];
+
+osdp_pd_t pd;
+osdp_pd_init(&pd, 0x05);
+
+const osdp_pd_buffers_t bufs = { .tx = big_tx, .tx_cap = sizeof(big_tx) };
+if (osdp_pd_set_buffers(&pd, &bufs) != OSDP_OK) { /* too small */ }
+```
+
+- A **NULL** member leaves that region on its current binding, so the call
+  above enlarges only the TX path.
+- The buffers are **borrowed, not copied** — they must outlive the PD and
+  must not overlap each other.
+- An undersized region returns `OSDP_ERR_BUFFER_TOO_SMALL` and applies
+  *nothing*, so a rejected call leaves the PD exactly as it was.
+- Call it before the first `osdp_pd_tick()` where you can. Rebinding a
+  retransmit cache mid-session clears it, which costs one repeat command
+  processed fresh rather than replayed — correct, just not free.
+
+A PD that never calls this uses its embedded arrays and behaves exactly as
+if the API didn't exist.
+
+---
+
 ## Getting started
 
 This section gets you from nothing to a PD that stays online and answers
@@ -232,7 +307,9 @@ typedef struct osdp_pd_reply {
 The payload buffer must stay valid only until the handler returns — the PD
 copies it into its own TX scratch before transmitting. The usual pattern
 is a scratch buffer inside your own application-state struct (pointed to
-by `user`), sized at most `OSDP_PD_TX_BUF_LEN`.
+by `user`), sized at most `OSDP_PD_BUF_LEN`. Pointing the reply back at the
+payload the handler was given is also fine; the PD never frames a reply over
+the buffer the command arrived in.
 
 ### Replies that carry data
 
