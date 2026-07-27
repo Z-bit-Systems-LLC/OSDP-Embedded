@@ -7,6 +7,7 @@
 #include "osdp/osdp_buz_state.h"
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_led_state.h"
+#include "osdp/osdp_multipart.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc2.h"
@@ -390,6 +391,20 @@ typedef void (*osdp_pd_acurxsize_cb)(void *user, uint16_t max_size);
  * powered is a physical capability the core cannot fake. */
 typedef osdp_status_t (*osdp_pd_keepactive_cb)(void *user, uint16_t time_ms);
 
+/* Called once per reassembled multi-part osdp_MFG. `data` / `data_len` are
+ * the whole vendor message with the multi-part headers removed; `vendor_code`
+ * is the 3 bytes that prefixed every fragment.
+ *
+ * Return OSDP_OK to ACK, or any status from the command-handler mapping
+ * (OSDP_ERR_NOT_SUPPORTED -> NAK 0x03, OSDP_ERR_INVALID_ARG -> NAK 0x09, and
+ * so on). To answer with an osdp_MFGREP instead, fill in *reply as a command
+ * handler would. */
+typedef osdp_status_t (*osdp_pd_mfg_cb)(void *user,
+                                        const uint8_t *vendor_code,
+                                        const uint8_t *data, size_t data_len,
+                                        osdp_pd_reply_t *reply);
+
+
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
@@ -689,6 +704,16 @@ typedef struct osdp_pd {
     osdp_pd_keepactive_cb      keepactive_cb;
     void                      *keepactive_user;
 
+    /* Multi-part osdp_MFG reassembly. `mfg_cb == NULL` means the application
+     * has not declared its vendor protocol multi-part, so osdp_MFG payloads
+     * stay opaque and go to cmd_cb — see osdp_pd_set_mfg_receiver. */
+    osdp_mp_reasm_t            mfg_reasm;
+    osdp_pd_mfg_cb             mfg_cb;
+    void                      *mfg_user;
+    /* Vendor code from the transfer in progress, so a mid-transfer switch to
+     * a different vendor can be rejected rather than silently interleaved. */
+    uint8_t                    mfg_vendor[3];
+
     /* Cleared for the current tick when the reply must NOT be cached as the
      * spec-5.9 retransmit answer. Only osdp_BUSY sets it: the ACU repeats the
      * command in its original form, so replaying a cached BUSY would answer a
@@ -843,6 +868,45 @@ void osdp_pd_set_file_stream(osdp_pd_t *pd, osdp_pd_file_cb cb, void *user);
 void osdp_pd_set_status_provider(osdp_pd_t *pd,
                                  const osdp_pd_status_provider_t *p,
                                  void *user);
+
+/* ---- Multi-part osdp_MFG ------------------------------------------------
+ *
+ * osdp_MFG carries vendor-defined data, and that data can exceed one frame.
+ * Spec 5.10 provides the standard multi-part format for exactly this, so a
+ * fragmented osdp_MFG payload is:
+ *
+ *     vendor_code[3] || MpSizeTotal,MpOffset,MpFragmentSize[6] || fragment
+ *
+ * The vendor code stays outside the fragmentation and repeats on every
+ * fragment. That is what lets a PD decide whether a transfer is even
+ * addressed to it before committing buffer to reassembling it, and it means
+ * a PD that does not recognise the vendor can refuse the first fragment
+ * rather than the last.
+ *
+ * **Whether the data is fragmented is the manufacturer's choice, and nothing
+ * on the wire distinguishes a 6-byte multi-part header from six bytes of
+ * ordinary vendor data.** The spec's Table 27 defines no multi-part fields
+ * for osdp_MFG, so this cannot be auto-detected and must not be guessed.
+ * Binding a receiver here IS the declaration that this PD's vendor protocol
+ * uses the standard format; leave it unbound and osdp_MFG payloads stay
+ * opaque and reach the command handler exactly as they do today. */
+
+/* Bind a reassembly buffer and completion callback for multi-part osdp_MFG.
+ *
+ * `buf` (capacity `cap`) is caller-owned and must be large enough for the
+ * biggest vendor message expected — a transfer declaring more than `cap` is
+ * refused with osdp_NAK 0x09, which spec 5.10.2 says aborts the sender's
+ * sequence. It must stay valid for as long as it is registered.
+ *
+ * Intermediate fragments are ACKed; `cb` fires once on the last one. An
+ * early-termination marker (5.10.2) discards the partial message and ACKs.
+ * Any sequencing violation — a gap, a changed total, a continuation with
+ * nothing in progress — is answered NAK 0x09 and resets the reassembler so
+ * the sender can restart at offset 0.
+ *
+ * Pass cb=NULL to detach. */
+void osdp_pd_set_mfg_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
+                              osdp_pd_mfg_cb cb, void *user);
 
 /* ---- PDCAP consistency (advisory) --------------------------------------*/
 

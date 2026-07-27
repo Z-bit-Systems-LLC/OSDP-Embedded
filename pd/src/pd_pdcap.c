@@ -109,16 +109,26 @@ osdp_status_t osdp_pd_check_pdcap(const osdp_pd_t           *pd,
             break;
         }
 
-        case PDCAP_FN_LARGEST_COMBINED_MSG:
-            /* Multi-part message assembly (spec 5.10) is not implemented, so
-             * any non-zero value here is a promise the PD cannot keep. Drop
-             * this branch when multi-part lands and check the bound
-             * reassembly buffer instead. */
-            if (record_size_value(r) != 0) {
+        case PDCAP_FN_LARGEST_COMBINED_MSG: {
+            /* Multi-part assembly (spec 5.10) now exists, so a non-zero value
+             * is a promise the PD can keep — but only if a reassembly buffer
+             * is actually bound, and only up to its capacity. Advertising
+             * more than the buffer holds means the transfer is refused at the
+             * first fragment, after the ACU has committed to sending it. */
+            const uint16_t advertised = record_size_value(r);
+            if (advertised == 0) {
+                break;   /* "I do not do multi-part" — always honest */
+            }
+            if (pd->mfg_reasm.buf == NULL) {
                 if (bad_index != NULL) { *bad_index = i; }
                 return OSDP_ERR_NOT_SUPPORTED;
             }
+            if ((size_t)advertised > pd->mfg_reasm.cap) {
+                if (bad_index != NULL) { *bad_index = i; }
+                return OSDP_ERR_BUFFER_TOO_SMALL;
+            }
             break;
+        }
 
         default:
             /* Everything else describes the device, not the library. The

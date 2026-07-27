@@ -680,6 +680,311 @@ static void test_mfg_for_another_vendor_naks_record_invalid(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
 }
 
+/* ---- Multi-part osdp_MFG (spec 5.10 + 6.19) ---------------------------
+ *
+ * Fragmented vendor data is  vendor[3] || Mp[6] || fragment , with the vendor
+ * code outside the fragmentation so the PD can tell whether a transfer is
+ * addressed to it before committing its buffer.
+ *
+ * Nothing on the wire distinguishes a multi-part header from six bytes of
+ * ordinary vendor data, so binding a receiver is how a manufacturer declares
+ * its protocol uses the standard format. The last test here pins the other
+ * half of that: with no receiver bound, the payload stays opaque.
+ */
+
+static const uint8_t kMfgVendor[3] = { 0x5A, 0x42, 0x43 };
+
+static uint8_t      mfg_asm_buf[256];
+static unsigned int mfg_complete_calls;
+static uint8_t      mfg_seen[256];
+static size_t       mfg_seen_len;
+static uint8_t      mfg_seen_vendor[3];
+static osdp_status_t mfg_verdict = OSDP_OK;
+
+static osdp_status_t mfg_receiver(void *user, const uint8_t *vendor_code,
+                                  const uint8_t *data, size_t data_len,
+                                  osdp_pd_reply_t *reply)
+{
+    (void)user; (void)reply;
+    mfg_complete_calls++;
+    (void)memcpy(mfg_seen_vendor, vendor_code, 3);
+    mfg_seen_len = (data_len <= sizeof(mfg_seen)) ? data_len : sizeof(mfg_seen);
+    (void)memcpy(mfg_seen, data, mfg_seen_len);
+    return mfg_verdict;
+}
+
+/* Build one  vendor[3] || Mp[6] || fragment  payload. */
+static size_t build_mfg_fragment(uint8_t *out, size_t out_cap,
+                                 const uint8_t *vendor,
+                                 uint16_t total, uint16_t offset,
+                                 const uint8_t *data, size_t data_len)
+{
+    uint8_t frag_payload[128];
+    const osdp_mp_fragment_t frag = {
+        .total_size = total, .offset = offset,
+        .data = (data_len > 0) ? data : NULL, .frag_len = data_len,
+    };
+    size_t frag_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_mp_fragment_build(&frag, frag_payload,
+                                             sizeof(frag_payload), &frag_len));
+
+    const osdp_mfg_cmd_t mfg = { .data = frag_payload, .data_len = frag_len };
+    osdp_mfg_cmd_t m = mfg;
+    (void)memcpy(m.vendor_code, vendor, 3);
+    size_t written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_build(&m, out, out_cap, &written));
+    return written;
+}
+
+static void setup_mfg(osdp_pd_t *pd, mock_transport_t *m,
+                      osdp_pd_transport_t *t)
+{
+    setup(pd, m, t);
+    mfg_complete_calls = 0;
+    mfg_seen_len       = 0;
+    mfg_verdict        = OSDP_OK;
+    osdp_pd_set_mfg_receiver(pd, mfg_asm_buf, sizeof(mfg_asm_buf),
+                             mfg_receiver, NULL);
+}
+
+static void test_multipart_mfg_reassembles_across_fragments(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    /* 30 bytes of vendor data in three 10-byte fragments. */
+    uint8_t whole[30];
+    for (size_t i = 0; i < sizeof(whole); i++) {
+        whole[i] = (uint8_t)(0xA0 + i);
+    }
+
+    for (uint16_t off = 0; off < sizeof(whole); off += 10) {
+        uint8_t body[64];
+        const size_t blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                               (uint16_t)sizeof(whole), off,
+                                               &whole[off], 10);
+        m.outgoing_len = 0;
+        inject(&m, OSDP_CMD_MFG, body, blen, (uint8_t)(1 + (off / 10) % 3));
+        osdp_pd_tick(&pd);
+
+        osdp_frame_t reply;
+        decode_reply(&m, &reply);
+        /* Every fragment is ACKed; the callback fires only on the last. */
+        TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    }
+
+    TEST_ASSERT_EQUAL_UINT(1, mfg_complete_calls);
+    TEST_ASSERT_EQUAL_size_t(sizeof(whole), mfg_seen_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(whole, mfg_seen, sizeof(whole));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(kMfgVendor, mfg_seen_vendor, 3);
+    /* The application never saw the raw fragments. */
+    TEST_ASSERT_EQUAL_UINT(0, handler_calls);
+}
+
+/* A single-fragment transfer is the degenerate case and must still work —
+ * a vendor protocol should not have to special-case short messages. */
+static void test_single_fragment_multipart_mfg_completes_immediately(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    static const uint8_t whole[5] = { 1, 2, 3, 4, 5 };
+    uint8_t body[64];
+    const size_t blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                           sizeof(whole), 0, whole,
+                                           sizeof(whole));
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_UINT(1, mfg_complete_calls);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(whole, mfg_seen, sizeof(whole));
+}
+
+/* Spec 5.10.2: a gap is a violation, answered NAK 0x09 to abort the ACU's
+ * sequence, and the reassembler resets so a restart at offset 0 works. */
+static void test_gap_in_multipart_mfg_naks_and_allows_restart(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    static const uint8_t whole[20] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+
+    uint8_t body[64];
+    size_t  blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                      sizeof(whole), 0, whole, 5);
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    /* Skip ahead to offset 10, leaving a hole after the 5 bytes held. */
+    m.outgoing_len = 0;
+    blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                              sizeof(whole), 10, &whole[10], 5);
+    inject(&m, OSDP_CMD_MFG, body, blen, 2);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+    TEST_ASSERT_EQUAL_UINT(0, mfg_complete_calls);
+
+    /* Restart from scratch and the whole message goes through. */
+    for (uint16_t off = 0; off < sizeof(whole); off += 10) {
+        m.outgoing_len = 0;
+        blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                  sizeof(whole), off, &whole[off], 10);
+        inject(&m, OSDP_CMD_MFG, body, blen, (uint8_t)(1 + (off / 10) % 3));
+        osdp_pd_tick(&pd);
+    }
+    TEST_ASSERT_EQUAL_UINT(1, mfg_complete_calls);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(whole, mfg_seen, sizeof(whole));
+}
+
+/* A transfer belongs to one vendor. A continuation under a different vendor
+ * code must not be merged into the message already in the buffer. */
+static void test_vendor_switch_mid_transfer_is_rejected(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    static const uint8_t whole[20] = { 0 };
+    uint8_t body[64];
+    size_t  blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                      sizeof(whole), 0, whole, 10);
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    static const uint8_t other_vendor[3] = { 0x00, 0x11, 0x22 };
+    m.outgoing_len = 0;
+    blen = build_mfg_fragment(body, sizeof(body), other_vendor,
+                              sizeof(whole), 10, &whole[10], 10);
+    inject(&m, OSDP_CMD_MFG, body, blen, 2);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+    TEST_ASSERT_EQUAL_UINT(0, mfg_complete_calls);
+}
+
+/* Spec 5.10.2 early termination: the ACU abandons the transfer, the PD
+ * discards the partial message and ACKs. */
+static void test_early_termination_discards_the_partial_mfg(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    static const uint8_t whole[20] = { 0 };
+    uint8_t body[64];
+    size_t  blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                      sizeof(whole), 0, whole, 10);
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    /* Marker: offset == total, fragment size 0. */
+    m.outgoing_len = 0;
+    blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                              sizeof(whole), sizeof(whole), NULL, 0);
+    inject(&m, OSDP_CMD_MFG, body, blen, 2);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    /* Abandoned, so the callback must NOT have fired with a partial message. */
+    TEST_ASSERT_EQUAL_UINT(0, mfg_complete_calls);
+}
+
+/* Spec 6.22: osdp_ABORT terminates a multi-part message as well as a file
+ * transfer. A half-assembled message left behind would merge into the next. */
+static void test_abort_terminates_a_multipart_mfg(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup_mfg(&pd, &m, &t);
+
+    static const uint8_t whole[20] = { 0 };
+    uint8_t body[64];
+    size_t  blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                      sizeof(whole), 0, whole, 10);
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    m.outgoing_len = 0;
+    inject(&m, OSDP_CMD_ABORT, NULL, 0, 2);
+    osdp_pd_tick(&pd);
+
+    /* The continuation that would have completed the message is now an
+     * orphan, so it is refused rather than silently merged. */
+    m.outgoing_len = 0;
+    blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                              sizeof(whole), 10, &whole[10], 10);
+    inject(&m, OSDP_CMD_MFG, body, blen, 3);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_UINT(0, mfg_complete_calls);
+}
+
+/* A message larger than the bound buffer is refused rather than truncated. */
+static void test_oversized_multipart_mfg_is_refused(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup(&pd, &m, &t);
+    static uint8_t small[16];
+    mfg_complete_calls = 0;
+    osdp_pd_set_mfg_receiver(&pd, small, sizeof(small), mfg_receiver, NULL);
+
+    static const uint8_t data[4] = { 1, 2, 3, 4 };
+    uint8_t body[64];
+    const size_t blen = build_mfg_fragment(body, sizeof(body), kMfgVendor,
+                                           1000, 0, data, sizeof(data));
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+    TEST_ASSERT_EQUAL_UINT(0, mfg_complete_calls);
+}
+
+/* The compatibility guarantee. With no receiver bound, an osdp_MFG payload
+ * is opaque vendor data and reaches the command handler unchanged — the PD
+ * must NOT try to read six bytes of it as a multi-part header. */
+static void test_without_a_receiver_mfg_stays_opaque(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t;
+    setup(&pd, &m, &t);
+    osdp_pd_set_command_handler(&pd, mfg_handler, NULL);
+
+    /* Six bytes of vendor data that happen to look like a plausible
+     * multi-part header. Without a receiver they must be passed through. */
+    static const uint8_t looks_like_a_header[] = {
+        0x0A, 0x00, 0x00, 0x00, 0x04, 0x00, 0xDE, 0xAD, 0xBE, 0xEF };
+    osdp_mfg_cmd_t req = { .data = looks_like_a_header,
+                           .data_len = sizeof(looks_like_a_header) };
+    (void)memcpy(req.vendor_code, kMfgVendor, 3);
+    uint8_t body[64]; size_t blen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mfg_build(&req, body, sizeof(body), &blen));
+
+    inject(&m, OSDP_CMD_MFG, body, blen, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    /* mfg_handler answers its own vendor code with an MFGREP. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_MFGREP, reply.code);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -708,5 +1013,14 @@ int main(void)
     /* osdp_MFG -> osdp_MFGREP through the application handler */
     RUN_TEST(test_mfg_round_trips_to_mfgrep_through_the_handler);
     RUN_TEST(test_mfg_for_another_vendor_naks_record_invalid);
+    /* Multi-part osdp_MFG (spec 5.10 + 6.19) */
+    RUN_TEST(test_multipart_mfg_reassembles_across_fragments);
+    RUN_TEST(test_single_fragment_multipart_mfg_completes_immediately);
+    RUN_TEST(test_gap_in_multipart_mfg_naks_and_allows_restart);
+    RUN_TEST(test_vendor_switch_mid_transfer_is_rejected);
+    RUN_TEST(test_early_termination_discards_the_partial_mfg);
+    RUN_TEST(test_abort_terminates_a_multipart_mfg);
+    RUN_TEST(test_oversized_multipart_mfg_is_refused);
+    RUN_TEST(test_without_a_receiver_mfg_stays_opaque);
     return UNITY_END();
 }

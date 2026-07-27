@@ -5,6 +5,7 @@
 #define OSDP_PAIR_H
 
 #include "osdp/osdp_pair_crypto.h"
+#include "osdp/osdp_multipart.h"
 #include "osdp/osdp_types.h"
 
 #ifdef __cplusplus
@@ -59,96 +60,16 @@ extern "C" {
 
 /* ---- Fragment carrier ---------------------------------------------------
  *
- * Both osdp_PAIR and osdp_PAIRR carry an identical 6-byte header followed
- * by the fragment bytes (CRAUTH-style multipart, 2-byte little-endian
- * fields):
+ * osdp_PAIR and osdp_PAIRR are multi-part messages, and their 6-byte header
+ * turned out to be byte-identical to the spec's Table 4 (5.10) rather than
+ * merely similar to it. The transport therefore lives in
+ * core/src/shared/multipart.c and is shared with every other multi-part
+ * message; pairing was simply the first consumer to need it.
  *
- *   total_size    u16 LE   whole reassembled message length
- *   offset        u16 LE   byte offset of this fragment within the message
- *   fragmentSize  u16 LE   number of fragment bytes that follow (== frag_len)
- *   data ...               `fragmentSize` bytes
- *
- * The two directions share one codec because the layout is identical; the
- * caller supplies the OSDP framing and the 0xB0 / 0x8A code byte around the
- * DATA this codec produces/consumes. */
-
-#define OSDP_PAIR_FRAG_HEADER_BYTES 6U
-
-typedef struct osdp_pair_fragment {
-    uint16_t       total_size;  /* whole reassembled message length (bytes) */
-    uint16_t       offset;      /* byte offset of this fragment              */
-    const uint8_t *data;        /* fragment bytes; NULL iff frag_len == 0    */
-    size_t         frag_len;    /* fragment byte count (on-wire fragmentSize)*/
-} osdp_pair_fragment_t;
-
-/* Decode a single PAIR/PAIRR fragment payload (the command/reply DATA field,
- * i.e. everything after the 0xB0 / 0x8A code byte). Rejects a short header,
- * an on-wire fragmentSize that disagrees with the trailing byte count, and
- * a fragment that would extend past the declared total_size. `out->data`
- * points into `payload`. */
-osdp_status_t osdp_pair_fragment_decode(const uint8_t *payload, size_t len,
-                                        osdp_pair_fragment_t *out);
-
-/* Build a single PAIR/PAIRR fragment payload into `buf`. Refuses an
- * inconsistent descriptor (fragment exceeding total_size, frag_len beyond a
- * u16, non-NULL/NULL data mismatch). On success writes 6 + frag_len bytes
- * and sets *written. */
-osdp_status_t osdp_pair_fragment_build(const osdp_pair_fragment_t *in,
-                                       uint8_t *buf, size_t buf_cap,
-                                       size_t *written);
-
-/* ---- Multipart reassembly (inbound) -------------------------------------
- *
- * Accumulates decoded fragments into a caller-owned buffer. Fragmentation
- * is sequential: a fragment at offset 0 (re)starts the message (retry-
- * friendly), and later fragments must be contiguous (no gaps). An exact
- * retransmit of an already-received span is idempotent. */
-
-typedef struct osdp_pair_reasm {
-    uint8_t *buf;       /* caller-owned reassembly buffer         */
-    size_t   cap;       /* capacity of buf                        */
-    uint16_t total;     /* declared message length (0 while idle) */
-    uint16_t received;  /* contiguous bytes received so far       */
-    bool     active;    /* a message is in progress               */
-} osdp_pair_reasm_t;
-
-/* Bind a caller-owned buffer to a reassembler and clear it. */
-void osdp_pair_reasm_init(osdp_pair_reasm_t *r, uint8_t *buf, size_t cap);
-
-/* Reset the reassembler to idle (keeps the bound buffer). */
-void osdp_pair_reasm_reset(osdp_pair_reasm_t *r);
-
-/* Feed one decoded fragment. Sets *complete = true once the whole message
- * has arrived (then `r->buf[0 .. r->total)` is the reassembled payload).
- * Returns OSDP_ERR_BUFFER_TOO_SMALL if the declared message exceeds the
- * bound buffer, OSDP_ERR_BAD_PAYLOAD on an inconsistent/out-of-order
- * fragment, OSDP_ERR_INVALID_ARG on a NULL argument. */
-osdp_status_t osdp_pair_reasm_push(osdp_pair_reasm_t *r,
-                                   const osdp_pair_fragment_t *frag,
-                                   bool *complete);
-
-/* ---- Multipart fragmentation (outbound) ---------------------------------
- *
- * Splits a whole message into successive fragment descriptors of at most
- * `max_frag` bytes each; each descriptor's `data` points into `msg`. */
-
-typedef struct osdp_pair_frag_iter {
-    const uint8_t *msg;
-    size_t         msg_len;
-    size_t         max_frag;
-    size_t         offset;   /* offset of the next fragment */
-} osdp_pair_frag_iter_t;
-
-/* Initialise an iterator over `msg`. A zero `max_frag` is treated as the
- * default fragment size. */
-void osdp_pair_frag_iter_init(osdp_pair_frag_iter_t *it,
-                              const uint8_t *msg, size_t msg_len,
-                              size_t max_frag);
-
-/* Fill `frag` with the next fragment and advance; returns false when the
- * whole message has been emitted (or if `msg_len` is 0). */
-bool osdp_pair_frag_iter_next(osdp_pair_frag_iter_t *it,
-                              osdp_pair_fragment_t *frag);
+ * The names below are the ones to use. `osdp_mp_*` handles the header, the
+ * sequencing rules, reassembly and fragmentation; the caller supplies the
+ * OSDP framing and the 0xB0 / 0x8A code byte around the DATA it produces.
+ * See osdp/osdp_multipart.h. */
 
 /* ---- C509 certificate ---------------------------------------------------
  *

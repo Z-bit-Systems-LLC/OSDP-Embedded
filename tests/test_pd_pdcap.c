@@ -220,16 +220,32 @@ static void test_large_receive_size_is_fine_without_sc(void)
 
 /* ---- Function code 11: largest combined message ------------------------*/
 
-static void test_combined_message_size_is_flagged_while_multipart_is_absent(void)
+/* Multi-part assembly exists now, so the question is no longer "is it
+ * implemented" but "is a buffer bound, and is it big enough". */
+static void test_combined_message_size_needs_a_bound_reassembly_buffer(void)
 {
     osdp_pd_t pd;
     osdp_pd_init(&pd, 0x05);
 
-    const osdp_pdcap_record_t r = size_record(FN_COMBINED_SIZE, 4096);
+    const osdp_pdcap_record_t r = size_record(FN_COMBINED_SIZE, 512);
+
+    /* No receiver bound: the PD cannot assemble anything. */
     size_t bad = 999;
     TEST_ASSERT_EQUAL(OSDP_ERR_NOT_SUPPORTED,
                       osdp_pd_check_pdcap(&pd, &r, 1, &bad));
     TEST_ASSERT_EQUAL_size_t(0, bad);
+
+    /* Bound but too small: the transfer would be refused at the first
+     * fragment, after the ACU had committed to sending the whole thing. */
+    static uint8_t small[64];
+    osdp_pd_set_mfg_receiver(&pd, small, sizeof(small), NULL, NULL);
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_pd_check_pdcap(&pd, &r, 1, NULL));
+
+    /* Bound and large enough: the claim is honest. */
+    static uint8_t big[512];
+    osdp_pd_set_mfg_receiver(&pd, big, sizeof(big), NULL, NULL);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_check_pdcap(&pd, &r, 1, NULL));
 }
 
 /* Zero means "I do not do multi-part", which is exactly true today. */
@@ -290,7 +306,7 @@ int main(void)
     RUN_TEST(test_receive_size_at_the_stream_buffer_passes);
     RUN_TEST(test_receive_size_beyond_rx_plain_is_flagged_under_sc);
     RUN_TEST(test_large_receive_size_is_fine_without_sc);
-    RUN_TEST(test_combined_message_size_is_flagged_while_multipart_is_absent);
+    RUN_TEST(test_combined_message_size_needs_a_bound_reassembly_buffer);
     RUN_TEST(test_zero_combined_message_size_passes);
     RUN_TEST(test_a_consistent_capability_list_passes);
     return UNITY_END();

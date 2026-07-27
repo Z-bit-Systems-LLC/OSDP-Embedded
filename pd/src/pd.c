@@ -885,6 +885,18 @@ void osdp_pd_set_status_provider(osdp_pd_t *pd,
     pd->status_user = user;
 }
 
+void osdp_pd_set_mfg_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
+                              osdp_pd_mfg_cb cb, void *user)
+{
+    if (pd == NULL) {
+        return;
+    }
+    osdp_mp_reasm_init(&pd->mfg_reasm, buf, cap);
+    pd->mfg_cb   = cb;
+    pd->mfg_user = user;
+    (void)memset(pd->mfg_vendor, 0, sizeof(pd->mfg_vendor));
+}
+
 void osdp_pd_set_abort_handler(osdp_pd_t *pd, osdp_pd_abort_cb cb, void *user)
 {
     if (pd == NULL) {

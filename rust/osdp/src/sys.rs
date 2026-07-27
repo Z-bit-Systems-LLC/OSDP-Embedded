@@ -1174,6 +1174,27 @@ mod pd_ffi {
     pub type osdp_pd_keepactive_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, time_ms: u16) -> osdp_status_t>;
 
+    /// Mirror of osdp_mp_reasm_t (core/include/osdp/osdp_multipart.h) —
+    /// embedded in osdp_pd_t for multi-part osdp_MFG reassembly.
+    #[repr(C)]
+    pub struct osdp_mp_reasm_t {
+        pub buf: *mut u8,
+        pub cap: usize,
+        pub total: u16,
+        pub received: u16,
+        pub active: bool,
+    }
+
+    pub type osdp_pd_mfg_cb = Option<
+        unsafe extern "C" fn(
+            user: *mut c_void,
+            vendor_code: *const u8,
+            data: *const u8,
+            data_len: usize,
+            reply: *mut osdp_pd_reply_t,
+        ) -> osdp_status_t,
+    >;
+
     /// Caller-owned working storage for the PD's four scratch regions. A NULL
     /// member means "leave that region on its current binding", so a caller
     /// can enlarge only the TX path. Mirrors `osdp_pd_buffers_t` in
@@ -1272,6 +1293,12 @@ mod pd_ffi {
         pub abort_user: *mut c_void,
         pub keepactive_cb: osdp_pd_keepactive_cb,
         pub keepactive_user: *mut c_void,
+
+        /* Multi-part osdp_MFG reassembly (spec 5.10). */
+        pub mfg_reasm: osdp_mp_reasm_t,
+        pub mfg_cb: osdp_pd_mfg_cb,
+        pub mfg_user: *mut c_void,
+        pub mfg_vendor: [u8; 3],
 
         /* Cleared for the current tick when the reply must not be cached
          * as the spec-5.9 retransmit answer (osdp_BUSY only). */

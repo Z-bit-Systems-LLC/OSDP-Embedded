@@ -5,6 +5,7 @@
 # stream/frame decoders. Always required by any consumer.
 add_library(osdp_core STATIC
     src/shared/crc16.c
+    src/shared/multipart.c
     src/shared/checksum.c
     src/shared/frame.c
     src/shared/stream.c
@@ -92,8 +93,6 @@ add_library(osdp::messages ALIAS osdp_messages)
 # fragment carrier + multipart reassembly); later phases add the C509 cert,
 # key schedule, message codecs, and the PD/ACU session state machines.
 add_library(osdp_pair STATIC
-    src/pair/fragment.c
-    src/pair/multipart.c
     src/pair/cbor.c
     src/pair/cert.c
     src/pair/keyschedule.c

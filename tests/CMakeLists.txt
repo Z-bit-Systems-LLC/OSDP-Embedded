@@ -32,10 +32,12 @@ osdp_add_test(test_stream)
 osdp_add_test(test_dispatch)
 osdp_add_test(test_led_state)
 
-# SC2 asymmetric pairing — Phase 0 transport (fragment codec + multipart).
-# Links only osdp_pair (self-contained opt-in module) + unity.
+# Multi-part message transport (spec 5.10): fragment codec, reassembly and
+# fragmentation. Named for pairing because that was the first consumer and
+# where this code was written; the transport now lives in osdp_core and is
+# shared with every multi-part message, so this links osdp_core too.
 add_executable(test_pair_transport test_pair_transport.c)
-target_link_libraries(test_pair_transport PRIVATE osdp_pair unity)
+target_link_libraries(test_pair_transport PRIVATE osdp_core osdp_pair unity)
 add_test(NAME test_pair_transport COMMAND test_pair_transport)
 
 # SC2 asymmetric pairing — Phase 1 canonical-CBOR codec. No crypto.

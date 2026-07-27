@@ -75,6 +75,7 @@ fn main() {
         // core: shared (CRC, checksum, framing, streaming)
         "core/src/shared/checksum.c",
         "core/src/shared/crc16.c",
+        "core/src/shared/multipart.c",
         "core/src/shared/frame.c",
         "core/src/shared/stream.c",
         "core/src/shared/led_state.c",
