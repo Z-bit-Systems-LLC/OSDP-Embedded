@@ -44,6 +44,14 @@ add_library(osdp_messages STATIC
     src/commands/cmd_comset.c
     src/commands/cmd_keyset.c
     src/commands/cmd_filetransfer.c
+    src/commands/cmd_lstat.c
+    src/commands/cmd_istat.c
+    src/commands/cmd_ostat.c
+    src/commands/cmd_rstat.c
+    src/commands/cmd_acurxsize.c
+    src/commands/cmd_mfg.c
+    src/commands/cmd_abort.c
+    src/commands/cmd_keepactive.c
     # Replies (PD → ACU)
     src/replies/reply_ack.c
     src/replies/reply_nak.c
@@ -57,6 +65,11 @@ add_library(osdp_messages STATIC
     src/replies/reply_keypad.c
     src/replies/reply_com.c
     src/replies/reply_ftstat.c
+    src/replies/reply_busy.c
+    src/replies/reply_fmt.c
+    src/replies/reply_mfgrep.c
+    src/replies/reply_mfgstatr.c
+    src/replies/reply_mfgerrr.c
 )
 
 target_include_directories(osdp_messages
