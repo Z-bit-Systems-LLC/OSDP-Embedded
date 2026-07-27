@@ -378,7 +378,7 @@ typedef struct osdp_pd_buz_slot {
  * context costs, and the setter when one particular PD needs something
  * different. */
 #ifndef OSDP_PD_BUF_LEN
-#define OSDP_PD_BUF_LEN 256U
+#define OSDP_PD_BUF_LEN 512U
 #endif
 
 /* Smallest buffer that can ever hold a complete frame: header + code + CRC

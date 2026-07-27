@@ -123,12 +123,18 @@ extern "C" {
 /* The ACU's maximum message size, and the size of its working buffers.
  * Overridable at build time, exactly like the PD's OSDP_PD_BUF_LEN.
  *
+ * Defaults to the full spec 5.6 maximum, unlike the PD's more modest default:
+ * an ACU is normally a host or controller where a couple of kilobytes is
+ * nothing, and it is the side that receives whatever any PD chooses to send.
+ * Sizing it to accept everything the protocol permits avoids the controller
+ * being the bottleneck on a bus of heterogeneous PDs.
+ *
  * This is also the value the application should declare in osdp_ACURXSIZE
  * (spec Table 28) to tell each PD how large a reply it may return — the ACU's
  * counterpart to the PD advertising PDCAP function code 10. Same constant
  * sizing the buffer and declaring the limit means the two cannot diverge. */
 #ifndef OSDP_ACU_BUF_LEN
-#define OSDP_ACU_BUF_LEN             256U
+#define OSDP_ACU_BUF_LEN             OSDP_FRAME_MAX_LEN
 #endif
 
 /* ---- Transport HAL ------------------------------------------------------*/

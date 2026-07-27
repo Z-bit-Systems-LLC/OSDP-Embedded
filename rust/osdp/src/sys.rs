@@ -1003,7 +1003,7 @@ mod pd_ffi {
      * working buffer embedded in osdp_pd_t, so a build that overrides the C
      * constant must override this mirror to match — pd_layout_tests catches a
      * mismatch, but only at run time. */
-    pub const OSDP_PD_BUF_LEN: usize = 256;
+    pub const OSDP_PD_BUF_LEN: usize = 512;
     /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
      * osdp_pd_t below mirrors the C layout field for field, so a mismatch
      * silently shifts every field after tx_buf. */
@@ -1285,7 +1285,9 @@ mod acu_ffi {
 
     pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
-    pub const OSDP_ACU_BUF_LEN: usize = 256;
+    /* Must track OSDP_ACU_BUF_LEN in acu/include/osdp/osdp_acu.h, which
+     * defaults to the spec 5.6 maximum. */
+    pub const OSDP_ACU_BUF_LEN: usize = OSDP_FRAME_MAX_LEN;
     pub const OSDP_ACU_MAX_LEDS: usize = 16;
     pub const OSDP_ACU_MAX_BUZZERS: usize = 8;
 
