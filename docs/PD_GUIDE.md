@@ -654,6 +654,55 @@ case OSDP_CMD_MFG: {
 `osdp_MFGREP` may also be sent unprompted as a poll response — enqueue it with
 `osdp_pd_enqueue_event` like any other event.
 
+### When the vendor data doesn't fit one frame
+
+Use the spec's standard multi-part format (5.10). A fragmented `osdp_MFG`
+payload is:
+
+```
+vendor_code[3] || MpSizeTotal,MpOffset,MpFragmentSize[6] || fragment bytes
+```
+
+The vendor code sits *outside* the fragmentation and repeats on every
+fragment, so you can refuse a transfer that isn't yours at the **first**
+fragment instead of reassembling someone else's message to find out.
+
+Bind a reassembly buffer and the library handles the sequencing:
+
+```c
+static uint8_t mfg_buf[2048];
+
+static osdp_status_t on_mfg(void *user, const uint8_t *vendor_code,
+                            const uint8_t *data, size_t data_len,
+                            osdp_pd_reply_t *reply)
+{
+    /* Called once, with the whole vendor message and no Mp headers. */
+    return handle_my_vendor_message(data, data_len) ? OSDP_OK
+                                                    : OSDP_ERR_INVALID_ARG;
+}
+
+osdp_pd_set_mfg_receiver(&pd, mfg_buf, sizeof(mfg_buf), on_mfg, app);
+```
+
+Intermediate fragments are ACKed; your callback fires once, on the last one.
+Gaps, a changed total, or a continuation with nothing in progress are answered
+`NAK 0x09` — which spec 5.10.2 says aborts the ACU's sequence — and the
+reassembler resets so a restart at offset 0 works. An early-termination marker
+(the ACU giving up) discards the partial message and ACKs. `osdp_ABORT`
+terminates a transfer too.
+
+**One thing you must know:** nothing on the wire distinguishes a 6-byte
+multi-part header from six bytes of ordinary vendor data. Table 27 defines no
+multi-part fields for `osdp_MFG`, so this cannot be auto-detected. **Binding
+the receiver is your declaration that your vendor protocol uses the standard
+format.** Leave it unbound and payloads stay opaque, reaching your command
+handler exactly as before — so adding this never changes an existing PD's
+behaviour by accident.
+
+If you advertise PDCAP function code 11 (Largest Combined Message Size), bind
+a buffer at least that large; `osdp_pd_check_pdcap` will tell you if you
+haven't.
+
 ---
 
 ## `osdp_pd_tick` — pump the state machine

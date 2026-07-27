@@ -213,6 +213,12 @@ static void handle_abort(osdp_pd_t *pd, osdp_pd_reply_t *reply)
     pd->ft_received = 0;
     pd->ft_type     = 0;
 
+    /* Spec 6.22 names both: "terminate any multi-part message or file
+     * transfer operation currently in progress". Leaving a half-assembled
+     * multi-part message behind would merge it into whatever the ACU sends
+     * next. */
+    osdp_mp_reasm_reset(&pd->mfg_reasm);
+
     if (pd->abort_cb != NULL &&
         pd->abort_cb(pd->abort_user) != OSDP_OK) {
         nak_into(pd, OSDP_NAK_UNKNOWN_CMD, reply);
@@ -274,6 +280,99 @@ static void handle_keepactive(osdp_pd_t       *pd,
     reply->code        = OSDP_REPLY_ACK;
     reply->payload     = NULL;
     reply->payload_len = 0;
+}
+
+/* ---- Multi-part osdp_MFG (spec 5.10 + 6.19) ---------------------------- */
+
+/* Defined just below; the MFG receiver maps its callback's verdict onto the
+ * wire through the same table as an ordinary command handler. */
+static osdp_pd_dispatch_outcome_t apply_app_status(osdp_pd_t       *pd,
+                                                   osdp_status_t    app_status,
+                                                   osdp_pd_reply_t *reply);
+
+/* Reassemble a fragmented osdp_MFG. The payload is
+ *
+ *     vendor_code[3] || Mp header[6] || fragment bytes
+ *
+ * with the vendor code outside the fragmentation and repeated on every
+ * fragment, so the PD can tell whether a transfer is even addressed to it
+ * before committing its buffer.
+ *
+ * Returns false when no receiver is bound, in which case the payload is
+ * opaque vendor data and belongs to the application handler. Nothing on the
+ * wire distinguishes a multi-part header from six bytes of ordinary vendor
+ * data — Table 27 defines no multi-part fields — so binding the receiver is
+ * how a manufacturer declares its protocol uses the standard format. */
+static bool handle_mfg_multipart(osdp_pd_t       *pd,
+                                 const uint8_t   *payload,
+                                 size_t           payload_len,
+                                 osdp_pd_reply_t *reply,
+                                 osdp_pd_dispatch_outcome_t *outcome)
+{
+    if (pd->mfg_cb == NULL) {
+        return false;
+    }
+    *outcome = OSDP_PD_DISPATCH_SEND;
+
+    osdp_mfg_cmd_t cmd;
+    if (osdp_mfg_decode(payload, payload_len, &cmd) != OSDP_OK) {
+        nak_into(pd, OSDP_NAK_CMD_LENGTH, reply);
+        return true;
+    }
+
+    osdp_mp_fragment_t frag;
+    if (osdp_mp_fragment_decode(cmd.data, cmd.data_len, &frag) != OSDP_OK) {
+        /* Spec 5.10.2: a rejected multi-part command is answered NAK 0x09,
+         * which tells the sender to abort the sequence. Reset so a restart
+         * at offset 0 is accepted rather than treated as a continuation. */
+        osdp_mp_reasm_reset(&pd->mfg_reasm);
+        nak_into(pd, OSDP_NAK_RECORD_INVALID, reply);
+        return true;
+    }
+
+    /* A transfer belongs to one vendor. Offset 0 claims it; a later fragment
+     * arriving under a different vendor code would otherwise be merged into
+     * the message already in the buffer. */
+    if (frag.offset == 0) {
+        (void)memcpy(pd->mfg_vendor, cmd.vendor_code,
+                     OSDP_MFG_VENDOR_CODE_BYTES);
+    } else if (memcmp(pd->mfg_vendor, cmd.vendor_code,
+                      OSDP_MFG_VENDOR_CODE_BYTES) != 0) {
+        osdp_mp_reasm_reset(&pd->mfg_reasm);
+        nak_into(pd, OSDP_NAK_RECORD_INVALID, reply);
+        return true;
+    }
+
+    osdp_mp_state_t state = OSDP_MP_IN_PROGRESS;
+    if (osdp_mp_reasm_push(&pd->mfg_reasm, &frag, &state) != OSDP_OK) {
+        osdp_mp_reasm_reset(&pd->mfg_reasm);
+        nak_into(pd, OSDP_NAK_RECORD_INVALID, reply);
+        return true;
+    }
+
+    if (state != OSDP_MP_COMPLETE) {
+        /* Mid-transfer, or the sender abandoned it (OSDP_MP_TERMINATED, which
+         * has already discarded the partial message). Either way there is
+         * nothing to hand up yet, and ACK is what keeps the sequence moving. */
+        reply->code        = OSDP_REPLY_ACK;
+        reply->payload     = NULL;
+        reply->payload_len = 0;
+        return true;
+    }
+
+    /* Whole vendor message assembled. Default to ACK so a callback that only
+     * consumes the data does the obvious thing, exactly as cmd_cb does. */
+    reply->code        = OSDP_REPLY_ACK;
+    reply->payload     = NULL;
+    reply->payload_len = 0;
+
+    const osdp_status_t app = pd->mfg_cb(pd->mfg_user, pd->mfg_vendor,
+                                         pd->mfg_reasm.buf,
+                                         pd->mfg_reasm.total, reply);
+    osdp_mp_reasm_reset(&pd->mfg_reasm);
+
+    *outcome = apply_app_status(pd, app, reply);
+    return true;
 }
 
 /* ---- Application verdict -> wire reply --------------------------------- */
@@ -352,6 +451,17 @@ osdp_pd_dispatch_outcome_t osdp_pd_internal_dispatch(
      * Otherwise they fall through to the application below. */
     if (handle_status_request(pd, cmd_code, reply)) {
         return OSDP_PD_DISPATCH_SEND;
+    }
+
+    /* osdp_MFG, when the manufacturer has declared its vendor protocol
+     * multi-part by binding a receiver. Without one the payload is opaque
+     * and goes to the application handler below, unchanged. */
+    if (cmd_code == OSDP_CMD_MFG) {
+        osdp_pd_dispatch_outcome_t mfg_outcome = OSDP_PD_DISPATCH_SEND;
+        if (handle_mfg_multipart(pd, payload, payload_len, reply,
+                                 &mfg_outcome)) {
+            return mfg_outcome;
+        }
     }
 
     /* An osdp_POLL with something queued is answered from the queue rather

@@ -645,12 +645,42 @@ validation at the end of the plan.
   OSDP_STREAM_BUFFER_LEN that hold at the defaults and not under
   -DOSDP_PD_BUF_LEN=1024 -DOSDP_STREAM_BUFFER_LEN=800; both now bind their
   own buffers instead.
-- ☐ **Phase 6: Multi-part transport (spec 5.10).** Generalize SC2's existing
-  `core/src/pair/fragment.c` + `multipart.c` (whose header is already
-  byte-identical to spec Table 4) into `core/src/shared/`, add the 5.10.2
-  rules, and add outbound fragmentation bounded by `acu_rx_size`. The
-  per-fragment budget comes from `osdp_pd_max_reply_payload` (Phase 2), so
-  the fragmenter never re-derives framing overhead itself.
+- ☑ **Phase 6: Multi-part transport (spec 5.10).** SC2 pairing's fragment
+  carrier and reassembler lifted into `core/src/shared/multipart.c` +
+  `osdp_multipart.h` as `osdp_mp_*`, with `core/src/pair/` re-pointed at it —
+  its header was byte-identical to spec Table 4, so there is now one copy
+  rather than two. The full pairing suite passing unchanged is what shows the
+  lift was behaviour-preserving.
+  - New beyond the pairing version: the 5.10.2 **early-termination** rule
+    (MpOffset at or past MpSizeTotal with MpFragmentSize 0), reported as
+    `OSDP_MP_TERMINATED` with the partial message discarded. It has to be
+    recognised *before* the "cannot extend past total" bounds check, since
+    being at or past the end is what identifies it. MpSizeTotal 0 is
+    deliberately excluded: an all-zero header is what a truncated frame looks
+    like, and accepting it as a marker would turn malformed input into a
+    silent ACK.
+  - **Scope corrected against the spec.** The plan called for outbound
+    fragmentation of queued poll-response events; that is not spec-legal —
+    osdp_RAW / KEYPAD / FMT define no multi-part fields. Every v2.2 message
+    that does (osdp_PIVDATAR, osdp_GENAUTHR, osdp_CRAUTHR, osdp_XWR/XRD) is
+    in the deferred credential set, which would have left this phase with no
+    in-scope consumer at all — except `osdp_MFG`, whose vendor-defined data
+    the standard format is exactly right for.
+  - **Multi-part `osdp_MFG`**: `vendor[3] || Mp[6] || fragment`, vendor code
+    outside the fragmentation and repeated per fragment so a PD can refuse a
+    foreign transfer at the first fragment rather than the last. Nothing on
+    the wire distinguishes a multi-part header from six bytes of vendor data
+    (Table 27 defines no Mp fields), so binding `osdp_pd_set_mfg_receiver` is
+    how a manufacturer declares the format; unbound, payloads stay opaque and
+    reach `cmd_cb` unchanged. Violations -> NAK 0x09 with a reset so the ACU
+    can restart; `osdp_ABORT` terminates a transfer, which is what 6.22 says.
+  - Phase 5's function-code-11 check updated now that it can be honest: a
+    non-zero Largest Combined Message Size needs a bound reassembly buffer at
+    least that large.
+  - 41 C tests (7 new transport, 8 new MFG), negative control run on the
+    early-termination detection: disabling it fails exactly the three tests
+    that cover it.
+
 - ☐ **Phase 7–8: Tests and docs.** Consolidated test inventory; CLAUDE.md,
   PLAN.md, PD_GUIDE.md.
 - ☐ **Phase 9: Rust + MCP follow-up.** Wrappers for the new codecs, bindings

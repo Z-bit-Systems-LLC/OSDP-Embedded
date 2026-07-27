@@ -29,7 +29,7 @@ static void pair_reset(osdp_pd_pair_t *p)
     osdp_pair_local_t lo = p->session.local;   /* copy before re-init zeroes */
     osdp_pair_trust_t tr = p->session.trust;
     osdp_pair_pd_init(&p->session, cr, &lo, &tr);
-    osdp_pair_reasm_reset(&p->reasm);
+    osdp_mp_reasm_reset(&p->reasm);
     p->delivering    = false;
     p->active        = false;
     p->pending_apply = false;
@@ -52,11 +52,11 @@ static size_t emit_nak(osdp_pd_t *pd, const osdp_frame_t *cmd, uint8_t err)
 
 /* Frame one fragment descriptor as an osdp_PAIRR reply into the TX buffer. */
 static size_t emit_pairr(osdp_pd_t *pd, const osdp_frame_t *cmd,
-                         const osdp_pair_fragment_t *frag)
+                         const osdp_mp_fragment_t *frag)
 {
-    uint8_t fbuf[OSDP_PAIR_FRAG_HEADER_BYTES + PD_PAIR_FRAG_SIZE];
+    uint8_t fbuf[OSDP_MP_HEADER_BYTES + PD_PAIR_FRAG_SIZE];
     size_t  flen = 0;
-    if (osdp_pair_fragment_build(frag, fbuf, sizeof(fbuf), &flen) != OSDP_OK) {
+    if (osdp_mp_fragment_build(frag, fbuf, sizeof(fbuf), &flen) != OSDP_OK) {
         return 0;
     }
     const osdp_pd_reply_t reply = { OSDP_REPLY_PAIRR, fbuf, flen };
@@ -68,7 +68,7 @@ static size_t emit_pairr(osdp_pd_t *pd, const osdp_frame_t *cmd,
 static size_t emit_single(osdp_pd_t *pd, const osdp_frame_t *cmd,
                           const uint8_t *msg, size_t msg_len)
 {
-    const osdp_pair_fragment_t frag = {
+    const osdp_mp_fragment_t frag = {
         .total_size = (uint16_t)msg_len,
         .offset     = 0,
         .data       = msg,
@@ -81,8 +81,8 @@ static size_t emit_single(osdp_pd_t *pd, const osdp_frame_t *cmd,
 static size_t deliver_msg2(osdp_pd_t *pd, osdp_pd_pair_t *p,
                            const osdp_frame_t *cmd)
 {
-    osdp_pair_fragment_t frag;
-    if (!osdp_pair_frag_iter_next(&p->out_iter, &frag)) {
+    osdp_mp_fragment_t frag;
+    if (!osdp_mp_frag_iter_next(&p->out_iter, &frag)) {
         p->delivering = false;
         return emit_ack(pd, cmd);
     }
@@ -103,7 +103,7 @@ static size_t handle_msg3(osdp_pd_t *pd, osdp_pd_pair_t *p,
 {
     bool    ok = false;
     uint8_t scbk[OSDP_PAIR_SCBK_LEN];
-    osdp_pair_reasm_reset(&p->reasm);
+    osdp_mp_reasm_reset(&p->reasm);
 
     if (osdp_pair_pd_process_msg3(&p->session, msg, msg_len, &ok, scbk)
         != OSDP_OK) {
@@ -145,7 +145,7 @@ static size_t handle_msg1(osdp_pd_t *pd, osdp_pd_pair_t *p,
                           const osdp_frame_t *cmd,
                           const uint8_t *msg, size_t msg_len)
 {
-    osdp_pair_reasm_reset(&p->reasm);
+    osdp_mp_reasm_reset(&p->reasm);
 
     size_t outlen = 0;
     bool   is_reject = false;
@@ -162,7 +162,7 @@ static size_t handle_msg1(osdp_pd_t *pd, osdp_pd_pair_t *p,
     }
 
     /* Message 2: deliver over subsequent POLLs; ACK this last Msg1 fragment. */
-    osdp_pair_frag_iter_init(&p->out_iter, p->outbuf, outlen, PD_PAIR_FRAG_SIZE);
+    osdp_mp_frag_iter_init(&p->out_iter, p->outbuf, outlen, PD_PAIR_FRAG_SIZE);
     p->delivering = true;
     return emit_ack(pd, cmd);
 }
@@ -201,18 +201,26 @@ static size_t pair_handle(struct osdp_pd *pd, const osdp_frame_t *cmd)
     p->last_activity_ms = pair_now_ms(pd);
     p->active           = true;
 
-    osdp_pair_fragment_t frag;
-    if (osdp_pair_fragment_decode(cmd->payload, cmd->payload_len, &frag)
+    osdp_mp_fragment_t frag;
+    if (osdp_mp_fragment_decode(cmd->payload, cmd->payload_len, &frag)
         != OSDP_OK) {
         return emit_nak(pd, cmd, OSDP_NAK_RECORD_INVALID);
     }
 
-    bool complete = false;
-    if (osdp_pair_reasm_push(&p->reasm, &frag, &complete) != OSDP_OK) {
+    osdp_mp_state_t state = OSDP_MP_IN_PROGRESS;
+    if (osdp_mp_reasm_push(&p->reasm, &frag, &state) != OSDP_OK) {
         pair_reset(p);
         return emit_nak(pd, cmd, OSDP_NAK_RECORD_INVALID);
     }
-    if (!complete) {
+    if (state == OSDP_MP_TERMINATED) {
+        /* Spec 5.10.2 early termination: the ACU abandoned the transfer.
+         * Drop the partial message and go back to idle — pairing has nothing
+         * to resume from, and treating it as an error would leave the PD
+         * refusing the retry that usually follows. */
+        pair_reset(p);
+        return emit_ack(pd, cmd);
+    }
+    if (state != OSDP_MP_COMPLETE) {
         return emit_ack(pd, cmd);
     }
 
@@ -258,7 +266,7 @@ void osdp_pd_pair_init(osdp_pd_pair_t           *pair,
     pair->hook.handle    = pair_handle;
     pair->hook.post_send = pair_post_send;
     osdp_pair_pd_init(&pair->session, crypto, local, trust);
-    osdp_pair_reasm_init(&pair->reasm, pair->inbuf, sizeof(pair->inbuf));
+    osdp_mp_reasm_init(&pair->reasm, pair->inbuf, sizeof(pair->inbuf));
 }
 
 void osdp_pd_pair_set_established_handler(osdp_pd_pair_t             *pair,

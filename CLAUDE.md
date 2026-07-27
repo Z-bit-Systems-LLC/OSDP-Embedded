@@ -270,6 +270,58 @@ three rules on it, all exceptions, all centralised in
 pins rule 2 by having the ACU send its next SCS_15 against the pre-BUSY chain
 state and unwrap the reply cleanly.
 
+## Multi-part messages (spec 5.10)
+
+The transport lives in `core/src/shared/multipart.c` + `osdp_multipart.h`
+(`osdp_mp_*`). It was written for SC2 pairing, whose fragment header turned
+out to be **byte-identical to spec Table 4** rather than merely similar, so
+`core/src/pair/` now uses this one copy rather than keeping its own.
+
+Header, everywhere it appears: `MpSizeTotal(2) || MpOffset(2) ||
+MpFragmentSize(2)`, all little-endian, then the fragment bytes.
+
+5.10.2 rules implemented: sequential with no gaps; first fragment at offset 0
+(which also makes a retry idempotent — offset 0 restarts rather than
+erroring); and **early termination**, which pairing never needed and is the
+one genuinely new piece. A sender abandons a transfer by setting MpOffset at
+or past MpSizeTotal with MpFragmentSize 0; `osdp_mp_reasm_push` reports
+`OSDP_MP_TERMINATED` and discards the partial message. Two subtleties:
+
+- The termination marker must be recognised **before** the "fragment cannot
+  extend past MpSizeTotal" bounds check, since sitting at or past the end is
+  exactly what identifies it.
+- **MpSizeTotal 0 does not count.** Read literally an all-zero header is a
+  valid marker, but a transfer declaring no bytes has nothing to terminate,
+  and all-zeros is the shape a truncated frame takes — treating it as a
+  marker would turn a malformed payload into a silent ACK instead of the
+  NAK 0x09 it deserves.
+
+Any sequencing violation is reported to the caller, which answers
+`osdp_NAK 0x09` — spec 5.10.2 says that reply aborts the sender's sequence.
+
+**`osdp_MFG` is the one in-scope v2.2 message that uses it.** Every other
+multi-part message (osdp_PIVDATAR 7.20, osdp_GENAUTHR 7.21, osdp_CRAUTHR,
+transparent-mode osdp_XWR/XRD) is in the deferred credential set. Fragmented
+MFG is:
+
+```
+vendor_code[3] || MpSizeTotal,MpOffset,MpFragmentSize[6] || fragment
+```
+
+The vendor code sits **outside** the fragmentation and repeats on every
+fragment, so a PD can tell whether a transfer is addressed to it before
+committing buffer, and can refuse the first fragment rather than the last.
+
+**Nothing on the wire distinguishes a multi-part header from six bytes of
+ordinary vendor data** — Table 27 defines no multi-part fields for osdp_MFG —
+so it cannot be auto-detected. Binding `osdp_pd_set_mfg_receiver` IS the
+manufacturer's declaration that its protocol uses the standard format; leave
+it unbound and MFG payloads stay opaque and reach `cmd_cb` unchanged. A
+mid-transfer vendor-code switch is rejected rather than merged.
+
+`osdp_ABORT` terminates a multi-part transfer as well as a file transfer,
+which is what spec 6.22 actually says.
+
 ## PDCAP consistency (advisory)
 
 `osdp_pd_check_pdcap` validates an application's capability records against
@@ -280,8 +332,9 @@ Only three records are checked — the ones describing the *library's* limits,
 since the rest describe the device and only the application knows those:
 function code 9 claiming AES128 with no crypto vtable/key bound; function
 code 10 exceeding `OSDP_STREAM_BUFFER_LEN`, or (with SC configured) implying
-a plaintext larger than the bound `rx_plain`; function code 11 non-zero while
-multi-part is unimplemented. Returns the offending record's index.
+a plaintext larger than the bound `rx_plain`; function code 11 non-zero with
+no multi-part reassembly buffer bound, or larger than the one that is.
+Returns the offending record's index.
 
 The fn-10-under-SC half is the non-obvious one: a message that fits the wire
 can still be too large to *decrypt*, because SC plaintext lands in

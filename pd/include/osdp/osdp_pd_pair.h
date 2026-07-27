@@ -55,13 +55,13 @@ typedef struct osdp_pd_pair {
     osdp_pair_pd_session_t     session;
 
     /* Inbound fragment reassembly (Message 1, then Message 3). */
-    osdp_pair_reasm_t          reasm;
+    osdp_mp_reasm_t          reasm;
     uint8_t                    inbuf[OSDP_PAIR_MSG_MAX];
 
     /* Outbound message held for fragmented delivery: Message 2 over POLLs, or
      * a single-fragment Result. */
     uint8_t                    outbuf[OSDP_PAIR_MSG_MAX];
-    osdp_pair_frag_iter_t      out_iter;
+    osdp_mp_frag_iter_t      out_iter;
     bool                       delivering;   /* Message 2 fragments pending */
 
     /* Deterministic handoff: SCBK staged during Msg3, applied post-send. */

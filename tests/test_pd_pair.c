@@ -181,13 +181,13 @@ static void acu_send_message(const uint8_t *msg, size_t msg_len,
                              uint8_t *last_code, uint8_t *last_pay,
                              size_t cap, size_t *last_plen)
 {
-    osdp_pair_frag_iter_t it;
-    osdp_pair_frag_iter_init(&it, msg, msg_len, 128);
-    osdp_pair_fragment_t frag;
-    while (osdp_pair_frag_iter_next(&it, &frag)) {
-        uint8_t fbuf[OSDP_PAIR_FRAG_HEADER_BYTES + 128]; size_t flen = 0;
+    osdp_mp_frag_iter_t it;
+    osdp_mp_frag_iter_init(&it, msg, msg_len, 128);
+    osdp_mp_fragment_t frag;
+    while (osdp_mp_frag_iter_next(&it, &frag)) {
+        uint8_t fbuf[OSDP_MP_HEADER_BYTES + 128]; size_t flen = 0;
         TEST_ASSERT_EQUAL(OSDP_OK,
-            osdp_pair_fragment_build(&frag, fbuf, sizeof(fbuf), &flen));
+            osdp_mp_fragment_build(&frag, fbuf, sizeof(fbuf), &flen));
         send_cmd(OSDP_CMD_PAIR, fbuf, flen, last_code, last_pay, cap, last_plen);
     }
 }
@@ -196,19 +196,19 @@ static void acu_send_message(const uint8_t *msg, size_t msg_len,
 static size_t acu_recv_message(uint8_t *out, size_t out_cap)
 {
     static uint8_t rbuf[OSDP_PAIR_MSG_MAX];
-    osdp_pair_reasm_t r;
-    osdp_pair_reasm_init(&r, rbuf, sizeof(rbuf));
-    bool complete = false;
+    osdp_mp_reasm_t r;
+    osdp_mp_reasm_init(&r, rbuf, sizeof(rbuf));
+    osdp_mp_state_t state = OSDP_MP_IN_PROGRESS;
     int guard = 0;
-    while (!complete && guard++ < 300) {
+    while (state != OSDP_MP_COMPLETE && guard++ < 300) {
         uint8_t code, pay[256]; size_t plen = 0;
         send_cmd(OSDP_CMD_POLL, NULL, 0, &code, pay, sizeof(pay), &plen);
         if (code != OSDP_REPLY_PAIRR) { continue; }
-        osdp_pair_fragment_t frag;
-        TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_fragment_decode(pay, plen, &frag));
-        TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_reasm_push(&r, &frag, &complete));
+        osdp_mp_fragment_t frag;
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_fragment_decode(pay, plen, &frag));
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_reasm_push(&r, &frag, &state));
     }
-    TEST_ASSERT_TRUE(complete);
+    TEST_ASSERT_EQUAL(OSDP_MP_COMPLETE, state);
     TEST_ASSERT_TRUE(r.total <= out_cap);
     (void)memcpy(out, rbuf, r.total);
     return r.total;
@@ -237,8 +237,8 @@ static void test_pd_completes_pairing_and_applies_scbk(void)
     acu_send_message(msg3, n3, &code, pay, sizeof(pay), &plen);
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PAIRR, code);
 
-    osdp_pair_fragment_t frag;
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_fragment_decode(pay, plen, &frag));
+    osdp_mp_fragment_t frag;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_fragment_decode(pay, plen, &frag));
     uint8_t acu_scbk[OSDP_PAIR_SCBK_LEN];
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_pair_acu_process_result(&acu, frag.data, frag.frag_len, acu_scbk));
@@ -260,7 +260,7 @@ static void test_pd_without_pairing_naks(void)
     osdp_pd_transport_t t = { pd_read, pd_write, pd_now, NULL };
     osdp_pd_set_transport(&bare, &t);
 
-    uint8_t frag[OSDP_PAIR_FRAG_HEADER_BYTES + 4] = { 10,0, 0,0, 4,0, 1,2,3,4 };
+    uint8_t frag[OSDP_MP_HEADER_BYTES + 4] = { 10,0, 0,0, 4,0, 1,2,3,4 };
     osdp_frame_t c;
     (void)memset(&c, 0, sizeof(c));
     c.address = PD_ADDR; c.sequence = 1; c.integrity = OSDP_INTEGRITY_CRC;
