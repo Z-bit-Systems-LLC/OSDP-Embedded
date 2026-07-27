@@ -221,7 +221,79 @@ checks the answer against what `build`/`wrap` actually accepts — reported
 maximum must succeed, one more byte must fail — rather than restating the
 arithmetic, so the helpers cannot drift from the code they describe.
 
-## Library-handled commands (KEYSET, COMSET, FILETRANSFER)
+## PD command dispatch — one path for every channel
+
+`pd/src/pd_dispatch.c::osdp_pd_internal_dispatch` decides the reply for one
+accepted command, whatever channel carried it. Plaintext, SC1 and SC2 all
+funnel through it once the payload is in the clear; each caller then frames
+the result its own way, which is the only thing that legitimately differs.
+Anything added here works on all three channels at once — that is the point,
+and it exists because the SC2 copy had already drifted (it intercepted
+neither COMSET nor FILETRANSFER).
+
+It returns an `osdp_pd_dispatch_outcome_t` rather than a status:
+
+| Outcome | Meaning |
+| --- | --- |
+| `SEND` | frame `*reply` on the inbound channel. **Refusals are `SEND`** — a NAK is an ordinary reply. |
+| `DROP` | no reply at all; the ACU waits out its timeout. Only an unrecognised handler error. |
+| `BUSY` | `osdp_BUSY`, which cannot be framed on the inbound channel — see below. |
+
+**Application handler status → wire reply (spec Table 47).** Before this
+mapping, anything other than `OSDP_OK` / `OSDP_ERR_NOT_SUPPORTED` was dropped
+silently and the ACU spent a full reply timeout learning nothing:
+
+| `cmd_cb` returns | PD sends |
+| --- | --- |
+| `OSDP_OK` | the reply the handler filled in |
+| `OSDP_ERR_NOT_SUPPORTED` | `osdp_NAK` 0x03 unknown command |
+| `OSDP_ERR_BAD_PAYLOAD` / `_BAD_LENGTH` | `osdp_NAK` 0x02 bad length |
+| `OSDP_ERR_INVALID_ARG` | `osdp_NAK` 0x09 unable to process record |
+| `OSDP_ERR_BUSY` | `osdp_BUSY` (appended to `osdp_status_t` as 11) |
+| anything else | nothing — silent drop survives as an escape hatch |
+
+**`osdp_BUSY` is the one reply that leaves its channel.** Spec 7.19 puts
+three rules on it, all exceptions, all centralised in
+`pd.c::osdp_pd_internal_build_busy` so no caller has to remember them:
+
+1. sequence number is **always 0**, not the inbound SQN;
+2. it goes out **plaintext even during an established Secure Channel** and
+   must not advance the MAC chain (SC1) or the message counter (SC2) — which
+   is why the SC paths return before their wrap rather than framing it
+   themselves. One of only three replies allowed outside the SCS format,
+   with `osdp_NAK` 0x01 and 0x06;
+3. it is **not cached** as the retransmit answer (`pd->reply_cacheable`),
+   because the ACU repeats the command in its original form — a replayed BUSY
+   would answer a command the PD is by then ready to handle.
+
+`tests/test_pd_sc.c::test_busy_under_sc_is_plaintext_and_preserves_the_mac_chain`
+pins rule 2 by having the ACU send its next SCS_15 against the pre-BUSY chain
+state and unwrap the reply cleanly.
+
+## PD status providers and the poll-response event queue
+
+**Status providers** (`osdp_pd_set_status_provider`) answer osdp_LSTAT /
+ISTAT / OSTAT / RSTAT. The reply *layout* is the spec's business and the
+*values* are the application's, so the library builds the frame and calls a
+provider for the bytes. Every member is independent and optional: a NULL
+member leaves that one command falling through to `cmd_cb`, so existing
+consumers that hand-build their own osdp_LSTATR keep working unchanged. The
+array-valued members are capped at `OSDP_PD_REPLY_SCRATCH_LEN` (64) items and
+an over-reporting provider is clamped rather than trusted.
+
+**The event queue** (`osdp_pd_set_event_queue` / `osdp_pd_enqueue_event`)
+holds the "sent as a poll response" replies — osdp_RAW, osdp_FMT,
+osdp_KEYPAD, osdp_MFGREP — until the ACU next polls. Caller-owned storage, no
+malloc. Records are `[u16 len][u8 code][payload]` laid out from offset 0, and
+it is deliberately **not** a wrapping ring: a wrap would split a payload
+across the buffer end, and the dequeue hands the payload to the framer as a
+contiguous slice. Dequeue compacts what remains down to the front instead.
+An empty queue falls through to `cmd_cb`, so this is additive. Per spec
+7.11/7.12 the queue is emptied on the offline transition — delivering a
+credential read from before an outage would have the ACU act on a stale
+presentation.
+
+## Library-handled commands (KEYSET, COMSET, FILETRANSFER, ABORT, ACURXSIZE, KEEPACTIVE)
 
 Most commands flow to the application's `osdp_pd_command_cb`, which chooses
 the reply. A few are intercepted by the PD state machine itself because they
@@ -298,6 +370,27 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   SC it wraps as SCS_18. Deferred while the callback is synchronous: the
   "finishing" (status 3) idle-fragment protocol and `FtUpdateMsgMax` throttling
   (the PD always reports `update_msg_max = 0`).
+- **`osdp_ABORT`** — handled entirely by the core. It tears down the
+  file-transfer state the spec requires terminated (6.22), then runs the
+  optional `osdp_pd_set_abort_handler` hook for application-side work the core
+  cannot know about. ACK by default; a hook returning non-OK becomes NAK 0x03,
+  the spec's "PD unable to abort" case (a firmware update past the point of no
+  return being its example).
+- **`osdp_ACURXSIZE`** — handled entirely by the core: it stores the ACU's
+  declared receive capacity (`osdp_pd_acu_rx_size`, seeded to
+  `OSDP_PD_DEFAULT_ACU_RX_SIZE` = 128 per spec 6.26) and ACKs. The optional
+  hook is a notification, not a veto — refusing to believe the ACU about its
+  own buffer would only produce replies it drops. Malformed payload → NAK 0x02
+  with the stored value left alone. **This is the peer's limit**; combine it
+  with `osdp_pd_max_reply_payload` (this PD's own) and honour the smaller.
+- **`osdp_KEEPACTIVE`** — decoded by the core, decided by the application via
+  `osdp_pd_set_keepactive_handler`. Unlike the hooks above, with **no** handler
+  the PD NAKs 0x03: holding a reader field energised is physical, so an ACK the
+  PD cannot honour would be a lie.
+- **`osdp_MFG` is deliberately NOT intercepted.** The content is
+  vendor-defined, so it flows to `cmd_cb`, which returns
+  `reply.code = OSDP_REPLY_MFGREP` with a body built by `osdp_mfgrep_build`.
+  See `docs/PD_GUIDE.md` for the pattern.
 
 ## Coding rules
 

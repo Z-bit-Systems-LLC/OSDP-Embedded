@@ -21,6 +21,33 @@ typedef enum osdp_pd_channel {
     OSDP_PD_CH_SC2
 } osdp_pd_channel_t;
 
+/* What the caller should do with the result of a dispatch.
+ *
+ * Most commands produce a reply to frame on the channel that carried them,
+ * which is OSDP_PD_DISPATCH_SEND. The other two exist because a couple of
+ * outcomes cannot be expressed as "a reply on this channel":
+ *
+ *   DROP  the command produces no reply at all, and the ACU waits out its
+ *         timeout. Reserved for an unrecognised application error.
+ *   BUSY  osdp_BUSY, which the spec (7.19) requires to go out at sequence 0
+ *         and OUTSIDE the Secure Channel even during an established session.
+ *         The dispatch cannot frame that itself — it does not own framing —
+ *         so it says "BUSY" and each caller routes to the plaintext builder
+ *         instead of its own wrap. */
+typedef enum osdp_pd_dispatch_outcome {
+    OSDP_PD_DISPATCH_SEND = 0,
+    OSDP_PD_DISPATCH_DROP,
+    OSDP_PD_DISPATCH_BUSY
+} osdp_pd_dispatch_outcome_t;
+
+/* Build osdp_BUSY into the bound TX buffer for `cmd`: plaintext framing with
+ * sequence number 0, whatever channel the command arrived on. Centralises the
+ * three spec-7.19 rules so no caller has to remember them; the "do not cache"
+ * half is handled by pd->reply_cacheable, which this clears. Defined in pd.c. */
+osdp_status_t osdp_pd_internal_build_busy(osdp_pd_t          *pd,
+                                          const osdp_frame_t *cmd,
+                                          size_t             *out_len);
+
 /* Decide the reply for ONE accepted command, whatever channel carried it.
  *
  * This is the single place that knows what a command *means*: which commands
@@ -39,16 +66,23 @@ typedef enum osdp_pd_channel {
  * payload points into whatever buffer cmd_cb handed back, whose lifetime the
  * existing osdp_pd_command_cb contract already guarantees for that window.
  *
- * Returns OSDP_ERR_INVALID_ARG when the command should produce NO reply at
- * all (an internal application-handler error); the caller drops it. Every
- * other outcome — including refusals — comes back as OSDP_OK with *reply set
- * to the appropriate osdp_NAK. */
-osdp_status_t osdp_pd_internal_dispatch(osdp_pd_t        *pd,
-                                        osdp_pd_channel_t channel,
-                                        uint8_t           cmd_code,
-                                        const uint8_t    *payload,
-                                        size_t            payload_len,
-                                        osdp_pd_reply_t  *reply);
+ * Refusals are ordinary results: they come back as _SEND with *reply set to
+ * the appropriate osdp_NAK. Only the two cases that cannot be framed as a
+ * reply on this channel get their own outcome — see
+ * osdp_pd_dispatch_outcome_t. */
+osdp_pd_dispatch_outcome_t osdp_pd_internal_dispatch(
+    osdp_pd_t        *pd,
+    osdp_pd_channel_t channel,
+    uint8_t           cmd_code,
+    const uint8_t    *payload,
+    size_t            payload_len,
+    osdp_pd_reply_t  *reply);
+
+/* Pop the head of the poll-response event queue into *reply, with the payload
+ * copied into pd->reply_scratch so it survives the dequeue. Returns false
+ * when the queue is empty or unbound, in which case *reply is untouched and
+ * the caller falls through to the application handler. Defined in pd.c. */
+bool osdp_pd_internal_dequeue_event(osdp_pd_t *pd, osdp_pd_reply_t *reply);
 
 /* Decode a KEYSET payload carrying a 32-byte AES-256 SCBK (key_type 0x02)
  * and apply it to pd->sc2.scbk. The SC2 counterpart of

@@ -256,10 +256,19 @@ static size_t handle_operational(osdp_pd_t *pd, const osdp_frame_t *cmd)
      * the registered receiver. Only the SCS_28 framing below is specific to
      * this path. */
     osdp_pd_reply_t reply;
-    if (osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC2, cmd_code,
-                                  pd->rx_plain, plaintext_len,
-                                  &reply) != OSDP_OK) {
-        return 0;  /* internal handler error — drop */
+    const osdp_pd_dispatch_outcome_t outcome =
+        osdp_pd_internal_dispatch(pd, OSDP_PD_CH_SC2, cmd_code,
+                                  pd->rx_plain, plaintext_len, &reply);
+    if (outcome == OSDP_PD_DISPATCH_DROP) {
+        return 0;  /* unrecognised handler error — drop */
+    }
+    if (outcome == OSDP_PD_DISPATCH_BUSY) {
+        /* As on the SC1 path: osdp_BUSY is framed plaintext at sequence 0
+         * and never wrapped, so the shared message counter is left alone.
+         * Advancing it here would desync both peers' nonces. */
+        size_t busy_len = 0;
+        return (osdp_pd_internal_build_busy(pd, cmd, &busy_len) == OSDP_OK)
+                   ? busy_len : 0;
     }
 
     /* Reply is always the encrypted PD→ACU variant (SCS_28). */

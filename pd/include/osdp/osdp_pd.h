@@ -143,16 +143,29 @@ typedef struct osdp_pd_reply {
 /* Command handler. The PD has already validated the inbound frame
  * (CRC/checksum, address match, length sanity) before invoking this.
  *
- * The handler may inspect `cmd_code` and `payload` and produce a reply.
- * Three return policies:
+ * The handler may inspect `cmd_code` and `payload` and produce a reply. The
+ * return value selects what goes on the wire, mapped onto spec Table 47:
  *
- *   - OSDP_OK: fill in *reply and the PD will frame and transmit it.
- *   - OSDP_ERR_NOT_SUPPORTED: the PD will send NAK with error code
- *     0x03 (Unknown Command Code). Use this for command codes the
- *     application doesn't implement.
- *   - any other osdp_status_t: treated as an internal error; the PD
- *     drops the command silently. (Future iterations may emit a NAK
- *     with a different error code instead.)
+ *   - OSDP_OK                  fill in *reply; the PD frames and sends it.
+ *   - OSDP_ERR_NOT_SUPPORTED   osdp_NAK 0x03 (Unknown Command Code). Use
+ *                              this for command codes you don't implement.
+ *   - OSDP_ERR_BAD_PAYLOAD     osdp_NAK 0x02 (bad command length) — the
+ *     OSDP_ERR_BAD_LENGTH      command is recognised but its payload is
+ *                              malformed or the wrong size.
+ *   - OSDP_ERR_INVALID_ARG     osdp_NAK 0x09 (unable to process command
+ *                              record) — well-formed but unusable content,
+ *                              e.g. a reader number this PD doesn't have.
+ *   - OSDP_ERR_BUSY            osdp_BUSY (spec 7.19): not ready yet, ask
+ *                              again. The PD sends it at sequence 0, in the
+ *                              clear even under Secure Channel, and does not
+ *                              cache it — the ACU repeats the command
+ *                              unchanged until it gets something else.
+ *   - any other osdp_status_t  treated as an unrecognised internal error;
+ *                              the command is dropped with no reply at all.
+ *
+ * Answering nothing is a deliberate last resort: the ACU waits out its reply
+ * timeout, which is slower for it than being told no. Prefer one of the
+ * mapped codes above wherever the situation fits one.
  */
 typedef osdp_status_t (*osdp_pd_command_cb)(
     void           *user,
@@ -325,6 +338,57 @@ typedef struct osdp_pd_file_info {
 typedef osdp_status_t (*osdp_pd_file_cb)(void *user,
                                          const osdp_pd_file_info_t *info);
 
+/* ---- Status providers ---------------------------------------------------
+ *
+ * osdp_LSTAT / osdp_ISTAT / osdp_OSTAT / osdp_RSTAT ask the PD to report
+ * device state. The reply layout is fixed by the spec, so the library builds
+ * it; only the values are the application's business. Bind a provider and the
+ * four status commands stop reaching the command handler entirely.
+ *
+ * Every member is optional. A NULL member (or no provider at all) leaves that
+ * command falling through to `cmd_cb` exactly as before, so an existing
+ * application that hand-builds its own osdp_LSTATR keeps working.
+ *
+ * The three array-valued members write up to `cap` status bytes into `out`
+ * and return how many they wrote; `cap` is OSDP_PD_REPLY_SCRATCH_LEN. A
+ * return above `cap` is clamped. Returning 0 is legal and produces an empty
+ * report — a PD with no inputs genuinely has nothing to say. */
+typedef struct osdp_pd_status_provider {
+    /* osdp_LSTAT -> osdp_LSTATR. Write the tamper and power bytes
+     * (OSDP_LSTATR_NORMAL / _TAMPER / _POWER_FAILURE). */
+    void   (*local)  (void *user, uint8_t *tamper, uint8_t *power);
+    /* osdp_ISTAT -> osdp_ISTATR, one OSDP_ISTATR_* byte per input. */
+    size_t (*inputs) (void *user, uint8_t *out, size_t cap);
+    /* osdp_OSTAT -> osdp_OSTATR, one OSDP_OSTATR_* byte per output. */
+    size_t (*outputs)(void *user, uint8_t *out, size_t cap);
+    /* osdp_RSTAT -> osdp_RSTATR, one OSDP_RSTATR_* byte per reader. */
+    size_t (*readers)(void *user, uint8_t *out, size_t cap);
+} osdp_pd_status_provider_t;
+
+/* ---- Miscellaneous command hooks ----------------------------------------*/
+
+/* osdp_ABORT (spec 6.22). The library has already torn down any in-flight
+ * file transfer and multi-part reassembly before this runs; the hook exists
+ * for application-side work the core cannot know about.
+ *
+ * Return OSDP_OK to ACK. Any other status produces osdp_NAK 0x03, the spec's
+ * "PD unable to abort" case — a firmware update past the point of no return
+ * being the example it gives. With no hook bound the PD always ACKs. */
+typedef osdp_status_t (*osdp_pd_abort_cb)(void *user);
+
+/* osdp_ACURXSIZE (spec 6.20): the ACU has declared how large a reply it can
+ * receive. The library stores the value (see osdp_pd_acu_rx_size) and ACKs
+ * regardless; this hook is a notification, not a veto. */
+typedef void (*osdp_pd_acurxsize_cb)(void *user, uint16_t max_size);
+
+/* osdp_KEEPACTIVE (spec 6.21): hold reader operations open for `time_ms`
+ * milliseconds. Zero cancels a previous extension.
+ *
+ * Return OSDP_OK to ACK. Any other status produces osdp_NAK 0x03. Unlike the
+ * hooks above, with NO handler bound the PD NAKs 0x03 — keeping a reader
+ * powered is a physical capability the core cannot fake. */
+typedef osdp_status_t (*osdp_pd_keepactive_cb)(void *user, uint16_t time_ms);
+
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
@@ -391,10 +455,21 @@ typedef struct osdp_pd_buz_slot {
  * application hands back from its command handler). The unified command
  * dispatch returns a reply whose payload may point here, so the buffer must
  * outlive the dispatch call and live until the caller has framed the reply.
- * Sized for the largest library-built payload today — osdp_FTSTAT is 7 bytes,
- * osdp_COM 5, osdp_NAK 1 — with headroom for the status reports that later
- * iterations will build here. */
-#define OSDP_PD_REPLY_SCRATCH_LEN 32U
+ *
+ * The fixed-size library replies are small (osdp_FTSTAT 7 bytes, osdp_COM 5,
+ * osdp_NAK 1). The size driver is the status reports: osdp_ISTATR, _OSTATR
+ * and _RSTATR carry one byte per input / output / reader, so this constant
+ * is also the ceiling on how many items a status provider can report in one
+ * reply. 64 covers any realistic reader panel; override it for a PD with
+ * more points than that. */
+#ifndef OSDP_PD_REPLY_SCRATCH_LEN
+#define OSDP_PD_REPLY_SCRATCH_LEN 64U
+#endif
+
+/* Largest reply the PD assumes an ACU can receive before any osdp_ACURXSIZE
+ * says otherwise (spec 6.26). Deliberately conservative — an ACU that can
+ * take more will tell the PD. */
+#define OSDP_PD_DEFAULT_ACU_RX_SIZE 128U
 
 /* Spec 5.7: PD considers itself offline if the gap between messages
  * to which it responds exceeds 8 seconds. */
@@ -586,6 +661,40 @@ typedef struct osdp_pd {
     uint32_t                   ft_total;
     uint32_t                   ft_received;
 
+    /* Status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT. A NULL member
+     * leaves that command falling through to cmd_cb. */
+    osdp_pd_status_provider_t  status;
+    void                      *status_user;
+
+    /* Poll-response event queue (osdp_RAW, osdp_KEYPAD, osdp_FMT,
+     * osdp_MFGREP). Caller-owned storage holding length-prefixed records;
+     * `event_len` is the number of bytes currently occupied, always starting
+     * at offset 0 — a dequeue compacts what remains down to the front rather
+     * than wrapping, which keeps every payload contiguous so it can be handed
+     * to the framer as a slice. */
+    uint8_t                   *event_buf;
+    size_t                     event_cap;
+    size_t                     event_len;
+
+    /* osdp_ACURXSIZE: the largest reply the ACU says it can receive. Seeded
+     * to OSDP_PD_DEFAULT_ACU_RX_SIZE (spec 6.26) until an ACU says otherwise. */
+    uint16_t                   acu_rx_size;
+    osdp_pd_acurxsize_cb       acurxsize_cb;
+    void                      *acurxsize_user;
+
+    /* osdp_ABORT / osdp_KEEPACTIVE application hooks. */
+    osdp_pd_abort_cb           abort_cb;
+    void                      *abort_user;
+    osdp_pd_keepactive_cb      keepactive_cb;
+    void                      *keepactive_user;
+
+    /* Cleared for the current tick when the reply must NOT be cached as the
+     * spec-5.9 retransmit answer. Only osdp_BUSY sets it: the ACU repeats the
+     * command in its original form, so replaying a cached BUSY would answer a
+     * command the PD is by then ready to handle. Transient per-tick state,
+     * not configuration. */
+    bool                       reply_cacheable;
+
     /* Optional SC2 asymmetric-pairing driver (osdp::pd_pair). NULL unless a
      * caller-owned osdp_pd_pair_t is attached via osdp_pd_attach_pair; its
      * first member is an osdp_pd_pair_hook_t through which pd.c dispatches.
@@ -720,6 +829,85 @@ void osdp_pd_set_file_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
  * (the PD then NAKs file transfers with 0x03). Registering either receiver
  * replaces the other. */
 void osdp_pd_set_file_stream(osdp_pd_t *pd, osdp_pd_file_cb cb, void *user);
+
+/* ---- Status reporting --------------------------------------------------*/
+
+/* Bind the status providers for osdp_LSTAT / ISTAT / OSTAT / RSTAT (see
+ * osdp_pd_status_provider_t). The vtable is copied into the context; the
+ * source may be on the stack. Pass p=NULL to detach, after which all four
+ * commands go back to `cmd_cb`.
+ *
+ * Each member is independent: bind only `local` and the PD answers
+ * osdp_LSTAT itself while osdp_ISTAT still reaches the application. */
+void osdp_pd_set_status_provider(osdp_pd_t *pd,
+                                 const osdp_pd_status_provider_t *p,
+                                 void *user);
+
+/* ---- Poll-response events ----------------------------------------------
+ *
+ * The spec's "sent as a poll response" replies — osdp_RAW (7.10), osdp_FMT
+ * (7.11), osdp_KEYPAD (7.12), osdp_MFGREP (7.18) — are generated by physical
+ * events, not by a command. The PD holds them until the ACU next polls.
+ *
+ * Without this queue every consumer reimplements it. With it, the application
+ * calls osdp_pd_enqueue_event from wherever the card read or keypress is
+ * detected, and the library answers the next osdp_POLL with the head of the
+ * queue instead of calling `cmd_cb`. An empty queue falls through to `cmd_cb`
+ * exactly as before, so this is opt-in and additive. */
+
+/* Bind caller-owned storage for the event queue. Records are stored
+ * length-prefixed; a rough guide is (payload + 3) bytes per queued event.
+ * The buffer must stay valid for as long as it is registered. Pass buf=NULL,
+ * cap=0 to detach, which also discards anything queued. */
+void osdp_pd_set_event_queue(osdp_pd_t *pd, uint8_t *buf, size_t cap);
+
+/* Queue one reply to be sent in answer to the next osdp_POLL.
+ *
+ * `reply_code` is the osdp_REPLY_* value (OSDP_REPLY_RAW, _KEYPAD, _FMT,
+ * _MFGREP); `payload` / `len` are its body, already encoded with the matching
+ * osdp::messages builder.
+ *
+ * Returns OSDP_ERR_BUFFER_TOO_SMALL when the queue is full — the application
+ * decides whether to drop the event or retry later, since only it knows
+ * whether a missed card read matters. OSDP_ERR_INVALID_ARG for a NULL pd, a
+ * payload/length mismatch, or no bound queue.
+ *
+ * Per spec 7.11/7.12 unreported data is discarded on a communication loss, so
+ * the queue is emptied when the PD goes offline; a queued credential is never
+ * delivered minutes late to an ACU that has since reconnected. */
+osdp_status_t osdp_pd_enqueue_event(osdp_pd_t *pd, uint8_t reply_code,
+                                    const uint8_t *payload, size_t len);
+
+/* True while at least one event is waiting for the next poll. */
+bool osdp_pd_event_pending(const osdp_pd_t *pd);
+
+/* Discard every queued event. Called automatically on the offline transition;
+ * exposed so an application can drop stale events itself (e.g. on a
+ * deliberate reconnect). */
+void osdp_pd_clear_events(osdp_pd_t *pd);
+
+/* ---- Miscellaneous command hooks ---------------------------------------*/
+
+/* Bind the osdp_ABORT hook (see osdp_pd_abort_cb). Optional: with no hook the
+ * PD tears down its own transfer state and ACKs. */
+void osdp_pd_set_abort_handler(osdp_pd_t *pd, osdp_pd_abort_cb cb, void *user);
+
+/* Bind the osdp_ACURXSIZE notification (see osdp_pd_acurxsize_cb). Optional;
+ * the library stores the value either way. */
+void osdp_pd_set_acurxsize_handler(osdp_pd_t *pd, osdp_pd_acurxsize_cb cb,
+                                   void *user);
+
+/* The largest reply the ACU has said it can receive, or
+ * OSDP_PD_DEFAULT_ACU_RX_SIZE if it has not said. This is the PEER's limit;
+ * combine it with osdp_pd_max_reply_payload (this PD's own limit) and honour
+ * the smaller of the two. */
+uint16_t osdp_pd_acu_rx_size(const osdp_pd_t *pd);
+
+/* Bind the osdp_KEEPACTIVE handler (see osdp_pd_keepactive_cb). Without one
+ * the PD NAKs 0x03, since holding a reader active is a physical capability
+ * the core cannot fake. */
+void osdp_pd_set_keepactive_handler(osdp_pd_t *pd, osdp_pd_keepactive_cb cb,
+                                    void *user);
 
 /* ---- Secure Channel configuration --------------------------------------
  *

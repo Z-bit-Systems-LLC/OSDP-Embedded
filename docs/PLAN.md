@@ -598,12 +598,36 @@ validation at the end of the plan.
 - ☐ **Phase 3: Missing codecs.** 8 commands (LSTAT, ISTAT, OSTAT, RSTAT,
   ACURXSIZE, MFG, ABORT, KEEPACTIVE) and 5 replies (FMT, BUSY, MFGREP,
   MFGSTATR, MFGERRR), one TU each, plus `dispatch_classify.c` entries.
-- ☐ **Phase 4: State machine mechanics.** Status providers (LSTAT/ISTAT/
-  OSTAT/RSTAT → the matching `*STATR`), a caller-owned poll-response event
-  queue, `osdp_BUSY` (SQN 0, plaintext even under SC, never cached),
-  `osdp_ABORT`, `osdp_ACURXSIZE`, `osdp_KEEPACTIVE`, and mapping the
-  remaining `cmd_cb` error codes onto spec Table 47 NAKs instead of
-  dropping silently.
+- ☑ **Phase 4: State machine mechanics.** All of it lands inside
+  `osdp_pd_internal_dispatch`, so every addition works identically in the
+  clear, under SC1 and under SC2.
+  - *Status providers* (`osdp_pd_set_status_provider`) answer LSTAT / ISTAT /
+    OSTAT / RSTAT. Members are independent — a NULL one falls through to
+    `cmd_cb`, so existing consumers that hand-build an osdp_LSTATR are
+    unaffected. An over-reporting provider is clamped, not trusted.
+  - *Poll-response event queue* (`osdp_pd_set_event_queue` /
+    `osdp_pd_enqueue_event`) for osdp_RAW / FMT / KEYPAD / MFGREP.
+    Caller-owned, no malloc, deliberately not a wrapping ring so payloads
+    stay contiguous for the framer; compacts on dequeue. Emptied on the
+    offline transition per spec 7.11/7.12.
+  - *`osdp_BUSY`*, via a new `OSDP_ERR_BUSY` (appended to `osdp_status_t`).
+    Needed a third dispatch outcome, since it cannot be framed on the
+    channel that carried the command: it goes out at SQN 0, plaintext even
+    under SC, and is not cached. `osdp_pd_internal_build_busy` owns all
+    three rules.
+  - *`osdp_ABORT`* (terminates in-flight file transfer, then optional hook;
+    non-OK → NAK 0x03), *`osdp_ACURXSIZE`* (stored, ACKed, readable via
+    `osdp_pd_acu_rx_size`), *`osdp_KEEPACTIVE`* (NAK 0x03 without a handler).
+  - *Table 47 NAK mapping*: BAD_PAYLOAD/BAD_LENGTH → 0x02, INVALID_ARG →
+    0x09, BUSY → osdp_BUSY. Silent drop survives only for an unrecognised
+    status, where it used to be the default for everything.
+  - `osdp_MFG` stays with the application by design; the MFG → MFGREP pattern
+    is documented and tested.
+  - 40 C tests (up from 38): new `test_pd_status.c` and `test_pd_events.c`,
+    plus the SC MAC-chain proof for BUSY. Bumping the reply scratch 32→64
+    for the status reports desynced the Rust mirror and the Phase 2 layout
+    guard caught it as STATUS_HEAP_CORRUPTION on the first `cargo test` —
+    working as intended.
 - ☐ **Phase 5: PDCAP consistency.** Advisory `osdp_pd_check_pdcap` catching
   an advertised Receive BufferSize the PD cannot honour.
 - ☐ **Phase 6: Multi-part transport (spec 5.10).** Generalize SC2's existing
