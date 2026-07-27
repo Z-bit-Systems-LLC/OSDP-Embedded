@@ -30,7 +30,7 @@ void tearDown(void) {}
 
 /* ---- Mock transport ----------------------------------------------------*/
 
-#define MOCK_BUF_LEN 1024U
+#define MOCK_BUF_LEN 4096U   /* room for a spec-scale SC frame in both directions */
 
 typedef struct mock_transport {
     uint8_t  incoming[MOCK_BUF_LEN];
@@ -1505,6 +1505,147 @@ static void test_filetransfer_under_sc_yields_scs_18_ftstat(void)
     TEST_ASSERT_TRUE(osdp_pd_sc_established(&pd));
 }
 
+/* ---- Caller-supplied buffers on the SC path ---------------------------- */
+
+/* Echoes the decrypted payload straight back. The reply payload IS the
+ * pointer the core handed the handler, which on this path is the PD's
+ * rx_plain region — so this also proves rx_plain and tx are distinct
+ * storage. If they aliased, osdp_sc_wrap_frame would be writing the
+ * outbound frame over the very bytes it is reading as the payload. */
+static osdp_status_t sc_echo_handler(void *user, uint8_t cmd_code,
+                                     const uint8_t *payload,
+                                     size_t payload_len,
+                                     osdp_pd_reply_t *reply)
+{
+    (void)user; (void)cmd_code;
+    reply->code        = OSDP_REPLY_RAW;
+    reply->payload     = payload;
+    reply->payload_len = payload_len;
+    return OSDP_OK;
+}
+
+/* An SCS_17 exchange whose plaintext is larger than any existing SC test
+ * sends, driven entirely through caller-bound tx / rx_plain regions. Proves
+ * the SC path goes through the bindings (it decrypted into the bound
+ * rx_plain, and re-encrypted out of it into the bound tx) and that the two
+ * regions are genuinely distinct storage — the handler hands back the exact
+ * pointer it was given, so any tx/rx_plain overlap corrupts the echo.
+ *
+ * The payload deliberately stays under 256 bytes. Binding larger PD buffers
+ * does NOT currently raise the Secure Channel ceiling, because
+ * osdp_sc_wrap_frame keeps its own fixed 256-byte stack scratch for the
+ * ciphertext (core/src/sc/wrap.c) — see
+ * test_sc_payload_over_the_wrap_scratch_is_refused below. */
+static void test_bound_buffers_carry_a_large_sc_exchange(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    static uint8_t tx[OSDP_FRAME_MAX_LEN];
+    static uint8_t rx_plain[OSDP_FRAME_MAX_LEN];
+    const osdp_pd_buffers_t bufs = {
+        .tx = tx, .tx_cap = sizeof(tx),
+        .rx_plain = rx_plain, .rx_plain_cap = sizeof(rx_plain),
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
+    osdp_pd_set_command_handler(&pd, sc_echo_handler, NULL);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    static uint8_t big[200];
+    for (size_t i = 0; i < sizeof(big); i++) {
+        big[i] = (uint8_t)((i * 7U) & 0xFFU);
+    }
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_TEXT;
+    cmd_template.payload     = big;
+    cmd_template.payload_len = sizeof(big);
+
+    static uint8_t cmd_wire[OSDP_FRAME_MAX_LEN];
+    size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+    mock_reset_incoming(&m);
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(MOCK_BUF_LEN, cmd_wire_len);
+    (void)memcpy(m.incoming, cmd_wire, cmd_wire_len);
+    m.incoming_len = cmd_wire_len;
+
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_SCS_18, reply.scb_type);
+
+    static uint8_t plain[OSDP_FRAME_MAX_LEN];
+    size_t plain_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_sc_unwrap_frame(sc_test_crypto_tiny_aes(), &acu, &reply,
+                             plain, sizeof(plain), &plain_len));
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+    /* Every byte round-tripped: decrypted into rx_plain, handed to the app,
+     * re-encrypted out of rx_plain into tx, and back. */
+    TEST_ASSERT_EQUAL_size_t(sizeof(big), plain_len);
+    TEST_ASSERT_EQUAL_MEMORY(big, plain, sizeof(big));
+}
+
+/* Documents the Secure Channel payload ceiling, which osdp_pd_set_buffers
+ * does NOT lift: osdp_sc_wrap_frame encrypts into a fixed 256-byte stack
+ * scratch (OSDP_SC_WRAP_SCRATCH_LEN in core/src/sc/wrap.c), so a payload
+ * that pads past it is refused however much TX capacity the caller bound.
+ * osdp_sc2_unwrap_frame has the same fixed scratch on the SC2 side.
+ *
+ * This is a real limit on large messages under SC, and lifting it means
+ * changing the osdp_sc_wrap_frame signature to take caller-supplied scratch
+ * — a core public API change, deliberately not made here. This test exists
+ * so the ceiling is visible and fails loudly the day it moves, rather than
+ * being rediscovered from a mysterious BUFFER_TOO_SMALL. */
+static void test_sc_payload_over_the_wrap_scratch_is_refused(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    osdp_pd_t pd;
+    configure_pd_sc(&pd, &m, &t);
+
+    osdp_sc_session_t acu;
+    perform_handshake(&pd, &m, /*selector*/ 1, &acu);
+
+    static uint8_t big[600];
+    (void)memset(big, 0xA5, sizeof(big));
+
+    osdp_frame_t cmd_template;
+    (void)memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.address     = 0x05;
+    cmd_template.integrity   = OSDP_INTEGRITY_CRC;
+    cmd_template.sequence    = 3;
+    cmd_template.has_scb     = true;
+    cmd_template.scb_length  = OSDP_SCB_MIN_LEN;
+    cmd_template.scb_type    = OSDP_SCS_17;
+    cmd_template.code        = OSDP_CMD_TEXT;
+    cmd_template.payload     = big;
+    cmd_template.payload_len = sizeof(big);
+
+    /* Ample output capacity — the refusal comes from the internal scratch,
+     * not from out_cap. */
+    static uint8_t cmd_wire[OSDP_FRAME_MAX_LEN];
+    size_t cmd_wire_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+        osdp_sc_wrap_frame(sc_test_crypto_tiny_aes(), &acu, &cmd_template,
+                           cmd_wire, sizeof(cmd_wire), &cmd_wire_len));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1534,6 +1675,9 @@ int main(void)
     RUN_TEST(test_comset_under_sc_reports_com_and_moves_address);
     /* File transfer under SC. */
     RUN_TEST(test_filetransfer_under_sc_yields_scs_18_ftstat);
+
+    RUN_TEST(test_bound_buffers_carry_a_large_sc_exchange);
+    RUN_TEST(test_sc_payload_over_the_wrap_scratch_is_refused);
     /* Regression: clear-text SQN 0 drops a stale SC session. */
     RUN_TEST(test_cleartext_sqn0_resets_session_but_still_enforces_allowlist);
     RUN_TEST(test_cleartext_sqn0_discovery_resets_session_and_processes);

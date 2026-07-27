@@ -39,7 +39,7 @@ use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::BaudControl;
 
 /// PD TX buffer cap as defined by the C side
-/// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
+/// (`OSDP_PD_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
 /// scratch buffer the handler builds replies into to match — any
 /// reply that doesn't fit is a programming error, not user input.
 const SCRATCH_LEN: usize = 256;
@@ -345,7 +345,7 @@ impl DefaultHandler {
     ) -> osdp_embedded::Result<Reply<'_>> {
         if ov.payload.len() > self.scratch.len() {
             // Programmer error — replies shouldn't exceed
-            // OSDP_PD_TX_BUF_LEN. Drop silently rather than panic;
+            // OSDP_PD_BUF_LEN. Drop silently rather than panic;
             // the agent will see the absence of a reply.
             return Err(osdp_embedded::Error::BadPayload);
         }

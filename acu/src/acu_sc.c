@@ -93,7 +93,7 @@ static osdp_status_t send_sc_cmd(osdp_acu_t          *acu,
 
     size_t written = 0;
     osdp_status_t s = osdp_frame_build(&frame, acu->tx_buf,
-                                       OSDP_ACU_TX_BUF_LEN, &written);
+                                       OSDP_ACU_BUF_LEN, &written);
     if (s != OSDP_OK) {
         return s;
     }
@@ -393,7 +393,7 @@ void osdp_acu_internal_handle_sc_reply(osdp_acu_t          *acu,
     }
 
     /* Verify MAC and (for SCS_18) decrypt the payload. */
-    uint8_t plaintext[OSDP_ACU_TX_BUF_LEN];
+    uint8_t plaintext[OSDP_ACU_BUF_LEN];
     size_t  plaintext_len = 0;
     osdp_status_t s = osdp_sc_unwrap_frame(&acu->sc_crypto,
                                            &slot->sc_session, frame,

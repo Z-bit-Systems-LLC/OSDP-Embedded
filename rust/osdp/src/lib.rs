@@ -59,6 +59,11 @@ extern crate alloc;
 // safe modules (frame, messages, pd, acu, sc).
 pub(crate) mod sys;
 
+// Layout guard for the hand-maintained osdp_pd_t mirror in `sys`. Lives
+// in-crate rather than under tests/ because `sys` is crate-private.
+#[cfg(all(test, feature = "pd"))]
+mod pd_layout_tests;
+
 pub mod error;
 pub mod frame;
 pub mod messages;

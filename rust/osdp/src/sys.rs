@@ -999,7 +999,11 @@ pub use pd_ffi::*;
 mod pd_ffi {
     use super::*;
 
-    pub const OSDP_PD_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_PD_BUF_LEN in pd/include/osdp/osdp_pd.h. It sizes every
+     * working buffer embedded in osdp_pd_t, so a build that overrides the C
+     * constant must override this mirror to match — pd_layout_tests catches a
+     * mismatch, but only at run time. */
+    pub const OSDP_PD_BUF_LEN: usize = 512;
     /* Must track OSDP_PD_REPLY_SCRATCH_LEN in pd/include/osdp/osdp_pd.h —
      * osdp_pd_t below mirrors the C layout field for field, so a mismatch
      * silently shifts every field after tx_buf. */
@@ -1128,6 +1132,22 @@ mod pd_ffi {
         pub rnd_b: [u8; OSDP_SC2_RND_LEN],
     }
 
+    /// Caller-owned working storage for the PD's four scratch regions. A NULL
+    /// member means "leave that region on its current binding", so a caller
+    /// can enlarge only the TX path. Mirrors `osdp_pd_buffers_t` in
+    /// `pd/include/osdp/osdp_pd.h`.
+    #[repr(C)]
+    pub struct osdp_pd_buffers_t {
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
+    }
+
     #[repr(C)]
     pub struct osdp_pd_t {
         pub address: u8,
@@ -1135,15 +1155,28 @@ mod pd_ffi {
         pub transport: osdp_pd_transport_t,
         pub cmd_cb: osdp_pd_command_cb,
         pub cmd_user: *mut c_void,
-        pub tx_buf: [u8; OSDP_PD_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_PD_BUF_LEN],
         pub reply_scratch: [u8; OSDP_PD_REPLY_SCRATCH_LEN],
+        pub rx_plain_buf: [u8; OSDP_PD_BUF_LEN],
 
-        pub last_reply: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_reply: [u8; OSDP_PD_BUF_LEN],
         pub last_reply_len: usize,
-        pub last_cmd: [u8; OSDP_PD_TX_BUF_LEN],
+        pub last_cmd: [u8; OSDP_PD_BUF_LEN],
         pub last_cmd_len: usize,
         pub last_seq: u8,
         pub have_last: bool,
+
+        /* Active bindings for the four working regions. osdp_pd_init points
+         * these at the embedded arrays above; osdp_pd_set_buffers re-points
+         * them at caller-owned storage. */
+        pub tx: *mut u8,
+        pub tx_cap: usize,
+        pub rx_plain: *mut u8,
+        pub rx_plain_cap: usize,
+        pub rpl_cache: *mut u8,
+        pub rpl_cache_cap: usize,
+        pub cmd_cache: *mut u8,
+        pub cmd_cache_cap: usize,
 
         pub online: bool,
         pub last_comm_ms: u32,
@@ -1186,6 +1219,10 @@ mod pd_ffi {
 
     extern "C" {
         pub fn osdp_pd_init(pd: *mut osdp_pd_t, address: u8);
+        pub fn osdp_pd_set_buffers(
+            pd: *mut osdp_pd_t,
+            bufs: *const osdp_pd_buffers_t,
+        ) -> osdp_status_t;
         pub fn osdp_pd_set_transport(pd: *mut osdp_pd_t, transport: *const osdp_pd_transport_t);
         pub fn osdp_pd_set_command_handler(
             pd: *mut osdp_pd_t,
@@ -1248,7 +1285,9 @@ mod acu_ffi {
 
     pub const OSDP_ACU_REPLY_TIMEOUT_MS: u32 = 200;
     pub const OSDP_ACU_OFFLINE_TIMEOUT_MS: u32 = 8000;
-    pub const OSDP_ACU_TX_BUF_LEN: usize = 256;
+    /* Must track OSDP_ACU_BUF_LEN in acu/include/osdp/osdp_acu.h, which
+     * defaults to the spec 5.6 maximum. */
+    pub const OSDP_ACU_BUF_LEN: usize = OSDP_FRAME_MAX_LEN;
     pub const OSDP_ACU_MAX_LEDS: usize = 16;
     pub const OSDP_ACU_MAX_BUZZERS: usize = 8;
 
@@ -1410,7 +1449,7 @@ mod acu_ffi {
         pub timeout_cb: osdp_acu_timeout_cb,
         pub timeout_user: *mut c_void,
         pub rx: osdp_stream_t,
-        pub tx_buf: [u8; OSDP_ACU_TX_BUF_LEN],
+        pub tx_buf: [u8; OSDP_ACU_BUF_LEN],
         pub integrity: osdp_integrity_t,
         pub sc_crypto: osdp_sc_crypto_t,
         pub sc_crypto_set: bool,
