@@ -37,12 +37,15 @@ seems to need a change, raise it explicitly with the user first.
    routing (e.g. a Monitor).
 7. **Build system: CMake.** Test framework: **Unity** (vendored).
 8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel.**
-   Currently implemented: Layer 1 framing, the baseline command/reply
-   set, PD-side state machine (with SC), ACU-side state machine (with
-   SC), and PD-side file transfer (osdp_FILETRANSFER / osdp_FTSTAT).
-   Still deferred: biometric, manufacturer-specific commands, multi-part
-   messages, ACU-side file transfer. See [docs/PLAN.md](docs/PLAN.md) for
-   what's done and what's next.
+   Currently implemented: Layer 1 framing, the full v2.2 command/reply
+   set (baseline plus osdp_KEYSET / LSTAT / ISTAT / OSTAT / RSTAT /
+   ABORT / ACURXSIZE / KEEPACTIVE / MFG and their replies), PD-side
+   state machine (with SC), ACU-side state machine (with SC), PD-side
+   file transfer (osdp_FILETRANSFER / osdp_FTSTAT), and multi-part
+   transport (spec 5.10) carrying fragmented osdp_MFG.
+   Still deferred: biometric, PIV / credential-set messages and their
+   multi-part replies, multi-record messages, ACU-side file transfer.
+   See [docs/PLAN.md](docs/PLAN.md) for what's done and what's next.
 
 ## Module layout
 
@@ -534,8 +537,11 @@ that aren't explicit in the spec:
   but production binaries are expected to bind their own (mbedTLS,
   hardware AES, BCryptGenRandom / /dev/urandom, etc.).
 - ACU-side file transfer (the PD side is implemented; the ACU currently
-  has no file-send driver). Biometric, manufacturer-specific commands,
-  multi-part / multi-record messages, PIV data exchange.
+  has no file-send driver). Biometric, PIV data exchange and the rest of
+  the credential set (osdp_GENAUTH / osdp_CRAUTH / transparent-mode
+  osdp_XWR / osdp_XRD), and multi-record messages. Multi-part transport
+  itself is implemented, but only osdp_MFG rides it — extending it to a
+  deferred credential message means implementing that message first.
 - Auto-poll scheduling on the ACU (the application currently drives
   every command).
 

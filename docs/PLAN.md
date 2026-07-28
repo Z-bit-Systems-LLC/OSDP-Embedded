@@ -368,10 +368,102 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
 - Card-read format/parity options (today the value is sent MSB-aligned as
   Wiegand without computed parity, matching the `inject_raw` tool).
 
-## Iteration 6+ — Optional extensions (not yet planned)
+## Iteration 6 — PD completeness and full v2.2 command coverage (done)
 
-- File transfer, biometric, keypad extensions, manufacturer-specific
-  commands, multi-part messages, certifiable test harness.
+**Goal:** take the PD from "handles the baseline set" to "answers every
+v2.2 command an ACU can legally send," and stop the library from imposing
+ceilings the spec doesn't. Landed across two rounds; the architectural
+rules each one settled are written up in
+[../CLAUDE.md](../CLAUDE.md) rather than repeated here.
+
+### Round 1 — spec-conformance hardening (shipped in v0.1.27)
+
+- ☑ **`osdp_COMSET` fully supported.** Handled by the core, never reaching
+  `cmd_cb`: it builds the mandated `osdp_COM` reply, switches the address
+  only *after* the reply is sent (spec 6.13), and brackets the exchange
+  with optional `decide` / `applied` app hooks. The `applied` hook is where
+  the app drains the transmitter before retuning the UART baud — a
+  premature switch clocks out the tail of `osdp_COM` at the new rate.
+- ☑ **0x7F is the configuration address, not a working address.** The PD
+  accepts frames sent to either its own address or 0x7F, and replies to a
+  0x7F-addressed command at 0xFF (spec 5.9 Note 2). A COMSET arriving at
+  0x7F is the config-discovery flow.
+- ☑ **NAK policy per Table 47.** A bad-CRC/checksum frame addressed to this
+  PD is answered `osdp_NAK 0x01` instead of dropped, which required
+  `osdp_frame_decode` to surface frame identity *before* the integrity
+  check. Clear-text commands during (or expected before) an established
+  Secure Channel are answered `osdp_NAK 0x06` and tear the session down.
+  Malformed `osdp_KEYSET` NAKs 0x09 rather than 0x03.
+- ☑ **PD-side file transfer** (`osdp_FILETRANSFER` / `osdp_FTSTAT`),
+  handled entirely by the core in two modes over one app callback:
+  reassembly into a caller-owned buffer, or streaming fragment-by-fragment
+  with no size ceiling for flash-writing MCUs.
+
+### Round 2 — the PD-complete phases
+
+- ☑ **Phase 1: one dispatch path for every channel.**
+  `pd/src/pd_dispatch.c` decides the reply for one accepted command
+  whatever channel carried it; plaintext and SC funnel through it once the
+  payload is in the clear, and each caller frames the result its own way.
+  Anything added there works on both channels at once.
+- ☑ **Phase 2: caller-supplied buffers and no internal ceilings.**
+  One build-overridable constant per role (`OSDP_PD_BUF_LEN` 512,
+  `OSDP_ACU_BUF_LEN` 1440), rebindable at run time via
+  `osdp_pd_set_buffers`. `osdp_sc_wrap_frame` lost its 256-byte stack
+  scratch — it now encrypts directly into the output at the frame's payload
+  offset — so an SC message is limited only by bound capacity. Sizing
+  helpers (`osdp_frame_max_payload`, `osdp_sc_max_payload`,
+  `osdp_pd_max_reply_payload`) replace deriving overhead by hand, and each
+  is tested against what `build`/`wrap` actually accepts.
+- ☑ **Phase 3: the 13 remaining v2.2 codecs.** Commands `osdp_LSTAT`,
+  `ISTAT`, `OSTAT`, `RSTAT`, `ABORT`, `ACURXSIZE`, `KEEPACTIVE`, `MFG`;
+  replies `osdp_BUSY`, `FMT`, `MFGREP`, `MFGERRR`, `MFGSTATR`. With the
+  `*STATR` replies and `osdp_KEYSET` already in place, the v2.2 set is now
+  complete outside the deferred credential/biometric group.
+- ☑ **Phase 4: status providers, the poll-response event queue, and
+  Table 47 NAK mapping.** `osdp_pd_set_status_provider` lets the app own
+  the *values* in LSTAT/ISTAT/OSTAT/RSTAT replies while the library owns
+  the layout, per-member optional. `osdp_pd_set_event_queue` /
+  `osdp_pd_enqueue_event` hold RAW / FMT / KEYPAD / MFGREP until the ACU
+  next polls (caller-owned storage, compacting rather than wrapping,
+  emptied on the offline transition per 7.11/7.12). Handler return codes
+  now map to real wire replies instead of a silent drop that cost the ACU
+  a full reply timeout — including `osdp_BUSY`, the one reply that goes
+  out plaintext at SQN 0 even under SC and is never cached.
+- ☑ **Phase 5: advisory PDCAP consistency check.** `osdp_pd_check_pdcap`
+  validates the three capability records that describe the *library's*
+  limits (fn 9 AES128 with no crypto bound; fn 10 exceeding the stream
+  buffer or, under SC, the bound `rx_plain`; fn 11 against the multi-part
+  buffer). Own TU, nothing calls it automatically. Catches the Annex B
+  trap where codes 10/11 encode a 16-bit size LSB-then-MSB across bytes
+  named "compliance level" and "number of" everywhere else.
+- ☑ **Phase 6: multi-part transport (spec 5.10) carrying `osdp_MFG`.**
+  `core/src/shared/multipart.c` implements sequential-no-gaps
+  reassembly, first-fragment-at-0 (which makes a retry idempotent), and
+  early termination — with the two subtleties that the termination marker
+  must be recognised before the bounds check, and that MpSizeTotal 0 is
+  *not* a marker (all-zeros is the shape a truncated frame takes).
+  `osdp_MFG` is the only in-scope v2.2 message that uses it; because
+  nothing on the wire distinguishes a multi-part header from six bytes of
+  vendor data, binding `osdp_pd_set_mfg_receiver` is the manufacturer's
+  declaration that its protocol uses the standard format.
+- ☑ **`osdp-pd-mock` exercises the Phase 4/5 APIs**, so the live-interop
+  tool covers the new surface rather than just the baseline.
+
+## Iteration 7+ — Optional extensions (not yet planned)
+
+- Biometric, PIV data exchange, and the rest of the credential set
+  (`osdp_GENAUTH` / `osdp_CRAUTH` / transparent-mode `osdp_XWR` /
+  `osdp_XRD`) — all of which ride the multi-part transport that already
+  exists, so the work is the messages themselves.
+- Multi-record messages; multi-record reply convenience helpers.
+- ACU-side file transfer (a file-send driver); auto-poll scheduling on the
+  ACU.
+- Inter-character timeout policing (spec 5.8).
+- The deferred halves of file transfer: the "finishing" (status 3)
+  idle-fragment protocol and `FtUpdateMsgMax` throttling, both of which
+  need the app callback to stop being synchronous.
+- Certifiable test harness.
 - Full-capture replay: extend `test_capture_replay` from the handshake
   alone (SCS_11..14) to all 592 frames in `sc-monitor-current.osdpcap`,
   including SCS_15..18 operational traffic.
