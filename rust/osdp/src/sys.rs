@@ -1064,10 +1064,8 @@ mod pd_ffi {
         pub readers: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize>,
     }
 
-    pub type osdp_pd_abort_cb =
-        Option<unsafe extern "C" fn(user: *mut c_void) -> osdp_status_t>;
-    pub type osdp_pd_acurxsize_cb =
-        Option<unsafe extern "C" fn(user: *mut c_void, max_size: u16)>;
+    pub type osdp_pd_abort_cb = Option<unsafe extern "C" fn(user: *mut c_void) -> osdp_status_t>;
+    pub type osdp_pd_acurxsize_cb = Option<unsafe extern "C" fn(user: *mut c_void, max_size: u16)>;
     pub type osdp_pd_keepactive_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, time_ms: u16) -> osdp_status_t>;
 
@@ -1324,8 +1322,6 @@ mod acu_ffi {
         pub sc_cuid: [u8; OSDP_SC_CUID_LEN],
 
         pub sc_session: osdp_sc_session_t,
-
-        // Secure Channel 2 slot state (mirror of the C additions).
     }
 
     #[repr(C)]
