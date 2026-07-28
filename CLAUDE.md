@@ -38,15 +38,18 @@ seems to need a change, raise it explicitly with the user first.
 7. **Build system: CMake.** Test framework: **Unity** (vendored).
 8. **Scope: OSDP v2.2 baseline command/reply set, plus Secure Channel
    (SC1) and Secure Channel 2 (SC2).** Currently implemented: Layer 1
-   framing, the baseline command/reply set, PD-side state machine (with
-   SC1 + SC2), ACU-side state machine (with SC1 + SC2), and PD-side file
-   transfer (osdp_FILETRANSFER / osdp_FTSTAT). SC2 is the
-   quantum-resistant channel (AES-256-GCM + KMAC256) built as a parallel
-   implementation in the SCS_21..28 range; both sides are live-validated
-   against OSDP.Net's `feature/osdp-sc2`. Still deferred: biometric,
-   manufacturer-specific commands, multi-part messages, ACU-side file
-   transfer. See [docs/PLAN.md](docs/PLAN.md) for what's done and what's
-   next.
+   framing, the full v2.2 command/reply set (baseline plus osdp_KEYSET /
+   LSTAT / ISTAT / OSTAT / RSTAT / ABORT / ACURXSIZE / KEEPACTIVE / MFG
+   and their replies), PD-side state machine (with SC1 + SC2), ACU-side
+   state machine (with SC1 + SC2), PD-side file transfer
+   (osdp_FILETRANSFER / osdp_FTSTAT), and multi-part transport (spec
+   5.10) carrying fragmented osdp_MFG. SC2 is the quantum-resistant
+   channel (AES-256-GCM + KMAC256) built as a parallel implementation in
+   the SCS_21..28 range; both sides are live-validated against OSDP.Net's
+   `feature/osdp-sc2`. Still deferred: biometric, PIV / credential-set
+   messages and their multi-part replies, multi-record messages, ACU-side
+   file transfer. See [docs/PLAN.md](docs/PLAN.md) for what's done and
+   what's next.
 
 ## Module layout
 
@@ -147,18 +150,18 @@ references only one of them, the other gets GC'd.
 
 ## Buffer sizing and working buffers
 
-**One constant per role.** `OSDP_PD_BUF_LEN` and `OSDP_ACU_BUF_LEN` (both
-256 by default, both `#ifndef`-guarded so a build can override with `-D` or
-CMake `target_compile_definitions`) size every working buffer in `osdp_pd_t` /
+**One constant per role.** `OSDP_PD_BUF_LEN` (512) and `OSDP_ACU_BUF_LEN`
+(1440), both `#ifndef`-guarded so a build can override with `-D` or CMake
+`target_compile_definitions`, size every working buffer in `osdp_pd_t` /
 `osdp_acu_t`. A device is a PD or an ACU, rarely both, so one knob per role is
-enough — the roles are deliberately independent rather than sharing a value.
+enough. The roles default differently on purpose: a PD is the constrained end,
+an ACU is normally a host and is the side that receives whatever any PD sends.
 
 The same constant is what the role should advertise to its peer: the PD's
 **PDCAP function code 10** ("Receive BufferSize", spec B.11) and the ACU's
 **`osdp_ACURXSIZE`** (spec Table 28). Deriving the advertised capability from
 the constant that sizes the buffers means a device cannot promise its peer
-more than it can hold. (Neither is wired up yet — the `osdp_ACURXSIZE` codec
-lands in Phase 3 and PDCAP is still entirely app-supplied.)
+more than it can hold.
 
 `OSDP_STREAM_BUFFER_LEN` (1440 = spec max) is separate and also overridable.
 It is *wire-level* reassembly — big enough to resync through any legal frame,
@@ -446,11 +449,11 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   "finishing" (status 3) idle-fragment protocol and `FtUpdateMsgMax` throttling
   (the PD always reports `update_msg_max = 0`).
 - **`osdp_ABORT`** — handled entirely by the core. It tears down the
-  file-transfer state the spec requires terminated (6.22), then runs the
-  optional `osdp_pd_set_abort_handler` hook for application-side work the core
-  cannot know about. ACK by default; a hook returning non-OK becomes NAK 0x03,
-  the spec's "PD unable to abort" case (a firmware update past the point of no
-  return being its example).
+  file-transfer and multi-part state the spec requires terminated (6.22), then
+  runs the optional `osdp_pd_set_abort_handler` hook for application-side work
+  the core cannot know about. ACK by default; a hook returning non-OK becomes
+  NAK 0x03, the spec's "PD unable to abort" case (a firmware update past the
+  point of no return being its example).
 - **`osdp_ACURXSIZE`** — handled entirely by the core: it stores the ACU's
   declared receive capacity (`osdp_pd_acu_rx_size`, seeded to
   `OSDP_PD_DEFAULT_ACU_RX_SIZE` = 128 per spec 6.26) and ACKs. The optional
@@ -462,10 +465,10 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   `osdp_pd_set_keepactive_handler`. Unlike the hooks above, with **no** handler
   the PD NAKs 0x03: holding a reader field energised is physical, so an ACK the
   PD cannot honour would be a lie.
-- **`osdp_MFG` is deliberately NOT intercepted.** The content is
-  vendor-defined, so it flows to `cmd_cb`, which returns
-  `reply.code = OSDP_REPLY_MFGREP` with a body built by `osdp_mfgrep_build`.
-  See `docs/PD_GUIDE.md` for the pattern.
+- **`osdp_MFG` is deliberately NOT intercepted** unless a multi-part receiver
+  is bound. The content is vendor-defined, so it flows to `cmd_cb`, which
+  returns `reply.code = OSDP_REPLY_MFGREP` with a body built by
+  `osdp_mfgrep_build`. See `docs/PD_GUIDE.md` for the pattern.
 
 ## Coding rules
 
@@ -678,8 +681,11 @@ that differ from SC1:
   but production binaries are expected to bind their own (mbedTLS,
   hardware AES, BCryptGenRandom / /dev/urandom, etc.).
 - ACU-side file transfer (the PD side is implemented; the ACU currently
-  has no file-send driver). Biometric, manufacturer-specific commands,
-  multi-part / multi-record messages, PIV data exchange.
+  has no file-send driver). Biometric, PIV data exchange and the rest of
+  the credential set (osdp_GENAUTH / osdp_CRAUTH / transparent-mode
+  osdp_XWR / osdp_XRD), and multi-record messages. Multi-part transport
+  itself is implemented, but only osdp_MFG rides it — extending it to a
+  deferred credential message means implementing that message first.
 - Auto-poll scheduling on the ACU (the application currently drives
   every command).
 

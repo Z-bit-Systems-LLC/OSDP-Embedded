@@ -44,10 +44,11 @@ channel):
   status providers answering `osdp_LSTAT`/`ISTAT`/`OSTAT`/`RSTAT`, a
   caller-owned poll-response queue for `osdp_RAW`/`KEYPAD`/`FMT`/`MFGREP`
   (emptied on a comms loss per spec 7.11/7.12), `osdp_BUSY` with its
-  sequence-0 / outside-the-secure-channel / not-cached rules, plus
-  library-handled `osdp_ABORT`, `osdp_ACURXSIZE` and `osdp_KEEPACTIVE`.
-  A command handler's return maps onto the spec's Table 47 NAK codes
-  instead of being dropped silently.
+  sequence-0 / outside-the-secure-channel / not-cached rules, multi-part
+  message transport (spec 5.10) with fragmented `osdp_MFG` reassembly,
+  plus library-handled `osdp_ABORT`, `osdp_ACURXSIZE` and
+  `osdp_KEEPACTIVE`. A command handler's return maps onto the spec's
+  Table 47 NAK codes instead of being dropped silently.
 - **ACU-side state machine** (`osdp::acu`): multi-PD slot management,
   per-PD SQN, reply/timeout callbacks, optional SC1 or SC2 handshake
   (fire-and-forget) and operational traffic with automatic session-loss

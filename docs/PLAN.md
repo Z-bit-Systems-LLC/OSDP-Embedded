@@ -368,6 +368,40 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
 - Card-read format/parity options (today the value is sent MSB-aligned as
   Wiegand without computed parity, matching the `inject_raw` tool).
 
+## Iteration 6 — Spec-conformance hardening (done, shipped in v0.1.27)
+
+The round of PD conformance fixes that landed on `main` before the
+Iteration 9 phase work began, and that this branch absorbed via Iteration 9
+Phase 0. Recorded here because the roadmap never captured them, and because
+they are the reason several Iteration 9 phases could assume the behaviour
+they do.
+
+- ☑ **`osdp_COMSET` fully supported.** Handled by the core, never reaching
+  `cmd_cb`: it builds the mandated `osdp_COM` reply, switches the address
+  only *after* the reply is sent (spec 6.13), and brackets the exchange
+  with optional `decide` / `applied` app hooks. The `applied` hook is where
+  the app drains the transmitter before retuning the UART baud — a
+  premature switch clocks out the tail of `osdp_COM` at the new rate.
+- ☑ **0x7F is the configuration address, not a working address.** The PD
+  accepts frames sent to either its own address or 0x7F, and replies to a
+  0x7F-addressed command at 0xFF (spec 5.9 Note 2). A COMSET arriving at
+  0x7F is the config-discovery flow.
+- ☑ **NAK policy per Table 47.** A bad-CRC/checksum frame addressed to this
+  PD is answered `osdp_NAK 0x01` instead of dropped, which required
+  `osdp_frame_decode` to surface frame identity *before* the integrity
+  check. Clear-text commands during (or expected before) an established
+  Secure Channel are answered `osdp_NAK 0x06` and tear the session down.
+  Malformed `osdp_KEYSET` NAKs 0x09 rather than 0x03.
+- ☑ **PD-side file transfer** (`osdp_FILETRANSFER` / `osdp_FTSTAT`),
+  handled entirely by the core in two modes over one app callback:
+  reassembly into a caller-owned buffer, or streaming fragment-by-fragment
+  with no size ceiling for flash-writing MCUs.
+
+The phase-by-phase record of the work that followed — unified dispatch,
+caller-supplied buffers, the remaining v2.2 codecs, status providers, the
+event queue, the PDCAP check and multi-part — is Iteration 9 below, which
+tracks it against this branch rather than against `main`.
+
 ## Iteration 7 — Secure Channel 2 (in progress)
 
 **Goal:** OSDP-SC2, the quantum-resistant secure channel (AES-256-GCM
@@ -687,10 +721,20 @@ validation at the end of the plan.
   for the status provider / event queue / BUSY, and osdp-mcp collapsing its
   own Rust-side queue and hard-coded LSTATR onto the new core APIs.
 
-## Iteration 6+ — Optional extensions (not yet planned)
+## Iteration 10+ — Optional extensions (not yet planned)
 
-- File transfer, biometric, keypad extensions, manufacturer-specific
-  commands, multi-part messages, certifiable test harness.
+- Biometric, PIV data exchange, and the rest of the credential set
+  (`osdp_GENAUTH` / `osdp_CRAUTH` / transparent-mode `osdp_XWR` /
+  `osdp_XRD`) — all of which ride the multi-part transport that already
+  exists, so the work is the messages themselves.
+- Multi-record messages; multi-record reply convenience helpers.
+- ACU-side file transfer (a file-send driver); auto-poll scheduling on the
+  ACU.
+- Inter-character timeout policing (spec 5.8).
+- The deferred halves of file transfer: the "finishing" (status 3)
+  idle-fragment protocol and `FtUpdateMsgMax` throttling, both of which
+  need the app callback to stop being synchronous.
+- Certifiable test harness.
 - Full-capture replay: extend `test_capture_replay` from the handshake
   alone (SCS_11..14) to all 592 frames in `sc-monitor-current.osdpcap`,
   including SCS_15..18 operational traffic.
