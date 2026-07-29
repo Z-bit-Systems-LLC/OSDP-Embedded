@@ -25,10 +25,10 @@ use std::rc::Rc;
 
 use osdp_embedded::acu::{Acu, ReplyEvent, ReplyHandler};
 use osdp_embedded::messages::{
-    PdcapRecord, Raw, OSDP_CMD_ABORT, OSDP_CMD_ACURXSIZE, OSDP_CMD_ISTAT, OSDP_CMD_KEEPACTIVE,
-    OSDP_CMD_LSTAT, OSDP_CMD_MFG, OSDP_CMD_POLL, OSDP_ISTATR_ACTIVE, OSDP_LSTATR_NORMAL,
-    OSDP_LSTATR_TAMPER, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_ISTATR, OSDP_REPLY_LSTATR,
-    OSDP_REPLY_MFGREP, OSDP_REPLY_NAK, OSDP_REPLY_RAW,
+    Mfgrep, PdcapRecord, Raw, OSDP_CMD_ABORT, OSDP_CMD_ACURXSIZE, OSDP_CMD_ISTAT,
+    OSDP_CMD_KEEPACTIVE, OSDP_CMD_LSTAT, OSDP_CMD_MFG, OSDP_CMD_POLL, OSDP_ISTATR_ACTIVE,
+    OSDP_LSTATR_NORMAL, OSDP_LSTATR_TAMPER, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK,
+    OSDP_REPLY_ISTATR, OSDP_REPLY_LSTATR, OSDP_REPLY_MFGREP, OSDP_REPLY_NAK, OSDP_REPLY_RAW,
 };
 use osdp_embedded::pd::{
     CommandHandler, MfgReceiver, Pd, Reply, StatusProviders, DEFAULT_ACU_RX_SIZE,
@@ -448,9 +448,14 @@ fn mfg_receiver_can_answer_with_mfgrep() {
     let (mut pd, mut acu, captured, _log) = rig();
 
     const VENDOR: [u8; 3] = [0x5A, 0x42, 0x43];
-    // osdp_MFGREP body is vendor_code[3] || vendor data. Hand-encoded here
-    // because the typed codec wrapper for it is not in `messages` yet.
-    let body: Vec<u8> = VENDOR.iter().copied().chain([0xAB, 0xCD]).collect();
+    let mut encoded = [0u8; 32];
+    let n = Mfgrep {
+        vendor_code: VENDOR,
+        data: &[0xAB, 0xCD],
+    }
+    .build(&mut encoded)
+    .expect("build MFGREP body");
+    let body = encoded[..n].to_vec();
 
     pd.set_mfg_receiver(256, Responder { body: body.clone() });
 

@@ -311,6 +311,28 @@ pub struct osdp_comset_cmd_t {
     pub baud_rate: u32,
 }
 
+pub const OSDP_MFG_VENDOR_CODE_BYTES: usize = 3;
+pub const OSDP_MFG_HEADER_BYTES: usize = OSDP_MFG_VENDOR_CODE_BYTES;
+
+#[repr(C)]
+pub struct osdp_mfg_cmd_t {
+    pub vendor_code: [u8; OSDP_MFG_VENDOR_CODE_BYTES],
+    pub data: *const u8,
+    pub data_len: usize,
+}
+
+#[repr(C)]
+pub struct osdp_acurxsize_cmd_t {
+    /// ACURX_BUFSIZE — 16-bit little-endian on the wire.
+    pub max_size: u16,
+}
+
+#[repr(C)]
+pub struct osdp_keepactive_cmd_t {
+    /// Milliseconds, 16-bit little-endian on the wire. 0 cancels.
+    pub time_ms: u16,
+}
+
 extern "C" {
     pub fn osdp_poll_decode(payload: *const u8, len: usize) -> osdp_status_t;
     pub fn osdp_poll_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
@@ -421,6 +443,55 @@ extern "C" {
     ) -> osdp_status_t;
     pub fn osdp_filetransfer_build(
         in_: *const osdp_filetransfer_cmd_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    // Status-report requests and osdp_ABORT — all four carry an empty
+    // payload, so decode only validates the length and build only emits it.
+    pub fn osdp_lstat_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_lstat_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+    pub fn osdp_istat_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_istat_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+    pub fn osdp_ostat_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_ostat_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+    pub fn osdp_rstat_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_rstat_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+    pub fn osdp_abort_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_abort_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+
+    pub fn osdp_acurxsize_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_acurxsize_cmd_t,
+    ) -> osdp_status_t;
+    pub fn osdp_acurxsize_build(
+        in_: *const osdp_acurxsize_cmd_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_keepactive_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_keepactive_cmd_t,
+    ) -> osdp_status_t;
+    pub fn osdp_keepactive_build(
+        in_: *const osdp_keepactive_cmd_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_mfg_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_mfg_cmd_t,
+    ) -> osdp_status_t;
+    pub fn osdp_mfg_build(
+        in_: *const osdp_mfg_cmd_t,
         buf: *mut u8,
         buf_cap: usize,
         written: *mut usize,
@@ -676,6 +747,50 @@ pub struct osdp_ftstat_t {
     pub update_msg_max: u16,
 }
 
+pub const OSDP_LSTATR_PAYLOAD_BYTES: usize = 2;
+
+#[repr(C)]
+pub struct osdp_lstatr_t {
+    pub tamper: u8,
+    pub power: u8,
+}
+
+pub const OSDP_FMT_HEADER_BYTES: usize = 3;
+pub const OSDP_FMT_DIR_FORWARD: u8 = 0x01;
+pub const OSDP_FMT_DIR_REVERSE: u8 = 0x02;
+
+#[repr(C)]
+pub struct osdp_fmt_t {
+    pub reader_no: u8,
+    pub direction: u8,
+    pub char_count: u8,
+    pub chars: *const u8,
+    pub chars_len: usize,
+}
+
+pub const OSDP_MFGREP_VENDOR_CODE_BYTES: usize = 3;
+pub const OSDP_MFGREP_HEADER_BYTES: usize = OSDP_MFGREP_VENDOR_CODE_BYTES;
+
+#[repr(C)]
+pub struct osdp_mfgrep_t {
+    pub vendor_code: [u8; OSDP_MFGREP_VENDOR_CODE_BYTES],
+    pub data: *const u8,
+    pub data_len: usize,
+}
+
+pub const OSDP_MFGSTATR_PAYLOAD_BYTES: usize = 1;
+pub const OSDP_MFGERRR_PAYLOAD_BYTES: usize = 1;
+
+#[repr(C)]
+pub struct osdp_mfgstatr_t {
+    pub data: u8,
+}
+
+#[repr(C)]
+pub struct osdp_mfgerrr_t {
+    pub data: u8,
+}
+
 extern "C" {
     pub fn osdp_ack_decode(payload: *const u8, len: usize) -> osdp_status_t;
     pub fn osdp_ack_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
@@ -747,6 +862,112 @@ extern "C" {
     ) -> osdp_status_t;
     pub fn osdp_ftstat_build(
         in_: *const osdp_ftstat_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_lstatr_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_lstatr_t,
+    ) -> osdp_status_t;
+    pub fn osdp_lstatr_build(
+        in_: *const osdp_lstatr_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    // The three array-valued reports share one shape: decode fills a
+    // caller-owned status array, build takes one.
+    pub fn osdp_istatr_decode(
+        payload: *const u8,
+        len: usize,
+        statuses: *mut u8,
+        statuses_cap: usize,
+        statuses_written: *mut usize,
+    ) -> osdp_status_t;
+    pub fn osdp_istatr_build(
+        statuses: *const u8,
+        count: usize,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_ostatr_decode(
+        payload: *const u8,
+        len: usize,
+        statuses: *mut u8,
+        statuses_cap: usize,
+        statuses_written: *mut usize,
+    ) -> osdp_status_t;
+    pub fn osdp_ostatr_build(
+        statuses: *const u8,
+        count: usize,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_rstatr_decode(
+        payload: *const u8,
+        len: usize,
+        statuses: *mut u8,
+        statuses_cap: usize,
+        statuses_written: *mut usize,
+    ) -> osdp_status_t;
+    pub fn osdp_rstatr_build(
+        statuses: *const u8,
+        count: usize,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_busy_decode(payload: *const u8, len: usize) -> osdp_status_t;
+    pub fn osdp_busy_build(buf: *mut u8, buf_cap: usize, written: *mut usize) -> osdp_status_t;
+
+    pub fn osdp_fmt_decode(payload: *const u8, len: usize, out: *mut osdp_fmt_t) -> osdp_status_t;
+    pub fn osdp_fmt_build(
+        in_: *const osdp_fmt_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_mfgrep_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_mfgrep_t,
+    ) -> osdp_status_t;
+    pub fn osdp_mfgrep_build(
+        in_: *const osdp_mfgrep_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_mfgstatr_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_mfgstatr_t,
+    ) -> osdp_status_t;
+    pub fn osdp_mfgstatr_build(
+        in_: *const osdp_mfgstatr_t,
+        buf: *mut u8,
+        buf_cap: usize,
+        written: *mut usize,
+    ) -> osdp_status_t;
+
+    pub fn osdp_mfgerrr_decode(
+        payload: *const u8,
+        len: usize,
+        out: *mut osdp_mfgerrr_t,
+    ) -> osdp_status_t;
+    pub fn osdp_mfgerrr_build(
+        in_: *const osdp_mfgerrr_t,
         buf: *mut u8,
         buf_cap: usize,
         written: *mut usize,

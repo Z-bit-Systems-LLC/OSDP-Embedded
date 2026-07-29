@@ -40,6 +40,8 @@ pub use sys::{
     OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_MFG, OSDP_CMD_OSTAT, OSDP_CMD_OUT,
     OSDP_CMD_POLL, OSDP_CMD_RSTAT, OSDP_CMD_SCRYPT, OSDP_CMD_TEXT,
 };
+// Direction bytes for osdp_FMT.
+pub use sys::{OSDP_FMT_DIR_FORWARD, OSDP_FMT_DIR_REVERSE};
 // Status bytes for the four *STATR reports — the values a
 // [`crate::pd::StatusProviders`] hands back.
 pub use sys::{
@@ -913,6 +915,445 @@ impl Ftstat {
 }
 
 // ========================================================================
+// Status-report requests (empty payload)
+// ========================================================================
+
+/// Generate the `decode`/`build` pair for a command or reply whose payload is
+/// empty — the codec only validates that nothing extra arrived, and builds
+/// zero bytes. Six messages share that shape exactly.
+macro_rules! empty_payload_message {
+    ($(#[$meta:meta])* $name:ident, $decode:ident, $build:ident) => {
+        $(#[$meta])*
+        #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+        pub struct $name;
+
+        impl $name {
+            pub fn decode(payload: &[u8]) -> Result<Self> {
+                let s = unsafe { sys::$decode(payload.as_ptr(), payload.len()) };
+                Error::from_status(s).map(|_| Self)
+            }
+
+            pub fn build(out: &mut [u8]) -> Result<usize> {
+                let mut written: usize = 0;
+                let s = unsafe { sys::$build(out.as_mut_ptr(), out.len(), &mut written) };
+                Error::from_status(s)?;
+                Ok(written)
+            }
+        }
+    };
+}
+
+empty_payload_message!(
+    /// `osdp_LSTAT` (0x64) — request local status; answered by `osdp_LSTATR`.
+    Lstat,
+    osdp_lstat_decode,
+    osdp_lstat_build
+);
+empty_payload_message!(
+    /// `osdp_ISTAT` (0x65) — request input status; answered by `osdp_ISTATR`.
+    Istat,
+    osdp_istat_decode,
+    osdp_istat_build
+);
+empty_payload_message!(
+    /// `osdp_OSTAT` (0x66) — request output status; answered by `osdp_OSTATR`.
+    Ostat,
+    osdp_ostat_decode,
+    osdp_ostat_build
+);
+empty_payload_message!(
+    /// `osdp_RSTAT` (0x67) — request reader status; answered by `osdp_RSTATR`.
+    Rstat,
+    osdp_rstat_decode,
+    osdp_rstat_build
+);
+empty_payload_message!(
+    /// `osdp_ABORT` (0xA2) — terminate any multi-part message or file
+    /// transfer in progress (spec 6.22).
+    Abort,
+    osdp_abort_decode,
+    osdp_abort_build
+);
+empty_payload_message!(
+    /// `osdp_BUSY` (0x79) — "not ready, repeat the command" (spec 7.19).
+    ///
+    /// The one reply that leaves its channel: it always goes out at sequence
+    /// number 0, stays plaintext even during an established Secure Channel,
+    /// and is never cached as the retransmit answer.
+    Busy,
+    osdp_busy_decode,
+    osdp_busy_build
+);
+
+// ========================================================================
+// Remaining v2.2 commands
+// ========================================================================
+
+/// `osdp_ACURXSIZE` (0x7B) — the ACU declares its receive capacity
+/// (spec 6.20).
+///
+/// This bounds what the PD may *send*; it is the mirror of the PD
+/// advertising PDCAP function code 10.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct AcuRxSize {
+    /// ACURX_BUFSIZE, 16-bit little-endian on the wire.
+    pub max_size: u16,
+}
+
+impl AcuRxSize {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_acurxsize_cmd_t>::zeroed();
+        let s = unsafe {
+            sys::osdp_acurxsize_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr())
+        };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            max_size: r.max_size,
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_acurxsize_cmd_t {
+            max_size: self.max_size,
+        };
+        let mut written: usize = 0;
+        let s =
+            unsafe { sys::osdp_acurxsize_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// `osdp_KEEPACTIVE` (0xA7) — hold reader operations open for `time_ms`
+/// milliseconds so a credential still in the field is not dropped
+/// (spec 6.21). A time of 0 cancels a previous extension and is legal.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct KeepActive {
+    /// Milliseconds, 16-bit little-endian on the wire.
+    pub time_ms: u16,
+}
+
+impl KeepActive {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_keepactive_cmd_t>::zeroed();
+        let s = unsafe {
+            sys::osdp_keepactive_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr())
+        };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self { time_ms: r.time_ms })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_keepactive_cmd_t {
+            time_ms: self.time_ms,
+        };
+        let mut written: usize = 0;
+        let s =
+            unsafe { sys::osdp_keepactive_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// `osdp_MFG` (0x80) — manufacturer-specific command: a 3-byte IEEE MA-L
+/// vendor code followed by vendor-defined data.
+///
+/// This codec covers the *unfragmented* form. A vendor protocol that uses
+/// spec 5.10 multi-part transport puts the header after the vendor code —
+/// see [`crate::pd::MfgReceiver`], which reassembles that case.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Mfg<'a> {
+    pub vendor_code: [u8; 3],
+    pub data: &'a [u8],
+}
+
+impl<'a> Mfg<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_mfg_cmd_t>::zeroed();
+        let s = unsafe { sys::osdp_mfg_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            vendor_code: r.vendor_code,
+            data: unsafe { slice_from_raw_or_empty(r.data, r.data_len) },
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_mfg_cmd_t {
+            vendor_code: self.vendor_code,
+            data: if self.data.is_empty() {
+                ptr::null()
+            } else {
+                self.data.as_ptr()
+            },
+            data_len: self.data.len(),
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_mfg_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+// ========================================================================
+// Status reports
+// ========================================================================
+
+/// `osdp_LSTATR` (0x48) — local status: tamper and power (spec Table 50).
+/// `0x00` is the healthy state for both bytes.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Lstatr {
+    pub tamper: u8,
+    pub power: u8,
+}
+
+impl Lstatr {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_lstatr_t>::zeroed();
+        let s =
+            unsafe { sys::osdp_lstatr_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            tamper: r.tamper,
+            power: r.power,
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_lstatr_t {
+            tamper: self.tamper,
+            power: self.power,
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_lstatr_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// Generate the wrapper for a status report that is just one status byte per
+/// object — `osdp_ISTATR`, `OSTATR` and `RSTATR` differ only in what the byte
+/// values mean.
+macro_rules! status_array_message {
+    ($(#[$meta:meta])* $name:ident, $decode:ident, $build:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, Eq, PartialEq, Debug, Default)]
+        pub struct $name {
+            pub statuses: Vec<u8>,
+        }
+
+        impl $name {
+            /// Decode into an owned `Vec`. A report with no objects is legal
+            /// and decodes to an empty vector.
+            pub fn decode(payload: &[u8]) -> Result<Self> {
+                // One status byte per object, so the payload length is an
+                // exact upper bound on the count.
+                let mut statuses = alloc::vec![0u8; payload.len()];
+                let mut written: usize = 0;
+                let s = unsafe {
+                    sys::$decode(
+                        payload.as_ptr(),
+                        payload.len(),
+                        statuses.as_mut_ptr(),
+                        statuses.len(),
+                        &mut written,
+                    )
+                };
+                Error::from_status(s)?;
+                statuses.truncate(written);
+                Ok(Self { statuses })
+            }
+
+            pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+                let mut written: usize = 0;
+                let s = unsafe {
+                    sys::$build(
+                        if self.statuses.is_empty() {
+                            ptr::null()
+                        } else {
+                            self.statuses.as_ptr()
+                        },
+                        self.statuses.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                        &mut written,
+                    )
+                };
+                Error::from_status(s)?;
+                Ok(written)
+            }
+        }
+    };
+}
+
+status_array_message!(
+    /// `osdp_ISTATR` (0x49) — one `OSDP_ISTATR_*` byte per input.
+    Istatr,
+    osdp_istatr_decode,
+    osdp_istatr_build
+);
+status_array_message!(
+    /// `osdp_OSTATR` (0x4A) — one `OSDP_OSTATR_*` byte per output.
+    Ostatr,
+    osdp_ostatr_decode,
+    osdp_ostatr_build
+);
+status_array_message!(
+    /// `osdp_RSTATR` (0x4B) — one `OSDP_RSTATR_*` byte per reader.
+    Rstatr,
+    osdp_rstatr_decode,
+    osdp_rstatr_build
+);
+
+// ========================================================================
+// Remaining v2.2 replies
+// ========================================================================
+
+/// `osdp_FMT` (0x51) — card data in character-array format (spec 7.11).
+///
+/// **Deprecated by the spec**; wrapped so a Monitor can decode existing
+/// traffic. New PD code should report card data as [`Raw`].
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Fmt<'a> {
+    pub reader_no: u8,
+    /// [`OSDP_FMT_DIR_FORWARD`] / [`OSDP_FMT_DIR_REVERSE`].
+    pub direction: u8,
+    /// ASCII characters; must match `char_count` on the wire.
+    pub chars: &'a [u8],
+}
+
+impl<'a> Fmt<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_fmt_t>::zeroed();
+        let s = unsafe { sys::osdp_fmt_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            reader_no: r.reader_no,
+            direction: r.direction,
+            chars: unsafe { slice_from_raw_or_empty(r.chars, r.chars_len) },
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_fmt_t {
+            reader_no: self.reader_no,
+            direction: self.direction,
+            // The C codec validates that char_count matches chars_len, so
+            // deriving it here keeps the two from ever disagreeing.
+            char_count: self.chars.len() as u8,
+            chars: if self.chars.is_empty() {
+                ptr::null()
+            } else {
+                self.chars.as_ptr()
+            },
+            chars_len: self.chars.len(),
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_fmt_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// `osdp_MFGREP` (0x90) — manufacturer-specific reply (spec 7.18). Same shape
+/// as [`Mfg`]: a 3-byte vendor code then vendor-defined data. Sent either in
+/// answer to an `osdp_MFG` or unprompted as a poll response.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Mfgrep<'a> {
+    pub vendor_code: [u8; 3],
+    pub data: &'a [u8],
+}
+
+impl<'a> Mfgrep<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut raw = MaybeUninit::<sys::osdp_mfgrep_t>::zeroed();
+        let s =
+            unsafe { sys::osdp_mfgrep_decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr()) };
+        Error::from_status(s)?;
+        let r = unsafe { raw.assume_init() };
+        Ok(Self {
+            vendor_code: r.vendor_code,
+            data: unsafe { slice_from_raw_or_empty(r.data, r.data_len) },
+        })
+    }
+
+    pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+        let raw = sys::osdp_mfgrep_t {
+            vendor_code: self.vendor_code,
+            data: if self.data.is_empty() {
+                ptr::null()
+            } else {
+                self.data.as_ptr()
+            },
+            data_len: self.data.len(),
+        };
+        let mut written: usize = 0;
+        let s = unsafe { sys::osdp_mfgrep_build(&raw, out.as_mut_ptr(), out.len(), &mut written) };
+        Error::from_status(s)?;
+        Ok(written)
+    }
+}
+
+/// Generate the wrapper for a one-vendor-byte reply — `osdp_MFGSTATR` and
+/// `osdp_MFGERRR` are identical in shape.
+macro_rules! single_byte_message {
+    ($(#[$meta:meta])* $name:ident, $ctype:ident, $decode:ident, $build:ident) => {
+        $(#[$meta])*
+        #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+        pub struct $name {
+            /// Vendor defined.
+            pub data: u8,
+        }
+
+        impl $name {
+            pub fn decode(payload: &[u8]) -> Result<Self> {
+                let mut raw = MaybeUninit::<sys::$ctype>::zeroed();
+                let s = unsafe {
+                    sys::$decode(payload.as_ptr(), payload.len(), raw.as_mut_ptr())
+                };
+                Error::from_status(s)?;
+                Ok(Self { data: unsafe { raw.assume_init() }.data })
+            }
+
+            pub fn build(&self, out: &mut [u8]) -> Result<usize> {
+                let raw = sys::$ctype { data: self.data };
+                let mut written: usize = 0;
+                let s = unsafe {
+                    sys::$build(&raw, out.as_mut_ptr(), out.len(), &mut written)
+                };
+                Error::from_status(s)?;
+                Ok(written)
+            }
+        }
+    };
+}
+
+single_byte_message!(
+    /// `osdp_MFGSTATR` (0x83) — one vendor-defined status byte (spec 7.23).
+    ///
+    /// **Deprecated**: the spec calls it "incomplete or incorrect" and will
+    /// redefine it in v2.3.0. Wrapped so the code is not a silent hole and a
+    /// Monitor can decode it; new PD code should not emit it.
+    Mfgstatr,
+    osdp_mfgstatr_t,
+    osdp_mfgstatr_decode,
+    osdp_mfgstatr_build
+);
+single_byte_message!(
+    /// `osdp_MFGERRR` (0x84) — one vendor-defined error byte (spec 7.24).
+    /// Deprecated on the same terms as [`Mfgstatr`].
+    Mfgerrr,
+    osdp_mfgerrr_t,
+    osdp_mfgerrr_decode,
+    osdp_mfgerrr_build
+);
+
+// ========================================================================
 // Internals
 // ========================================================================
 
@@ -1106,5 +1547,164 @@ mod tests {
         assert_eq!(decoded.delay_ms, 250);
         assert_eq!(decoded.update_msg_max, 128);
         assert_eq!(decoded.action, OSDP_FTSTAT_ACTION_INTERLEAVE_OK);
+    }
+
+    // ---- The v2.2 codecs added by the PD-completion work --------------
+
+    #[test]
+    fn empty_payload_messages_round_trip_and_reject_trailing_bytes() {
+        // All six build nothing and accept nothing — assert that as a group
+        // so a codec that silently grew a payload is caught.
+        assert_eq!(round_trip(Lstat::build).len(), 0);
+        assert_eq!(round_trip(Istat::build).len(), 0);
+        assert_eq!(round_trip(Ostat::build).len(), 0);
+        assert_eq!(round_trip(Rstat::build).len(), 0);
+        assert_eq!(round_trip(Abort::build).len(), 0);
+        assert_eq!(round_trip(Busy::build).len(), 0);
+
+        assert!(Lstat::decode(&[]).is_ok());
+        assert!(Abort::decode(&[]).is_ok());
+        assert!(Busy::decode(&[]).is_ok());
+
+        // A stray byte is a malformed frame, not something to ignore.
+        assert!(Lstat::decode(&[0x00]).is_err());
+        assert!(Istat::decode(&[0x00]).is_err());
+        assert!(Ostat::decode(&[0x00]).is_err());
+        assert!(Rstat::decode(&[0x00]).is_err());
+        assert!(Abort::decode(&[0x00]).is_err());
+        assert!(Busy::decode(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn acurxsize_round_trip_is_little_endian() {
+        let bytes = round_trip(|b| AcuRxSize { max_size: 0x0640 }.build(b));
+        assert_eq!(bytes, [0x40, 0x06], "ACURX_BUFSIZE is 16-bit LE");
+        assert_eq!(AcuRxSize::decode(&bytes).unwrap().max_size, 0x0640);
+        assert!(AcuRxSize::decode(&[0x40]).is_err(), "truncated");
+    }
+
+    #[test]
+    fn keepactive_round_trip_including_the_zero_cancel() {
+        let bytes = round_trip(|b| KeepActive { time_ms: 5000 }.build(b));
+        assert_eq!(KeepActive::decode(&bytes).unwrap().time_ms, 5000);
+
+        // 0 is a legal value — it cancels a previous extension.
+        let zero = round_trip(|b| KeepActive { time_ms: 0 }.build(b));
+        assert_eq!(KeepActive::decode(&zero).unwrap().time_ms, 0);
+
+        assert!(KeepActive::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn mfg_round_trip_keeps_vendor_code_and_data_separate() {
+        let m = Mfg {
+            vendor_code: [0x5A, 0x42, 0x43],
+            data: &[0x11, 0x22, 0x33],
+        };
+        let bytes = round_trip(|b| m.build(b));
+        assert_eq!(bytes, [0x5A, 0x42, 0x43, 0x11, 0x22, 0x33]);
+
+        let decoded = Mfg::decode(&bytes).unwrap();
+        assert_eq!(decoded.vendor_code, [0x5A, 0x42, 0x43]);
+        assert_eq!(decoded.data, &[0x11, 0x22, 0x33]);
+
+        // Vendor code alone (no data) is legal; two bytes is not.
+        assert!(Mfg::decode(&[0x5A, 0x42, 0x43]).is_ok());
+        assert!(Mfg::decode(&[0x5A, 0x42]).is_err());
+    }
+
+    #[test]
+    fn lstatr_round_trip() {
+        let bytes = round_trip(|b| {
+            Lstatr {
+                tamper: OSDP_LSTATR_TAMPER,
+                power: OSDP_LSTATR_NORMAL,
+            }
+            .build(b)
+        });
+        assert_eq!(bytes, [OSDP_LSTATR_TAMPER, OSDP_LSTATR_NORMAL]);
+        let decoded = Lstatr::decode(&bytes).unwrap();
+        assert_eq!(decoded.tamper, OSDP_LSTATR_TAMPER);
+        assert_eq!(decoded.power, OSDP_LSTATR_NORMAL);
+        assert!(Lstatr::decode(&[0x00]).is_err(), "needs both bytes");
+    }
+
+    #[test]
+    fn status_array_reports_round_trip_including_the_empty_case() {
+        let statuses = vec![OSDP_ISTATR_ACTIVE, OSDP_ISTATR_INACTIVE, OSDP_ISTATR_FAULT];
+        let bytes = round_trip(|b| {
+            Istatr {
+                statuses: statuses.clone(),
+            }
+            .build(b)
+        });
+        assert_eq!(Istatr::decode(&bytes).unwrap().statuses, statuses);
+
+        let o = vec![OSDP_OSTATR_ACTIVE, OSDP_OSTATR_INACTIVE];
+        let bytes = round_trip(|b| {
+            Ostatr {
+                statuses: o.clone(),
+            }
+            .build(b)
+        });
+        assert_eq!(Ostatr::decode(&bytes).unwrap().statuses, o);
+
+        let r = vec![OSDP_RSTATR_NORMAL, OSDP_RSTATR_TAMPER];
+        let bytes = round_trip(|b| {
+            Rstatr {
+                statuses: r.clone(),
+            }
+            .build(b)
+        });
+        assert_eq!(Rstatr::decode(&bytes).unwrap().statuses, r);
+
+        // A PD with no inputs genuinely has nothing to report, and an empty
+        // report must survive the round trip rather than being an error.
+        let bytes = round_trip(|b| Istatr::default().build(b));
+        assert!(bytes.is_empty());
+        assert!(Istatr::decode(&bytes).unwrap().statuses.is_empty());
+    }
+
+    #[test]
+    fn fmt_round_trip_derives_char_count_from_the_slice() {
+        let f = Fmt {
+            reader_no: 0,
+            direction: OSDP_FMT_DIR_FORWARD,
+            chars: b"12345",
+        };
+        let bytes = round_trip(|b| f.build(b));
+        assert_eq!(bytes[2], 5, "char_count must match the slice length");
+
+        let decoded = Fmt::decode(&bytes).unwrap();
+        assert_eq!(decoded.chars, b"12345");
+        assert_eq!(decoded.direction, OSDP_FMT_DIR_FORWARD);
+
+        assert!(Fmt::decode(&bytes[..2]).is_err(), "truncated header");
+    }
+
+    #[test]
+    fn mfgrep_round_trip() {
+        let m = Mfgrep {
+            vendor_code: [0x5A, 0x42, 0x43],
+            data: &[0xAB, 0xCD],
+        };
+        let bytes = round_trip(|b| m.build(b));
+        let decoded = Mfgrep::decode(&bytes).unwrap();
+        assert_eq!(decoded.vendor_code, [0x5A, 0x42, 0x43]);
+        assert_eq!(decoded.data, &[0xAB, 0xCD]);
+        assert!(Mfgrep::decode(&[0x5A, 0x42]).is_err());
+    }
+
+    #[test]
+    fn single_byte_replies_round_trip() {
+        let bytes = round_trip(|b| Mfgstatr { data: 0x7F }.build(b));
+        assert_eq!(bytes, [0x7F]);
+        assert_eq!(Mfgstatr::decode(&bytes).unwrap().data, 0x7F);
+
+        let bytes = round_trip(|b| Mfgerrr { data: 0x02 }.build(b));
+        assert_eq!(Mfgerrr::decode(&bytes).unwrap().data, 0x02);
+
+        assert!(Mfgstatr::decode(&[]).is_err());
+        assert!(Mfgerrr::decode(&[0x01, 0x02]).is_err());
     }
 }
