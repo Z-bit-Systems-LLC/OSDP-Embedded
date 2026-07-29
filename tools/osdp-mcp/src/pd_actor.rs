@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use osdp_embedded::messages::{Pdcap, Pdid, OSDP_REPLY_LSTATR};
-use osdp_embedded::pd::Pd;
+use osdp_embedded::messages::{Pdcap, Pdid, OSDP_LSTATR_NORMAL, OSDP_REPLY_LSTATR};
+use osdp_embedded::pd::{Pd, StatusProviders};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
@@ -35,6 +35,7 @@ use crate::reader_state::{
     self, ConnectionView, ReaderBuzzerHandler, ReaderLedHandler, ReaderStateView, SharedReaderState,
 };
 use crate::serial_transport::{SerialHealth, SerialTransport};
+use crate::status::{DeviceStatus, SharedStatus};
 use crate::wire::{WirePage, WireTrace, DEFAULT_WIRE_CAPACITY};
 
 /// How long after the most recent inbound command the link still
@@ -254,6 +255,11 @@ pub struct PdHandle {
     /// `pd_reader_state` tool. Created once at spawn; cleared whenever a
     /// PD is (re)opened so a fresh reader starts blank.
     reader_state: SharedReaderState,
+    /// Monitored conditions behind osdp_LSTAT / ISTAT / OSTAT / RSTAT,
+    /// bound into the PD as status providers. Created once at spawn so an
+    /// injected tamper survives `configure` / `stop` the way the PDID and
+    /// PDCAP edits do.
+    status: SharedStatus,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
     _join: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -279,6 +285,7 @@ impl PdHandle {
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
         let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let reader_state = reader_state::new_shared();
+        let status = crate::status::shared();
         // Hand-off cell for a KEYSET-rotated SCBK: the handler (on the
         // actor thread) writes it, the actor loop folds it into the
         // remembered SC config so a rebuild survives the rotation.
@@ -292,6 +299,7 @@ impl PdHandle {
         let pdcap_for_thread = Arc::clone(&pdcap);
         let reader_state_for_thread = Arc::clone(&reader_state);
         let key_rotation_for_thread = Arc::clone(&key_rotation);
+        let status_for_thread = Arc::clone(&status);
         let join = thread::Builder::new()
             .name("osdp-mcp-pd".into())
             .spawn(move || {
@@ -306,6 +314,7 @@ impl PdHandle {
                     pdcap_for_thread,
                     reader_state_for_thread,
                     key_rotation_for_thread,
+                    status_for_thread,
                     crypto_factory,
                     startup,
                 )
@@ -321,6 +330,7 @@ impl PdHandle {
             pdid,
             pdcap,
             reader_state,
+            status,
             _join: Arc::new(Mutex::new(Some(join))),
         }
     }
@@ -493,6 +503,31 @@ impl PdHandle {
         events::len(&self.events)
     }
 
+    /// Record a tamper / power condition **and** queue the matching
+    /// `osdp_LSTATR` event.
+    ///
+    /// Both halves are needed and they are not the same thing (spec 7.6):
+    /// the queued event announces the *transition* on the next `osdp_POLL`,
+    /// while the stored condition is what an `osdp_LSTAT` *query* is
+    /// answered from. Queueing alone — what this used to do — meant the PD
+    /// reported a tamper once and then denied it ever after.
+    pub fn set_local_status(&self, tamper: u8, power: u8) {
+        crate::status::set_local(&self.status, tamper, power);
+        self.enqueue_event(OverrideReply {
+            code: OSDP_REPLY_LSTATR,
+            payload: vec![tamper, power],
+        });
+    }
+
+    /// Snapshot the monitored conditions the four status queries report.
+    /// A poisoned lock yields the nominal default rather than failing.
+    pub fn device_status(&self) -> DeviceStatus {
+        self.status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| DeviceStatus::default())
+    }
+
     /// Snapshot the reader's observed output state (LED colours). Reads
     /// the shared state directly — no actor round-trip. A poisoned lock
     /// yields an empty snapshot rather than failing.
@@ -653,6 +688,7 @@ fn actor_loop(
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
     key_rotation: SharedKeyRotation,
+    status: SharedStatus,
     crypto_factory: CryptoFactory,
     startup: Option<StartupConfig>,
 ) {
@@ -694,6 +730,7 @@ fn actor_loop(
                     &pdcap,
                     &reader_state,
                     &key_rotation,
+                    &status,
                     &crypto_factory,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -787,6 +824,7 @@ fn actor_loop(
                             Arc::clone(&pdcap),
                             Arc::clone(&reader_state),
                             Arc::clone(&key_rotation),
+                            Arc::clone(&status),
                             cfg.sc.clone(),
                             &crypto_factory,
                         ) {
@@ -834,6 +872,7 @@ fn handle_cmd(
     pdcap: &SharedPdcap,
     reader_state: &SharedReaderState,
     key_rotation: &SharedKeyRotation,
+    status: &SharedStatus,
     crypto_factory: &CryptoFactory,
 ) {
     match cmd {
@@ -871,6 +910,7 @@ fn handle_cmd(
                 Arc::clone(pdcap),
                 Arc::clone(reader_state),
                 Arc::clone(key_rotation),
+                Arc::clone(status),
                 sc,
                 crypto_factory,
             )
@@ -917,6 +957,7 @@ fn handle_cmd(
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
                         Arc::clone(key_rotation),
+                        Arc::clone(status),
                         cfg.sc.clone(),
                         crypto_factory,
                     )
@@ -965,6 +1006,7 @@ fn handle_cmd(
                         Arc::clone(pdcap),
                         Arc::clone(reader_state),
                         Arc::clone(key_rotation),
+                        Arc::clone(status),
                         sc,
                         crypto_factory,
                     );
@@ -1028,6 +1070,30 @@ fn handle_cmd(
 // builder struct but every arg is distinct, so a plain function is
 // clearer despite the count.
 #[allow(clippy::too_many_arguments)]
+/// Copy one array-valued status report into the library's reply scratch,
+/// returning how many bytes were written.
+///
+/// Truncating to `out.len()` keeps this honest if the reported object count
+/// ever outgrows `OSDP_PD_REPLY_SCRATCH_LEN` — the library clamps an
+/// over-reporting provider anyway, but silently handing back a length larger
+/// than what was written would be a bug on this side of the boundary.
+fn copy_statuses(
+    status: &SharedStatus,
+    out: &mut [u8],
+    pick: impl Fn(&DeviceStatus) -> &Vec<u8>,
+) -> usize {
+    let Ok(s) = status.lock() else {
+        // Poisoned lock: report nothing rather than failing the reply. An
+        // empty report is legal (a PD with no objects has nothing to say).
+        return 0;
+    };
+    let src = pick(&s);
+    let n = src.len().min(out.len());
+    out[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+#[allow(clippy::too_many_arguments)]
 fn open_pd(
     port: &str,
     baud: u32,
@@ -1041,6 +1107,7 @@ fn open_pd(
     pdcap: SharedPdcap,
     reader_state: SharedReaderState,
     key_rotation: SharedKeyRotation,
+    status: SharedStatus,
     sc: Option<ScConfig>,
     crypto_factory: &CryptoFactory,
 ) -> anyhow::Result<Slot> {
@@ -1090,7 +1157,8 @@ fn open_pd(
             drop_remaining,
             address,
         )
-        .with_key_rotation(key_rotation),
+        .with_key_rotation(key_rotation)
+        .with_status(Arc::clone(&status)),
     );
 
     // A freshly-opened PD starts with no LED state; clear any colours the
@@ -1122,6 +1190,32 @@ fn open_pd(
     // the receiver (which logs + accepts) and replies osdp_FTSTAT, with no
     // buffer and no file-size ceiling.
     pd.set_file_stream(crate::handler::DefaultFileReceiver);
+
+    // osdp_LSTAT / ISTAT / OSTAT / RSTAT: the library builds the four *STATR
+    // replies, we supply the values from the shared status block. All four are
+    // bound because the PDCAP we advertise claims one input, one output and
+    // one reader — leaving any of them unbound would NAK 0x03 a query about a
+    // capability this PD just claimed to have. Each closure takes the lock for
+    // the duration of one reply; a poisoned lock reports nominal rather than
+    // failing the reply, matching how the PDID/PDCAP snapshots degrade.
+    {
+        let local = Arc::clone(&status);
+        let inputs = Arc::clone(&status);
+        let outputs = Arc::clone(&status);
+        let readers = Arc::clone(&status);
+        pd.set_status_providers(
+            StatusProviders::new()
+                .local(move || {
+                    local
+                        .lock()
+                        .map(|s| (s.tamper, s.power))
+                        .unwrap_or((OSDP_LSTATR_NORMAL, OSDP_LSTATR_NORMAL))
+                })
+                .inputs(move |out| copy_statuses(&inputs, out, |s| &s.inputs))
+                .outputs(move |out| copy_statuses(&outputs, out, |s| &s.outputs))
+                .readers(move |out| copy_statuses(&readers, out, |s| &s.readers)),
+        );
+    }
 
     // Bind Secure Channel material if requested. The crypto factory
     // mints a fresh provider per PD so the AES + RNG state is

@@ -69,9 +69,10 @@ extern "C" {
 /* Secure Channel 2 (OSDP-SC2) Security Block types, occupying the 0x2X
  * range parallel to SC1's 0x1X. SC2 is a quantum-resistant channel
  * built on AES-256-GCM + KMAC256 key derivation; SEC_BLK_DATA[0] = 0x02
- * selects it during the handshake. The crypto lives in osdp::core's
- * SC2 code (core/src/sc2/); the framing layer only needs the byte
- * values and the size of the trailing GCM tag. */
+ * selects it during the handshake. The SC2 crypto itself is not on this
+ * branch; the framing layer only needs the byte values and the size of
+ * the trailing GCM tag, so it recognises and sizes SC2 frames without
+ * being able to unwrap them. */
 #define OSDP_SCS_21  0x21U   /* ACU→PD: SC2 initiation challenge   */
 #define OSDP_SCS_22  0x22U   /* PD→ACU: SC2 client cryptogram      */
 #define OSDP_SCS_23  0x23U   /* ACU→PD: SC2 server cryptogram      */
@@ -254,9 +255,8 @@ osdp_status_t osdp_frame_payload_offset(const osdp_frame_t *in,
  * for a NULL argument or an inconsistent SCB.
  *
  * Under Secure Channel the answer is smaller still, because the ciphertext
- * carries padding (SC1) or an encrypted code byte (SC2). Use
- * osdp_sc_max_payload / osdp_sc2_max_payload for those; each accounts for
- * its own transform on top of this. */
+ * carries padding. Use osdp_sc_max_payload for that; it accounts for the
+ * SC transform on top of this. */
 osdp_status_t osdp_frame_max_payload(const osdp_frame_t *shape,
                                      size_t buf_cap,
                                      size_t *out_max_payload);

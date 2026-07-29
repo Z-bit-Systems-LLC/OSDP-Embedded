@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use osdp_embedded::messages::{
-    Keypad, Pdcap, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
+    Keypad, Pdcap, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW,
 };
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
@@ -1125,26 +1125,24 @@ impl OsdpMcp {
     /// bytes: tamper_status (0/1), power_status (0/1).
     #[tool(
         title = "Inject Tamper / Power Status",
-        description = "Inject a tamper/power state change. The PD will reply LSTATR on its next POLL with the supplied flags."
+        description = "Inject a tamper/power state change. The PD reports it as LSTATR on its next POLL, and answers any later LSTAT query with the same flags."
     )]
     fn inject_local_status(
         &self,
         Parameters(args): Parameters<InjectLocalStatusArgs>,
     ) -> Result<String, String> {
-        // No typed builder in osdp-embedded for LSTATR; the payload
-        // is simply [tamper, power], each 0 or 1 per spec D.2.1.
+        // Spec D.2.1: the LSTATR payload is two bytes, each 0 or 1.
         if args.tamper > 1 || args.power > 1 {
             return Err(format!(
                 "tamper and power must be 0 or 1, got tamper={}, power={}",
                 args.tamper, args.power
             ));
         }
-        self.pd.enqueue_event(OverrideReply {
-            code: OSDP_REPLY_LSTATR,
-            payload: vec![args.tamper, args.power],
-        });
+        // Sets the standing condition *and* queues the report — see
+        // PdHandle::set_local_status for why both.
+        self.pd.set_local_status(args.tamper, args.power);
         Ok(format!(
-            "LSTATR queued: tamper={}, power={}",
+            "LSTATR queued and local status set: tamper={}, power={}",
             args.tamper, args.power
         ))
     }
