@@ -562,6 +562,27 @@ pub const OSDP_REPLY_MFGERRR: u8 = 0x84;
 pub const OSDP_REPLY_MFGREP: u8 = 0x90;
 pub const OSDP_REPLY_XRD: u8 = 0xB1;
 
+/* Status bytes carried by the four *STATR reports (osdp_replies.h). Note
+ * OSDP_LSTATR_TAMPER and _POWER_FAILURE are both 0x01 — which one 0x01
+ * means depends on which of the two osdp_LSTATR bytes it sits in. */
+pub const OSDP_LSTATR_NORMAL: u8 = 0x00;
+pub const OSDP_LSTATR_TAMPER: u8 = 0x01;
+pub const OSDP_LSTATR_POWER_FAILURE: u8 = 0x01;
+
+pub const OSDP_ISTATR_INACTIVE: u8 = 0x00;
+pub const OSDP_ISTATR_ACTIVE: u8 = 0x01;
+pub const OSDP_ISTATR_SHORT: u8 = 0x02;
+pub const OSDP_ISTATR_OPEN: u8 = 0x03;
+pub const OSDP_ISTATR_FAULT: u8 = 0x04;
+pub const OSDP_ISTATR_UNKNOWN: u8 = 0x05;
+
+pub const OSDP_OSTATR_INACTIVE: u8 = 0x00;
+pub const OSDP_OSTATR_ACTIVE: u8 = 0x01;
+
+pub const OSDP_RSTATR_NORMAL: u8 = 0x00;
+pub const OSDP_RSTATR_NOT_CONNECTED: u8 = 0x01;
+pub const OSDP_RSTATR_TAMPER: u8 = 0x02;
+
 pub const OSDP_NAK_NO_ERROR: u8 = 0x00;
 pub const OSDP_NAK_BAD_CHECK: u8 = 0x01;
 pub const OSDP_NAK_CMD_LENGTH: u8 = 0x02;
@@ -945,6 +966,9 @@ mod pd_ffi {
      * silently shifts every field after tx_buf. */
     pub const OSDP_PD_REPLY_SCRATCH_LEN: usize = 64;
     pub const OSDP_PD_OFFLINE_TIMEOUT_MS: u32 = 8000;
+    /* What osdp_pd_acu_rx_size reports before any osdp_ACURXSIZE arrives
+     * (spec 6.26). Must track OSDP_PD_DEFAULT_ACU_RX_SIZE in osdp_pd.h. */
+    pub const OSDP_PD_DEFAULT_ACU_RX_SIZE: u16 = 128;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
     pub const OSDP_PD_MAX_BUZZERS: usize = 4;
 
@@ -1240,6 +1264,60 @@ mod pd_ffi {
         );
 
         pub fn osdp_pd_set_file_stream(pd: *mut osdp_pd_t, cb: osdp_pd_file_cb, user: *mut c_void);
+
+        /// The vtable is COPIED into the context, so `p` may be a stack
+        /// temporary; `user` must outlive the binding. NULL `p` detaches.
+        pub fn osdp_pd_set_status_provider(
+            pd: *mut osdp_pd_t,
+            p: *const osdp_pd_status_provider_t,
+            user: *mut c_void,
+        );
+
+        pub fn osdp_pd_set_mfg_receiver(
+            pd: *mut osdp_pd_t,
+            buf: *mut u8,
+            cap: usize,
+            cb: osdp_pd_mfg_cb,
+            user: *mut c_void,
+        );
+
+        /// Advisory: `bad_index` (when non-NULL) receives the index of the
+        /// first offending record. Nothing calls this automatically.
+        pub fn osdp_pd_check_pdcap(
+            pd: *const osdp_pd_t,
+            records: *const osdp_pdcap_record_t,
+            count: usize,
+            bad_index: *mut usize,
+        ) -> osdp_status_t;
+
+        pub fn osdp_pd_set_event_queue(pd: *mut osdp_pd_t, buf: *mut u8, cap: usize);
+        pub fn osdp_pd_enqueue_event(
+            pd: *mut osdp_pd_t,
+            reply_code: u8,
+            payload: *const u8,
+            len: usize,
+        ) -> osdp_status_t;
+        pub fn osdp_pd_event_pending(pd: *const osdp_pd_t) -> bool;
+        pub fn osdp_pd_clear_events(pd: *mut osdp_pd_t);
+
+        pub fn osdp_pd_set_abort_handler(
+            pd: *mut osdp_pd_t,
+            cb: osdp_pd_abort_cb,
+            user: *mut c_void,
+        );
+        pub fn osdp_pd_set_acurxsize_handler(
+            pd: *mut osdp_pd_t,
+            cb: osdp_pd_acurxsize_cb,
+            user: *mut c_void,
+        );
+        /// The PEER's declared limit — combine with `osdp_pd_max_reply_payload`
+        /// (this PD's own limit) and honour the smaller.
+        pub fn osdp_pd_acu_rx_size(pd: *const osdp_pd_t) -> u16;
+        pub fn osdp_pd_set_keepactive_handler(
+            pd: *mut osdp_pd_t,
+            cb: osdp_pd_keepactive_cb,
+            user: *mut c_void,
+        );
 
         pub fn osdp_pd_set_sc_crypto(pd: *mut osdp_pd_t, crypto: *const osdp_sc_crypto_t);
         pub fn osdp_pd_set_sc_scbk(pd: *mut osdp_pd_t, scbk: *const u8);
