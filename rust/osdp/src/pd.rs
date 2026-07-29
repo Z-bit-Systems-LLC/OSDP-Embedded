@@ -725,6 +725,121 @@ impl Pd {
         self.mfg_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut MfgReceiverBox) });
     }
 
+    // ---- PDCAP: defaults + dynamic binding -----------------------------
+
+    /// Starting-point capability set: reasonable reference values for
+    /// everything the device describes (LEDs, inputs, card format, smart
+    /// card, downstream readers, OSDP version, multi-part size), EXCLUDING
+    /// the four function codes (8, 9, 10, 17) the C library computes for
+    /// itself and never accepts back — see [`Pd::set_pdcap`].
+    ///
+    /// Function code 11 (Largest Combined Message) defaults to 0xFFFF, a
+    /// placeholder meaning "however much this PD can multi-part once it has
+    /// a reassembly buffer" — [`Pd::set_pdcap`] rejects it until
+    /// [`Pd::set_mfg_receiver`] is bound. Lower it to 0, or to the
+    /// receiver's real capacity, if this PD does not do multi-part.
+    pub fn default_pdcap() -> Vec<crate::messages::PdcapRecord> {
+        let mut buf = [sys::osdp_pdcap_record_t::default(); sys::OSDP_PD_MAX_PDCAP_RECORDS];
+        let mut count: usize = 0;
+        let rc = unsafe { sys::osdp_pd_default_pdcap(buf.as_mut_ptr(), buf.len(), &mut count) };
+        debug_assert_eq!(
+            rc,
+            sys::osdp_status_t::OSDP_OK,
+            "buf is sized from the same constant the C side checks against"
+        );
+        buf[..count]
+            .iter()
+            .map(|r| crate::messages::PdcapRecord {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect()
+    }
+
+    /// Validate `records`, then — only if every one passes — bind them so
+    /// the library answers `osdp_CAP` directly, without involving the
+    /// [`CommandHandler`].
+    ///
+    /// Four function codes are RESERVED: the library computes them itself
+    /// and rejects them here — 8 (Check Character Support, always
+    /// `0x01`/`0x00`), 9 (Communication Security — compliance always
+    /// `0x01`; `num_objects` reports whether a unique operational SCBK is
+    /// set), 10 (Receive BufferSize, derived from the bound plaintext
+    /// buffer), 17 (Secure PD Biometrics Match, fixed `0x01`/`0x00`).
+    /// Every other record is checked against spec Annex B and, for
+    /// function code 11, against this PD's actual multi-part reassembly
+    /// binding (same rule [`Pd::check_pdcap`] applies).
+    ///
+    /// On failure applies nothing — this PD keeps whatever was bound
+    /// before, or falls through to the [`CommandHandler`] if nothing was.
+    /// Pass an empty slice to clear the binding and return `osdp_CAP` to
+    /// the handler.
+    pub fn set_pdcap(
+        &mut self,
+        records: &[crate::messages::PdcapRecord],
+    ) -> core::result::Result<(), PdcapProblem> {
+        let c_records: Vec<sys::osdp_pdcap_record_t> = records
+            .iter()
+            .map(|r| sys::osdp_pdcap_record_t {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect();
+
+        let mut bad_index: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_set_pdcap(
+                &mut *self.inner,
+                if c_records.is_empty() {
+                    ptr::null()
+                } else {
+                    c_records.as_ptr()
+                },
+                c_records.len(),
+                &mut bad_index,
+            )
+        };
+
+        match Error::from_status(rc) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(PdcapProblem {
+                index: bad_index,
+                error,
+            }),
+        }
+    }
+
+    /// Snapshot exactly what `osdp_CAP` would answer right now: the records
+    /// bound via [`Pd::set_pdcap`] PLUS the four reserved records (fn
+    /// 8/9/10/17), recomputed fresh from this PD's current state — not a
+    /// cached value, so this can change between two calls with nothing
+    /// else in between if, say, [`Pd::set_sc_scbk`] was called in the
+    /// meantime. Empty if nothing is bound, i.e. `osdp_CAP` still falls
+    /// through to the [`CommandHandler`].
+    pub fn pdcap(&self) -> Vec<crate::messages::PdcapRecord> {
+        let mut buf = [sys::osdp_pdcap_record_t::default();
+            sys::OSDP_PD_MAX_PDCAP_RECORDS + sys::OSDP_PDCAP_RESERVED_COUNT];
+        let mut count: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_get_pdcap(&*self.inner, buf.as_mut_ptr(), buf.len(), &mut count)
+        };
+        debug_assert_eq!(
+            rc,
+            sys::osdp_status_t::OSDP_OK,
+            "buf is sized from the same constants the C side checks against"
+        );
+        buf[..count]
+            .iter()
+            .map(|r| crate::messages::PdcapRecord {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect()
+    }
+
     // ---- PDCAP consistency (advisory) ---------------------------------
 
     /// Check capability records against what this PD can actually honour.

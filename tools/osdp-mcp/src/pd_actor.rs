@@ -20,15 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use osdp_embedded::messages::{Pdcap, Pdid, OSDP_LSTATR_NORMAL, OSDP_REPLY_LSTATR};
-use osdp_embedded::pd::{Pd, StatusProviders};
+use osdp_embedded::messages::{PdcapRecord, Pdid, OSDP_LSTATR_NORMAL, OSDP_REPLY_LSTATR};
+use osdp_embedded::pd::{Pd, PdcapProblem, StatusProviders};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
 use crate::events::{self, EventQueue};
-use crate::handler::{
-    DefaultHandler, DropCounter, PdStats, SharedKeyRotation, SharedPdcap, SharedPdid,
-};
+use crate::handler::{DefaultHandler, DropCounter, PdStats, SharedKeyRotation, SharedPdid};
 use crate::log::{EffectiveFilter, LogInner, LogPage, LogSummary, DEFAULT_CAPACITY};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::reader_state::{
@@ -215,6 +213,19 @@ enum Cmd {
     ForceSessionLoss {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// Snapshot the capability set currently bound (independent of whether
+    /// a PD is running — see `remembered_pdcap` in `actor_loop`).
+    GetPdcap {
+        reply: oneshot::Sender<Vec<PdcapRecord>>,
+    },
+    /// Validate then bind a new capability set. Applied to the running PD
+    /// immediately (if any) via `Pd::set_pdcap`, and remembered so a later
+    /// `pd_configure` / `pd_start` / reconnect picks it up too. On failure
+    /// nothing changes — same all-or-nothing contract as `Pd::set_pdcap`.
+    SetPdcap {
+        records: Vec<PdcapRecord>,
+        reply: oneshot::Sender<core::result::Result<(), PdcapProblem>>,
+    },
 }
 
 /// Handle the MCP service holds. Clone-able, Send + Sync — multiple
@@ -245,11 +256,6 @@ pub struct PdHandle {
     /// so `get_pdid` / `set_pdid` can read and mutate it live. Created
     /// once at spawn, so edits persist across `configure` / `stop`.
     pdid: SharedPdid,
-    /// The capability set reported in `osdp_PDCAP`. Shared with the
-    /// handler so `get_pdcap` / `set_pdcap` can read and mutate it live.
-    /// Created once at spawn, so edits persist across `configure` /
-    /// `stop`.
-    pdcap: SharedPdcap,
     /// Observed reader output state (LED colours), updated on the actor
     /// thread by the PD's LED change callback and read by the
     /// `pd_reader_state` tool. Created once at spawn; cleared whenever a
@@ -257,8 +263,11 @@ pub struct PdHandle {
     reader_state: SharedReaderState,
     /// Monitored conditions behind osdp_LSTAT / ISTAT / OSTAT / RSTAT,
     /// bound into the PD as status providers. Created once at spawn so an
-    /// injected tamper survives `configure` / `stop` the way the PDID and
-    /// PDCAP edits do.
+    /// injected tamper survives `configure` / `stop` the way the PDID edits
+    /// do (the PDCAP capability set survives the same way, but as
+    /// `remembered_pdcap` inside `actor_loop` — it goes through
+    /// `Cmd::GetPdcap` / `Cmd::SetPdcap` since it must run on the actor
+    /// thread to reach the real `osdp_pd_t`, not a plain shared handle).
     status: SharedStatus,
     /// Kept alive so we can `join` on shutdown (currently unused;
     /// reserved for graceful stop in later milestones).
@@ -283,7 +292,6 @@ impl PdHandle {
         let events = events::new_queue();
         let drop_remaining: DropCounter = Arc::new(AtomicU32::new(0));
         let pdid: SharedPdid = Arc::new(Mutex::new(crate::handler::default_pdid()));
-        let pdcap: SharedPdcap = Arc::new(Mutex::new(crate::handler::default_pdcap()));
         let reader_state = reader_state::new_shared();
         let status = crate::status::shared();
         // Hand-off cell for a KEYSET-rotated SCBK: the handler (on the
@@ -296,7 +304,6 @@ impl PdHandle {
         let events_for_thread = Arc::clone(&events);
         let drop_for_thread = Arc::clone(&drop_remaining);
         let pdid_for_thread = Arc::clone(&pdid);
-        let pdcap_for_thread = Arc::clone(&pdcap);
         let reader_state_for_thread = Arc::clone(&reader_state);
         let key_rotation_for_thread = Arc::clone(&key_rotation);
         let status_for_thread = Arc::clone(&status);
@@ -311,7 +318,6 @@ impl PdHandle {
                     events_for_thread,
                     drop_for_thread,
                     pdid_for_thread,
-                    pdcap_for_thread,
                     reader_state_for_thread,
                     key_rotation_for_thread,
                     status_for_thread,
@@ -328,7 +334,6 @@ impl PdHandle {
             events,
             drop_remaining,
             pdid,
-            pdcap,
             reader_state,
             status,
             _join: Arc::new(Mutex::new(Some(join))),
@@ -469,25 +474,36 @@ impl PdHandle {
         }
     }
 
-    /// Snapshot the capability set currently reported in `osdp_PDCAP`.
-    /// Reads the shared value directly — no actor round-trip — so it
-    /// works whether or not a PD is running. A poisoned lock falls back
-    /// to the default capability set.
-    pub fn get_pdcap(&self) -> Pdcap {
-        self.pdcap
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| crate::handler::default_pdcap())
+    /// Snapshot the capability set currently reported in `osdp_PDCAP`,
+    /// INCLUDING the four records the C library computes for itself (fn
+    /// 8/9/10/17) — this is what actually goes out on the wire. Works
+    /// whether or not a PD is running (reads `remembered_pdcap` in that
+    /// case). Requires an actor round-trip: unlike PDID, the real bound
+    /// values live inside the C `osdp_pd_t`, which only the actor thread
+    /// may touch.
+    pub async fn get_pdcap(&self) -> Vec<PdcapRecord> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Cmd::GetPdcap { reply }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
-    /// Replace the capability set reported in `osdp_PDCAP`. Takes effect
-    /// on the next `osdp_CAP` command. Persists across `configure` /
-    /// `stop`. Validation against the OSDP spec is the caller's
-    /// responsibility (see `crate::pdcap_spec`).
-    pub fn set_pdcap(&self, pdcap: Pdcap) {
-        if let Ok(mut g) = self.pdcap.lock() {
-            *g = pdcap;
-        }
+    /// Validate then bind a new capability set (rejecting the four
+    /// reserved function codes — see `osdp_embedded::pd::Pd::set_pdcap`).
+    /// Applied to the running PD immediately if one exists; always
+    /// remembered so `configure` / `start` / a serial reconnect picks it up
+    /// too. On failure nothing changes.
+    pub async fn set_pdcap(
+        &self,
+        records: Vec<PdcapRecord>,
+    ) -> anyhow::Result<core::result::Result<(), PdcapProblem>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::SetPdcap { records, reply })
+            .map_err(|_| anyhow::anyhow!("PD actor is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("PD actor dropped the reply"))
     }
 
     /// Queue a pre-baked reply to be emitted on the next POLL
@@ -685,7 +701,6 @@ fn actor_loop(
     events: EventQueue,
     drop_remaining: DropCounter,
     pdid: SharedPdid,
-    pdcap: SharedPdcap,
     reader_state: SharedReaderState,
     key_rotation: SharedKeyRotation,
     status: SharedStatus,
@@ -707,6 +722,14 @@ fn actor_loop(
         address: s.address,
         sc: s.sc,
     });
+    // The capability set reported in `osdp_PDCAP`. Lives here (not a
+    // shared handle like `pdid`) because the values that matter — what
+    // actually goes out on the wire — are the ones bound into the real
+    // `osdp_pd_t` via `Pd::set_pdcap`, which only this thread may touch;
+    // `Cmd::GetPdcap` / `Cmd::SetPdcap` are the round-trip. Survives
+    // `Stop` / a serial reconnect the same way `last_config` does, and
+    // every `open_pd` rebinds it onto the freshly constructed `Pd`.
+    let mut remembered_pdcap: Vec<PdcapRecord> = Pd::default_pdcap();
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
     let tick_period = Duration::from_millis(1);
@@ -720,6 +743,7 @@ fn actor_loop(
                     cmd,
                     &mut slot,
                     &mut last_config,
+                    &mut remembered_pdcap,
                     &mut reconnect,
                     &log,
                     &wire,
@@ -727,7 +751,6 @@ fn actor_loop(
                     &events,
                     &drop_remaining,
                     &pdid,
-                    &pdcap,
                     &reader_state,
                     &key_rotation,
                     &status,
@@ -821,7 +844,7 @@ fn actor_loop(
                             Arc::clone(&events),
                             Arc::clone(&drop_remaining),
                             Arc::clone(&pdid),
-                            Arc::clone(&pdcap),
+                            &remembered_pdcap,
                             Arc::clone(&reader_state),
                             Arc::clone(&key_rotation),
                             Arc::clone(&status),
@@ -862,6 +885,7 @@ fn handle_cmd(
     cmd: Cmd,
     slot: &mut Option<Slot>,
     last_config: &mut Option<RememberedConfig>,
+    remembered_pdcap: &mut Vec<PdcapRecord>,
     reconnect: &mut Option<Reconnect>,
     log: &Arc<LogInner>,
     wire: &Arc<WireTrace>,
@@ -869,7 +893,6 @@ fn handle_cmd(
     events: &EventQueue,
     drop_remaining: &DropCounter,
     pdid: &SharedPdid,
-    pdcap: &SharedPdcap,
     reader_state: &SharedReaderState,
     key_rotation: &SharedKeyRotation,
     status: &SharedStatus,
@@ -907,7 +930,7 @@ fn handle_cmd(
                 Arc::clone(events),
                 Arc::clone(drop_remaining),
                 Arc::clone(pdid),
-                Arc::clone(pdcap),
+                remembered_pdcap,
                 Arc::clone(reader_state),
                 Arc::clone(key_rotation),
                 Arc::clone(status),
@@ -954,7 +977,7 @@ fn handle_cmd(
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
-                        Arc::clone(pdcap),
+                        remembered_pdcap,
                         Arc::clone(reader_state),
                         Arc::clone(key_rotation),
                         Arc::clone(status),
@@ -1003,7 +1026,7 @@ fn handle_cmd(
                         Arc::clone(events),
                         Arc::clone(drop_remaining),
                         Arc::clone(pdid),
-                        Arc::clone(pdcap),
+                        remembered_pdcap,
                         Arc::clone(reader_state),
                         Arc::clone(key_rotation),
                         Arc::clone(status),
@@ -1019,6 +1042,39 @@ fn handle_cmd(
                     }
                 }
             };
+            let _ = reply.send(result);
+        }
+        Cmd::GetPdcap { reply } => {
+            // The running PD's bound records (which include the four
+            // library-computed ones) when there is one; otherwise the
+            // remembered set a future `open_pd` will bind.
+            let current = match slot.as_ref() {
+                Some(s) => s.pd.pdcap(),
+                None => remembered_pdcap.clone(),
+            };
+            let _ = reply.send(current);
+        }
+        Cmd::SetPdcap { records, reply } => {
+            // Validate against the running PD if there is one — this both
+            // checks AND applies atomically. With no PD running there is
+            // nothing live to apply to, so validate against a throwaway
+            // instance instead; the real application happens the next time
+            // `open_pd` runs. That throwaway needs the same multi-part
+            // receiver `open_pd` always binds — otherwise a fn 11 value
+            // inherited from `remembered_pdcap` (the default's 0xFFFF, or
+            // anything else non-zero) would fail here for a reason that
+            // has nothing to do with the edit actually being made.
+            let result = match slot.as_mut() {
+                Some(s) => s.pd.set_pdcap(&records),
+                None => {
+                    let mut scratch = Pd::new(0);
+                    scratch.set_mfg_receiver(0xFFFF, crate::handler::DefaultMfgReceiver);
+                    scratch.set_pdcap(&records)
+                }
+            };
+            if result.is_ok() {
+                *remembered_pdcap = records;
+            }
             let _ = reply.send(result);
         }
         Cmd::Status { reply } => {
@@ -1104,7 +1160,7 @@ fn open_pd(
     events: EventQueue,
     drop_remaining: DropCounter,
     pdid: SharedPdid,
-    pdcap: SharedPdcap,
+    pdcap: &[PdcapRecord],
     reader_state: SharedReaderState,
     key_rotation: SharedKeyRotation,
     status: SharedStatus,
@@ -1149,7 +1205,6 @@ fn open_pd(
     pd.set_command_handler(
         DefaultHandler::with_pdid(
             pdid,
-            pdcap,
             Arc::clone(&stats),
             log,
             overrides,
@@ -1160,6 +1215,26 @@ fn open_pd(
         .with_key_rotation(key_rotation)
         .with_status(Arc::clone(&status)),
     );
+
+    // Multi-part osdp_MFG (spec 5.10) reassembly: bound at the wire-max
+    // capacity so the default PDCAP's fn 11 ("Largest Combined Message")
+    // claim of 0xFFFF is honest. Must happen BEFORE set_pdcap below —
+    // fn 11's validation checks whether a receiver is already bound.
+    pd.set_mfg_receiver(0xFFFF, crate::handler::DefaultMfgReceiver);
+
+    // osdp_CAP: answered directly from here, never reaching the command
+    // handler above. Should always succeed — `pdcap` was already validated
+    // (either as the built-in default, or by a prior `pd_set_capability` /
+    // `pd_reset_pdcap`) — but if it somehow doesn't, osdp_CAP degrades to
+    // NAK 0x03 rather than silently reporting nothing.
+    if let Err(e) = pd.set_pdcap(pdcap) {
+        tracing::error!(
+            index = e.index,
+            error = ?e.error,
+            "osdp_CAP: failed to bind capability set; osdp_CAP will NAK 0x03 \
+             until this is fixed"
+        );
+    }
 
     // A freshly-opened PD starts with no LED state; clear any colours the
     // previous PD left in the snapshot, then bind the change callback so

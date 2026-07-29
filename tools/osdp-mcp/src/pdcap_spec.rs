@@ -389,7 +389,7 @@ mod tests {
         // annotates every byte — so the default must itself pass the
         // same validation pd_set_capability enforces, or the tool would
         // contradict itself.
-        for r in crate::handler::default_pdcap().records {
+        for r in osdp_embedded::pd::Pd::default_pdcap() {
             validate_record(r.function_code, r.compliance_level, r.num_objects).unwrap_or_else(
                 |e| panic!("default PDCAP record {r:?} is not spec-conformant: {e}"),
             );

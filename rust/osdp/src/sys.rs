@@ -688,6 +688,7 @@ pub struct osdp_pdid_t {
 pub const OSDP_PDCAP_RECORD_BYTES: usize = 3;
 
 #[repr(C)]
+#[derive(Copy, Clone, Default)]
 pub struct osdp_pdcap_record_t {
     pub function_code: u8,
     pub compliance_level: u8,
@@ -826,6 +827,9 @@ extern "C" {
         buf_cap: usize,
         written: *mut usize,
     ) -> osdp_status_t;
+    /// Pure function of the three bytes (spec Annex B), independent of any
+    /// osdp_pd_t. OSDP_OK if conformant, else OSDP_ERR_INVALID_ARG.
+    pub fn osdp_pdcap_validate_record(record: *const osdp_pdcap_record_t) -> osdp_status_t;
 
     pub fn osdp_raw_decode(payload: *const u8, len: usize, out: *mut osdp_raw_t) -> osdp_status_t;
     pub fn osdp_raw_build(
@@ -1192,6 +1196,12 @@ mod pd_ffi {
     pub const OSDP_PD_DEFAULT_ACU_RX_SIZE: u16 = 128;
     pub const OSDP_PD_MAX_LEDS: usize = 8;
     pub const OSDP_PD_MAX_BUZZERS: usize = 4;
+    /* Must track OSDP_PD_MAX_PDCAP_RECORDS in pd/include/osdp/osdp_pd.h —
+     * sizes the pdcap_records array embedded in osdp_pd_t below. */
+    pub const OSDP_PD_MAX_PDCAP_RECORDS: usize = 13;
+    /* Must track OSDP_PDCAP_RESERVED_COUNT in pd/include/osdp/osdp_pd.h —
+     * how many more records osdp_pd_get_pdcap returns than were bound. */
+    pub const OSDP_PDCAP_RESERVED_COUNT: usize = 4;
 
     pub type osdp_pd_read_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
@@ -1414,6 +1424,12 @@ mod pd_ffi {
         pub status: osdp_pd_status_provider_t,
         pub status_user: *mut c_void,
 
+        /* osdp_PDCAP records bound via osdp_pd_set_pdcap. Copied in, not
+         * borrowed — pdcap_count == 0 (osdp_pd_init's default) leaves
+         * osdp_CAP falling through to the command handler. */
+        pub pdcap_records: [osdp_pdcap_record_t; OSDP_PD_MAX_PDCAP_RECORDS],
+        pub pdcap_count: usize,
+
         /* Poll-response event queue (caller-owned storage). */
         pub event_buf: *mut u8,
         pub event_cap: usize,
@@ -1509,6 +1525,36 @@ mod pd_ffi {
             records: *const osdp_pdcap_record_t,
             count: usize,
             bad_index: *mut usize,
+        ) -> osdp_status_t;
+
+        /// Starting-point capability set, excluding the four reserved
+        /// function codes (8, 9, 10, 17) the library computes for itself.
+        pub fn osdp_pd_default_pdcap(
+            out: *mut osdp_pdcap_record_t,
+            cap: usize,
+            count: *mut usize,
+        ) -> osdp_status_t;
+
+        /// Validate then bind `records` so the library answers osdp_CAP
+        /// directly; rejects the four reserved function codes and anything
+        /// osdp_pdcap_validate_record / osdp_pd_check_pdcap objects to.
+        /// `bad_index` (when non-NULL) receives the offending record's
+        /// index. count=0 (records may be NULL) clears the binding.
+        pub fn osdp_pd_set_pdcap(
+            pd: *mut osdp_pd_t,
+            records: *const osdp_pdcap_record_t,
+            count: usize,
+            bad_index: *mut usize,
+        ) -> osdp_status_t;
+
+        /// Snapshot of what osdp_CAP would answer right now: bound records
+        /// plus the four reserved ones, recomputed fresh from `pd`'s
+        /// current state. `*count` is 0 when nothing is bound.
+        pub fn osdp_pd_get_pdcap(
+            pd: *const osdp_pd_t,
+            out: *mut osdp_pdcap_record_t,
+            cap: usize,
+            count: *mut usize,
         ) -> osdp_status_t;
 
         pub fn osdp_pd_set_event_queue(pd: *mut osdp_pd_t, buf: *mut u8, cap: usize);

@@ -281,6 +281,49 @@ static void handle_keepactive(osdp_pd_t       *pd,
     reply->payload_len = 0;
 }
 
+/* ---- osdp_CAP (6.2) ----------------------------------------------------*/
+
+/* Answer osdp_CAP from the records bound via osdp_pd_set_pdcap, when any
+ * are bound, plus the library-computed reserved records (fn 8/9/10/17 —
+ * see osdp_pd_internal_fill_reserved_pdcap) recomputed fresh from `pd`'s
+ * current state on every call. Returns false when nothing is bound
+ * (pdcap_count == 0, the state after osdp_pd_init), in which case the
+ * caller falls through to cmd_cb exactly as it did before osdp_pd_set_pdcap
+ * existed. */
+static bool handle_pdcap(osdp_pd_t *pd, osdp_pd_reply_t *reply)
+{
+    if (pd->pdcap_count == 0) {
+        return false;
+    }
+
+    osdp_pdcap_record_t all[OSDP_PD_MAX_PDCAP_RECORDS + OSDP_PDCAP_RESERVED_COUNT];
+    osdp_pd_internal_fill_reserved_pdcap(pd, all);
+    (void)memcpy(&all[OSDP_PDCAP_RESERVED_COUNT], pd->pdcap_records,
+                pd->pdcap_count * sizeof(*pd->pdcap_records));
+    const size_t total = OSDP_PDCAP_RESERVED_COUNT + pd->pdcap_count;
+    /* Ascending by function code (Annex B order), not "reserved four, then
+     * whatever order the application bound" — see
+     * osdp_pd_internal_sort_pdcap's doc comment in pd_internal.h. */
+    osdp_pd_internal_sort_pdcap(all, total);
+
+    size_t written = 0;
+    const osdp_status_t s = osdp_pdcap_build(all, total, pd->reply_scratch,
+                                             OSDP_PD_REPLY_SCRATCH_LEN,
+                                             &written);
+    if (s != OSDP_OK) {
+        /* Can only happen if OSDP_PD_REPLY_SCRATCH_LEN was overridden down
+         * below what OSDP_PD_MAX_PDCAP_RECORDS + OSDP_PDCAP_RESERVED_COUNT
+         * needs — osdp_pd_set_pdcap itself never lets an oversized bound
+         * set through. */
+        nak_into(pd, OSDP_NAK_RECORD_INVALID, reply);
+        return true;
+    }
+    reply->code        = OSDP_REPLY_PDCAP;
+    reply->payload     = pd->reply_scratch;
+    reply->payload_len = written;
+    return true;
+}
+
 /* ---- Multi-part osdp_MFG (spec 5.10 + 6.19) ---------------------------- */
 
 /* Defined just below; the MFG receiver maps its callback's verdict onto the
@@ -449,6 +492,12 @@ osdp_pd_dispatch_outcome_t osdp_pd_internal_dispatch(
     /* Status requests, when a provider is bound for that specific one.
      * Otherwise they fall through to the application below. */
     if (handle_status_request(pd, cmd_code, reply)) {
+        return OSDP_PD_DISPATCH_SEND;
+    }
+
+    /* osdp_CAP, when a capability set is bound via osdp_pd_set_pdcap.
+     * Otherwise it falls through to the application below. */
+    if (cmd_code == OSDP_CMD_CAP && handle_pdcap(pd, reply)) {
         return OSDP_PD_DISPATCH_SEND;
     }
 

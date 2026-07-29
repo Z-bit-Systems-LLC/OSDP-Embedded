@@ -409,6 +409,23 @@ typedef struct osdp_pd_led_slot {
  * the PD tracks. One buzzer per reader. */
 #define OSDP_PD_MAX_BUZZERS 4U
 
+/* osdp_PDCAP record bank capacity for osdp_pd_set_pdcap: OSDP v2.2.2
+ * Annex B defines function codes 1..17 (18 is undefined in the spec text
+ * this project was built from — see osdp_pdcap_validate_record()), of
+ * which four (8, 9, 10, 17) are computed by the library itself and
+ * rejected if the application tries to set them — see
+ * osdp_pd_set_pdcap()'s doc comment. This many slots covers every
+ * remaining function code a spec-conformant PD could bind at once. */
+#define OSDP_PD_MAX_PDCAP_RECORDS 13U
+
+/* Number of osdp_PDCAP records the library computes for itself: function
+ * codes 8, 9, 10, and 17 — see osdp_pd_set_pdcap()'s doc comment for which
+ * and why. osdp_pd_get_pdcap() always returns this many more records than
+ * osdp_pd_set_pdcap() was given, so size a readback buffer as
+ * OSDP_PD_MAX_PDCAP_RECORDS + OSDP_PDCAP_RESERVED_COUNT to cover the
+ * largest possible reply. */
+#define OSDP_PDCAP_RESERVED_COUNT 4U
+
 /* One tracked reader buzzer: its reader identity, the resolved on/off
  * pattern state, and the last sounding flag reported (so the PD fires only
  * on an actual change). */
@@ -635,6 +652,13 @@ typedef struct osdp_pd {
     osdp_pd_status_provider_t  status;
     void                      *status_user;
 
+    /* osdp_PDCAP (0x46) records reported in answer to osdp_CAP. Copied in
+     * (not borrowed) by osdp_pd_set_pdcap, which is the only writer;
+     * `pdcap_count == 0` (the state after osdp_pd_init) leaves osdp_CAP
+     * falling through to cmd_cb exactly as before this existed. */
+    osdp_pdcap_record_t        pdcap_records[OSDP_PD_MAX_PDCAP_RECORDS];
+    size_t                     pdcap_count;
+
     /* Poll-response event queue (osdp_RAW, osdp_KEYPAD, osdp_FMT,
      * osdp_MFGREP). Caller-owned storage holding length-prefixed records;
      * `event_len` is the number of bytes currently occupied, always starting
@@ -855,7 +879,135 @@ void osdp_pd_set_status_provider(osdp_pd_t *pd,
 void osdp_pd_set_mfg_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
                               osdp_pd_mfg_cb cb, void *user);
 
-/* ---- PDCAP consistency (advisory) --------------------------------------*/
+/* ---- PDCAP: defaults, dynamic binding, consistency ---------------------
+ *
+ * A consumer has three ways to answer osdp_CAP, in increasing order of
+ * convenience:
+ *
+ *   1. Ignore all of this and answer osdp_CMD_CAP from cmd_cb by hand,
+ *      building the reply with osdp_pdcap_build() directly (unchanged
+ *      from before this section existed — nothing here is mandatory).
+ *   2. Assemble a records[] array (start from osdp_pd_default_pdcap() and
+ *      override the function codes that differ for this device), bind it
+ *      with osdp_pd_set_pdcap(), and the library answers osdp_CAP itself
+ *      from then on — cmd_cb is never called for it.
+ *   3. Skip binding and just call osdp_pd_check_pdcap() for its advisory
+ *      report while still answering osdp_CAP by hand.
+ *
+ * Four function codes — 8 (Check Character Support), 9 (Communication
+ * Security), 10 (Receive BufferSize), 17 (Secure PD Biometrics Match
+ * Support) — are RESERVED: they describe a fact about this library or this
+ * PD instance's live state rather than the physical device, so
+ * osdp_pd_set_pdcap() rejects them from `records` and the library computes
+ * and injects them itself, fresh on every osdp_CAP query:
+ *
+ *   fn 8  Check Character Support   always 0x01/0x00 — core/src/shared
+ *                                   always links both crc16.c and
+ *                                   checksum.c, so CRC-16 is
+ *                                   unconditionally true for any consumer
+ *                                   of this library.
+ *   fn 9  Communication Security    compliance always 0x01 (AES128 — a
+ *                                   library fact, like fn 8, not a
+ *                                   per-instance state check). num_objects
+ *                                   reports which key `pd` is actually
+ *                                   keyed with: 0x00 once a unique
+ *                                   operational SCBK has been set
+ *                                   (osdp_pd_set_sc_scbk), else 0x01
+ *                                   (still on the well-known SCBK-D, or no
+ *                                   key at all).
+ *   fn 10 Receive BufferSize        min(pd->rx_plain_cap,
+ *                                   OSDP_STREAM_BUFFER_LEN) — the same
+ *                                   compiled buffer constants that already
+ *                                   size the PD's working storage (see
+ *                                   OSDP_PD_BUF_LEN), so the advertised
+ *                                   figure can never outrun what this PD
+ *                                   can actually receive.
+ *   fn 17 Secure PD Biometrics      fixed 0x01/0x00.
+ *       Match Support
+ *
+ * Every other function code (including fn 11, Largest Combined Message)
+ * describes the physical device or an application-chosen policy, which
+ * only the application knows, so those stay consumer-settable through
+ * osdp_pd_default_pdcap()/osdp_pd_set_pdcap() as before. fn 11 in
+ * particular is still checked against pd's actual multi-part reassembly
+ * binding by osdp_pd_check_pdcap, exactly as it always was. */
+
+/* Fill `out[0..*count)` with a spec-conformant starting-point capability
+ * set — LED / buzzer / text / input / output / smart-card / downstream-
+ * reader / OSDP-version / multi-part-size records at reasonable reference
+ * values (the same ones OSDP.Net's PDConsole and this project's own
+ * osdp-pd-mock ship). The reserved function codes (see above) are NOT
+ * included: passing this array straight to osdp_pd_set_pdcap always
+ * succeeds on that front.
+ *
+ * fn 11 (Largest Combined Message) defaults to 0xFFFF — the largest size
+ * the wire encoding can express — as a placeholder meaning "however much
+ * this PD can multi-part once it has a reassembly buffer", not a claim
+ * that is honest on its own: osdp_pd_set_pdcap will reject it until
+ * osdp_pd_set_mfg_receiver is bound. Bind the receiver first, or lower
+ * this to 0 (or the receiver's real capacity) before binding.
+ *
+ * Every other record describes the physical device — LEDs, inputs, card
+ * formats — which only the application knows, so those stay at fixed
+ * reference values; override the ones that do not match this PD's actual
+ * hardware before binding.
+ *
+ * Returns OSDP_ERR_INVALID_ARG for a NULL out/count, OSDP_ERR_BUFFER_TOO_SMALL
+ * if `cap` is under the default set's size (nothing is written), otherwise
+ * OSDP_OK with `*count` set to the number of records written. */
+osdp_status_t osdp_pd_default_pdcap(osdp_pdcap_record_t   *out,
+                                    size_t                 cap,
+                                    size_t                *count);
+
+/* Validate `records[0..count)` — rejecting any reserved function code (see
+ * above), then each remaining record against osdp_pdcap_validate_record(),
+ * then the whole remaining set against osdp_pd_check_pdcap() (in practice,
+ * today, only its fn-11 case can still fire, since 9/10 can no longer reach
+ * it) — and, only if everything passes, COPY the records into `pd` (bounded
+ * by OSDP_PD_MAX_PDCAP_RECORDS) so the library answers osdp_CAP with them,
+ * plus the four reserved records it computes itself, from then on, without
+ * involving cmd_cb.
+ *
+ * The records are copied, not borrowed: unlike osdp_pd_set_buffers, the
+ * source array does not need to outlive this call. To change a value
+ * later, edit the application's own array and call osdp_pd_set_pdcap()
+ * again — every update is revalidated the same way the first one was.
+ *
+ * On success returns OSDP_OK. On failure applies nothing (the PD keeps
+ * whatever was bound before, or falls through to cmd_cb if nothing was)
+ * and returns:
+ *   OSDP_ERR_INVALID_ARG      NULL pd, or NULL records with count > 0, or
+ *                             a record's function code is reserved, or a
+ *                             record failed osdp_pdcap_validate_record
+ *                             (unknown function code / disallowed value).
+ *   OSDP_ERR_BUFFER_TOO_SMALL count exceeds OSDP_PD_MAX_PDCAP_RECORDS, or
+ *                             osdp_pd_check_pdcap's fn-11 buffer check
+ *                             failed.
+ *   OSDP_ERR_NOT_SUPPORTED    osdp_pd_check_pdcap's fn-11 (no multi-part
+ *                             receiver bound) check failed.
+ * When non-NULL, `*bad_index` receives the offending record's index for
+ * any of these (0 when the failure is not per-record, e.g. a NULL argument
+ * or an oversized count). Pass count=0 (records may be NULL) to clear the
+ * binding and return osdp_CAP to cmd_cb. */
+osdp_status_t osdp_pd_set_pdcap(osdp_pd_t                  *pd,
+                                const osdp_pdcap_record_t  *records,
+                                size_t                      count,
+                                size_t                     *bad_index);
+
+/* Snapshot exactly what osdp_CAP would answer right now: the records bound
+ * via osdp_pd_set_pdcap PLUS the four reserved records (fn 8/9/10/17),
+ * recomputed fresh from `pd`'s current state rather than a cached value —
+ * so this can change between two calls with nothing else in between if,
+ * say, osdp_pd_set_sc_scbk was called in the meantime.
+ *
+ * `*count` is 0 (OSDP_OK, nothing written) when nothing is bound, matching
+ * osdp_CAP's own fallback to cmd_cb in that case. Otherwise returns
+ * OSDP_ERR_BUFFER_TOO_SMALL if `cap` is under what is currently bound plus
+ * the four reserved records. */
+osdp_status_t osdp_pd_get_pdcap(const osdp_pd_t     *pd,
+                                osdp_pdcap_record_t *out,
+                                size_t               cap,
+                                size_t              *count);
 
 /* Check an application's osdp_PDCAP records against what this PD can
  * actually honour. Call it once at start-up with the same records the
@@ -885,8 +1037,11 @@ void osdp_pd_set_mfg_receiver(osdp_pd_t *pd, uint8_t *buf, size_t cap,
  * record, so the caller can report which one rather than just that
  * something is wrong.
  *
- * Purely advisory: no wire behaviour changes, nothing calls this
- * automatically, and a PD that never calls it does not link it. */
+ * No wire behaviour changes as a result of calling this directly — it
+ * only inspects `records`/`count` and reports. Nothing calls it
+ * automatically UNLESS the application also uses osdp_pd_set_pdcap(),
+ * which runs this same check before accepting a new binding; a PD that
+ * calls neither does not link it. */
 osdp_status_t osdp_pd_check_pdcap(const osdp_pd_t           *pd,
                                   const osdp_pdcap_record_t *records,
                                   size_t                     count,

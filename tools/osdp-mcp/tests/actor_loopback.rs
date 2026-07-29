@@ -111,7 +111,6 @@ fn pdid_edit_reflected_in_next_id_reply() {
     });
     pd.set_command_handler(handler::DefaultHandler::with_pdid(
         Arc::clone(&shared_pdid),
-        Arc::new(Mutex::new(handler::default_pdcap())),
         Arc::clone(&stats),
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
@@ -166,9 +165,11 @@ fn pdid_edit_reflected_in_next_id_reply() {
     }
 }
 
-/// A handler built with `with_pdid` serves the `osdp_CAP` reply from the
-/// shared PDCAP, and an edit to that shared value shows up in the very
-/// next reply — the mechanism behind the `pd_set_capability` /
+/// `osdp_CAP` is answered directly by the C library once a capability set
+/// is bound via `Pd::set_pdcap` — the handler is never invoked for it. An
+/// edit via `set_pdcap` shows up in the very next reply, and the four
+/// library-computed records (fn 8/9/10/17) are present alongside whatever
+/// was bound. This is the mechanism behind the `pd_set_capability` /
 /// `pd_reset_pdcap` tools.
 #[test]
 fn pdcap_edit_reflected_in_next_cap_reply() {
@@ -182,17 +183,12 @@ fn pdcap_edit_reflected_in_next_cap_reply() {
     let evq = events::new_queue();
     let drops: handler::DropCounter = StdArc::new(std::sync::atomic::AtomicU32::new(0));
 
-    // Shared PDCAP, owned here and by the handler — exactly how the actor
-    // wires it so `pd_set_capability` can mutate a live PD's capabilities.
-    let shared_pdcap = Arc::new(Mutex::new(handler::default_pdcap()));
-
     let mut pd = Pd::new(0x10);
     pd.set_transport(WireAdapter::<true> {
         wire: Rc::clone(&wire),
     });
     pd.set_command_handler(handler::DefaultHandler::with_pdid(
         Arc::new(Mutex::new(handler::default_pdid())),
-        Arc::clone(&shared_pdcap),
         Arc::clone(&stats),
         StdArc::clone(&log),
         StdArc::clone(&ovmap),
@@ -200,6 +196,20 @@ fn pdcap_edit_reflected_in_next_cap_reply() {
         StdArc::clone(&drops),
         0x10,
     ));
+
+    // Bind a default capability set directly on the PD. fn 11's 0xFFFF
+    // placeholder needs a bound multi-part receiver, which this test
+    // doesn't exercise, so zero it — same fix-up `pd_actor`'s own default
+    // applies.
+    let mut default_records = Pd::default_pdcap();
+    for r in &mut default_records {
+        if r.function_code == 11 {
+            r.compliance_level = 0;
+            r.num_objects = 0;
+        }
+    }
+    pd.set_pdcap(&default_records)
+        .expect("default pdcap should validate");
 
     let captured = Rc::new(RefCell::new(Captured::default()));
     let mut acu = Acu::new(1);
@@ -211,26 +221,26 @@ fn pdcap_edit_reflected_in_next_cap_reply() {
     });
     acu.register_pd(0, 0x10).expect("register_pd");
 
-    // First CAP → default capability set.
+    // First CAP → the bound capability set, exactly as `pd.pdcap()` reports
+    // it (device records plus the four library-computed ones).
     acu.send_command(0x10, OSDP_CMD_CAP, &[0x00]).unwrap();
     cycle(&mut pd, &mut acu, 4);
     {
         let cap = captured.borrow();
         let (_, _, reply, payload) = cap.log.last().expect("a CAP reply");
         assert_eq!(*reply, OSDP_REPLY_PDCAP);
-        assert_eq!(Pdcap::decode(payload).unwrap(), handler::default_pdcap());
+        let decoded = Pdcap::decode(payload).unwrap();
+        assert_eq!(decoded.records, pd.pdcap());
     }
 
-    // Edit the shared capability set to a single, distinctive record,
-    // then poll CAP again.
-    let edited = Pdcap {
-        records: vec![PdcapRecord {
-            function_code: 4,
-            compliance_level: 6,
-            num_objects: 3,
-        }],
-    };
-    *shared_pdcap.lock().unwrap() = edited.clone();
+    // Edit the bound capability set to a single, distinctive device
+    // record, then poll CAP again.
+    let edited = vec![PdcapRecord {
+        function_code: 4,
+        compliance_level: 6,
+        num_objects: 3,
+    }];
+    pd.set_pdcap(&edited).expect("edited pdcap should validate");
 
     acu.send_command(0x10, OSDP_CMD_CAP, &[0x00]).unwrap();
     cycle(&mut pd, &mut acu, 4);
@@ -238,10 +248,18 @@ fn pdcap_edit_reflected_in_next_cap_reply() {
         let cap = captured.borrow();
         let (_, _, reply, payload) = cap.log.last().expect("a second CAP reply");
         assert_eq!(*reply, OSDP_REPLY_PDCAP);
+        let decoded = Pdcap::decode(payload).unwrap();
         assert_eq!(
-            Pdcap::decode(payload).unwrap(),
-            edited,
+            decoded.records,
+            pd.pdcap(),
             "the edited PDCAP should appear in the next CAP reply"
+        );
+        assert!(
+            decoded
+                .records
+                .iter()
+                .any(|r| r.function_code == 4 && r.compliance_level == 6 && r.num_objects == 3),
+            "the edited record itself should be present"
         );
     }
 }
@@ -267,6 +285,17 @@ fn default_handler_handles_baseline() {
         StdArc::clone(&drops),
         0x10,
     ));
+    // osdp_CAP is answered directly from here, never reaching the handler
+    // above — same as pd_actor::open_pd always binding one.
+    let mut default_records = Pd::default_pdcap();
+    for r in &mut default_records {
+        if r.function_code == 11 {
+            r.compliance_level = 0;
+            r.num_objects = 0;
+        }
+    }
+    pd.set_pdcap(&default_records)
+        .expect("default pdcap should validate");
 
     let captured = Rc::new(RefCell::new(Captured::default()));
     let mut acu = Acu::new(1);
@@ -304,23 +333,26 @@ fn default_handler_handles_baseline() {
     let pdid = Pdid::decode(payload).expect("decode default PDID");
     assert_eq!(pdid, handler::default_pdid());
 
-    // CAP → PDCAP — decode and confirm it matches default_pdcap().
+    // CAP → PDCAP — decode and confirm it matches what was bound.
     let (_, cmd, reply, payload) = &cap.log[2];
     assert_eq!((*cmd, *reply), (OSDP_CMD_CAP, OSDP_REPLY_PDCAP));
     let pdcap = Pdcap::decode(payload).expect("decode default PDCAP");
-    assert_eq!(pdcap, handler::default_pdcap());
+    assert_eq!(pdcap.records, pd.pdcap());
     drop(cap);
 
-    // Stats picked up the last cmd/reply.
+    // Stats are stamped by the handler, which osdp_CAP no longer reaches
+    // (library-answered, same as osdp_COMSET already was) — so they still
+    // show the last command that DID reach it, osdp_ID.
     let s = stats.lock().unwrap();
-    assert_eq!(s.last_cmd_code, Some(OSDP_CMD_CAP));
-    assert_eq!(s.last_reply_code, Some(OSDP_REPLY_PDCAP));
+    assert_eq!(s.last_cmd_code, Some(OSDP_CMD_ID));
+    assert_eq!(s.last_reply_code, Some(OSDP_REPLY_PDID));
     drop(s);
 
-    // ---- Log captured all three round trips ----
-    // POLL/ACK go to the heartbeat counter (push-filtered, no ring
-    // slot) so the 1024-entry ring stays reserved for interesting
-    // traffic; only ID/PDID and CAP/PDCAP show up as entries.
+    // ---- Log captured the one round trip that reached the handler ----
+    // POLL/ACK go to the heartbeat counter (push-filtered, no ring slot).
+    // osdp_CAP is answered directly by the C library (same as osdp_COMSET
+    // already was) and never reaches DefaultHandler::handle, so it never
+    // reaches self.log.push either — only ID/PDID shows up as an entry.
     let page = log.snapshot(0, 100, EffectiveFilter::Exclude(vec![]));
     let codes: Vec<(Direction, u8)> = page.entries.iter().map(|e| (e.direction, e.code)).collect();
     assert_eq!(
@@ -328,8 +360,6 @@ fn default_handler_handles_baseline() {
         vec![
             (Direction::Cmd, OSDP_CMD_ID),
             (Direction::Reply, OSDP_REPLY_PDID),
-            (Direction::Cmd, OSDP_CMD_CAP),
-            (Direction::Reply, OSDP_REPLY_PDCAP),
         ]
     );
     // The heartbeat IS visible — just aggregated. The suppression
