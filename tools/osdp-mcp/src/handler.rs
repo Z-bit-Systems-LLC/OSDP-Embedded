@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use osdp_embedded::messages::{
-    Keyset, Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_KEYSET,
-    OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
-    OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR,
-    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    Keyset, Out, Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID,
+    OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
+    OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_PDCAP,
+    OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{
     CommandHandler, ComsetHandler, FileFragment, FileReceiver, FileReject, Reply,
@@ -37,6 +37,7 @@ use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::BaudControl;
+use crate::status::SharedStatus;
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_TX_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -269,6 +270,14 @@ pub struct DefaultHandler {
     /// constructors); the actor binds the shared one via
     /// [`DefaultHandler::with_key_rotation`].
     key_rotation: SharedKeyRotation,
+    /// Monitored conditions behind the four status queries. The PD answers
+    /// osdp_LSTAT / ISTAT / OSTAT / RSTAT from the providers bound in
+    /// `pd_actor::open_pd`, so this handler only ever *writes* it — the
+    /// osdp_OUT arm records commanded relay state so a later osdp_OSTAT is
+    /// truthful. `None` in the test constructors, which have no PD actor
+    /// binding providers; the actor supplies it via
+    /// [`DefaultHandler::with_status`].
+    status: Option<SharedStatus>,
 }
 
 impl DefaultHandler {
@@ -321,6 +330,7 @@ impl DefaultHandler {
             pd_address,
             epoch: Instant::now(),
             key_rotation: Arc::new(Mutex::new(None)),
+            status: None,
         }
     }
 
@@ -331,6 +341,15 @@ impl DefaultHandler {
     /// default in place.
     pub fn with_key_rotation(mut self, cell: SharedKeyRotation) -> Self {
         self.key_rotation = cell;
+        self
+    }
+
+    /// Bind the shared status block so `osdp_OUT` commands are recorded into
+    /// the output state the `osdp_OSTAT` provider reports. Same arrangement
+    /// as [`DefaultHandler::with_key_rotation`]: the actor calls this in
+    /// `open_pd`, tests that don't care leave it unbound.
+    pub fn with_status(mut self, status: SharedStatus) -> Self {
+        self.status = Some(status);
         self
     }
 
@@ -450,7 +469,24 @@ impl CommandHandler for DefaultHandler {
                 let n = pdcap.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDCAP, n)
             }
-            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_OUT => {
+                // Record what the ACU commanded so a later osdp_OSTAT
+                // reports the real relay state instead of a constant. The
+                // reply is a plain ACK either way — a payload we can't
+                // decode is still ACKed, matching the previous behaviour;
+                // we simply have nothing to record.
+                if let Some(status) = self.status.as_ref() {
+                    if let Ok(records) = Out::decode(payload) {
+                        if let Ok(mut s) = status.lock() {
+                            for r in &records.records {
+                                s.apply_output(r.output_no, r.control_code);
+                            }
+                        }
+                    }
+                }
+                (OSDP_REPLY_ACK, 0)
+            }
+            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_TEXT => (OSDP_REPLY_ACK, 0),
             OSDP_CMD_KEYSET => {
                 // The C library rotates the PD's live SCBK in place for a
                 // well-formed SCBK KEYSET (and NAKs a malformed one,
@@ -475,18 +511,11 @@ impl CommandHandler for DefaultHandler {
                 }
                 (OSDP_REPLY_ACK, 0)
             }
-            OSDP_CMD_LSTAT => {
-                // Local status query. Hard-coded "all clear" for now:
-                // tamper=0, power=0 (spec D.2.1 LSTATR payload is two
-                // bytes). TODO: the library has no way for a consumer
-                // to supply real tamper/power state in response to an
-                // LSTAT *command* — only via the inject_local_status
-                // POLL event. A future API should let the application
-                // own this reply rather than us synthesising a constant.
-                self.scratch[0] = 0; // tamper: not tampered
-                self.scratch[1] = 0; // power: OK
-                (OSDP_REPLY_LSTATR, 2)
-            }
+            // osdp_LSTAT / ISTAT / OSTAT / RSTAT never reach here: the PD
+            // answers all four from the status providers bound in
+            // `pd_actor::open_pd`, which build the *STATR replies from the
+            // shared status block. This handler used to synthesise a
+            // constant "all clear" LSTATR and NAK the other three.
             _ => {
                 // Library will synthesise NAK 0x03; record it now
                 // since we won't get a hook on the outbound path.
