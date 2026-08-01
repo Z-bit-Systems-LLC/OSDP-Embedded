@@ -214,8 +214,11 @@ mod tests {
         let q = new_queue();
         // LSTATR / ISTATR / OSTATR / RSTATR queued long ago (e.g. a
         // power-cycle report sitting from boot until the ACU first
-        // polls) must all still be deliverable.
-        let ancient = EVENT_TTL * 1000;
+        // polls) must all still be deliverable. Comfortably past EVENT_TTL
+        // is enough to prove the exemption; a much larger backdate risked
+        // underflowing Instant on a host with little monotonic uptime
+        // (Instant has no epoch before process/system start).
+        let ancient = EVENT_TTL * 10;
         enqueue_aged(&q, r(OSDP_REPLY_LSTATR, &[0, 1]), ancient);
         enqueue_aged(&q, r(OSDP_REPLY_ISTATR, &[0]), ancient);
         enqueue_aged(&q, r(OSDP_REPLY_OSTATR, &[0]), ancient);
