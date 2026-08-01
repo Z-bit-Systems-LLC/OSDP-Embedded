@@ -25,8 +25,10 @@
 
     Every gate runs even if an earlier one fails (dependent steps are
     skipped, not silently passed), so a single invocation surfaces all
-    problems at once. The script exits non-zero if any gate failed,
-    which makes it usable straight from a git pre-push hook.
+    problems at once. The script exits non-zero if any gate failed. Run
+    it by hand before pushing; New-Release.ps1 also runs it once before
+    tagging a release. There is deliberately no git pre-push hook running
+    it a second time — see README.md's "Pre-push checks" section.
 
     On Windows + MSVC, run from a *Developer PowerShell for VS* so `cl`
     and `rc` are on PATH — the C presets use the Ninja generator, which
@@ -86,7 +88,22 @@ function Test-Tool {
 # Visual Studio and are absent from a plain shell's PATH. Returns $true
 # if cmake is invokable afterwards, $false if no toolchain was found.
 function Initialize-VsToolchain {
-    if (Test-Tool 'cmake') { return $true }
+    # Deliberately does NOT short-circuit just because `cmake` already
+    # resolves — that used to be the whole check, on the assumption that
+    # meant PATH was already fully and correctly set up (e.g. a genuine
+    # Developer PowerShell for VS). That assumption broke the one time
+    # this script ran spawned from git's bundled sh.exe (MSYS2), which
+    # rewrites PATH and puts its own /usr/bin ahead of everything before
+    # spawning pwsh: `cmake` still resolved fine (MSYS2 ships no colliding
+    # cmake), but `link` silently resolved to MSYS2's coreutils `link` (a
+    # hard-link utility) instead of MSVC's linker, producing a confusing
+    # link failure instead of a clean skip or pass. Nothing in this repo
+    # spawns pwsh that way anymore, but any other enclosing shell could
+    # reorder PATH the same way, so always locate VS and (re-)prepend its
+    # tool dirs so resolution order is right regardless of what an
+    # enclosing shell already did to PATH;
+    # only fall back to trusting an already-correct PATH when VS genuinely
+    # can't be located.
 
     # Locate the VS install. vswhere is the canonical locator; fall back
     # to scanning the standard install roots if it's missing.
@@ -110,10 +127,10 @@ function Initialize-VsToolchain {
             if ($hit) { $vsRoot = $hit.FullName; break }
         }
     }
-    if (-not $vsRoot) { return $false }
+    if (-not $vsRoot) { return [bool](Test-Tool 'cmake') }
 
     $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
-    if (-not (Test-Path $vcvars)) { return $false }
+    if (-not (Test-Path $vcvars)) { return [bool](Test-Tool 'cmake') }
 
     # Import the environment vcvars64 produces (PATH, INCLUDE, LIB, ...)
     # into this process — the standard "source vcvars into PowerShell"

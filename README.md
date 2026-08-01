@@ -293,24 +293,19 @@ clippy -D warnings`, `cargo build`/`test --workspace --release`, and the
 two loopback examples for the Rust workspace. A clean run means the
 pipeline should pass. Every gate runs even if an earlier one fails, so a
 single invocation surfaces all problems; the script exits non-zero if any
-gate failed, so it drops straight into a git `pre-push` hook.
+gate failed.
 
 The C gates use the Ninja-based `release` preset, so on Windows run from a
 *Developer PowerShell for VS* (it skips the CMake stack with a hint if
 `cmake` isn't on PATH). Handy flags: `-Fix` auto-applies `cargo fmt`
 instead of failing on it; `-SkipC` / `-SkipRust` run just one stack.
 
-To run the suite automatically on every `git push`, enable the
-version-controlled hook once per clone:
-
-```sh
-git config core.hooksPath scripts/hooks
-```
-
-[`scripts/hooks/pre-push`](scripts/hooks/pre-push) then runs the checks
-and aborts the push if any gate fails. It needs PowerShell (`pwsh` or
-Windows `powershell`) on PATH; bypass in a pinch with
-`git push --no-verify`.
+There is no git `pre-push` hook — [`scripts/New-Release.ps1`](scripts/New-Release.ps1)
+already runs this suite once before tagging a release (`-SkipChecks` to
+skip it there too), and a hook re-running it on every push added a second,
+redundant invocation in a fresh subprocess whose PATH could end up
+different from the one that already validated the code. Run it by hand
+before an ordinary push if you want the same assurance.
 
 ### Inspecting a capture
 

@@ -43,8 +43,9 @@
 .PARAMETER AutoConfirm
     Skip the interactive confirmation prompt (for unattended use).
 .PARAMETER SkipChecks
-    Skip the Check-Code.ps1 verification gates. The pre-push hook still
-    runs them at push time if it's enabled.
+    Skip the Check-Code.ps1 verification gates. Nothing else runs them —
+    there is no git pre-push hook — so the tagged commit's correctness
+    rests entirely on whatever you verified beforehand.
 .EXAMPLE
     ./scripts/New-Release.ps1 -DryRun
     Preview a patch release (0.1.0 -> 0.1.1) end to end.
