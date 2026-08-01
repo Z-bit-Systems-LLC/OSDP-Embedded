@@ -17,7 +17,7 @@
  * function codes whose truth it — not the application — knows, because they
  * describe the library's own limits or this PD instance's live state rather
  * than the device: see is_reserved_pdcap_fn's doc comment for exactly which,
- * osdp_pd_default_pdcap for the rest, and osdp_pd_set_pdcap for how the two
+ * osdp_pd_pdcap_template for the rest, and osdp_pd_set_pdcap for how the two
  * combine into what pd_dispatch.c actually answers osdp_CAP with.
  *
  * osdp_pd_check_pdcap remains independently useful and purely advisory —
@@ -33,12 +33,13 @@
 
 #include <string.h>
 
-/* PDCAP function codes this check understands (spec Annex B). */
+/* PDCAP function codes this check understands (spec Annex B). Annex B in
+ * the reference text this project was built from ends at function code 16
+ * (OSDP Version) — there is no function code 17 or 18 to define here. */
 #define PDCAP_FN_CHECK_CHARACTER          8U   /* B.9  */
 #define PDCAP_FN_COMMUNICATION_SECURITY   9U   /* B.10 */
 #define PDCAP_FN_RECEIVE_BUFFER_SIZE     10U   /* B.11 */
 #define PDCAP_FN_LARGEST_COMBINED_MSG    11U   /* B.12 */
-#define PDCAP_FN_SECURE_BIOMETRICS       17U   /* B.18 */
 
 /* B.10: compliance byte is a bitmap of supported encryption algorithms. */
 #define PDCAP_SEC_AES128 0x01U
@@ -178,12 +179,10 @@ osdp_status_t osdp_pd_check_pdcap(const osdp_pd_t           *pd,
  *                                   OSDP_STREAM_BUFFER_LEN) — the same
  *                                   compiled buffer constants that already
  *                                   size the PD's working storage.
- *   fn 17 Secure PD Biometrics      fixed 0x01/0x00.
- *       Match Support
  *
  * fn 11 (Largest Combined Message) is NOT in this list — unlike the above,
- * it stays consumer-settable (see k_pdcap_device_defaults) and is checked
- * against pd's actual multi-part reassembly binding by
+ * it stays consumer-settable (see k_pdcap_template_secure_reader) and is
+ * checked against pd's actual multi-part reassembly binding by
  * osdp_pd_check_pdcap, same as it always was.
  *
  * Kept as one flat list of function codes (rather than duplicating it at
@@ -195,19 +194,21 @@ static bool is_reserved_pdcap_fn(uint8_t function_code)
     case PDCAP_FN_CHECK_CHARACTER:
     case PDCAP_FN_COMMUNICATION_SECURITY:
     case PDCAP_FN_RECEIVE_BUFFER_SIZE:
-    case PDCAP_FN_SECURE_BIOMETRICS:
         return true;
     default:
         return false;
     }
 }
 
-/* Reference values for the records only the application can know the truth
- * of (LEDs, inputs, card formats, ...). Mirrors the reference PD this
- * project's own test tooling ships (osdp-pd-mock, tools/osdp-mcp), so a
- * from-scratch PD interoperates the same way those already-validated
- * fixtures do. The reserved function codes above are deliberately absent —
- * see is_reserved_pdcap_fn's doc comment.
+/* OSDP_PDCAP_TEMPLATE_SECURE_READER: reference values for the records only
+ * the application can know the truth of (card format, LEDs, buzzer,
+ * downstream readers, OSDP version, multi-part size) — a pure credential
+ * reader with no contact inputs, relay outputs, text display, or smart-card
+ * support of its own. The reserved function codes (see above) are
+ * deliberately absent — see is_reserved_pdcap_fn's doc comment. A device
+ * that also has contacts/outputs/a display/smart-card support adds those
+ * function codes itself before binding; this template is a floor, not a
+ * ceiling.
  *
  * fn 11 defaults to 0xFFFF — the largest size the wire encoding can express
  * — rather than 0: it is a placeholder meaning "however much this PD can
@@ -217,35 +218,45 @@ static bool is_reserved_pdcap_fn(uint8_t function_code)
  * default unmodified fails loudly rather than silently advertising
  * multi-part support the PD cannot back up. Bind the receiver first, or
  * lower this to 0 / the receiver's real capacity. */
-static const osdp_pdcap_record_t k_pdcap_device_defaults[] = {
-    { 1,  4,    1 },     /* B.2  Contact Status Monitoring   */
-    { 2,  4,    1 },     /* B.3  Output Control              */
+static const osdp_pdcap_record_t k_pdcap_template_secure_reader[] = {
     { 3,  1,    0 },     /* B.4  Card Data Format             */
     { 4,  4,    1 },     /* B.5  Reader LED Control           */
     { 5,  2,    1 },     /* B.6  Reader Audible Output        */
-    { 6,  1,    1 },     /* B.7  Reader Text Output           */
     { 11, 0xFF, 0xFF },  /* B.12 Largest Combined Msg: max    */
-    { 12, 0,    0 },     /* B.13 Smart Card Support           */
     { 13, 0,    1 },     /* B.14 Readers (downstream)         */
     { 16, 4,    0 },     /* B.17 OSDP Version: SIA OSDP 2.2.2 */
 };
 
-#define OSDP_PDCAP_DEVICE_DEFAULT_COUNT \
-    (sizeof(k_pdcap_device_defaults) / sizeof(k_pdcap_device_defaults[0]))
+#define OSDP_PDCAP_TEMPLATE_SECURE_READER_COUNT \
+    (sizeof(k_pdcap_template_secure_reader) / sizeof(k_pdcap_template_secure_reader[0]))
 
-osdp_status_t osdp_pd_default_pdcap(osdp_pdcap_record_t *out,
-                                    size_t               cap,
-                                    size_t              *count)
+osdp_status_t osdp_pd_pdcap_template(osdp_pd_pdcap_template_t template,
+                                     osdp_pdcap_record_t      *out,
+                                     size_t                    cap,
+                                     size_t                   *count)
 {
     if (out == NULL || count == NULL) {
         return OSDP_ERR_INVALID_ARG;
     }
-    if (cap < OSDP_PDCAP_DEVICE_DEFAULT_COUNT) {
+
+    const osdp_pdcap_record_t *records;
+    size_t n;
+
+    switch (template) {
+    case OSDP_PDCAP_TEMPLATE_SECURE_READER:
+        records = k_pdcap_template_secure_reader;
+        n = OSDP_PDCAP_TEMPLATE_SECURE_READER_COUNT;
+        break;
+    default:
+        return OSDP_ERR_INVALID_ARG;
+    }
+
+    if (cap < n) {
         return OSDP_ERR_BUFFER_TOO_SMALL;
     }
 
-    (void)memcpy(out, k_pdcap_device_defaults, sizeof(k_pdcap_device_defaults));
-    *count = OSDP_PDCAP_DEVICE_DEFAULT_COUNT;
+    (void)memcpy(out, records, n * sizeof(*records));
+    *count = n;
     return OSDP_OK;
 }
 
@@ -322,10 +333,6 @@ void osdp_pd_internal_fill_reserved_pdcap(
     out[2].function_code    = PDCAP_FN_RECEIVE_BUFFER_SIZE;
     out[2].compliance_level = (uint8_t)(rx_cap & 0xFFU);
     out[2].num_objects      = (uint8_t)((rx_cap >> 8) & 0xFFU);
-
-    out[3].function_code    = PDCAP_FN_SECURE_BIOMETRICS;
-    out[3].compliance_level = 0x01U;
-    out[3].num_objects      = 0x00U;
 }
 
 /* Insertion sort: n is at most OSDP_PD_MAX_PDCAP_RECORDS +

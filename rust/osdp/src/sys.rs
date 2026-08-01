@@ -1201,7 +1201,19 @@ mod pd_ffi {
     pub const OSDP_PD_MAX_PDCAP_RECORDS: usize = 13;
     /* Must track OSDP_PDCAP_RESERVED_COUNT in pd/include/osdp/osdp_pd.h —
      * how many more records osdp_pd_get_pdcap returns than were bound. */
-    pub const OSDP_PDCAP_RESERVED_COUNT: usize = 4;
+    pub const OSDP_PDCAP_RESERVED_COUNT: usize = 3;
+
+    /// Mirror of the C `osdp_pd_pdcap_template_t` enum — same newtype
+    /// pattern as `osdp_status_t` (see its doc comment): a `#[repr(C)] enum`
+    /// would be UB if the C side ever returned a value Rust hadn't
+    /// enumerated.
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    pub struct osdp_pd_pdcap_template_t(pub c_int);
+
+    impl osdp_pd_pdcap_template_t {
+        pub const OSDP_PDCAP_TEMPLATE_SECURE_READER: Self = Self(0);
+    }
 
     pub type osdp_pd_read_cb =
         Option<unsafe extern "C" fn(user: *mut c_void, buf: *mut u8, cap: usize) -> c_int>;
@@ -1527,16 +1539,18 @@ mod pd_ffi {
             bad_index: *mut usize,
         ) -> osdp_status_t;
 
-        /// Starting-point capability set, excluding the four reserved
-        /// function codes (8, 9, 10, 17) the library computes for itself.
-        pub fn osdp_pd_default_pdcap(
+        /// Named, starting-point capability set, excluding the three
+        /// reserved function codes (8, 9, 10) the library computes for
+        /// itself.
+        pub fn osdp_pd_pdcap_template(
+            template: osdp_pd_pdcap_template_t,
             out: *mut osdp_pdcap_record_t,
             cap: usize,
             count: *mut usize,
         ) -> osdp_status_t;
 
         /// Validate then bind `records` so the library answers osdp_CAP
-        /// directly; rejects the four reserved function codes and anything
+        /// directly; rejects the three reserved function codes and anything
         /// osdp_pdcap_validate_record / osdp_pd_check_pdcap objects to.
         /// `bad_index` (when non-NULL) receives the offending record's
         /// index. count=0 (records may be NULL) clears the binding.
@@ -1548,7 +1562,7 @@ mod pd_ffi {
         ) -> osdp_status_t;
 
         /// Snapshot of what osdp_CAP would answer right now: bound records
-        /// plus the four reserved ones, recomputed fresh from `pd`'s
+        /// plus the three reserved ones, recomputed fresh from `pd`'s
         /// current state. `*count` is 0 when nothing is bound.
         pub fn osdp_pd_get_pdcap(
             pd: *const osdp_pd_t,

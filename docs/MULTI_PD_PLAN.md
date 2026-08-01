@@ -164,5 +164,6 @@ passes.
   If two physical lines are needed, run two processes (HTTP transport
   + different `--bind` makes that ergonomic).
 - Per-PD PDID/PDCAP overrides. Today every PD reports the same
-  defaults from `handler::default_pdid()` / `default_pdcap()`; per-PD
-  overrides would be a follow-on once the multi-PD API stabilises.
+  defaults from `handler::default_pdid()` / the "Secure Reader" PDCAP
+  template (`osdp_embedded::pd::Pd::pdcap_template`); per-PD overrides
+  would be a follow-on once the multi-PD API stabilises.

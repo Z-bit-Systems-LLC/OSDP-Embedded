@@ -20,7 +20,7 @@ use osdp_embedded::messages::{
     OSDP_CMD_LED, OSDP_CMD_POLL, OSDP_REPLY_ACK, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR,
     OSDP_REPLY_PDCAP, OSDP_REPLY_PDID, OSDP_REPLY_RAW,
 };
-use osdp_embedded::pd::{LedColor, Pd};
+use osdp_embedded::pd::{LedColor, Pd, PdcapTemplate};
 use osdp_embedded::Transport;
 use osdp_mcp::overrides::OverrideReply;
 use osdp_mcp::reader_state::{self, ReaderBuzzerHandler, ReaderLedHandler};
@@ -167,8 +167,8 @@ fn pdid_edit_reflected_in_next_id_reply() {
 
 /// `osdp_CAP` is answered directly by the C library once a capability set
 /// is bound via `Pd::set_pdcap` — the handler is never invoked for it. An
-/// edit via `set_pdcap` shows up in the very next reply, and the four
-/// library-computed records (fn 8/9/10/17) are present alongside whatever
+/// edit via `set_pdcap` shows up in the very next reply, and the three
+/// library-computed records (fn 8/9/10) are present alongside whatever
 /// was bound. This is the mechanism behind the `pd_set_capability` /
 /// `pd_reset_pdcap` tools.
 #[test]
@@ -201,7 +201,7 @@ fn pdcap_edit_reflected_in_next_cap_reply() {
     // placeholder needs a bound multi-part receiver, which this test
     // doesn't exercise, so zero it — same fix-up `pd_actor`'s own default
     // applies.
-    let mut default_records = Pd::default_pdcap();
+    let mut default_records = Pd::pdcap_template(PdcapTemplate::SecureReader);
     for r in &mut default_records {
         if r.function_code == 11 {
             r.compliance_level = 0;
@@ -287,7 +287,7 @@ fn default_handler_handles_baseline() {
     ));
     // osdp_CAP is answered directly from here, never reaching the handler
     // above — same as pd_actor::open_pd always binding one.
-    let mut default_records = Pd::default_pdcap();
+    let mut default_records = Pd::pdcap_template(PdcapTemplate::SecureReader);
     for r in &mut default_records {
         if r.function_code == 11 {
             r.compliance_level = 0;

@@ -202,7 +202,7 @@ void osdp_pd_internal_fill_reserved_pdcap(
 /* Sort `records[0..count)` ascending by function_code in place. The
  * reserved records and the bound ones are assembled from two different
  * places (see osdp_pd_internal_fill_reserved_pdcap), so without this the
- * wire order would be "reserved four, then whatever order the application
+ * wire order would be "reserved three, then whatever order the application
  * bound" rather than the ascending Annex B order a human (or another PD
  * implementation) reading the reply would expect. Defined in pd_pdcap.c;
  * shared by pd_dispatch.c's osdp_CMD_CAP handler and osdp_pd_get_pdcap. */

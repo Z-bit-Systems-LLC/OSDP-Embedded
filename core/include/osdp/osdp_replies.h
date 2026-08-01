@@ -118,11 +118,13 @@ osdp_status_t osdp_pdcap_build(const osdp_pdcap_record_t *records,
 
 /* Validate one osdp_PDCAP record's function code, compliance level, and
  * number-of-objects byte against OSDP v2.2.2 Annex B ("Function Code
- * Definitions List"). Covers function codes 1..17 as defined in the spec
- * text this project was built from; function code 18 ("Extended
- * Capability Display") is listed in the spec's table of contents but its
- * body is marked "Error! Bookmark not defined." there, so it is rejected
- * as unrecognised until a definition exists to validate against.
+ * Definitions List"). Covers function codes 1..16 as defined in the spec
+ * text this project was built from; Annex B ends there — function codes 17
+ * ("Secure PD Biometrics Match Support") and 18 ("Extended Capability
+ * Display") are listed in the spec's table of contents (the latter with
+ * its body marked "Error! Bookmark not defined.") but neither has a body in
+ * the document itself, so both are rejected as unrecognised until a
+ * definition exists to validate against.
  *
  * Returns OSDP_OK if the record is spec-conformant, OSDP_ERR_INVALID_ARG
  * for an unrecognised function code or a value Annex B does not allow for

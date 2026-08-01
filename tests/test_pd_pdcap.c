@@ -297,16 +297,15 @@ static void test_a_consistent_capability_list_passes(void)
 }
 
 /* ========================================================================
- * osdp_pd_default_pdcap / osdp_pd_set_pdcap
+ * osdp_pd_pdcap_template / osdp_pd_set_pdcap
  *
- * The reserved function codes (8, 9, 10, 17) are library-computed and
- * never accepted from the application; osdp_pd_default_pdcap's output
- * never includes them, and osdp_pd_set_pdcap rejects them from records[].
- * fn 11 stays consumer-settable and still goes through osdp_pd_check_pdcap.
+ * The reserved function codes (8, 9, 10) are library-computed and never
+ * accepted from the application; osdp_pd_pdcap_template's output never
+ * includes them, and osdp_pd_set_pdcap rejects them from records[]. fn 11
+ * stays consumer-settable and still goes through osdp_pd_check_pdcap.
  * ====================================================================== */
 
 #define FN_CHECK_CHARACTER  8U
-#define FN_SECURE_BIOMETRICS 17U
 
 static const osdp_pdcap_record_t *find_record(const osdp_pdcap_record_t *recs,
                                               size_t count, uint8_t fc)
@@ -319,42 +318,54 @@ static const osdp_pdcap_record_t *find_record(const osdp_pdcap_record_t *recs,
     return NULL;
 }
 
-static void test_default_pdcap_rejects_null(void)
+static void test_pdcap_template_rejects_null(void)
 {
     osdp_pdcap_record_t out[16];
     size_t count;
     TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
-                      osdp_pd_default_pdcap(NULL, 16, &count));
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             NULL, 16, &count));
     TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
-                      osdp_pd_default_pdcap(out, 16, NULL));
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, 16, NULL));
 }
 
-static void test_default_pdcap_rejects_undersized_buffer(void)
+static void test_pdcap_template_rejects_unknown_template(void)
+{
+    osdp_pdcap_record_t out[16];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_pdcap_template((osdp_pd_pdcap_template_t)99,
+                                             out, 16, &count));
+}
+
+static void test_pdcap_template_rejects_undersized_buffer(void)
 {
     osdp_pdcap_record_t out[1];
     size_t count;
     TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
-                      osdp_pd_default_pdcap(out, 1, &count));
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, 1, &count));
 }
 
-/* The whole point of the split: the default set can always be handed
+/* The whole point of the split: the template's set can always be handed
  * straight to osdp_pd_set_pdcap on a freshly-initialized PD without ever
  * touching a reserved function code — except fn 11, whose 0xFFFF
  * placeholder is a deliberate exception (see its own test below). */
-static void test_default_pdcap_excludes_reserved_function_codes(void)
+static void test_pdcap_template_excludes_reserved_function_codes(void)
 {
     osdp_pdcap_record_t out[OSDP_PD_MAX_PDCAP_RECORDS];
     size_t count;
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_pd_default_pdcap(out, OSDP_PD_MAX_PDCAP_RECORDS,
-                                            &count));
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, OSDP_PD_MAX_PDCAP_RECORDS,
+                                             &count));
     TEST_ASSERT_GREATER_THAN(0, count);
     for (size_t i = 0; i < count; i++) {
         const uint8_t fc = out[i].function_code;
         TEST_ASSERT_FALSE(fc == FN_CHECK_CHARACTER);
         TEST_ASSERT_FALSE(fc == FN_COMM_SECURITY);
         TEST_ASSERT_FALSE(fc == FN_RECEIVE_SIZE);
-        TEST_ASSERT_FALSE(fc == FN_SECURE_BIOMETRICS);
     }
 }
 
@@ -362,7 +373,7 @@ static void test_default_pdcap_excludes_reserved_function_codes(void)
  * it must fail osdp_pd_set_pdcap (via osdp_pd_check_pdcap) until a
  * multi-part receiver is actually bound, so a consumer cannot ship it
  * unmodified and silently over-promise. */
-static void test_default_pdcap_fn11_placeholder_needs_a_bound_receiver(void)
+static void test_pdcap_template_fn11_placeholder_needs_a_bound_receiver(void)
 {
     osdp_pd_t pd;
     osdp_pd_init(&pd, 0x05);
@@ -370,8 +381,9 @@ static void test_default_pdcap_fn11_placeholder_needs_a_bound_receiver(void)
     osdp_pdcap_record_t out[OSDP_PD_MAX_PDCAP_RECORDS];
     size_t count;
     TEST_ASSERT_EQUAL(OSDP_OK,
-                      osdp_pd_default_pdcap(out, OSDP_PD_MAX_PDCAP_RECORDS,
-                                            &count));
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, OSDP_PD_MAX_PDCAP_RECORDS,
+                                             &count));
 
     size_t bad = 999;
     TEST_ASSERT_EQUAL(OSDP_ERR_NOT_SUPPORTED,
@@ -399,7 +411,7 @@ static void test_set_pdcap_rejects_reserved_function_codes(void)
     osdp_pd_init(&pd, 0x05);
 
     const uint8_t reserved[] = { FN_CHECK_CHARACTER, FN_COMM_SECURITY,
-                                FN_RECEIVE_SIZE, FN_SECURE_BIOMETRICS };
+                                FN_RECEIVE_SIZE };
     for (size_t i = 0; i < sizeof(reserved); i++) {
         const osdp_pdcap_record_t records[] = {
             { .function_code = 1, .compliance_level = 1, .num_objects = 1 },
@@ -595,7 +607,7 @@ static void test_cap_falls_through_to_cmd_cb_when_nothing_bound(void)
 }
 
 /* Once bound, the library answers osdp_CAP directly with the consumer's
- * records PLUS the four reserved records it computes itself, and cmd_cb is
+ * records PLUS the three reserved records it computes itself, and cmd_cb is
  * never invoked. */
 static void test_cap_answered_from_bound_records_plus_reserved(void)
 {
@@ -624,7 +636,7 @@ static void test_cap_answered_from_bound_records_plus_reserved(void)
     TEST_ASSERT_EQUAL(OSDP_OK,
                       osdp_pdcap_decode(reply.payload, reply.payload_len,
                                         got, 16, &n));
-    TEST_ASSERT_EQUAL_size_t(2 + 4, n);   /* bound + the 4 reserved records */
+    TEST_ASSERT_EQUAL_size_t(2 + 3, n);   /* bound + the 3 reserved records */
 
     /* The bound records are present, verbatim. */
     const osdp_pdcap_record_t *r1 = find_record(got, n, 1);
@@ -654,11 +666,9 @@ static void test_cap_answered_from_bound_records_plus_reserved(void)
     TEST_ASSERT_EQUAL_HEX8((uint8_t)(expect_rx & 0xFFU), r10->compliance_level);
     TEST_ASSERT_EQUAL_HEX8((uint8_t)(expect_rx >> 8), r10->num_objects);
 
-    /* fn 17: fixed 0x01/0x00. */
-    const osdp_pdcap_record_t *r17 = find_record(got, n, FN_SECURE_BIOMETRICS);
-    TEST_ASSERT_NOT_NULL(r17);
-    TEST_ASSERT_EQUAL_HEX8(0x01, r17->compliance_level);
-    TEST_ASSERT_EQUAL_HEX8(0x00, r17->num_objects);
+    /* fn 17 is not a real Annex B function code in this project's reference
+     * spec text (Annex B's body ends at fn 16) and is never injected. */
+    TEST_ASSERT_NULL(find_record(got, n, 17U));
 }
 
 /* fn 9's num_objects must reflect pd's key state at QUERY time, not at
@@ -721,10 +731,11 @@ int main(void)
     RUN_TEST(test_zero_combined_message_size_passes);
     RUN_TEST(test_a_consistent_capability_list_passes);
 
-    RUN_TEST(test_default_pdcap_rejects_null);
-    RUN_TEST(test_default_pdcap_rejects_undersized_buffer);
-    RUN_TEST(test_default_pdcap_excludes_reserved_function_codes);
-    RUN_TEST(test_default_pdcap_fn11_placeholder_needs_a_bound_receiver);
+    RUN_TEST(test_pdcap_template_rejects_null);
+    RUN_TEST(test_pdcap_template_rejects_unknown_template);
+    RUN_TEST(test_pdcap_template_rejects_undersized_buffer);
+    RUN_TEST(test_pdcap_template_excludes_reserved_function_codes);
+    RUN_TEST(test_pdcap_template_fn11_placeholder_needs_a_bound_receiver);
     RUN_TEST(test_set_pdcap_rejects_reserved_function_codes);
     RUN_TEST(test_set_pdcap_rejects_spec_nonconformant_record);
     RUN_TEST(test_set_pdcap_rejects_oversized_count);

@@ -172,9 +172,16 @@ static void test_validate_record_rejects_unknown_function_code(void)
 {
     const osdp_pdcap_record_t r0 = { .function_code = 0,
                                      .compliance_level = 0, .num_objects = 0 };
+    /* fn 17 ("Secure PD Biometrics Match Support"): listed in the spec's
+     * table of contents with a page number, but Annex B's actual body ends
+     * at function code 16 and jumps straight to Annex C — no fn 17 section
+     * exists in the document, so it is unrecognised like fn 18. */
+    const osdp_pdcap_record_t r17 = { .function_code = 17,
+                                      .compliance_level = 0, .num_objects = 0 };
     const osdp_pdcap_record_t r18 = { .function_code = 18,
                                       .compliance_level = 0, .num_objects = 0 };
     TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r0));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r17));
     TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r18));
 }
 

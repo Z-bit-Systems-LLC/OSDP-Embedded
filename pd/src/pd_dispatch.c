@@ -284,7 +284,7 @@ static void handle_keepactive(osdp_pd_t       *pd,
 /* ---- osdp_CAP (6.2) ----------------------------------------------------*/
 
 /* Answer osdp_CAP from the records bound via osdp_pd_set_pdcap, when any
- * are bound, plus the library-computed reserved records (fn 8/9/10/17 —
+ * are bound, plus the library-computed reserved records (fn 8/9/10 —
  * see osdp_pd_internal_fill_reserved_pdcap) recomputed fresh from `pd`'s
  * current state on every call. Returns false when nothing is bound
  * (pdcap_count == 0, the state after osdp_pd_init), in which case the
@@ -301,7 +301,7 @@ static bool handle_pdcap(osdp_pd_t *pd, osdp_pd_reply_t *reply)
     (void)memcpy(&all[OSDP_PDCAP_RESERVED_COUNT], pd->pdcap_records,
                 pd->pdcap_count * sizeof(*pd->pdcap_records));
     const size_t total = OSDP_PDCAP_RESERVED_COUNT + pd->pdcap_count;
-    /* Ascending by function code (Annex B order), not "reserved four, then
+    /* Ascending by function code (Annex B order), not "reserved three, then
      * whatever order the application bound" — see
      * osdp_pd_internal_sort_pdcap's doc comment in pd_internal.h. */
     osdp_pd_internal_sort_pdcap(all, total);

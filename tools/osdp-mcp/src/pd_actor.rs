@@ -21,7 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use osdp_embedded::messages::{PdcapRecord, Pdid, OSDP_LSTATR_NORMAL, OSDP_REPLY_LSTATR};
-use osdp_embedded::pd::{Pd, PdcapProblem, StatusProviders};
+use osdp_embedded::pd::{Pd, PdcapProblem, PdcapTemplate, StatusProviders};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::crypto::{BoxedSc, CryptoFactory};
@@ -475,8 +475,8 @@ impl PdHandle {
     }
 
     /// Snapshot the capability set currently reported in `osdp_PDCAP`,
-    /// INCLUDING the four records the C library computes for itself (fn
-    /// 8/9/10/17) — this is what actually goes out on the wire. Works
+    /// INCLUDING the three records the C library computes for itself (fn
+    /// 8/9/10) — this is what actually goes out on the wire. Works
     /// whether or not a PD is running (reads `remembered_pdcap` in that
     /// case). Requires an actor round-trip: unlike PDID, the real bound
     /// values live inside the C `osdp_pd_t`, which only the actor thread
@@ -729,7 +729,7 @@ fn actor_loop(
     // `Cmd::GetPdcap` / `Cmd::SetPdcap` are the round-trip. Survives
     // `Stop` / a serial reconnect the same way `last_config` does, and
     // every `open_pd` rebinds it onto the freshly constructed `Pd`.
-    let mut remembered_pdcap: Vec<PdcapRecord> = Pd::default_pdcap();
+    let mut remembered_pdcap: Vec<PdcapRecord> = Pd::pdcap_template(PdcapTemplate::SecureReader);
     // Tick the PD ~1000 times/sec. OSDP timing tolerances are loose
     // (ms-scale) so this is plenty; sleeping yields the CPU.
     let tick_period = Duration::from_millis(1);

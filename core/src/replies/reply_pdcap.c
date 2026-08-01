@@ -115,9 +115,10 @@ typedef struct {
     { OSDP_PDCAP_FIELD_RANGE_OR_PRIVATE, (max), (priv_from) }
 #define OSDP_PDCAP_BITMAP(mask)      { OSDP_PDCAP_FIELD_BITMAP, (mask), 0 }
 
-/* One entry per function code Annex B defines (1..17). Function code 18
- * ("Extended Capability Display") is left out on purpose — see the
- * osdp_pdcap_validate_record() doc comment in osdp_replies.h. */
+/* One entry per function code Annex B defines (1..16). Function codes 17
+ * ("Secure PD Biometrics Match Support") and 18 ("Extended Capability
+ * Display") are left out on purpose — see the osdp_pdcap_validate_record()
+ * doc comment in osdp_replies.h. */
 static const osdp_pdcap_catalog_entry_t k_pdcap_catalog[] = {
     /* B.2  Contact Status Monitoring: 0..4, num_objects = input count. */
     { 1,  OSDP_PDCAP_RANGE(4), OSDP_PDCAP_ANY },
@@ -155,10 +156,6 @@ static const osdp_pdcap_catalog_entry_t k_pdcap_catalog[] = {
     /* B.17 OSDP Version: 0..4 named, 0x80..0xFF private use, num_objects
      * must be 0x00. */
     { 16, OSDP_PDCAP_RANGE_PRIV(4, 0x80), OSDP_PDCAP_ZERO },
-    /* B.18 Secure PD Biometrics Match Support: body missing from the
-     * extracted spec text, so both bytes are accepted permissively
-     * rather than guessed at. */
-    { 17, OSDP_PDCAP_ANY, OSDP_PDCAP_ANY },
 };
 
 #define OSDP_PDCAP_CATALOG_LEN \

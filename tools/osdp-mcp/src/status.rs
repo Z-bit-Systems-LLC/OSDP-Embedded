@@ -37,10 +37,11 @@ use osdp_embedded::messages::{
 };
 
 /// How many objects of each kind the virtual PD has. These must match the
-/// `num_objects` fields in [`crate::handler::default_pdcap`] — function code
-/// 1 (contact status monitoring), 2 (output control) and 4 (reader LED
-/// control) respectively. A status report shorter than the advertised count
-/// is a PD contradicting its own capability record.
+/// `num_objects` fields in the "Secure Reader" PDCAP template
+/// (`osdp_embedded::pd::Pd::pdcap_template`) — function code 1 (contact
+/// status monitoring), 2 (output control) and 4 (reader LED control)
+/// respectively. A status report shorter than the advertised count is a PD
+/// contradicting its own capability record.
 const INPUT_COUNT: usize = 1;
 const OUTPUT_COUNT: usize = 1;
 const READER_COUNT: usize = 1;

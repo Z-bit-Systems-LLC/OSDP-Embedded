@@ -380,6 +380,24 @@ pub const REPLY_SCRATCH_LEN: usize = sys::OSDP_PD_REPLY_SCRATCH_LEN;
 /// (spec 6.26).
 pub const DEFAULT_ACU_RX_SIZE: u16 = sys::OSDP_PD_DEFAULT_ACU_RX_SIZE;
 
+/// A named, spec-conformant starting-point capability set for
+/// [`Pd::pdcap_template`]. More will be added over time; only one exists
+/// today.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PdcapTemplate {
+    SecureReader,
+}
+
+impl PdcapTemplate {
+    fn as_sys(self) -> sys::osdp_pd_pdcap_template_t {
+        match self {
+            PdcapTemplate::SecureReader => {
+                sys::osdp_pd_pdcap_template_t::OSDP_PDCAP_TEMPLATE_SECURE_READER
+            }
+        }
+    }
+}
+
 /// A capability record that this PD cannot honour, as found by
 /// [`Pd::check_pdcap`].
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -725,23 +743,25 @@ impl Pd {
         self.mfg_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut MfgReceiverBox) });
     }
 
-    // ---- PDCAP: defaults + dynamic binding -----------------------------
+    // ---- PDCAP: named templates + dynamic binding ----------------------
 
-    /// Starting-point capability set: reasonable reference values for
-    /// everything the device describes (LEDs, inputs, card format, smart
-    /// card, downstream readers, OSDP version, multi-part size), EXCLUDING
-    /// the four function codes (8, 9, 10, 17) the C library computes for
-    /// itself and never accepts back — see [`Pd::set_pdcap`].
+    /// Starting-point capability set for `template`: reasonable reference
+    /// values for the fields it covers (card format, LEDs, buzzer,
+    /// downstream readers, OSDP version, multi-part size), EXCLUDING the
+    /// three function codes (8, 9, 10) the C library computes for itself
+    /// and never accepts back — see [`Pd::set_pdcap`].
     ///
     /// Function code 11 (Largest Combined Message) defaults to 0xFFFF, a
     /// placeholder meaning "however much this PD can multi-part once it has
     /// a reassembly buffer" — [`Pd::set_pdcap`] rejects it until
     /// [`Pd::set_mfg_receiver`] is bound. Lower it to 0, or to the
     /// receiver's real capacity, if this PD does not do multi-part.
-    pub fn default_pdcap() -> Vec<crate::messages::PdcapRecord> {
+    pub fn pdcap_template(template: PdcapTemplate) -> Vec<crate::messages::PdcapRecord> {
         let mut buf = [sys::osdp_pdcap_record_t::default(); sys::OSDP_PD_MAX_PDCAP_RECORDS];
         let mut count: usize = 0;
-        let rc = unsafe { sys::osdp_pd_default_pdcap(buf.as_mut_ptr(), buf.len(), &mut count) };
+        let rc = unsafe {
+            sys::osdp_pd_pdcap_template(template.as_sys(), buf.as_mut_ptr(), buf.len(), &mut count)
+        };
         debug_assert_eq!(
             rc,
             sys::osdp_status_t::OSDP_OK,
@@ -761,13 +781,12 @@ impl Pd {
     /// the library answers `osdp_CAP` directly, without involving the
     /// [`CommandHandler`].
     ///
-    /// Four function codes are RESERVED: the library computes them itself
+    /// Three function codes are RESERVED: the library computes them itself
     /// and rejects them here — 8 (Check Character Support, always
     /// `0x01`/`0x00`), 9 (Communication Security — compliance always
     /// `0x01`; `num_objects` reports whether a unique operational SCBK is
     /// set), 10 (Receive BufferSize, derived from the bound plaintext
-    /// buffer), 17 (Secure PD Biometrics Match, fixed `0x01`/`0x00`).
-    /// Every other record is checked against spec Annex B and, for
+    /// buffer). Every other record is checked against spec Annex B and, for
     /// function code 11, against this PD's actual multi-part reassembly
     /// binding (same rule [`Pd::check_pdcap`] applies).
     ///
@@ -812,8 +831,8 @@ impl Pd {
     }
 
     /// Snapshot exactly what `osdp_CAP` would answer right now: the records
-    /// bound via [`Pd::set_pdcap`] PLUS the four reserved records (fn
-    /// 8/9/10/17), recomputed fresh from this PD's current state — not a
+    /// bound via [`Pd::set_pdcap`] PLUS the three reserved records (fn
+    /// 8/9/10), recomputed fresh from this PD's current state — not a
     /// cached value, so this can change between two calls with nothing
     /// else in between if, say, [`Pd::set_sc_scbk`] was called in the
     /// meantime. Empty if nothing is bound, i.e. `osdp_CAP` still falls

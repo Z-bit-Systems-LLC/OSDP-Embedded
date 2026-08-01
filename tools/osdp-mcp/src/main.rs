@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use osdp_embedded::messages::{Keypad, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW};
-use osdp_embedded::pd::Pd;
+use osdp_embedded::pd::{Pd, PdcapTemplate};
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
@@ -447,18 +447,22 @@ impl From<&[PdcapRecord]> for PdcapView {
 
 /// Function codes the C library computes for itself and never accepts —
 /// see `osdp_embedded::pd::Pd::set_pdcap`. `pd_set_capability` rejects any
-/// of these before it even reaches the library.
-const RESERVED_PDCAP_FUNCTION_CODES: [u8; 4] = [8, 9, 10, 17];
+/// of these before it even reaches the library. (Function code 17 is not
+/// among them: it isn't a real Annex B function code in this project's
+/// reference spec text — Annex B's body ends at function code 16 — so it's
+/// simply rejected as unrecognised by `pdcap_spec::validate_record`, same
+/// as function code 18.)
+const RESERVED_PDCAP_FUNCTION_CODES: [u8; 3] = [8, 9, 10];
 
 /// Args for `pd_set_capability` — upsert or remove a single capability
 /// record, keyed by function code.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PdSetCapabilityArgs {
-    /// OSDP function code to edit (spec Annex B, 1..=17). Examples:
+    /// OSDP function code to edit (spec Annex B, 1..=16). Examples:
     /// 1 = Contact Status Monitoring, 2 = Output Control,
     /// 4 = Reader LED Control, 5 = Reader Audible Output,
     /// 6 = Reader Text Output, 11 = Largest Combined Message,
-    /// 16 = OSDP Version. Function codes 8, 9, 10, and 17 are computed by
+    /// 16 = OSDP Version. Function codes 8, 9, and 10 are computed by
     /// the library itself (see `pd_get_pdcap`) and rejected here.
     function_code: u8,
     /// Compliance level for this function code. Required unless
@@ -776,8 +780,8 @@ impl OsdpMcp {
     /// (`osdp_PDCAP`, 0x46). Each record is annotated with the spec
     /// (Annex B) meaning of its function code and both data bytes, so
     /// you can see what the PD advertises without consulting the spec.
-    /// Includes the four records the C library computes for itself (fn
-    /// 8/9/10/17) — this is what actually goes out on the wire, live from
+    /// Includes the three records the C library computes for itself (fn
+    /// 8/9/10) — this is what actually goes out on the wire, live from
     /// the running PD when one exists. Independent of whether a PD is
     /// running — the capability set persists across `pd_stop` /
     /// `pd_configure`.
@@ -786,7 +790,7 @@ impl OsdpMcp {
         description = "Return the capability set reported in the osdp_PDCAP (0x46) reply: \
                        one record per function code (Annex B), each annotated with its name and \
                        the meaning of its compliance-level and number-of-objects bytes. Includes \
-                       the four records the library computes for itself (fn 8/9/10/17) — this is \
+                       the three records the library computes for itself (fn 8/9/10) — this is \
                        what actually goes out on the wire. Edit the rest with pd_set_capability or \
                        restore defaults with pd_reset_pdcap."
     )]
@@ -800,7 +804,7 @@ impl OsdpMcp {
     /// Annex B — an out-of-range compliance level, a non-zero
     /// "number of objects" where the spec requires zero, reserved
     /// bitmap bits, or an unknown function code are all rejected with a
-    /// message listing the valid values. Function codes 8, 9, 10, and 17
+    /// message listing the valid values. Function codes 8, 9, and 10
     /// are computed by the library itself and rejected outright — see
     /// `pd_get_pdcap`. Takes effect immediately if a PD is running, and
     /// persists across `pd_stop` / `pd_configure` either way.
@@ -809,7 +813,7 @@ impl OsdpMcp {
         description = "Add/update or remove one osdp_PDCAP capability record by function code \
                        (spec Annex B). Pass compliance_level (required to add/update) and \
                        optionally num_objects; or remove=true to delete the record. Function \
-                       codes 8, 9, 10, and 17 are computed by the library itself and always \
+                       codes 8, 9, and 10 are computed by the library itself and always \
                        rejected. The record is validated against the spec (valid compliance \
                        levels, required-zero fields, bitmap masks) and rejected with the allowed \
                        values on a violation. Returns the full resulting capability set."
@@ -826,7 +830,7 @@ impl OsdpMcp {
             ));
         }
 
-        // The four reserved records are part of what get_pdcap returns (it's
+        // The three reserved records are part of what get_pdcap returns (it's
         // the live wire reply) but must never be fed back into set_pdcap —
         // filter them out before editing.
         let mut records: Vec<PdcapRecord> = self
@@ -897,17 +901,18 @@ impl OsdpMcp {
         Ok(Json((&updated[..]).into()))
     }
 
-    /// Restore the capability set to the built-in default (the same
-    /// spec-conformant set a freshly-configured PD reports). Useful to
-    /// undo experimentation. Returns the restored set.
+    /// Restore the capability set to the library's "Secure Reader" template
+    /// (the same spec-conformant set a freshly-configured PD reports).
+    /// Useful to undo experimentation. Returns the restored set.
     #[tool(
         title = "Reset PDCAP",
-        description = "Restore the osdp_PDCAP capability set to the built-in default \
-                       (vendor reference set, spec-conformant). Returns the restored set."
+        description = "Restore the osdp_PDCAP capability set to the library's built-in \
+                       \"Secure Reader\" template (vendor reference set, spec-conformant). \
+                       Returns the restored set."
     )]
     async fn pd_reset_pdcap(&self) -> Result<Json<PdcapView>, String> {
         self.pd
-            .set_pdcap(Pd::default_pdcap())
+            .set_pdcap(Pd::pdcap_template(PdcapTemplate::SecureReader))
             .await
             .map_err(|e| format!("pd_reset_pdcap failed: {}", e))?
             .map_err(|e| format!("pd_reset_pdcap rejected: record {}: {:?}", e.index, e.error))?;
