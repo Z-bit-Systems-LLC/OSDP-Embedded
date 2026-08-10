@@ -359,3 +359,18 @@ osdp_status_t osdp_pair_pqclean_gen_dsa(osdp_pair_pqclean_ctx_t *ctx)
     ctx->has_dsa = true;
     return OSDP_OK;
 }
+
+osdp_status_t osdp_pair_pqclean_set_dsa(
+    osdp_pair_pqclean_ctx_t *ctx,
+    const uint8_t            pk[OSDP_MLDSA44_PK_LEN],
+    const uint8_t           *sk, size_t sk_len)
+{
+    if (ctx == NULL || pk == NULL || sk == NULL
+        || sk_len != OSDP_PAIR_PQCLEAN_DSA_SK_LEN) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    (void)memcpy(ctx->dsa_pk, pk, OSDP_MLDSA44_PK_LEN);
+    (void)memcpy(ctx->dsa_sk, sk, sk_len);
+    ctx->has_dsa = true;
+    return OSDP_OK;
+}

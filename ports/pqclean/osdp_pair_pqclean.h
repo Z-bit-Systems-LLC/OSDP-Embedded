@@ -61,8 +61,24 @@ void osdp_pair_pqclean_crypto_init(osdp_pair_crypto_t *crypto,
                                    osdp_pair_pqclean_ctx_t *ctx);
 
 /* Generate a fresh long-term ML-DSA-44 device keypair into `ctx`. The public
- * key is left in ctx->dsa_pk for building / self-signing a certificate. */
+ * key is left in ctx->dsa_pk for building / self-signing a certificate.
+ *
+ * Fails if no entropy source is installed, rather than producing a key from
+ * a zeroed seed — PQClean's keypair call cannot report that itself, so this
+ * is checked here. */
 osdp_status_t osdp_pair_pqclean_gen_dsa(osdp_pair_pqclean_ctx_t *ctx);
+
+/* Install a previously generated long-term ML-DSA-44 keypair — the device
+ * credential a provisioning step produced and the firmware carries. Avoids
+ * poking ctx's fields directly, which is easy to get half-right (a key set
+ * without has_dsa signs nothing, and the failure looks like a HAL fault).
+ *
+ * Returns OSDP_ERR_INVALID_ARG for a NULL argument or an sk_len that is not
+ * OSDP_PAIR_PQCLEAN_DSA_SK_LEN; the context is left untouched. */
+osdp_status_t osdp_pair_pqclean_set_dsa(
+    osdp_pair_pqclean_ctx_t *ctx,
+    const uint8_t            pk[OSDP_MLDSA44_PK_LEN],
+    const uint8_t           *sk, size_t sk_len);
 
 #ifdef OSDP_PAIR_PQCLEAN_DETERMINISTIC
 /* Queue `len` deterministic bytes for the next PQCLEAN_randombytes calls, so

@@ -22,6 +22,7 @@
  * (osdp::core, osdp::messages) remain freestanding-friendly. */
 
 #include "aes_adapter.h"
+#include "pair_adapter.h"
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_dispatch.h"
 #include "osdp/osdp_pd.h"
@@ -79,6 +80,11 @@ static const osdp_pdid_t kDefaultPdid = {
  * osdp_pd_set_pdcap rejects an application that tries to supply them. That is
  * what gets this tool an fn 10 record it never used to send — and gets its
  * two size bytes in the LSB-then-MSB order Annex B's field names disguise. */
+/* Pairing state, ~22 KB of message buffers. File scope rather than a local in
+ * main() so it does not sit on the stack; a real PD would put it in .bss the
+ * same way, and only when it enables pairing at all. */
+static osdp_pd_pair_t g_pair;
+
 static const osdp_pdcap_record_t kDefaultPdcap[] = {
     { .function_code = 1,  .compliance_level = 4, .num_objects = 1 }, /* ContactStatusMonitoring */
     { .function_code = 2,  .compliance_level = 4, .num_objects = 1 }, /* OutputControl */
@@ -180,6 +186,7 @@ static void hex_dump(FILE *f, const uint8_t *buf, size_t len)
  * globals; the core library never does. */
 static struct {
     int (*real_read)(void *user, uint8_t *buf, size_t cap);
+    int (*real_write)(void *user, const uint8_t *buf, size_t len);
     int verbose;
 } g_tap;
 
@@ -192,6 +199,42 @@ static int read_tap(void *user, uint8_t *buf, size_t cap)
         fputc('\n', stderr);
     }
     return n;
+}
+
+/* The TX side matters for the same reason the RX side does, and more so for
+ * pairing: osdp_PAIR and osdp_PAIRR are handled by the pairing driver above
+ * the application callback, so an ACK, a NAK and a dropped frame all look
+ * identical in the decoded log — which is to say, absent. Only the reply code
+ * is dumped, not the whole frame, since a PAIRR fragment is ~500 bytes and
+ * burying the exchange in hex defeats the purpose. */
+static int write_tap(void *user, const uint8_t *buf, size_t len)
+{
+    if (len > 0 && g_tap.verbose >= 2) {
+        /* Skip the leading 0xFF mark bytes to find the SOM, then the reply
+         * code sits at offset 5 (SOM, addr, len_lsb, len_msb, ctrl). */
+        size_t off = 0;
+        while (off < len && buf[off] == 0xFFu) { off++; }
+        if (len - off > 5) {
+            const uint8_t code = buf[off + 5];
+            /* For a multi-part reply the 6-byte spec-5.10 header is the first
+             * thing in the payload, and it is what a stalled transfer shows up
+             * in — a repeating offset, or a total that does not match. */
+            if ((code == OSDP_REPLY_PAIRR) && (len - off >= 12)) {
+                const uint8_t *h = &buf[off + 6];
+                fprintf(stderr,
+                        "    tx[%zu] reply 0x%02X  mp total=%u off=%u frag=%u\n",
+                        len, code,
+                        (unsigned)(h[0] | (h[1] << 8)),
+                        (unsigned)(h[2] | (h[3] << 8)),
+                        (unsigned)(h[4] | (h[5] << 8)));
+            } else {
+                fprintf(stderr, "    tx[%zu] reply 0x%02X\n", len, code);
+            }
+        } else {
+            fprintf(stderr, "    tx[%zu] (short)\n", len);
+        }
+    }
+    return g_tap.real_write(user, buf, len);
 }
 
 /* Look up the declared object count for a PDCAP function code (e.g. the
@@ -406,6 +449,7 @@ typedef struct cli {
     }            sc_mode;
     uint8_t      sc_custom_key[OSDP_SC_KEY_LEN];
     uint8_t      sc2_key[OSDP_SC2_KEY_LEN];
+    bool         pair;          /* SC2 asymmetric pairing; supersedes sc_mode */
     int          verbose;
     bool         tamper;        /* report tamper in osdp_LSTATR */
     unsigned int card_every_ms; /* 0 = off; queue an osdp_RAW this often */
@@ -423,6 +467,12 @@ static void usage(const char *prog)
         "  --sc=MODE          Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
         "                                     'scbk:HEX32' (SC1 custom 16-byte key),\n"
         "                                     'scbk2:HEX64' (SC2 AES-256 32-byte key)\n"
+        "  --pair             SC2 asymmetric pairing (ML-KEM-768 / ML-DSA-44).\n"
+        "                       Configures SC2 with NO pre-shared key and waits\n"
+        "                       for an ACU to pair; the derived SCBK is applied in\n"
+        "                       place, so the ACU's next CHLNG establishes SC2 on\n"
+        "                       the same connection. Overrides --sc. Uses a\n"
+        "                       demonstration credential — see osdp-pair-provision.\n"
         "  --tamper           report a tamper condition in osdp_LSTATR\n"
         "  --card-every MS    queue a synthetic card read (osdp_RAW) every MS\n"
         "                       milliseconds, delivered on the next osdp_POLL\n"
@@ -463,6 +513,8 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             out->verbose = 2;
         } else if (strcmp(a, "--tamper") == 0) {
             out->tamper = true;
+        } else if (strcmp(a, "--pair") == 0) {
+            out->pair = true;
         } else if (strcmp(a, "--card-every") == 0 && i + 1 < argc) {
             out->card_every_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--port") == 0 && i + 1 < argc) {
@@ -644,9 +696,11 @@ int main(int argc, char **argv)
 
     /* Install the raw-RX tap (-vv) by wrapping the transport's read
      * callback before the PD copies the vtable. */
-    g_tap.real_read = transport.read;
-    g_tap.verbose   = cli.verbose;
-    transport.read  = read_tap;
+    g_tap.real_read  = transport.read;
+    g_tap.real_write = transport.write;
+    g_tap.verbose    = cli.verbose;
+    transport.read   = read_tap;
+    transport.write  = write_tap;
 
     /* Initialise the PD. */
     osdp_pd_t pd;
@@ -691,7 +745,20 @@ int main(int argc, char **argv)
     /* Optionally configure Secure Channel. The crypto vtable, the cUID
      * (derived from our PDID), and the requested key all need to be
      * set before the first inbound CHLNG / SCRYPT. */
-    if (cli.sc_mode == SC_SCBK2) {
+    if (cli.pair) {
+        /* Pairing mode: SC2 is configured except for its key, because
+         * deriving that key is exactly what pairing is for. The SCBK lands in
+         * pd->sc2 when the exchange completes, and the ACU's next CHLNG then
+         * runs the ordinary SCS_21..28 handshake on the same connection. */
+        uint8_t cuid[OSDP_SC2_CUID_LEN];
+        cuid_from_pdid(&app.pdid, cuid);
+        osdp_pd_set_sc2_crypto(&pd, pd_mock_sc2_crypto());
+        osdp_pd_set_sc2_cuid  (&pd, cuid);
+        if (!pd_mock_pair_attach(&pd, &g_pair)) {
+            serial_close(serial);
+            return 1;
+        }
+    } else if (cli.sc_mode == SC_SCBK2) {
         /* OSDP-SC2: AES-256-GCM / KMAC256, 32-byte SCBK, 8-byte cUID. */
         uint8_t cuid[OSDP_SC2_CUID_LEN];
         cuid_from_pdid(&app.pdid, cuid);
@@ -742,10 +809,17 @@ int main(int argc, char **argv)
             "osdp-pd-mock: PD listening on %s @ %u baud, address 0x%02x,"
             " SC=%s (Ctrl-C to exit)\n",
             cli.port, cli.baud, cli.address,
-            cli.sc_mode == SC_NONE        ? "off"
+            cli.pair                      ? "SC2 via pairing (no pre-shared key)"
+          : cli.sc_mode == SC_NONE        ? "off"
           : cli.sc_mode == SC_SCBKD       ? "SCBK-D"
           : cli.sc_mode == SC_SCBK2       ? "SC2 (AES-256)"
                                           : "SCBK (custom)");
+    if (cli.pair) {
+        fprintf(stderr,
+                "osdp-pd-mock: pairing credential subject %s"
+                " (demonstration CA — not for production)\n",
+                pd_mock_pair_subject());
+    }
 
     /* Catch Ctrl-C for orderly shutdown. */
     signal(SIGINT, on_signal);

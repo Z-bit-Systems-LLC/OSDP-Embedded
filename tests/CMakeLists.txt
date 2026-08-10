@@ -63,6 +63,14 @@ add_test(NAME test_pair_messages COMMAND test_pair_messages)
 add_library(pair_test_crypto INTERFACE)
 target_link_libraries(pair_test_crypto INTERFACE osdp_port_pair_pqclean_kat)
 
+# Cross-implementation vector: a certificate OSDP.Net actually emitted,
+# decoded and verified against the demo CA regenerated from the published
+# seed. Needs the KAT backend for that seed.
+add_executable(test_pair_interop test_pair_interop.c)
+target_link_libraries(test_pair_interop PRIVATE pair_test_crypto unity)
+target_include_directories(test_pair_interop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_pair_interop COMMAND test_pair_interop)
+
 # The port's entropy contract, against the PLAIN target — the variant a tool
 # links. Deliberately NOT pair_test_crypto: with the seed queue compiled in
 # there is always a fallback, so the "no source installed" case it asserts

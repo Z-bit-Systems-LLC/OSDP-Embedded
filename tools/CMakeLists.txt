@@ -6,3 +6,4 @@
 add_subdirectory(osdp-parser)
 add_subdirectory(osdp-pd-mock)
 add_subdirectory(osdp-acu-mock)
+add_subdirectory(osdp-pair-provision)
