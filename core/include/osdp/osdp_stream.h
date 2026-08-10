@@ -92,6 +92,27 @@ osdp_status_t osdp_stream_feed(osdp_stream_t *s,
  *                         frames already buffered. */
 osdp_status_t osdp_stream_next(osdp_stream_t *s, osdp_frame_t *out);
 
+/* Bytes retained because they do not yet form a complete frame.
+ *
+ * Zero after osdp_stream_next has returned OSDP_ERR_TRUNCATED means the
+ * decoder is idle; non-zero means a receive is in progress and the stream is
+ * waiting for the rest of a frame that may never arrive.
+ *
+ * This exists so a caller that owns a clock can implement spec 5.8's
+ * inter-character timeout, which the core cannot do for itself: it is
+ * freestanding and has no notion of time. Poll this after draining
+ * osdp_stream_next; if the count is non-zero and has not changed for the
+ * timeout, the sender stopped mid-frame and the retained bytes are stale.
+ * Call osdp_stream_reset to abort the receive sequence.
+ *
+ * Leaving them in place is not a harmless "wait longer": the retained bytes
+ * sit in front of whatever arrives next, so the decoder counts a following
+ * frame's bytes toward the abandoned frame's length, decodes across the
+ * boundary and reports a CRC failure for a frame that was transmitted
+ * perfectly. One lost byte then desynchronizes the link indefinitely, since
+ * every retransmission meets the same misalignment. */
+size_t osdp_stream_pending(const osdp_stream_t *s);
+
 #ifdef __cplusplus
 }
 #endif

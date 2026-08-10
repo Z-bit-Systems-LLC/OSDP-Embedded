@@ -508,6 +508,27 @@ typedef struct osdp_pd_buz_slot {
  * to which it responds exceeds 8 seconds. */
 #define OSDP_PD_OFFLINE_TIMEOUT_MS 8000U
 
+/* Spec 5.8: "If there is an inter-character timeout while receiving the
+ * message the PD shall abort the receive sequence", after which it resyncs by
+ * looking for the next SOM. The nominal value is 20 ms; the spec explicitly
+ * allows adjusting it "for special channel timing considerations", hence the
+ * #ifndef guard.
+ *
+ * This is what keeps a single lost byte from desynchronizing the link for
+ * good. Without it the truncated frame's bytes stay buffered and the sender's
+ * retransmission is decoded across the boundary, failing its CRC — so the PD
+ * NAKs 0x01 forever and the retry never lands. The timeout is only meaningful
+ * with a transport that supplies now_ms; without a clock the abort never
+ * fires and the old behaviour stands.
+ *
+ * Raise it if the link interleaves long pauses inside a frame (a slow bridge,
+ * a busy USB adapter). It must stay well under the ACU's reply timeout, or
+ * the PD is still holding stale bytes when the retransmission arrives, which
+ * is the situation it exists to prevent. */
+#ifndef OSDP_PD_INTERCHAR_TIMEOUT_MS
+#define OSDP_PD_INTERCHAR_TIMEOUT_MS 20U
+#endif
+
 /* ---- Secure Channel state (embedded in osdp_pd_t) ----------------------
  *
  * The PD treats SC as fully optional: leave the fields below at their
@@ -651,6 +672,16 @@ typedef struct osdp_pd {
      * back true on the next successful reply. */
     bool                       online;
     uint32_t                   last_comm_ms;
+
+    /* Inter-character timeout tracking (spec 5.8). `rx_partial_len` is how
+     * many bytes the stream decoder was holding at the end of the last tick;
+     * `rx_partial_ms` is when that count last changed. A count that stops
+     * growing means the sender stopped mid-frame, and once the gap reaches
+     * OSDP_PD_INTERCHAR_TIMEOUT_MS the receive is aborted. Comparing the
+     * count rather than just its presence is what distinguishes a stalled
+     * frame from one still legitimately arriving byte by byte. */
+    size_t                     rx_partial_len;
+    uint32_t                   rx_partial_ms;
 
     /* Secure Channel state (optional; opt-in via the set_sc_* APIs). */
     osdp_pd_sc_t               sc;

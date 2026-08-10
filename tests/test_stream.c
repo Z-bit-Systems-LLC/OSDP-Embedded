@@ -245,6 +245,104 @@ static void test_stream_reset_drops_buffered_data(void)
                      r == OSDP_ERR_BAD_CTRL);
 }
 
+/* ---- Inter-character timeout support (spec 5.8) --------------------------
+ *
+ * The core cannot time anything — it is freestanding. osdp_stream_pending is
+ * the hook that lets a caller with a clock notice a stalled receive; these
+ * pin the contract that decision rests on. */
+
+static void test_stream_pending_reports_an_incomplete_frame(void)
+{
+    osdp_stream_t s;
+    osdp_stream_init(&s);
+    TEST_ASSERT_EQUAL_size_t(0, osdp_stream_pending(&s));
+
+    uint8_t bytes[16];
+    const size_t n = make_poll_frame(bytes, sizeof(bytes), 5,
+                                     OSDP_INTEGRITY_CRC);
+
+    /* One byte short of the whole frame: no frame yet, and the decoder is
+     * holding every byte it was given. */
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, bytes, n - 1));
+    osdp_frame_t f;
+    TEST_ASSERT_EQUAL(OSDP_ERR_TRUNCATED, osdp_stream_next(&s, &f));
+    /* Less the spec-5.7 marking byte(s) the builder prepends: osdp_stream_next
+     * resyncs to the SOM before parsing, so those are already gone. */
+    TEST_ASSERT_EQUAL_size_t(n - 1 - OSDP_FRAME_MARK_LEN,
+                             osdp_stream_pending(&s));
+
+    /* The last byte completes it, and nothing is left over. */
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, &bytes[n - 1], 1));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL(OSDP_ERR_TRUNCATED, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL_size_t(0, osdp_stream_pending(&s));
+}
+
+/* The bug this whole mechanism exists for: a truncated frame left in the
+ * buffer swallows the front of the NEXT frame, so a retransmission that
+ * arrives perfectly is reported as a CRC failure. Reset is what breaks the
+ * cycle. */
+static void test_a_stale_partial_frame_corrupts_the_frame_behind_it(void)
+{
+    uint8_t bytes[16];
+    const size_t n = make_poll_frame(bytes, sizeof(bytes), 5,
+                                     OSDP_INTEGRITY_CRC);
+
+    /* Without the abort: feed all but the last byte, then a complete
+     * retransmission. The decoder splices the two and rejects the result. */
+    osdp_stream_t s;
+    osdp_stream_init(&s);
+    osdp_frame_t f;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, bytes, n - 1));
+    TEST_ASSERT_EQUAL(OSDP_ERR_TRUNCATED, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, bytes, n));
+    TEST_ASSERT_NOT_EQUAL(OSDP_OK, osdp_stream_next(&s, &f));
+
+    /* With it: same truncated frame, aborted on the timeout, and the
+     * retransmission decodes exactly as sent. */
+    osdp_stream_init(&s);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, bytes, n - 1));
+    TEST_ASSERT_EQUAL(OSDP_ERR_TRUNCATED, osdp_stream_next(&s, &f));
+    TEST_ASSERT_TRUE(osdp_stream_pending(&s) > 0);
+    osdp_stream_reset(&s);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, bytes, n));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL_HEX8(5, f.address);
+    TEST_ASSERT_EQUAL_HEX8(0x60, f.code);
+}
+
+static void test_stream_pending_excludes_the_frame_just_returned(void)
+{
+    osdp_stream_t s;
+    osdp_stream_init(&s);
+
+    uint8_t a[16];
+    uint8_t b[16];
+    const size_t na = make_poll_frame(a, sizeof(a), 1, OSDP_INTEGRITY_CRC);
+    const size_t nb = make_poll_frame(b, sizeof(b), 2, OSDP_INTEGRITY_CRC);
+
+    /* A whole frame plus a fragment of the next. The returned frame's bytes
+     * are dropped on the following call, so they must not be counted as an
+     * in-progress receive — counting them would keep refreshing the timeout
+     * deadline and the stall would never be detected. */
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, a, na));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, b, 3));
+
+    osdp_frame_t f;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL_HEX8(1, f.address);
+    TEST_ASSERT_EQUAL_size_t(3, osdp_stream_pending(&s));
+
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_feed(&s, &b[3], nb - 3));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_stream_next(&s, &f));
+    TEST_ASSERT_EQUAL_HEX8(2, f.address);
+}
+
+static void test_stream_pending_rejects_null(void)
+{
+    TEST_ASSERT_EQUAL_size_t(0, osdp_stream_pending(NULL));
+}
+
 static void test_stream_rejects_null_args(void)
 {
     osdp_stream_t s;
@@ -269,6 +367,10 @@ int main(void)
     RUN_TEST(test_stream_reports_bad_length_field_and_resyncs);
     RUN_TEST(test_stream_frame_payload_pointer_remains_valid_until_next_call);
     RUN_TEST(test_stream_reset_drops_buffered_data);
+    RUN_TEST(test_stream_pending_reports_an_incomplete_frame);
+    RUN_TEST(test_a_stale_partial_frame_corrupts_the_frame_behind_it);
+    RUN_TEST(test_stream_pending_excludes_the_frame_just_returned);
+    RUN_TEST(test_stream_pending_rejects_null);
     RUN_TEST(test_stream_rejects_null_args);
     return UNITY_END();
 }

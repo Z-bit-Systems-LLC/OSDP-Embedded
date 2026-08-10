@@ -93,6 +93,17 @@ osdp_status_t osdp_stream_feed(osdp_stream_t *s,
     return OSDP_OK;
 }
 
+size_t osdp_stream_pending(const osdp_stream_t *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    /* pending_consume covers the frame handed out by the last successful
+     * osdp_stream_next, which is dropped on the next call — those bytes are
+     * already spoken for and are not part of an in-progress receive. */
+    return (s->fill > s->pending_consume) ? (s->fill - s->pending_consume) : 0;
+}
+
 osdp_status_t osdp_stream_next(osdp_stream_t *s, osdp_frame_t *out)
 {
     if (s == NULL || out == NULL) {

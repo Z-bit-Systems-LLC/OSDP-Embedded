@@ -1339,6 +1339,145 @@ static void test_filetransfer_malformed_payload_naks(void)
     TEST_ASSERT_EQUAL_INT(0, cap.calls);
 }
 
+/* ---- Inter-character timeout (spec 5.8) ---------------------------------
+ *
+ * These reproduce a failure observed on a live 38400-baud link: the sender
+ * dropped one byte of a large frame, and every retransmission after it was
+ * answered NAK 0x01 (bad CRC) even though it arrived intact. The stale bytes
+ * of the truncated frame were still buffered, so the decoder read the retry's
+ * header as the tail of the abandoned frame. */
+
+/* Inject a frame minus its final byte — a frame the sender transmitted in
+ * full and the receiver lost the end of. */
+static void inject_truncated_command(mock_transport_t *m, uint8_t addr,
+                                     uint8_t code, uint8_t sequence)
+{
+    osdp_frame_t f = {0};
+    f.address   = addr;
+    f.sequence  = sequence;
+    f.integrity = OSDP_INTEGRITY_CRC;
+    f.code      = code;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_build(&f, buf, sizeof(buf), &written));
+    TEST_ASSERT_TRUE(written > 1);
+    (void)memcpy(&m->incoming[m->incoming_len], buf, written - 1);
+    m->incoming_len += written - 1;
+}
+
+static void test_a_truncated_frame_does_not_poison_the_retransmission(void)
+{
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* The sender's frame loses its last byte on the wire. Nothing to reply
+     * to yet — the PD is right to stay silent and wait. */
+    inject_truncated_command(&m, 0x05, OSDP_CMD_POLL, 1);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+
+    /* The line goes quiet past the inter-character timeout, so the receive
+     * is aborted. */
+    m.now_ms += OSDP_PD_INTERCHAR_TIMEOUT_MS + 1;
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+
+    /* The sender retransmits at the same sequence number. It must be
+     * answered on its own merits — before the abort existed, the leftover
+     * bytes turned this into a CRC failure and the PD answered NAK 0x01. */
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
+/* The timeout must not fire on a frame that is merely arriving slowly, or a
+ * slow link would never complete a large frame at all. */
+static void test_a_frame_still_arriving_is_not_aborted(void)
+{
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    osdp_frame_t cmd = {0};
+    cmd.address   = 0x05;
+    cmd.sequence  = 1;
+    cmd.integrity = OSDP_INTEGRITY_CRC;
+    cmd.code      = OSDP_CMD_POLL;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_build(&cmd, buf, sizeof(buf), &written));
+
+    /* One byte per tick, each tick a full timeout apart. The gap between
+     * bytes exceeds the timeout every time, but the buffered count keeps
+     * growing, so the receive is still making progress and must survive. */
+    for (size_t i = 0; i < written; i++) {
+        m.incoming[m.incoming_len++] = buf[i];
+        m.now_ms += OSDP_PD_INTERCHAR_TIMEOUT_MS + 1;
+        osdp_pd_tick(&pd);
+    }
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
+/* Without a clock there is nothing to time, so the abort must not fire —
+ * and must not crash or discard a frame that is simply still arriving. */
+static void test_no_clock_leaves_a_partial_frame_alone(void)
+{
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    t.now_ms = NULL;
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    osdp_frame_t cmd = {0};
+    cmd.address   = 0x05;
+    cmd.sequence  = 1;
+    cmd.integrity = OSDP_INTEGRITY_CRC;
+    cmd.code      = OSDP_CMD_POLL;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_build(&cmd, buf, sizeof(buf), &written));
+
+    (void)memcpy(m.incoming, buf, written - 1);
+    m.incoming_len = written - 1;
+    osdp_pd_tick(&pd);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+
+    m.incoming[m.incoming_len++] = buf[written - 1];
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1383,5 +1522,9 @@ int main(void)
     RUN_TEST(test_filetransfer_streaming_no_buffer);
     RUN_TEST(test_filetransfer_streaming_gap_aborts);
     RUN_TEST(test_filetransfer_malformed_payload_naks);
+
+    RUN_TEST(test_a_truncated_frame_does_not_poison_the_retransmission);
+    RUN_TEST(test_a_frame_still_arriving_is_not_aborted);
+    RUN_TEST(test_no_clock_leaves_a_partial_frame_alone);
     return UNITY_END();
 }
