@@ -42,13 +42,20 @@ else()
     message(FATAL_ERROR "osdp-pd-mock: no serial adapter for this platform")
 endif()
 
-# NOTE: tiny_gcm / tiny_kmac are reached only through pd_mock_sc2 (PRIVATE),
-# never linked here directly — see the comment above.
+# The SC1 AES primitives come from ports/tiny; aes_adapter.c keeps only this
+# tool's RNG policy. tiny_aes is reached through the port rather than linked
+# here, so the vendored headers stay out of this tool's include path.
+#
+# NOTE: tiny_gcm / tiny_kmac are likewise reached only through pd_mock_sc2
+# (PRIVATE), never linked here directly — see the comment above. That
+# isolation is the same idea the port applies to tiny_aes, and it is load
+# bearing here: tiny_aes256's PUBLIC defines would otherwise recompile
+# aes_adapter.c against the 256-bit key schedule and corrupt every SC1 key.
 target_link_libraries(osdp-pd-mock PRIVATE
     osdp_core
     osdp_messages
     osdp_pd
-    tiny_aes
+    osdp_port_sc_tiny
     pd_mock_sc2
 )
 

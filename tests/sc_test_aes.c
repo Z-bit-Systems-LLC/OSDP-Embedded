@@ -1,44 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
+/* The AES half of this adapter now comes from ports/tiny — it was identical
+ * to osdp-pd-mock's copy, byte for byte. What stays here is the part that is
+ * genuinely test-specific: an RNG that replays a fixed sequence so a KAT or a
+ * captured session reproduces exactly. */
+
 #include "sc_test_aes.h"
 
-#include "aes.h"   /* vendor/tiny-aes/aes.h */
+#include "osdp_sc_tiny.h"
 
+#include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
-
-static osdp_status_t adapter_encrypt(
-    void          *user,
-    const uint8_t  key[OSDP_AES_KEY_LEN],
-    const uint8_t  in [OSDP_AES_BLOCK_LEN],
-    uint8_t        out[OSDP_AES_BLOCK_LEN])
-{
-    (void)user;
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, key);
-    if (out != in) {
-        (void)memcpy(out, in, OSDP_AES_BLOCK_LEN);
-    }
-    AES_ECB_encrypt(&ctx, out);
-    return OSDP_OK;
-}
-
-static osdp_status_t adapter_decrypt(
-    void          *user,
-    const uint8_t  key[OSDP_AES_KEY_LEN],
-    const uint8_t  in [OSDP_AES_BLOCK_LEN],
-    uint8_t        out[OSDP_AES_BLOCK_LEN])
-{
-    (void)user;
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, key);
-    if (out != in) {
-        (void)memcpy(out, in, OSDP_AES_BLOCK_LEN);
-    }
-    AES_ECB_decrypt(&ctx, out);
-    return OSDP_OK;
-}
 
 /* Deterministic LCG so tests get reproducible RND values. Reset via
  * sc_test_crypto_seed_prng() at the start of each test. */
@@ -77,14 +50,19 @@ void sc_test_crypto_set_fixed_rand(const uint8_t *buf, size_t len)
     g_fixed_rand_len = (buf != NULL) ? len : 0;
 }
 
-static const osdp_sc_crypto_t k_tiny_aes_vtable = {
-    .aes128_ecb_encrypt = adapter_encrypt,
-    .aes128_ecb_decrypt = adapter_decrypt,
-    .rand_bytes         = adapter_rand,
-    .user               = NULL,
-};
+/* Built once on first use rather than as a static initialiser, because the
+ * AES members come from a function call now. Tests are single-threaded, so
+ * the lazy init needs no guard beyond the flag. */
+static osdp_sc_crypto_t g_tiny_aes_vtable;
+static bool             g_tiny_aes_ready;
 
 const osdp_sc_crypto_t *sc_test_crypto_tiny_aes(void)
 {
-    return &k_tiny_aes_vtable;
+    if (!g_tiny_aes_ready) {
+        osdp_sc_tiny_aes128(&g_tiny_aes_vtable);
+        g_tiny_aes_vtable.rand_bytes = adapter_rand;
+        g_tiny_aes_vtable.user       = NULL;
+        g_tiny_aes_ready             = true;
+    }
+    return &g_tiny_aes_vtable;
 }

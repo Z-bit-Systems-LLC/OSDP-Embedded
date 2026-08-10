@@ -73,6 +73,12 @@ static const osdp_pdid_t kDefaultPdid = {
  * key-exchange (num_objects) byte must be 0x01. The previous value 0x04
  * left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
  * spec-conformant ACU would never initiate a handshake. */
+/* Function codes 8 (CheckCharacterSupport), 9 (CommunicationSecurity) and 10
+ * (Receive BufferSize) are deliberately absent: the library computes all three
+ * from its own state and injects them into every osdp_CAP answer, and
+ * osdp_pd_set_pdcap rejects an application that tries to supply them. That is
+ * what gets this tool an fn 10 record it never used to send — and gets its
+ * two size bytes in the LSB-then-MSB order Annex B's field names disguise. */
 static const osdp_pdcap_record_t kDefaultPdcap[] = {
     { .function_code = 1,  .compliance_level = 4, .num_objects = 1 }, /* ContactStatusMonitoring */
     { .function_code = 2,  .compliance_level = 4, .num_objects = 1 }, /* OutputControl */
@@ -80,12 +86,9 @@ static const osdp_pdcap_record_t kDefaultPdcap[] = {
     { .function_code = 4,  .compliance_level = 4, .num_objects = 1 }, /* ReaderLEDControl */
     { .function_code = 5,  .compliance_level = 2, .num_objects = 1 }, /* ReaderAudibleOutput */
     { .function_code = 6,  .compliance_level = 1, .num_objects = 1 }, /* ReaderTextOutput */
-    { .function_code = 8,  .compliance_level = 1, .num_objects = 0 }, /* CheckCharacterSupport (num must be 0x00 per spec B.9) */
-    { .function_code = 9,  .compliance_level = 1, .num_objects = 1 }, /* CommunicationSecurity (AES128) */
     { .function_code = 12, .compliance_level = 0, .num_objects = 0 }, /* SmartCardSupport */
     { .function_code = 13, .compliance_level = 0, .num_objects = 1 }, /* Readers */
     { .function_code = 16, .compliance_level = 2, .num_objects = 0 }, /* OSDPVersion */
-    { .function_code = 17, .compliance_level = 1, .num_objects = 0 }, /* SecurePDBiometricsMatchSupport (spec B.18) */
 };
 #define DEFAULT_PDCAP_COUNT (sizeof(kDefaultPdcap) / sizeof(kDefaultPdcap[0]))
 
@@ -313,16 +316,11 @@ static osdp_status_t app_handler(void           *user,
         break;
     }
 
-    case OSDP_CMD_CAP: {
-        size_t built = 0;
-        r = osdp_pdcap_build(s->pdcap, s->pdcap_count,
-                             s->scratch, sizeof(s->scratch), &built);
-        if (r != OSDP_OK) { r = OSDP_ERR_BAD_PAYLOAD; break; }
-        reply->code        = OSDP_REPLY_PDCAP;
-        reply->payload     = s->scratch;
-        reply->payload_len = built;
-        break;
-    }
+    /* osdp_CAP is answered by the library from the records bound with
+     * osdp_pd_set_pdcap in main(), so it never reaches this handler — the same
+     * arrangement as osdp_COMSET below. Falling back to a hand-built reply
+     * here would only differ from the library's by omitting the three reserved
+     * records it computes, so there is nothing useful to keep. */
 
     /* osdp_COMSET is intercepted by the library (it replies osdp_COM and
      * mutates the PD address), so it never reaches this handler — see the
@@ -712,35 +710,31 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Advertise AES128 only when Secure Channel is actually configured. The
-     * default capability set claims it unconditionally, which is a lie on a
-     * --sc=off run: an ACU reading function code 9 would open a handshake and
-     * get NAK 0x05. Fix the record rather than silence the check. */
-    for (size_t i = 0; i < app.pdcap_count; i++) {
-        if (app.pdcap[i].function_code == 9) {
-            const uint8_t aes = (cli.sc_mode == SC_NONE) ? 0x00U : 0x01U;
-            app.pdcap[i].compliance_level = aes;
-            app.pdcap[i].num_objects      = aes;
-        }
-    }
-
-    /* Check what we are about to advertise against what this PD can actually
-     * honour. Advisory: report and carry on, since an operator may be probing
-     * a deliberately odd configuration on purpose.
+    /* Hand the capability set to the library, which answers osdp_CAP with it
+     * from here on plus the three records it computes for itself (fn 8, 9 and
+     * 10 — see kDefaultPdcap). The AES128 advertisement that used to be
+     * patched in by hand here is one of those: fn 9 now reports this PD's real
+     * key state, so there is nothing left to correct.
      *
-     * Runs AFTER the Secure Channel setup above. An earlier version sat
-     * before it and reported every --sc run as inconsistent, which is exactly
-     * the false alarm that gets a check switched off. */
+     * Runs AFTER the Secure Channel setup above, because that is what the
+     * computed records describe. An earlier version of the equivalent check
+     * sat before it and reported every --sc run as inconsistent, which is
+     * exactly the false alarm that gets a check switched off.
+     *
+     * osdp_pd_set_pdcap validates before it binds, so a rejection means this
+     * tool is advertising something it cannot honour. Report and carry on
+     * unbound — osdp_CAP then falls through to the handler, which no longer
+     * answers it, so the ACU sees a NAK rather than a plausible lie. */
     {
         size_t bad = 0;
-        const osdp_status_t cap_check =
-            osdp_pd_check_pdcap(&pd, app.pdcap, app.pdcap_count, &bad);
-        if (cap_check != OSDP_OK) {
+        const osdp_status_t cap_bind =
+            osdp_pd_set_pdcap(&pd, app.pdcap, app.pdcap_count, &bad);
+        if (cap_bind != OSDP_OK) {
             fprintf(stderr,
-                    "warning: PDCAP record %zu (function code %u) is "
-                    "inconsistent with this PD's configuration (%d)\n",
+                    "warning: PDCAP record %zu (function code %u) was "
+                    "rejected (%d); osdp_CAP will not be answered\n",
                     bad, (unsigned)app.pdcap[bad].function_code,
-                    (int)cap_check);
+                    (int)cap_bind);
         }
     }
 

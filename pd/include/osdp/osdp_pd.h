@@ -804,6 +804,29 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
  * since that is the *peer's* limit rather than this PD's. */
 size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd);
 
+/* Largest multi-part FRAGMENT payload this PD should send right now, in
+ * bytes — i.e. how many message bytes fit in one osdp_MFG (or any other
+ * spec-5.10 multi-part reply) after both packet limits and the fragment
+ * header are accounted for.
+ *
+ * This is osdp_pd_max_reply_payload's answer with the two adjustments a
+ * multi-part sender always has to make, and which are easy to get subtly
+ * wrong by hand:
+ *
+ *   - It honours osdp_pd_acu_rx_size — the PEER's limit — as well as this
+ *     PD's own bound TX capacity, taking the smaller. A sender that ignores
+ *     the ACU's declared capacity either overruns it or, far more commonly,
+ *     leaves a compile-time default in place and ships every large message in
+ *     needlessly small pieces, one per poll.
+ *   - It subtracts OSDP_MP_HEADER_BYTES, since the multi-part header rides
+ *     inside the payload rather than alongside it.
+ *
+ * Returns 0 for a NULL pd, or if no payload at all can fit — feed the result
+ * to osdp_mp_frag_iter_init only after checking for that. Like its sibling
+ * the value resolves against live state, so it shrinks once Secure Channel is
+ * established and grows when an osdp_ACURXSIZE raises the peer's limit. */
+size_t osdp_pd_max_fragment_payload(const osdp_pd_t *pd);
+
 /* Pump the PD state machine: read available bytes, process any complete
  * frames addressed to this PD or to the broadcast, dispatch to the
  * command handler, and send any reply. Idempotent and non-blocking;

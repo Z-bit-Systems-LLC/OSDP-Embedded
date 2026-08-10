@@ -144,7 +144,10 @@ add_library(sc_test_aes STATIC
 target_include_directories(sc_test_aes
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(sc_test_aes PUBLIC osdp_core tiny_aes)
+# The AES primitives come from ports/tiny; only the deterministic test RNG
+# lives in sc_test_aes.c now. tiny_aes is reached through the port rather than
+# linked here, so the vendored headers stay out of the tests' include path.
+target_link_libraries(sc_test_aes PUBLIC osdp_core osdp_port_sc_tiny)
 
 function(osdp_add_sc_test test_name)
     add_executable(${test_name} ${test_name}.c)

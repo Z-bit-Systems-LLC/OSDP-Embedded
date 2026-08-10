@@ -5,6 +5,7 @@
 
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_frame.h"
+#include "osdp/osdp_multipart.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc.h"
 #include "osdp/osdp_sc2.h"
@@ -716,12 +717,12 @@ void osdp_pd_set_command_handler(osdp_pd_t *pd,
     pd->cmd_user = user;
 }
 
-size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd)
+/* Largest reply payload that fits in a packet of `cap` total bytes, given the
+ * channel this PD is on right now. Shared by osdp_pd_max_reply_payload (which
+ * passes the bound TX capacity) and osdp_pd_max_fragment_payload (which passes
+ * whichever of that and the ACU's declared capacity is smaller). */
+static size_t max_payload_for_cap(const osdp_pd_t *pd, size_t cap)
 {
-    if (pd == NULL) {
-        return 0;
-    }
-
     /* Describe the reply this PD would send right now. Only the header
      * fields matter to the sizing helpers; the payload is what we're
      * solving for. A reply always mirrors the inbound integrity mode, and
@@ -744,12 +745,47 @@ size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd)
         shape.has_scb    = true;
         shape.scb_length = OSDP_SCB_MIN_LEN;
         shape.scb_type   = OSDP_SCS_18;   /* data-bearing PD→ACU */
-        s = osdp_sc_max_payload(&shape, pd->tx_cap, &max);
+        s = osdp_sc_max_payload(&shape, cap, &max);
     } else {
-        s = osdp_frame_max_payload(&shape, pd->tx_cap, &max);
+        s = osdp_frame_max_payload(&shape, cap, &max);
     }
 
     return (s == OSDP_OK) ? max : 0;
+}
+
+size_t osdp_pd_max_reply_payload(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return 0;
+    }
+    return max_payload_for_cap(pd, pd->tx_cap);
+}
+
+size_t osdp_pd_max_fragment_payload(const osdp_pd_t *pd)
+{
+    if (pd == NULL) {
+        return 0;
+    }
+
+    /* Both limits are whole-packet numbers, so taking the smaller BEFORE the
+     * framing arithmetic is what makes this correct: osdp_frame_max_payload /
+     * osdp_sc_max_payload subtract the header, integrity and (under SC) the
+     * security block and padding from whatever capacity they are handed. Doing
+     * the min on the two payload figures instead would subtract that overhead
+     * from the ACU's limit twice on the branch where the ACU is the smaller. */
+    size_t cap = pd->tx_cap;
+    if ((size_t)pd->acu_rx_size < cap) {
+        cap = (size_t)pd->acu_rx_size;
+    }
+
+    const size_t max = max_payload_for_cap(pd, cap);
+
+    /* The multi-part header rides INSIDE the payload (spec 5.10 Table 4), so
+     * it comes off the top of what the framer will carry. */
+    if (max <= OSDP_MP_HEADER_BYTES) {
+        return 0;
+    }
+    return max - OSDP_MP_HEADER_BYTES;
 }
 
 /* ---- Poll-response event queue -----------------------------------------
