@@ -11,8 +11,26 @@
 
 #include <string.h>
 
-/* Outbound fragment size for osdp_PAIRR replies (matches the reference). */
-#define PD_PAIR_FRAG_SIZE OSDP_PAIR_DEFAULT_FRAGMENT_SIZE
+/* Outbound fragment payload for osdp_PAIRR replies.
+ *
+ * Message 2 is ~7.7 KB delivered one fragment per POLL, so this number sets
+ * how many round-trips the PD costs the ACU: 62 at the reference's 128-byte
+ * default, 16 at 512. The ACU tells us what it can take (osdp_ACURXSIZE, which
+ * the benchmark sets to 1440); ignoring that and shipping the minimum shows up
+ * as PD slowness on an exchange that is already the slow part of pairing.
+ *
+ * osdp_pd_max_fragment_payload resolves this PD's own TX capacity against that
+ * declared peer limit and takes off the multi-part header. Clamped to the
+ * compile-time ceiling that sizes emit_pairr's scratch, and floored at nothing
+ * — a helper answer of 0 means no fragment fits and the caller must not send. */
+static size_t pair_frag_size(const osdp_pd_t *pd)
+{
+    size_t n = osdp_pd_max_fragment_payload(pd);
+    if (n > OSDP_PAIR_MAX_FRAGMENT_SIZE) {
+        n = OSDP_PAIR_MAX_FRAGMENT_SIZE;
+    }
+    return n;
+}
 
 static uint32_t pair_now_ms(const osdp_pd_t *pd)
 {
@@ -54,7 +72,11 @@ static size_t emit_nak(osdp_pd_t *pd, const osdp_frame_t *cmd, uint8_t err)
 static size_t emit_pairr(osdp_pd_t *pd, const osdp_frame_t *cmd,
                          const osdp_mp_fragment_t *frag)
 {
-    uint8_t fbuf[OSDP_MP_HEADER_BYTES + PD_PAIR_FRAG_SIZE];
+    /* Sized by the ceiling, not by the fragment size actually in use, because
+     * the two differ once the size is resolved at run time. osdp_mp_fragment_build
+     * bounds-checks against it, so an over-large descriptor fails here rather
+     * than overrunning. */
+    uint8_t fbuf[OSDP_MP_HEADER_BYTES + OSDP_PAIR_MAX_FRAGMENT_SIZE];
     size_t  flen = 0;
     if (osdp_mp_fragment_build(frag, fbuf, sizeof(fbuf), &flen) != OSDP_OK) {
         return 0;
@@ -161,8 +183,19 @@ static size_t handle_msg1(osdp_pd_t *pd, osdp_pd_pair_t *p,
         return emit_single(pd, cmd, p->outbuf, outlen);
     }
 
-    /* Message 2: deliver over subsequent POLLs; ACK this last Msg1 fragment. */
-    osdp_mp_frag_iter_init(&p->out_iter, p->outbuf, outlen, PD_PAIR_FRAG_SIZE);
+    /* Message 2: deliver over subsequent POLLs; ACK this last Msg1 fragment.
+     * The size is resolved here, once, rather than per fragment: by now the
+     * ACU has sent whatever osdp_ACURXSIZE it is going to, and a mid-delivery
+     * change would renumber offsets the peer is already reassembling. */
+    const size_t frag_size = pair_frag_size(pd);
+    if (frag_size == 0U) {
+        /* Nothing can be transmitted — no capacity for even one fragment.
+         * Abandon rather than emit a zero-length fragment the ACU would read
+         * as the 5.10.2 early-termination marker. */
+        pair_reset(p);
+        return emit_nak(pd, cmd, OSDP_NAK_RECORD_INVALID);
+    }
+    osdp_mp_frag_iter_init(&p->out_iter, p->outbuf, outlen, frag_size);
     p->delivering = true;
     return emit_ack(pd, cmd);
 }

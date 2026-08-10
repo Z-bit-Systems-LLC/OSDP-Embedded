@@ -47,9 +47,25 @@ extern "C" {
 #define OSDP_PAIR_MSG_TYPE_RESULT  0x04U   /* Result     (PD -> ACU) */
 
 /* Default outbound fragment payload size and the session inactivity
- * timeout, both per the reference. */
+ * timeout, both per the reference. The default applies only when the peer's
+ * receive capacity is unknown; see OSDP_PAIR_MAX_FRAGMENT_SIZE. */
 #define OSDP_PAIR_DEFAULT_FRAGMENT_SIZE  128U
 #define OSDP_PAIR_SESSION_TIMEOUT_MS     30000U
+
+/* Ceiling on an outbound pairing fragment's payload, and hence on the one
+ * scratch buffer the PAIRR emitter needs. The driver sizes each fragment from
+ * what the peer and this PD can actually take (osdp_pd_max_fragment_payload)
+ * and clamps to this, so raising it costs stack and lowering it costs poll
+ * round-trips: Message 2 is ~7.7 KB, which is ~62 fragments at the 128-byte
+ * default and ~16 at 512.
+ *
+ * 512 matches OSDP_PD_BUF_LEN, so a PD on the default buffers is never
+ * clamped below what it could actually transmit. Overridable like the other
+ * buffer constants — a PD with larger buffers facing an ACU that declares a
+ * large osdp_ACURXSIZE wants this raised to match. */
+#ifndef OSDP_PAIR_MAX_FRAGMENT_SIZE
+#define OSDP_PAIR_MAX_FRAGMENT_SIZE      512U
+#endif
 
 /* Recommended reassembly-buffer size. The largest pairing message
  * (Message 2, PD -> ACU) is ~7.7 KB; this bounds an integrator's single

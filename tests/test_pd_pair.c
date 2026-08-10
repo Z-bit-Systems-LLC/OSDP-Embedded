@@ -192,6 +192,12 @@ static void acu_send_message(const uint8_t *msg, size_t msg_len,
     }
 }
 
+/* Observed shape of the last Message-2 delivery: how many osdp_PAIRR
+ * fragments it took and the largest fragment payload seen. Both are what the
+ * ACU pays for in poll round-trips, so they are worth asserting on. */
+static size_t g_msg2_frag_count;
+static size_t g_msg2_frag_max;
+
 /* POLL until the PD's queued Message 2 is fully reassembled. */
 static size_t acu_recv_message(uint8_t *out, size_t out_cap)
 {
@@ -200,13 +206,17 @@ static size_t acu_recv_message(uint8_t *out, size_t out_cap)
     osdp_mp_reasm_init(&r, rbuf, sizeof(rbuf));
     osdp_mp_state_t state = OSDP_MP_IN_PROGRESS;
     int guard = 0;
+    g_msg2_frag_count = 0;
+    g_msg2_frag_max   = 0;
     while (state != OSDP_MP_COMPLETE && guard++ < 300) {
-        uint8_t code, pay[256]; size_t plen = 0;
+        uint8_t code, pay[1024]; size_t plen = 0;
         send_cmd(OSDP_CMD_POLL, NULL, 0, &code, pay, sizeof(pay), &plen);
         if (code != OSDP_REPLY_PAIRR) { continue; }
         osdp_mp_fragment_t frag;
         TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_fragment_decode(pay, plen, &frag));
         TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_reasm_push(&r, &frag, &state));
+        g_msg2_frag_count++;
+        if (frag.frag_len > g_msg2_frag_max) { g_msg2_frag_max = frag.frag_len; }
     }
     TEST_ASSERT_EQUAL(OSDP_MP_COMPLETE, state);
     TEST_ASSERT_TRUE(r.total <= out_cap);
@@ -252,6 +262,71 @@ static void test_pd_completes_pairing_and_applies_scbk(void)
     TEST_ASSERT_EQUAL_MEMORY("SN-ACU", g_peer_serial, g_peer_serial_len);
 }
 
+/* Message-2 fragments are sized from what the ACU said it can receive, not
+ * from a compile-time constant.
+ *
+ * Two halves, and the first is a correctness point rather than a speed one.
+ * With no osdp_ACURXSIZE the peer limit is the conservative spec-6.26 default
+ * of 128 bytes for the WHOLE packet, so a fragment payload has to leave room
+ * for the OSDP framing and the 6-byte multi-part header inside it — the PD
+ * must send strictly less than 128, not exactly 128. Measured: 113 bytes,
+ * which the previously hard-coded 128 would have overrun.
+ *
+ * Then, once the ACU declares 1440, fragments grow to what this PD's own TX
+ * buffer allows and the round-trip count collapses. Measured on the default
+ * buffers: 113-byte fragments over 66 polls becomes 497-byte fragments over
+ * 15. Asserted as relationships rather than those literals, so retuning a
+ * buffer constant does not fail a test that is really about direction. */
+static void test_msg2_fragments_follow_the_acu_declared_size(void)
+{
+    static uint8_t msg1[8192], msg2[8192], msg3[8192];
+    size_t n1 = 0, n3 = 0;
+    uint8_t code, pay[1024]; size_t plen = 0;
+
+    /* --- Default peer limit: every fragment must fit a 128-byte packet. --- */
+    TEST_ASSERT_EQUAL_UINT16(OSDP_PD_DEFAULT_ACU_RX_SIZE,
+                             osdp_pd_acu_rx_size(&pd));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
+    acu_send_message(msg1, n1, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, code);
+    (void)acu_recv_message(msg2, sizeof(msg2));
+
+    const size_t defaulted_max   = g_msg2_frag_max;
+    const size_t defaulted_count = g_msg2_frag_count;
+    TEST_ASSERT_GREATER_THAN_size_t(0, defaulted_max);
+    TEST_ASSERT_LESS_THAN_size_t(OSDP_PD_DEFAULT_ACU_RX_SIZE, defaulted_max);
+
+    /* --- Same exchange after the ACU declares 1440. --- */
+    setUp();   /* fresh PD, ACU session and wire */
+
+    const uint8_t rx1440[2] = { 0xA0, 0x05 };   /* 1440, little-endian */
+    send_cmd(OSDP_CMD_ACURXSIZE, rx1440, sizeof(rx1440),
+             &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, code);
+    TEST_ASSERT_EQUAL_UINT16(1440U, osdp_pd_acu_rx_size(&pd));
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
+    acu_send_message(msg1, n1, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, code);
+    const size_t n2 = acu_recv_message(msg2, sizeof(msg2));
+
+    TEST_ASSERT_GREATER_THAN_size_t(defaulted_max, g_msg2_frag_max);
+    TEST_ASSERT_LESS_THAN_size_t(defaulted_count, g_msg2_frag_count);
+    /* Bounded by this PD's own TX capacity, not by the ACU's 1440. */
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(OSDP_PAIR_MAX_FRAGMENT_SIZE,
+                                     g_msg2_frag_max);
+
+    /* And the exchange still completes — a bigger fragment is not merely
+     * emitted, it is accepted, reassembled and verified end to end. */
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_process_msg2(&acu, msg2, n2, msg3, sizeof(msg3), &n3));
+    acu_send_message(msg3, n3, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PAIRR, code);
+    TEST_ASSERT_TRUE(pd.sc2.scbk_set);
+}
+
 /* An unconfigured PD (no pairing attached) NAKs osdp_PAIR. */
 static void test_pd_without_pairing_naks(void)
 {
@@ -284,6 +359,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_pd_completes_pairing_and_applies_scbk);
+    RUN_TEST(test_msg2_fragments_follow_the_acu_declared_size);
     RUN_TEST(test_pd_without_pairing_naks);
     return UNITY_END();
 }
