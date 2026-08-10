@@ -158,6 +158,101 @@ static void test_pdcap_accepts_empty_list(void)
     TEST_ASSERT_EQUAL_size_t(0, n);
 }
 
+/* ---- osdp_pdcap_validate_record -----------------------------------------
+ *
+ * A pure function of the three bytes, independent of any osdp_pd_t — so
+ * these tests never touch osdp::pd, just the Annex B catalog. */
+
+static void test_validate_record_rejects_null(void)
+{
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(NULL));
+}
+
+static void test_validate_record_rejects_unknown_function_code(void)
+{
+    const osdp_pdcap_record_t r0 = { .function_code = 0,
+                                     .compliance_level = 0, .num_objects = 0 };
+    /* fn 17 ("Secure PD Biometrics Match Support"): listed in the spec's
+     * table of contents with a page number, but Annex B's actual body ends
+     * at function code 16 and jumps straight to Annex C — no fn 17 section
+     * exists in the document, so it is unrecognised like fn 18. */
+    const osdp_pdcap_record_t r17 = { .function_code = 17,
+                                      .compliance_level = 0, .num_objects = 0 };
+    const osdp_pdcap_record_t r18 = { .function_code = 18,
+                                      .compliance_level = 0, .num_objects = 0 };
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r0));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r17));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&r18));
+}
+
+/* fn 4 (Reader LED Control) is a contiguous 0..6 enumeration (B.5). */
+static void test_validate_record_range_enum(void)
+{
+    const osdp_pdcap_record_t ok = { .function_code = 4,
+                                     .compliance_level = 6, .num_objects = 1 };
+    const osdp_pdcap_record_t bad = { .function_code = 4,
+                                      .compliance_level = 7, .num_objects = 1 };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&ok));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&bad));
+}
+
+/* fn 3 (Card Data Format) requires num_objects == 0x00 (B.4). */
+static void test_validate_record_zero_only_field(void)
+{
+    const osdp_pdcap_record_t ok = { .function_code = 3,
+                                     .compliance_level = 1, .num_objects = 0 };
+    const osdp_pdcap_record_t bad = { .function_code = 3,
+                                      .compliance_level = 1, .num_objects = 1 };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&ok));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&bad));
+}
+
+/* fn 9 (Communication Security) is a 1-bit bitmap on both bytes (B.10). */
+static void test_validate_record_bitmap_rejects_reserved_bits(void)
+{
+    const osdp_pdcap_record_t ok = { .function_code = 9,
+                                     .compliance_level = 0x01,
+                                     .num_objects = 0x01 };
+    const osdp_pdcap_record_t bad = { .function_code = 9,
+                                      .compliance_level = 0x02,
+                                      .num_objects = 0x01 };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&ok));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG, osdp_pdcap_validate_record(&bad));
+}
+
+/* fn 16 (OSDP Version) allows a named 0..4 range plus 0x80..0xFF private
+ * use (B.17); the gap in between is reserved. */
+static void test_validate_record_range_or_private(void)
+{
+    const osdp_pdcap_record_t named   = { .function_code = 16,
+                                          .compliance_level = 0x04,
+                                          .num_objects = 0 };
+    const osdp_pdcap_record_t private_use = { .function_code = 16,
+                                              .compliance_level = 0x90,
+                                              .num_objects = 0 };
+    const osdp_pdcap_record_t reserved = { .function_code = 16,
+                                           .compliance_level = 0x05,
+                                           .num_objects = 0 };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&named));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&private_use));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pdcap_validate_record(&reserved));
+}
+
+/* fn 10 (Receive BufferSize) is a free-form 16-bit size split across both
+ * bytes — every value is legal on its own terms. */
+static void test_validate_record_any_field_accepts_everything(void)
+{
+    const osdp_pdcap_record_t lo = { .function_code = 10,
+                                     .compliance_level = 0x00,
+                                     .num_objects = 0x02 };
+    const osdp_pdcap_record_t hi = { .function_code = 10,
+                                     .compliance_level = 0xFF,
+                                     .num_objects = 0xFF };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&lo));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_validate_record(&hi));
+}
+
 /* ========================================================================
  * osdp_LSTATR
  * ====================================================================== */
@@ -670,6 +765,13 @@ int main(void)
     RUN_TEST(test_pdcap_round_trip);
     RUN_TEST(test_pdcap_decode_rejects_partial_record);
     RUN_TEST(test_pdcap_accepts_empty_list);
+    RUN_TEST(test_validate_record_rejects_null);
+    RUN_TEST(test_validate_record_rejects_unknown_function_code);
+    RUN_TEST(test_validate_record_range_enum);
+    RUN_TEST(test_validate_record_zero_only_field);
+    RUN_TEST(test_validate_record_bitmap_rejects_reserved_bits);
+    RUN_TEST(test_validate_record_range_or_private);
+    RUN_TEST(test_validate_record_any_field_accepts_everything);
     /* LSTATR */
     RUN_TEST(test_lstatr_round_trip);
     RUN_TEST(test_lstatr_decode_rejects_wrong_size);

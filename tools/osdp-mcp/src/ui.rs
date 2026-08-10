@@ -23,9 +23,10 @@
 //! - `POST /api/card` → inject a card read; the PD surfaces it as an
 //!   `osdp_RAW` reply on its next POLL (a card tapped, from the browser).
 //! - `POST /api/tamper` → inject a tamper condition; the PD surfaces it
-//!   as an `osdp_LSTATR` (tamper bit set) on its next POLL. A status
-//!   report, so it never goes stale — delivered whenever the ACU next
-//!   polls.
+//!   as an `osdp_LSTATR` (tamper bit set) on its next POLL *and* records
+//!   it as the standing condition, so a later `osdp_LSTAT` query reports
+//!   the same thing. A status report, so it never goes stale — delivered
+//!   whenever the ACU next polls.
 //! - `POST /api/power-cycle` → power-cycle the reader: rebuild the PD
 //!   (SQN reset, Secure Channel session dropped — the ACU must
 //!   re-handshake), which on re-init queues a non-stale power-up
@@ -45,7 +46,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW};
+use osdp_embedded::messages::{Keypad, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
@@ -117,18 +118,6 @@ pub fn card_event(facility: u8, card: u16) -> Result<OverrideReply, &'static str
         code: OSDP_REPLY_RAW,
         payload: buf,
     })
-}
-
-/// Build a Local Status Report (`osdp_LSTATR`) event with the given
-/// tamper / power flags. Spec §7.6 / Table 50: a 2-byte payload, byte 0
-/// = tamper status (0 normal, 1 tamper), byte 1 = power status (0
-/// normal, 1 power failure). A status report, so `events::enqueue` keeps
-/// it non-staleable — it is reported on the next POLL however delayed.
-pub fn local_status_event(tamper: u8, power: u8) -> OverrideReply {
-    OverrideReply {
-        code: OSDP_REPLY_LSTATR,
-        payload: vec![tamper, power],
-    }
 }
 
 /// The reader visual page. Self-contained (inline CSS + JS, no external
@@ -239,11 +228,15 @@ const TAMPER_CLEAR_DELAY: Duration = Duration::from_secs(5);
 /// to normal and a subsequent press is again a fresh change it registers
 /// (see [`TAMPER_CLEAR_DELAY`]).
 async fn api_tamper(State(pd): State<Arc<PdHandle>>) -> StatusCode {
-    pd.enqueue_event(local_status_event(1, 0)); // tamper active
+    // set_local_status stores the condition as well as queueing the report,
+    // so an ACU that answers the LSTATR by *querying* osdp_LSTAT gets the
+    // same answer instead of a stale "all clear". The scheduled clear below
+    // returns both to normal together.
+    pd.set_local_status(1, 0); // tamper active
     let pd = Arc::clone(&pd);
     tokio::spawn(async move {
         tokio::time::sleep(TAMPER_CLEAR_DELAY).await;
-        pd.enqueue_event(local_status_event(0, 0)); // tamper clear
+        pd.set_local_status(0, 0); // tamper clear
     });
     StatusCode::NO_CONTENT
 }

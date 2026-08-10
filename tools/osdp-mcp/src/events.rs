@@ -140,18 +140,36 @@ mod tests {
         }
     }
 
-    /// Enqueue a report as if it had arrived `age` ago, for exercising
-    /// the freshness window without sleeping.
-    fn enqueue_aged(q: &EventQueue, e: OverrideReply, age: Duration) {
-        let at = Instant::now()
-            .checked_sub(age)
-            .expect("test instant underflow");
+    /// Enqueue a report at an explicit past instant, for exercising the
+    /// freshness window without sleeping. Callers derive `at` by adding
+    /// forward from a captured base instant (see `pop_as_of`/`len_as_of`
+    /// below) rather than subtracting from `Instant::now()` — `Instant`
+    /// has no epoch before process/system start, so backdating by a fixed
+    /// `Duration` risks underflowing (and panicking) on a host with too
+    /// little monotonic uptime, however small the duration.
+    fn enqueue_at(q: &EventQueue, e: OverrideReply, at: Instant) {
         let staleable = !is_status_report(e.code);
         q.lock().expect("event queue mutex").push_back(Pending {
             reply: e,
             enqueued_at: at,
             staleable,
         });
+    }
+
+    /// `pop`, but checked against an explicit `now` instead of the real
+    /// clock, so freshness-window tests never depend on wall/monotonic
+    /// time.
+    fn pop_as_of(q: &EventQueue, now: Instant) -> Option<OverrideReply> {
+        let mut dq = q.lock().expect("event queue mutex");
+        drop_stale(&mut dq, now, EVENT_TTL);
+        dq.pop_front().map(|p| p.reply)
+    }
+
+    /// `len`, but checked against an explicit `now` — see `pop_as_of`.
+    fn len_as_of(q: &EventQueue, now: Instant) -> usize {
+        let mut dq = q.lock().expect("event queue mutex");
+        drop_stale(&mut dq, now, EVENT_TTL);
+        dq.len()
     }
 
     #[test]
@@ -180,59 +198,64 @@ mod tests {
     #[test]
     fn stale_card_read_is_dropped_on_pop() {
         let q = new_queue();
+        let base = Instant::now();
         // A card-read (RAW) that arrived well outside the freshness
         // window — e.g. queued while the ACU was disconnected.
-        enqueue_aged(
-            &q,
-            r(0x50, b"stale"),
-            EVENT_TTL + Duration::from_millis(500),
-        );
+        enqueue_at(&q, r(0x50, b"stale"), base);
+        let checked_at = base + EVENT_TTL + Duration::from_millis(500);
         // Nothing deliverable: the stale read is discarded, not surfaced.
-        assert!(pop(&q).is_none());
-        assert_eq!(len(&q), 0);
+        assert!(pop_as_of(&q, checked_at).is_none());
+        assert_eq!(len_as_of(&q, checked_at), 0);
     }
 
     #[test]
     fn fresh_card_read_survives_a_stale_one_ahead_of_it() {
         let q = new_queue();
-        enqueue_aged(
-            &q,
-            r(0x50, b"stale"),
-            EVENT_TTL + Duration::from_millis(500),
-        );
-        enqueue(&q, r(0x53, b"fresh"));
+        let base = Instant::now();
+        enqueue_at(&q, r(0x50, b"stale"), base);
+        let checked_at = base + EVENT_TTL + Duration::from_millis(500);
+        enqueue_at(&q, r(0x53, b"fresh"), checked_at);
         // Depth counts only the fresh one.
-        assert_eq!(len(&q), 1);
+        assert_eq!(len_as_of(&q, checked_at), 1);
         // The stale head is dropped; the fresh report is delivered.
-        let got = pop(&q).expect("fresh event");
+        let got = pop_as_of(&q, checked_at).expect("fresh event");
         assert_eq!(got.code, 0x53);
-        assert!(pop(&q).is_none());
+        assert!(pop_as_of(&q, checked_at).is_none());
     }
 
     #[test]
     fn status_reports_never_go_stale() {
         let q = new_queue();
+        let base = Instant::now();
         // LSTATR / ISTATR / OSTATR / RSTATR queued long ago (e.g. a
         // power-cycle report sitting from boot until the ACU first
         // polls) must all still be deliverable.
-        let ancient = EVENT_TTL * 1000;
-        enqueue_aged(&q, r(OSDP_REPLY_LSTATR, &[0, 1]), ancient);
-        enqueue_aged(&q, r(OSDP_REPLY_ISTATR, &[0]), ancient);
-        enqueue_aged(&q, r(OSDP_REPLY_OSTATR, &[0]), ancient);
-        enqueue_aged(&q, r(OSDP_REPLY_RSTATR, &[0]), ancient);
-        assert_eq!(len(&q), 4, "no status report should be aged out");
-        assert_eq!(pop(&q).unwrap().code, OSDP_REPLY_LSTATR);
-        assert_eq!(pop(&q).unwrap().code, OSDP_REPLY_ISTATR);
-        assert_eq!(pop(&q).unwrap().code, OSDP_REPLY_OSTATR);
-        assert_eq!(pop(&q).unwrap().code, OSDP_REPLY_RSTATR);
+        enqueue_at(&q, r(OSDP_REPLY_LSTATR, &[0, 1]), base);
+        enqueue_at(&q, r(OSDP_REPLY_ISTATR, &[0]), base);
+        enqueue_at(&q, r(OSDP_REPLY_OSTATR, &[0]), base);
+        enqueue_at(&q, r(OSDP_REPLY_RSTATR, &[0]), base);
+        // Ancient relative to the freshness window — status reports must
+        // survive this regardless, since the exemption doesn't look at age.
+        let ancient = base + EVENT_TTL * 1000;
+        assert_eq!(
+            len_as_of(&q, ancient),
+            4,
+            "no status report should be aged out"
+        );
+        assert_eq!(pop_as_of(&q, ancient).unwrap().code, OSDP_REPLY_LSTATR);
+        assert_eq!(pop_as_of(&q, ancient).unwrap().code, OSDP_REPLY_ISTATR);
+        assert_eq!(pop_as_of(&q, ancient).unwrap().code, OSDP_REPLY_OSTATR);
+        assert_eq!(pop_as_of(&q, ancient).unwrap().code, OSDP_REPLY_RSTATR);
     }
 
     #[test]
     fn just_fresh_read_is_kept() {
         let q = new_queue();
+        let base = Instant::now();
         // Comfortably inside the window — a normal inject-then-poll.
-        enqueue_aged(&q, r(0x50, b"ok"), EVENT_TTL / 2);
-        assert_eq!(len(&q), 1);
-        assert_eq!(pop(&q).expect("fresh event").code, 0x50);
+        enqueue_at(&q, r(0x50, b"ok"), base);
+        let checked_at = base + EVENT_TTL / 2;
+        assert_eq!(len_as_of(&q, checked_at), 1);
+        assert_eq!(pop_as_of(&q, checked_at).expect("fresh event").code, 0x50);
     }
 }

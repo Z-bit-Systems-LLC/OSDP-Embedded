@@ -139,10 +139,13 @@ pub struct CapSpec {
 }
 
 /// The catalog, one entry per function code defined in Annex B
-/// (1..=17). Function code 18 ("Extended Capability Display") is
-/// referenced by the spec's table of contents but its body is marked
-/// "Error! Bookmark not defined." in the source document, so it is
-/// deliberately omitted until the definition is available.
+/// (1..=16). Function codes 17 ("Secure PD Biometrics Match Support") and
+/// 18 ("Extended Capability Display") are both referenced by the spec's
+/// table of contents, but Annex B's body ends at function code 16 and
+/// jumps straight to Annex C — neither has a defined body in the source
+/// document (18's TOC bookmark is even marked "Error! Bookmark not
+/// defined."), so both are deliberately omitted until a definition is
+/// available.
 static CATALOG: &[CapSpec] = &[
     CapSpec {
         code: 1,
@@ -307,16 +310,6 @@ static CATALOG: &[CapSpec] = &[
         ),
         num_objects: FieldRule::Zero("must be 0x00"),
     },
-    CapSpec {
-        code: 17,
-        name: "Secure PD Biometrics Match Support",
-        // Spec B.18 body is not present in the extracted reference text,
-        // so both bytes are accepted permissively rather than guessing
-        // at the enumeration.
-        summary: "Secure PD biometrics match support (spec B.18).",
-        compliance: FieldRule::Any("compliance level (see spec B.18)"),
-        num_objects: FieldRule::Any("number of objects (see spec B.18)"),
-    },
 ];
 
 /// Look up a function code's definition, if it is one this catalog
@@ -384,14 +377,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shipped_default_pdcap_is_spec_conformant() {
+    fn shipped_secure_reader_template_is_spec_conformant() {
         // pd_reset_pdcap restores this set wholesale, and the get-view
-        // annotates every byte — so the default must itself pass the
+        // annotates every byte — so the template must itself pass the
         // same validation pd_set_capability enforces, or the tool would
         // contradict itself.
-        for r in crate::handler::default_pdcap().records {
+        use osdp_embedded::pd::PdcapTemplate;
+        for r in osdp_embedded::pd::Pd::pdcap_template(PdcapTemplate::SecureReader) {
             validate_record(r.function_code, r.compliance_level, r.num_objects).unwrap_or_else(
-                |e| panic!("default PDCAP record {r:?} is not spec-conformant: {e}"),
+                |e| panic!("Secure Reader template record {r:?} is not spec-conformant: {e}"),
             );
         }
     }

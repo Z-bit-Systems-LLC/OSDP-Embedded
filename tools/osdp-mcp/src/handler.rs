@@ -6,14 +6,17 @@
 //!
 //! Milestone 2 ships the "default" behavior — the same baseline the
 //! [`osdp-pd-mock`](../../../tools/osdp-pd-mock/main.c) tool provides:
-//! POLL → ACK, ID → PDID, CAP → PDCAP, LED / BUZ / OUT / TEXT /
-//! KEYSET → ACK, everything else → NAK (unknown command).
+//! POLL → ACK, ID → PDID, LED / BUZ / OUT / TEXT / KEYSET → ACK,
+//! everything else → NAK (unknown command).
 //!
-//! `osdp_COMSET` never reaches this handler: the C library intercepts it,
-//! builds the `osdp_COM` reply, and switches the PD address itself. The
-//! virtual PD's COMSET policy lives in [`DefaultComsetHandler`] instead
-//! (registered in the actor). One consequence: the override / fault-
-//! injection tools can't target COMSET, the same as the SC handshake.
+//! `osdp_COMSET` and `osdp_CAP` never reach this handler: the C library
+//! intercepts both. COMSET builds the `osdp_COM` reply and switches the PD
+//! address itself (the virtual PD's COMSET policy lives in
+//! [`DefaultComsetHandler`] instead, registered in the actor). CAP is
+//! answered directly from the capability set bound via `Pd::set_pdcap`
+//! (`pd_actor::open_pd` binds it unconditionally). One consequence: the
+//! override / fault-injection tools can't target either, the same as the
+//! SC handshake.
 //!
 //! Later milestones add an override table the agent can populate via
 //! `set_reply_for` etc.; the override check will be wired into the
@@ -24,10 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use osdp_embedded::messages::{
-    Keyset, Pdcap, PdcapRecord, Pdid, OSDP_CMD_BUZ, OSDP_CMD_CAP, OSDP_CMD_ID, OSDP_CMD_KEYSET,
-    OSDP_CMD_LED, OSDP_CMD_LSTAT, OSDP_CMD_OUT, OSDP_CMD_POLL, OSDP_CMD_TEXT,
-    OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK, OSDP_REPLY_LSTATR,
-    OSDP_REPLY_PDCAP, OSDP_REPLY_PDID,
+    Keyset, Out, Pdid, OSDP_CMD_BUZ, OSDP_CMD_ID, OSDP_CMD_KEYSET, OSDP_CMD_LED, OSDP_CMD_OUT,
+    OSDP_CMD_POLL, OSDP_CMD_TEXT, OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_NAK_UNKNOWN_CMD, OSDP_REPLY_ACK,
+    OSDP_REPLY_PDID,
 };
 use osdp_embedded::pd::{
     CommandHandler, ComsetHandler, FileFragment, FileReceiver, FileReject, Reply,
@@ -37,6 +39,7 @@ use crate::events::{self, EventQueue};
 use crate::log::{Direction, LogInner};
 use crate::overrides::{self, OverrideMap, OverrideReply};
 use crate::serial_transport::BaudControl;
+use crate::status::SharedStatus;
 
 /// PD TX buffer cap as defined by the C side
 /// (`OSDP_PD_BUF_LEN` in pd/include/osdp/osdp_pd.h). We size the
@@ -119,6 +122,33 @@ impl FileReceiver for DefaultFileReceiver {
     }
 }
 
+/// Default multi-part `osdp_MFG` (spec 5.10) receiver for the virtual PD.
+/// Registered so the reassembly buffer backing the default PDCAP's fn 11
+/// ("Largest Combined Message") claim actually exists — without a bound
+/// receiver, that claim would fail `Pd::set_pdcap`'s validation the moment
+/// it's non-zero. Just logs the reassembled message and ACKs; a consumer
+/// that wants to decode vendor-specific multi-part payloads can extend
+/// this to return an `osdp_MFGREP`.
+pub struct DefaultMfgReceiver;
+
+impl osdp_embedded::pd::MfgReceiver for DefaultMfgReceiver {
+    fn on_message<'a>(
+        &'a mut self,
+        vendor_code: &[u8; 3],
+        data: &[u8],
+    ) -> osdp_embedded::Result<Option<Reply<'a>>> {
+        tracing::info!(
+            vendor_code = format!(
+                "{:02X}{:02X}{:02X}",
+                vendor_code[0], vendor_code[1], vendor_code[2]
+            ),
+            len = data.len(),
+            "osdp_MFG multi-part message reassembled"
+        );
+        Ok(None)
+    }
+}
+
 /// Default PDID — matches the osdp-pd-mock CLI tool so behavior is
 /// consistent across the two interop harnesses. Vendor "ZBC" is a
 /// placeholder; consumers override it at runtime via the `pd_set_pdid`
@@ -132,84 +162,6 @@ pub fn default_pdid() -> Pdid {
         firmware_major: 0,
         firmware_minor: 1,
         firmware_build: 0,
-    }
-}
-
-/// Default PDCAP, mirroring OSDP.Net's PDConsole reference PD
-/// (src/PDConsole/appsettings.json) so an ACU that interoperates with
-/// PDConsole treats this PD identically. Kept in lockstep with
-/// osdp-pd-mock's `kDefaultPdcap`. Function codes follow spec Annex B.
-///
-/// Function code 9 (Communication Security) is what gates Secure
-/// Channel: per spec B.10 BOTH bytes are "Bit 0 = AES128 support", so
-/// the key-exchange (num_objects) byte must be 0x01. The previous value
-/// 0x04 left bit 0 CLEAR — advertising "no AES128 key exchange" — so a
-/// spec-conformant ACU never initiated a handshake and the link stayed
-/// clear-text.
-pub fn default_pdcap() -> Pdcap {
-    Pdcap {
-        records: vec![
-            PdcapRecord {
-                function_code: 1,
-                compliance_level: 4,
-                num_objects: 1,
-            }, // ContactStatusMonitoring
-            PdcapRecord {
-                function_code: 2,
-                compliance_level: 4,
-                num_objects: 1,
-            }, // OutputControl
-            PdcapRecord {
-                function_code: 3,
-                compliance_level: 1,
-                num_objects: 0,
-            }, // CardDataFormat (num must be 0x00 per spec B.4)
-            PdcapRecord {
-                function_code: 4,
-                compliance_level: 4,
-                num_objects: 1,
-            }, // ReaderLEDControl
-            PdcapRecord {
-                function_code: 5,
-                compliance_level: 2,
-                num_objects: 1,
-            }, // ReaderAudibleOutput
-            PdcapRecord {
-                function_code: 6,
-                compliance_level: 1,
-                num_objects: 1,
-            }, // ReaderTextOutput
-            PdcapRecord {
-                function_code: 8,
-                compliance_level: 1,
-                num_objects: 0,
-            }, // CheckCharacterSupport (num must be 0x00 per spec B.9)
-            PdcapRecord {
-                function_code: 9,
-                compliance_level: 1,
-                num_objects: 1,
-            }, // CommunicationSecurity (AES128)
-            PdcapRecord {
-                function_code: 12,
-                compliance_level: 0,
-                num_objects: 0,
-            }, // SmartCardSupport
-            PdcapRecord {
-                function_code: 13,
-                compliance_level: 0,
-                num_objects: 1,
-            }, // Readers
-            PdcapRecord {
-                function_code: 16,
-                compliance_level: 2,
-                num_objects: 0,
-            }, // OSDPVersion
-            PdcapRecord {
-                function_code: 17,
-                compliance_level: 1,
-                num_objects: 0,
-            }, // SecurePDBiometricsMatchSupport (spec B.18)
-        ],
     }
 }
 
@@ -240,22 +192,17 @@ pub type SharedKeyRotation = Arc<Mutex<Option<[u8; 16]>>>;
 /// `pd_stop` / `pd_configure` like the override and event state do.
 pub type SharedPdid = Arc<Mutex<Pdid>>;
 
-/// The capability set reported in the `osdp_PDCAP` (0x46) reply. Shared
-/// (`Arc<Mutex<_>>`) so the `pd_get_pdcap` / `pd_set_capability` /
-/// `pd_reset_pdcap` tools on the async side can read and mutate it while
-/// the handler — pinned to the PD actor thread — serves the reply from
-/// the current value. Created once per process in `PdHandle::spawn`, so
-/// edits persist across `pd_stop` / `pd_configure` like the PDID and
-/// override state do.
-pub type SharedPdcap = Arc<Mutex<Pdcap>>;
-
-/// Application handler. Reports its PDID and PDCAP from shared handles
-/// (so the `pd_set_*` tools can edit them live) and serialises replies
-/// into a scratch buffer; the `Reply.payload` slice the PD copies out
-/// borrows from that buffer.
+/// Application handler. Reports its PDID from a shared handle (so
+/// `pd_set_pdid` can edit it live) and serialises replies into a scratch
+/// buffer; the `Reply.payload` slice the PD copies out borrows from that
+/// buffer.
+///
+/// `osdp_CAP` never reaches this handler once a capability set is bound —
+/// see `PdHandle::set_pdcap` / `pd_actor::open_pd` — so there is no PDCAP
+/// field here the way there is a PDID one; the C library answers it
+/// directly from `osdp::pd::Pd::set_pdcap`.
 pub struct DefaultHandler {
     pub pdid: SharedPdid,
-    pub pdcap: SharedPdcap,
     scratch: [u8; SCRATCH_LEN],
     stats: Arc<Mutex<PdStats>>,
     log: Arc<LogInner>,
@@ -269,6 +216,14 @@ pub struct DefaultHandler {
     /// constructors); the actor binds the shared one via
     /// [`DefaultHandler::with_key_rotation`].
     key_rotation: SharedKeyRotation,
+    /// Monitored conditions behind the four status queries. The PD answers
+    /// osdp_LSTAT / ISTAT / OSTAT / RSTAT from the providers bound in
+    /// `pd_actor::open_pd`, so this handler only ever *writes* it — the
+    /// osdp_OUT arm records commanded relay state so a later osdp_OSTAT is
+    /// truthful. `None` in the test constructors, which have no PD actor
+    /// binding providers; the actor supplies it via
+    /// [`DefaultHandler::with_status`].
+    status: Option<SharedStatus>,
 }
 
 impl DefaultHandler {
@@ -284,7 +239,6 @@ impl DefaultHandler {
     ) -> Self {
         Self::with_pdid(
             Arc::new(Mutex::new(default_pdid())),
-            Arc::new(Mutex::new(default_pdcap())),
             stats,
             log,
             overrides,
@@ -294,14 +248,12 @@ impl DefaultHandler {
         )
     }
 
-    /// Build a handler that serves its `osdp_PDID` and `osdp_PDCAP`
-    /// replies from the given shared handles, so the `pd_set_pdid` /
-    /// `pd_set_capability` tools can mutate the reported identity and
-    /// capabilities live.
+    /// Build a handler that serves its `osdp_PDID` reply from the given
+    /// shared handle, so the `pd_set_pdid` tool can mutate the reported
+    /// identity live.
     #[allow(clippy::too_many_arguments)]
     pub fn with_pdid(
         pdid: SharedPdid,
-        pdcap: SharedPdcap,
         stats: Arc<Mutex<PdStats>>,
         log: Arc<LogInner>,
         overrides: OverrideMap,
@@ -311,7 +263,6 @@ impl DefaultHandler {
     ) -> Self {
         Self {
             pdid,
-            pdcap,
             scratch: [0; SCRATCH_LEN],
             stats,
             log,
@@ -321,6 +272,7 @@ impl DefaultHandler {
             pd_address,
             epoch: Instant::now(),
             key_rotation: Arc::new(Mutex::new(None)),
+            status: None,
         }
     }
 
@@ -331,6 +283,15 @@ impl DefaultHandler {
     /// default in place.
     pub fn with_key_rotation(mut self, cell: SharedKeyRotation) -> Self {
         self.key_rotation = cell;
+        self
+    }
+
+    /// Bind the shared status block so `osdp_OUT` commands are recorded into
+    /// the output state the `osdp_OSTAT` provider reports. Same arrangement
+    /// as [`DefaultHandler::with_key_rotation`]: the actor calls this in
+    /// `open_pd`, tests that don't care leave it unbound.
+    pub fn with_status(mut self, status: SharedStatus) -> Self {
+        self.status = Some(status);
         self
     }
 
@@ -438,19 +399,29 @@ impl CommandHandler for DefaultHandler {
                 let n = pdid.build(&mut self.scratch)?;
                 (OSDP_REPLY_PDID, n)
             }
-            OSDP_CMD_CAP => {
-                // Snapshot the shared PDCAP (a poisoned lock falls back
-                // to the default capability set rather than failing the
-                // reply).
-                let pdcap = self
-                    .pdcap
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_else(|_| default_pdcap());
-                let n = pdcap.build(&mut self.scratch)?;
-                (OSDP_REPLY_PDCAP, n)
+            // osdp_CAP never reaches here once a capability set is bound via
+            // `Pd::set_pdcap` (done unconditionally in `pd_actor::open_pd`)
+            // — the C library answers it directly. Falling through to the
+            // `_` arm below (NAK 0x03) only happens if that binding somehow
+            // failed, which `open_pd` logs loudly if it ever does.
+            OSDP_CMD_OUT => {
+                // Record what the ACU commanded so a later osdp_OSTAT
+                // reports the real relay state instead of a constant. The
+                // reply is a plain ACK either way — a payload we can't
+                // decode is still ACKed, matching the previous behaviour;
+                // we simply have nothing to record.
+                if let Some(status) = self.status.as_ref() {
+                    if let Ok(records) = Out::decode(payload) {
+                        if let Ok(mut s) = status.lock() {
+                            for r in &records.records {
+                                s.apply_output(r.output_no, r.control_code);
+                            }
+                        }
+                    }
+                }
+                (OSDP_REPLY_ACK, 0)
             }
-            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_OUT | OSDP_CMD_TEXT => (OSDP_REPLY_ACK, 0),
+            OSDP_CMD_LED | OSDP_CMD_BUZ | OSDP_CMD_TEXT => (OSDP_REPLY_ACK, 0),
             OSDP_CMD_KEYSET => {
                 // The C library rotates the PD's live SCBK in place for a
                 // well-formed SCBK KEYSET (and NAKs a malformed one,
@@ -475,18 +446,11 @@ impl CommandHandler for DefaultHandler {
                 }
                 (OSDP_REPLY_ACK, 0)
             }
-            OSDP_CMD_LSTAT => {
-                // Local status query. Hard-coded "all clear" for now:
-                // tamper=0, power=0 (spec D.2.1 LSTATR payload is two
-                // bytes). TODO: the library has no way for a consumer
-                // to supply real tamper/power state in response to an
-                // LSTAT *command* — only via the inject_local_status
-                // POLL event. A future API should let the application
-                // own this reply rather than us synthesising a constant.
-                self.scratch[0] = 0; // tamper: not tampered
-                self.scratch[1] = 0; // power: OK
-                (OSDP_REPLY_LSTATR, 2)
-            }
+            // osdp_LSTAT / ISTAT / OSTAT / RSTAT never reach here: the PD
+            // answers all four from the status providers bound in
+            // `pd_actor::open_pd`, which build the *STATR replies from the
+            // shared status block. This handler used to synthesise a
+            // constant "all clear" LSTATR and NAK the other three.
             _ => {
                 // Library will synthesise NAK 0x03; record it now
                 // since we won't get a hook on the outbound path.

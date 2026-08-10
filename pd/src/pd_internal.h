@@ -209,4 +209,24 @@ osdp_status_t osdp_pd_internal_filetransfer(osdp_pd_t     *pd,
                                             size_t         payload_len,
                                             uint8_t       *ftstat_payload);
 
+/* OSDP_PDCAP_RESERVED_COUNT is public (osdp_pd.h) — osdp_pd_get_pdcap's
+ * buffer-sizing contract depends on it too, not just this internal helper.
+ *
+ * Fill `out[0..OSDP_PDCAP_RESERVED_COUNT)` with the library-computed PDCAP
+ * records reflecting `pd`'s state right now (not a snapshot from whenever
+ * osdp_pd_set_pdcap was last called). Defined in pd_pdcap.c; used by
+ * pd_dispatch.c's osdp_CMD_CAP handler to splice them into every reply
+ * alongside whatever osdp_pd_set_pdcap has bound. */
+void osdp_pd_internal_fill_reserved_pdcap(
+    const osdp_pd_t *pd, osdp_pdcap_record_t out[OSDP_PDCAP_RESERVED_COUNT]);
+
+/* Sort `records[0..count)` ascending by function_code in place. The
+ * reserved records and the bound ones are assembled from two different
+ * places (see osdp_pd_internal_fill_reserved_pdcap), so without this the
+ * wire order would be "reserved three, then whatever order the application
+ * bound" rather than the ascending Annex B order a human (or another PD
+ * implementation) reading the reply would expect. Defined in pd_pdcap.c;
+ * shared by pd_dispatch.c's osdp_CMD_CAP handler and osdp_pd_get_pdcap. */
+void osdp_pd_internal_sort_pdcap(osdp_pdcap_record_t *records, size_t count);
+
 #endif /* OSDP_PD_INTERNAL_H */

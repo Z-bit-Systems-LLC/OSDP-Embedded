@@ -233,6 +233,19 @@ typed message structs. Foundation for both PD and ACU work later.
   borrowed-slice payloads (`Nak`, `Text`, `Raw`, `Keypad`) carry a
   lifetime back to the input. Eight unit tests cover round-trip plus
   a representative truncated-decode negative.
+- ☑ **Caught up with Iteration 6.** The PD-completion work landed a whole
+  API surface the crate could not reach — 11 of the 30 public `osdp_pd_*`
+  functions had no binding at any level. Added: the status providers
+  (`StatusProviders`, a builder rather than a trait so the C vtable's
+  per-member optionality survives — Rust cannot tell which default trait
+  methods an impl overrode), the poll-response event queue, multi-part
+  `osdp_MFG` reception (`MfgReceiver`), the advisory `check_pdcap`, and the
+  `ABORT` / `ACURXSIZE` / `KEEPACTIVE` hooks. `messages` gained the 13
+  remaining v2.2 codecs (`Lstat`, `Istat`, `Ostat`, `Rstat`, `Abort`,
+  `AcuRxSize`, `KeepActive`, `Mfg<'a>`; `Busy`, `Fmt<'a>`, `Mfgrep<'a>`,
+  `Mfgstatr`, `Mfgerrr`) plus the four `*STATR` reports and their status-byte
+  constants. 18 integration tests drive a real `Pd` against a real `Acu`;
+  9 more cover the codecs' round-trip and negative cases.
 - ☑ **Publish-ready packaging.** `scripts/Stage-Crate.ps1` mirrors the
   C tree into `rust/osdp/vendor-c/` (gitignored) so `cargo package`
   produces a tarball that compiles standalone from inside the

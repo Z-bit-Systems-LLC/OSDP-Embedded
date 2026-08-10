@@ -11,6 +11,8 @@
  * cries wolf gets switched off.
  */
 
+#include "osdp/osdp_commands.h"
+#include "osdp/osdp_frame.h"
 #include "osdp/osdp_pd.h"
 #include "osdp/osdp_replies.h"
 #include "osdp/osdp_sc_crypto.h"
@@ -294,6 +296,425 @@ static void test_a_consistent_capability_list_passes(void)
                                           &bad));
 }
 
+/* ========================================================================
+ * osdp_pd_pdcap_template / osdp_pd_set_pdcap
+ *
+ * The reserved function codes (8, 9, 10) are library-computed and never
+ * accepted from the application; osdp_pd_pdcap_template's output never
+ * includes them, and osdp_pd_set_pdcap rejects them from records[]. fn 11
+ * stays consumer-settable and still goes through osdp_pd_check_pdcap.
+ * ====================================================================== */
+
+#define FN_CHECK_CHARACTER  8U
+
+static const osdp_pdcap_record_t *find_record(const osdp_pdcap_record_t *recs,
+                                              size_t count, uint8_t fc)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (recs[i].function_code == fc) {
+            return &recs[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_pdcap_template_rejects_null(void)
+{
+    osdp_pdcap_record_t out[16];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             NULL, 16, &count));
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, 16, NULL));
+}
+
+static void test_pdcap_template_rejects_unknown_template(void)
+{
+    osdp_pdcap_record_t out[16];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_pdcap_template((osdp_pd_pdcap_template_t)99,
+                                             out, 16, &count));
+}
+
+static void test_pdcap_template_rejects_undersized_buffer(void)
+{
+    osdp_pdcap_record_t out[1];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, 1, &count));
+}
+
+/* The whole point of the split: the template's set can always be handed
+ * straight to osdp_pd_set_pdcap on a freshly-initialized PD without ever
+ * touching a reserved function code — except fn 11, whose 0xFFFF
+ * placeholder is a deliberate exception (see its own test below). */
+static void test_pdcap_template_excludes_reserved_function_codes(void)
+{
+    osdp_pdcap_record_t out[OSDP_PD_MAX_PDCAP_RECORDS];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, OSDP_PD_MAX_PDCAP_RECORDS,
+                                             &count));
+    TEST_ASSERT_GREATER_THAN(0, count);
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t fc = out[i].function_code;
+        TEST_ASSERT_FALSE(fc == FN_CHECK_CHARACTER);
+        TEST_ASSERT_FALSE(fc == FN_COMM_SECURITY);
+        TEST_ASSERT_FALSE(fc == FN_RECEIVE_SIZE);
+    }
+}
+
+/* fn 11's 0xFFFF placeholder default is intentionally NOT self-consistent:
+ * it must fail osdp_pd_set_pdcap (via osdp_pd_check_pdcap) until a
+ * multi-part receiver is actually bound, so a consumer cannot ship it
+ * unmodified and silently over-promise. */
+static void test_pdcap_template_fn11_placeholder_needs_a_bound_receiver(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    osdp_pdcap_record_t out[OSDP_PD_MAX_PDCAP_RECORDS];
+    size_t count;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_pd_pdcap_template(OSDP_PDCAP_TEMPLATE_SECURE_READER,
+                                             out, OSDP_PD_MAX_PDCAP_RECORDS,
+                                             &count));
+
+    size_t bad = 999;
+    TEST_ASSERT_EQUAL(OSDP_ERR_NOT_SUPPORTED,
+                      osdp_pd_set_pdcap(&pd, out, count, &bad));
+
+    /* Binding a receiver alone is not enough — 0xFFFF also has to fit its
+     * capacity. Lowering fn 11 to the receiver's real size is the
+     * documented fix, not just binding the receiver. */
+    static uint8_t mp_buf[512];
+    osdp_pd_set_mfg_receiver(&pd, mp_buf, sizeof(mp_buf), NULL, NULL);
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_pd_set_pdcap(&pd, out, count, NULL));
+
+    osdp_pdcap_record_t *fn11 = (osdp_pdcap_record_t *)
+        find_record(out, count, 11U);
+    TEST_ASSERT_NOT_NULL(fn11);
+    fn11->compliance_level = (uint8_t)(sizeof(mp_buf) & 0xFFU);
+    fn11->num_objects      = (uint8_t)(sizeof(mp_buf) >> 8);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, out, count, NULL));
+}
+
+static void test_set_pdcap_rejects_reserved_function_codes(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    const uint8_t reserved[] = { FN_CHECK_CHARACTER, FN_COMM_SECURITY,
+                                FN_RECEIVE_SIZE };
+    for (size_t i = 0; i < sizeof(reserved); i++) {
+        const osdp_pdcap_record_t records[] = {
+            { .function_code = 1, .compliance_level = 1, .num_objects = 1 },
+            { .function_code = reserved[i],
+              .compliance_level = 0, .num_objects = 0 },
+        };
+        size_t bad = 999;
+        TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                          osdp_pd_set_pdcap(&pd, records, 2, &bad));
+        TEST_ASSERT_EQUAL_size_t(1, bad);
+    }
+}
+
+static void test_set_pdcap_rejects_spec_nonconformant_record(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    /* fn 4 (Reader LED Control) tops out at compliance 6 (B.5). */
+    const osdp_pdcap_record_t records[] = {
+        { .function_code = 4, .compliance_level = 7, .num_objects = 1 },
+    };
+    size_t bad = 999;
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_set_pdcap(&pd, records, 1, &bad));
+    TEST_ASSERT_EQUAL_size_t(0, bad);
+}
+
+static void test_set_pdcap_rejects_oversized_count(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    /* The count ceiling is checked before any per-record validation, so a
+     * non-NULL array (contents irrelevant) is what proves THIS check fired
+     * rather than the NULL-argument one. */
+    osdp_pdcap_record_t records[OSDP_PD_MAX_PDCAP_RECORDS + 1] = {0};
+    TEST_ASSERT_EQUAL(OSDP_ERR_BUFFER_TOO_SMALL,
+                      osdp_pd_set_pdcap(&pd, records,
+                                        OSDP_PD_MAX_PDCAP_RECORDS + 1, NULL));
+}
+
+/* A rejected call must not disturb whatever was bound before it. */
+static void test_set_pdcap_failure_leaves_previous_binding_intact(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    const osdp_pdcap_record_t good[] = {
+        { .function_code = 1, .compliance_level = 1, .num_objects = 4 },
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, good, 1, NULL));
+
+    const osdp_pdcap_record_t bad_set[] = {
+        { .function_code = 4, .compliance_level = 7, .num_objects = 1 },
+    };
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+                      osdp_pd_set_pdcap(&pd, bad_set, 1, NULL));
+
+    TEST_ASSERT_EQUAL_UINT(1, (unsigned)pd.pdcap_count);
+    TEST_ASSERT_EQUAL_HEX8(1, pd.pdcap_records[0].function_code);
+}
+
+static void test_set_pdcap_zero_count_clears_the_binding(void)
+{
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+
+    const osdp_pdcap_record_t records[] = {
+        { .function_code = 1, .compliance_level = 1, .num_objects = 4 },
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, records, 1, NULL));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, NULL, 0, NULL));
+    TEST_ASSERT_EQUAL_UINT(0, (unsigned)pd.pdcap_count);
+}
+
+/* ========================================================================
+ * osdp_CMD_CAP dispatch end-to-end: drive a real frame through
+ * osdp_pd_tick and decode what comes back, so it is the wire bytes that
+ * get checked rather than internal state.
+ * ====================================================================== */
+
+#define MOCK_BUF_LEN 1024U
+
+typedef struct mock_transport {
+    uint8_t  incoming[MOCK_BUF_LEN];
+    size_t   incoming_len;
+    size_t   incoming_off;
+    uint8_t  outgoing[MOCK_BUF_LEN];
+    size_t   outgoing_len;
+    uint32_t now_ms;
+} mock_transport_t;
+
+static int mock_read(void *user, uint8_t *buf, size_t cap)
+{
+    mock_transport_t *m = (mock_transport_t *)user;
+    if (m->incoming_off > m->incoming_len) {
+        return 0;
+    }
+    const size_t available = m->incoming_len - m->incoming_off;
+    const size_t n = (cap < available) ? cap : available;
+    if (n > 0) {
+        (void)memcpy(buf, &m->incoming[m->incoming_off], n);
+        m->incoming_off += n;
+    }
+    return (int)n;
+}
+
+static int mock_write(void *user, const uint8_t *buf, size_t len)
+{
+    mock_transport_t *m = (mock_transport_t *)user;
+    const size_t free_room = MOCK_BUF_LEN - m->outgoing_len;
+    const size_t n = (len < free_room) ? len : free_room;
+    if (n > 0) {
+        (void)memcpy(&m->outgoing[m->outgoing_len], buf, n);
+        m->outgoing_len += n;
+    }
+    return (int)n;
+}
+
+static uint32_t mock_now_ms(void *user)
+{
+    return ((const mock_transport_t *)user)->now_ms;
+}
+
+static void mock_init(mock_transport_t *m, osdp_pd_transport_t *t)
+{
+    (void)memset(m, 0, sizeof(*m));
+    t->read   = mock_read;
+    t->write  = mock_write;
+    t->now_ms = mock_now_ms;
+    t->user   = m;
+}
+
+static void inject(mock_transport_t *m, uint8_t code,
+                   const uint8_t *payload, size_t payload_len, uint8_t seq)
+{
+    osdp_frame_t f = {0};
+    f.address     = 0x05;
+    f.sequence    = seq;
+    f.integrity   = OSDP_INTEGRITY_CRC;
+    f.code        = code;
+    f.payload     = payload;
+    f.payload_len = payload_len;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  written = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &written));
+    (void)memcpy(&m->incoming[m->incoming_len], buf, written);
+    m->incoming_len += written;
+}
+
+static void decode_reply(const mock_transport_t *m, osdp_frame_t *out)
+{
+    TEST_ASSERT_GREATER_OR_EQUAL(OSDP_FRAME_MIN_LEN_CKSUM, m->outgoing_len);
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_frame_decode(m->outgoing + OSDP_FRAME_MARK_LEN,
+                                        m->outgoing_len - OSDP_FRAME_MARK_LEN,
+                                        out));
+}
+
+typedef struct app_spy { unsigned int calls; } app_spy_t;
+
+static osdp_status_t spy_handler(void *user, uint8_t cmd_code,
+                                 const uint8_t *payload, size_t payload_len,
+                                 osdp_pd_reply_t *reply)
+{
+    (void)cmd_code; (void)payload; (void)payload_len;
+    ((app_spy_t *)user)->calls++;
+    reply->code        = OSDP_REPLY_ACK;
+    reply->payload     = NULL;
+    reply->payload_len = 0;
+    return OSDP_OK;
+}
+
+/* Nothing bound: osdp_CAP falls through to cmd_cb exactly as it did before
+ * osdp_pd_set_pdcap existed. */
+static void test_cap_falls_through_to_cmd_cb_when_nothing_bound(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t; app_spy_t spy = {0};
+    mock_init(&m, &t);
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, spy_handler, &spy);
+
+    inject(&m, OSDP_CMD_CAP, NULL, 0, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_UINT(1, spy.calls);
+}
+
+/* Once bound, the library answers osdp_CAP directly with the consumer's
+ * records PLUS the three reserved records it computes itself, and cmd_cb is
+ * never invoked. */
+static void test_cap_answered_from_bound_records_plus_reserved(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t; app_spy_t spy = {0};
+    mock_init(&m, &t);
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, spy_handler, &spy);
+
+    const osdp_pdcap_record_t bound[] = {
+        { .function_code = 1, .compliance_level = 4, .num_objects = 8 },
+        { .function_code = 4, .compliance_level = 4, .num_objects = 2 },
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, bound, 2, NULL));
+
+    inject(&m, OSDP_CMD_CAP, NULL, 0, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_reply(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PDCAP, reply.code);
+    TEST_ASSERT_EQUAL_UINT(0, spy.calls);
+
+    osdp_pdcap_record_t got[16];
+    size_t n;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_pdcap_decode(reply.payload, reply.payload_len,
+                                        got, 16, &n));
+    TEST_ASSERT_EQUAL_size_t(2 + 3, n);   /* bound + the 3 reserved records */
+
+    /* The bound records are present, verbatim. */
+    const osdp_pdcap_record_t *r1 = find_record(got, n, 1);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_EQUAL_HEX8(4, r1->compliance_level);
+    TEST_ASSERT_EQUAL_HEX8(8, r1->num_objects);
+
+    /* fn 8: always 0x01/0x00, per osdp_pd_internal_fill_reserved_pdcap. */
+    const osdp_pdcap_record_t *r8 = find_record(got, n, FN_CHECK_CHARACTER);
+    TEST_ASSERT_NOT_NULL(r8);
+    TEST_ASSERT_EQUAL_HEX8(0x01, r8->compliance_level);
+    TEST_ASSERT_EQUAL_HEX8(0x00, r8->num_objects);
+
+    /* fn 9: compliance always claims AES128; num_objects reports "no
+     * unique key" (0x01) since osdp_pd_set_sc_scbk was never called. */
+    const osdp_pdcap_record_t *r9 = find_record(got, n, FN_COMM_SECURITY);
+    TEST_ASSERT_NOT_NULL(r9);
+    TEST_ASSERT_EQUAL_HEX8(0x01, r9->compliance_level);
+    TEST_ASSERT_EQUAL_HEX8(0x01, r9->num_objects);
+
+    /* fn 10: min(rx_plain_cap, OSDP_STREAM_BUFFER_LEN) at the defaults. */
+    const osdp_pdcap_record_t *r10 = find_record(got, n, FN_RECEIVE_SIZE);
+    TEST_ASSERT_NOT_NULL(r10);
+    const uint16_t expect_rx =
+        (pd.rx_plain_cap > OSDP_STREAM_BUFFER_LEN)
+            ? (uint16_t)OSDP_STREAM_BUFFER_LEN : (uint16_t)pd.rx_plain_cap;
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)(expect_rx & 0xFFU), r10->compliance_level);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)(expect_rx >> 8), r10->num_objects);
+
+    /* fn 17 is not a real Annex B function code in this project's reference
+     * spec text (Annex B's body ends at fn 16) and is never injected. */
+    TEST_ASSERT_NULL(find_record(got, n, 17U));
+}
+
+/* fn 9's num_objects must reflect pd's key state at QUERY time, not at
+ * osdp_pd_set_pdcap time — no re-binding needed after keying the PD. */
+static void test_cap_fn9_num_objects_tracks_key_state_live(void)
+{
+    osdp_pd_t pd; mock_transport_t m; osdp_pd_transport_t t; app_spy_t spy = {0};
+    mock_init(&m, &t);
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, spy_handler, &spy);
+
+    const osdp_pdcap_record_t bound[] = {
+        { .function_code = 1, .compliance_level = 1, .num_objects = 1 },
+    };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_pdcap(&pd, bound, 1, NULL));
+
+    inject(&m, OSDP_CMD_CAP, NULL, 0, 1);
+    osdp_pd_tick(&pd);
+    osdp_frame_t reply1;
+    decode_reply(&m, &reply1);
+    osdp_pdcap_record_t got1[16]; size_t n1;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_decode(reply1.payload,
+                                                 reply1.payload_len,
+                                                 got1, 16, &n1));
+    TEST_ASSERT_EQUAL_HEX8(0x01,
+                          find_record(got1, n1, FN_COMM_SECURITY)->num_objects);
+
+    static const uint8_t key[OSDP_SC_KEY_LEN] = {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
+    osdp_pd_set_sc_scbk(&pd, key);
+
+    m.outgoing_len = 0;
+    inject(&m, OSDP_CMD_CAP, NULL, 0, 2);
+    osdp_pd_tick(&pd);
+    osdp_frame_t reply2;
+    decode_reply(&m, &reply2);
+    osdp_pdcap_record_t got2[16]; size_t n2;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pdcap_decode(reply2.payload,
+                                                 reply2.payload_len,
+                                                 got2, 16, &n2));
+    TEST_ASSERT_EQUAL_HEX8(0x00,
+                          find_record(got2, n2, FN_COMM_SECURITY)->num_objects);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -309,5 +730,20 @@ int main(void)
     RUN_TEST(test_combined_message_size_needs_a_bound_reassembly_buffer);
     RUN_TEST(test_zero_combined_message_size_passes);
     RUN_TEST(test_a_consistent_capability_list_passes);
+
+    RUN_TEST(test_pdcap_template_rejects_null);
+    RUN_TEST(test_pdcap_template_rejects_unknown_template);
+    RUN_TEST(test_pdcap_template_rejects_undersized_buffer);
+    RUN_TEST(test_pdcap_template_excludes_reserved_function_codes);
+    RUN_TEST(test_pdcap_template_fn11_placeholder_needs_a_bound_receiver);
+    RUN_TEST(test_set_pdcap_rejects_reserved_function_codes);
+    RUN_TEST(test_set_pdcap_rejects_spec_nonconformant_record);
+    RUN_TEST(test_set_pdcap_rejects_oversized_count);
+    RUN_TEST(test_set_pdcap_failure_leaves_previous_binding_intact);
+    RUN_TEST(test_set_pdcap_zero_count_clears_the_binding);
+
+    RUN_TEST(test_cap_falls_through_to_cmd_cb_when_nothing_bound);
+    RUN_TEST(test_cap_answered_from_bound_records_plus_reserved);
+    RUN_TEST(test_cap_fn9_num_objects_tracks_key_state_live);
     return UNITY_END();
 }

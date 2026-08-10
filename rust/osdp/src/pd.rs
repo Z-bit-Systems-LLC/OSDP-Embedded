@@ -275,6 +275,141 @@ pub trait FileReceiver: 'static {
     }
 }
 
+/// Application-supplied values for the four status commands — `osdp_LSTAT`,
+/// `ISTAT`, `OSTAT`, `RSTAT`. The reply *layout* is the spec's business and
+/// the library builds it; only the values are yours.
+///
+/// **Every provider is independent and opt-in**, mirroring the C vtable: a
+/// command you don't supply keeps falling through to your
+/// [`CommandHandler`], so an application already hand-building its own
+/// `osdp_LSTATR` keeps working while it adopts the rest.
+///
+/// ```no_run
+/// # use osdp_embedded::pd::{Pd, StatusProviders};
+/// # let mut pd = Pd::new(0x10);
+/// pd.set_status_providers(
+///     StatusProviders::new()
+///         .local(|| (0, 0))                       // tamper, power: normal
+///         .inputs(|out| { out[0] = 0; 1 })        // one input, inactive
+/// );
+/// // osdp_OSTAT / osdp_RSTAT still reach the command handler.
+/// ```
+///
+/// The three array-valued providers write into a scratch slice of
+/// [`REPLY_SCRATCH_LEN`] bytes and return how many they wrote; returning more
+/// than the slice holds is clamped, and returning 0 is legal — a PD with no
+/// inputs genuinely has nothing to report.
+#[derive(Default)]
+pub struct StatusProviders {
+    local: Option<StatusLocalFn>,
+    inputs: Option<StatusArrayFn>,
+    outputs: Option<StatusArrayFn>,
+    readers: Option<StatusArrayFn>,
+}
+
+/// Answers `osdp_LSTAT` with the `(tamper, power)` pair.
+type StatusLocalFn = Box<dyn FnMut() -> (u8, u8)>;
+/// Answers `osdp_ISTAT` / `OSTAT` / `RSTAT`: fill the scratch slice, return
+/// how many bytes were written.
+type StatusArrayFn = Box<dyn FnMut(&mut [u8]) -> usize>;
+
+impl StatusProviders {
+    /// An empty set — every status command still reaches the command handler.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer `osdp_LSTAT` with `(tamper, power)` bytes. Use the
+    /// `LSTATR_*` constants ([`crate::messages`] re-exports the raw values).
+    pub fn local<F: FnMut() -> (u8, u8) + 'static>(mut self, f: F) -> Self {
+        self.local = Some(Box::new(f));
+        self
+    }
+
+    /// Answer `osdp_ISTAT` with one status byte per input.
+    pub fn inputs<F: FnMut(&mut [u8]) -> usize + 'static>(mut self, f: F) -> Self {
+        self.inputs = Some(Box::new(f));
+        self
+    }
+
+    /// Answer `osdp_OSTAT` with one status byte per output.
+    pub fn outputs<F: FnMut(&mut [u8]) -> usize + 'static>(mut self, f: F) -> Self {
+        self.outputs = Some(Box::new(f));
+        self
+    }
+
+    /// Answer `osdp_RSTAT` with one status byte per reader.
+    pub fn readers<F: FnMut(&mut [u8]) -> usize + 'static>(mut self, f: F) -> Self {
+        self.readers = Some(Box::new(f));
+        self
+    }
+}
+
+/// Receiver for a reassembled multi-part `osdp_MFG` (spec 5.10).
+///
+/// **Binding one is a declaration about your vendor protocol.** Nothing on
+/// the wire distinguishes a 6-byte multi-part header from six bytes of
+/// ordinary vendor data — Table 27 defines no multi-part fields for
+/// `osdp_MFG` — so the library cannot detect the format and must not guess.
+/// Registering a receiver says "this PD's vendor messages use the standard
+/// multi-part format"; leave it unbound and `osdp_MFG` payloads stay opaque
+/// and reach your [`CommandHandler`] unchanged.
+///
+/// `vendor_code` is the 3 bytes that prefixed *every* fragment (the vendor
+/// code sits outside the fragmentation, so a PD can refuse a transfer that
+/// isn't addressed to it before committing buffer). `data` is the whole
+/// reassembled message with the multi-part headers removed.
+pub trait MfgReceiver: 'static {
+    /// Handle one complete vendor message.
+    ///
+    /// Return `Ok(None)` to ACK, `Ok(Some(reply))` to answer with an
+    /// `osdp_MFGREP` (or any other reply), or `Err(...)` to NAK using the
+    /// same mapping as [`CommandHandler`].
+    fn on_message<'a>(
+        &'a mut self,
+        vendor_code: &[u8; 3],
+        data: &[u8],
+    ) -> Result<Option<Reply<'a>>>;
+}
+
+/// Scratch capacity handed to the array-valued [`StatusProviders`], matching
+/// the C `OSDP_PD_REPLY_SCRATCH_LEN`.
+pub const REPLY_SCRATCH_LEN: usize = sys::OSDP_PD_REPLY_SCRATCH_LEN;
+
+/// What [`Pd::acu_rx_size`] reports before any `osdp_ACURXSIZE` has arrived
+/// (spec 6.26).
+pub const DEFAULT_ACU_RX_SIZE: u16 = sys::OSDP_PD_DEFAULT_ACU_RX_SIZE;
+
+/// A named, spec-conformant starting-point capability set for
+/// [`Pd::pdcap_template`]. More will be added over time; only one exists
+/// today.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PdcapTemplate {
+    SecureReader,
+}
+
+impl PdcapTemplate {
+    fn as_sys(self) -> sys::osdp_pd_pdcap_template_t {
+        match self {
+            PdcapTemplate::SecureReader => {
+                sys::osdp_pd_pdcap_template_t::OSDP_PDCAP_TEMPLATE_SECURE_READER
+            }
+        }
+    }
+}
+
+/// A capability record that this PD cannot honour, as found by
+/// [`Pd::check_pdcap`].
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct PdcapProblem {
+    /// Index of the first offending record in the slice that was checked.
+    pub index: usize,
+    /// Why it was rejected — `NotSupported` for a capability the library
+    /// does not implement, `BufferTooSmall` for one that outruns a bound
+    /// buffer.
+    pub error: Error,
+}
+
 // ---- Internal storage ---------------------------------------------------
 //
 // Each trait object is wrapped in a `Box<dyn Trait>`. We need the
@@ -287,6 +422,10 @@ type LedHandlerBox = Box<dyn LedHandler>;
 type BuzzerHandlerBox = Box<dyn BuzzerHandler>;
 type ComsetHandlerBox = Box<dyn ComsetHandler>;
 type FileReceiverBox = Box<dyn FileReceiver>;
+type MfgReceiverBox = Box<dyn MfgReceiver>;
+type AbortHandlerBox = Box<dyn FnMut() -> Result<()>>;
+type AcuRxSizeHandlerBox = Box<dyn FnMut(u16)>;
+type KeepActiveHandlerBox = Box<dyn FnMut(u16) -> Result<()>>;
 
 /// PD context. Owns the C state plus any user-supplied trait objects.
 ///
@@ -313,6 +452,21 @@ pub struct Pd {
     /// Its heap allocation must outlive registration (the C side holds a raw
     /// `file_buf` pointer into it); held here for exactly `self`'s lifetime.
     file_buffer: Option<Vec<u8>>,
+    /// Status providers (`status.user`). The C side copied the vtable of
+    /// thunk pointers into `osdp_pd_t`, but the user pointer in that copy
+    /// aims at this box, so it has to outlive the binding.
+    status_providers: Option<Box<StatusProviders>>,
+    /// Same arrangement for the multi-part MFG receiver (`mfg_user`)…
+    mfg_receiver: Option<Box<MfgReceiverBox>>,
+    /// …and its caller-owned reassembly buffer (`mfg_reasm.buf`).
+    mfg_buffer: Option<Vec<u8>>,
+    /// Caller-owned storage for the poll-response event queue. The C side
+    /// holds a raw pointer into this allocation.
+    event_buffer: Option<Vec<u8>>,
+    /// The three miscellaneous command hooks (`abort_user` etc.).
+    abort_handler: Option<Box<AbortHandlerBox>>,
+    acurxsize_handler: Option<Box<AcuRxSizeHandlerBox>>,
+    keepactive_handler: Option<Box<KeepActiveHandlerBox>>,
     /// Secure-channel crypto vtable. The C side embedded a copy of
     /// the function-pointer struct inside `osdp_pd_t.sc.crypto`; we
     /// keep the trait-object box alive so the user pointer in that
@@ -340,6 +494,13 @@ impl Pd {
             comset_handler: None,
             file_receiver: None,
             file_buffer: None,
+            status_providers: None,
+            mfg_receiver: None,
+            mfg_buffer: None,
+            event_buffer: None,
+            abort_handler: None,
+            acurxsize_handler: None,
+            keepactive_handler: None,
             sc_crypto: None,
             sc2_crypto: None,
         }
@@ -518,6 +679,354 @@ impl Pd {
         // Streaming needs no reassembly buffer; drop any previously-held one.
         self.file_buffer = None;
         self.file_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut FileReceiverBox) });
+    }
+
+    // ---- Status reporting ---------------------------------------------
+
+    /// Bind the status providers for `osdp_LSTAT` / `ISTAT` / `OSTAT` /
+    /// `RSTAT` (see [`StatusProviders`]). Only the commands you supplied a
+    /// provider for are answered by the library; the rest keep reaching the
+    /// [`CommandHandler`]. Replaces any previously-set providers.
+    pub fn set_status_providers(&mut self, providers: StatusProviders) {
+        // One box holds all four closures; the C vtable's single `user`
+        // pointer aims at it and each thunk picks the member it needs.
+        let boxed = Box::new(providers);
+        let user_ptr = Box::into_raw(boxed);
+
+        // Bind a thunk only where the caller actually supplied a closure —
+        // this is what preserves the C API's per-member optionality.
+        let providers_ref = unsafe { &*user_ptr };
+        let vtable = sys::osdp_pd_status_provider_t {
+            local: providers_ref
+                .local
+                .as_ref()
+                .map(|_| status_local_thunk as unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8)),
+            inputs: providers_ref.inputs.as_ref().map(|_| {
+                status_inputs_thunk as unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize
+            }),
+            outputs: providers_ref.outputs.as_ref().map(|_| {
+                status_outputs_thunk as unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize
+            }),
+            readers: providers_ref.readers.as_ref().map(|_| {
+                status_readers_thunk as unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize
+            }),
+        };
+
+        unsafe {
+            sys::osdp_pd_set_status_provider(&mut *self.inner, &vtable, user_ptr as *mut c_void);
+        }
+
+        self.status_providers = Some(unsafe { Box::from_raw(user_ptr) });
+    }
+
+    // ---- Multi-part osdp_MFG ------------------------------------------
+
+    /// Bind a reassembly buffer and receiver for multi-part `osdp_MFG` (see
+    /// [`MfgReceiver`]). `capacity` must hold the biggest vendor message
+    /// expected — a transfer declaring more is refused with `osdp_NAK 0x09`,
+    /// which spec 5.10.2 says aborts the sender's sequence. Replaces any
+    /// previously-set receiver and its buffer (both dropped).
+    pub fn set_mfg_receiver<R: MfgReceiver>(&mut self, capacity: usize, receiver: R) {
+        let boxed: Box<MfgReceiverBox> = Box::new(Box::new(receiver));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        let mut buffer: Vec<u8> = alloc::vec![0u8; capacity];
+        let buf_ptr = buffer.as_mut_ptr();
+
+        unsafe {
+            sys::osdp_pd_set_mfg_receiver(
+                &mut *self.inner,
+                buf_ptr,
+                capacity,
+                Some(mfg_receiver_thunk),
+                user_ptr,
+            );
+        }
+
+        self.mfg_buffer = Some(buffer);
+        self.mfg_receiver = Some(unsafe { Box::from_raw(user_ptr as *mut MfgReceiverBox) });
+    }
+
+    // ---- PDCAP: named templates + dynamic binding ----------------------
+
+    /// Starting-point capability set for `template`: reasonable reference
+    /// values for the fields it covers (card format, LEDs, buzzer,
+    /// downstream readers, OSDP version, multi-part size), EXCLUDING the
+    /// three function codes (8, 9, 10) the C library computes for itself
+    /// and never accepts back — see [`Pd::set_pdcap`].
+    ///
+    /// Function code 11 (Largest Combined Message) defaults to 0xFFFF, a
+    /// placeholder meaning "however much this PD can multi-part once it has
+    /// a reassembly buffer" — [`Pd::set_pdcap`] rejects it until
+    /// [`Pd::set_mfg_receiver`] is bound. Lower it to 0, or to the
+    /// receiver's real capacity, if this PD does not do multi-part.
+    pub fn pdcap_template(template: PdcapTemplate) -> Vec<crate::messages::PdcapRecord> {
+        let mut buf = [sys::osdp_pdcap_record_t::default(); sys::OSDP_PD_MAX_PDCAP_RECORDS];
+        let mut count: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_pdcap_template(template.as_sys(), buf.as_mut_ptr(), buf.len(), &mut count)
+        };
+        debug_assert_eq!(
+            rc,
+            sys::osdp_status_t::OSDP_OK,
+            "buf is sized from the same constant the C side checks against"
+        );
+        buf[..count]
+            .iter()
+            .map(|r| crate::messages::PdcapRecord {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect()
+    }
+
+    /// Validate `records`, then — only if every one passes — bind them so
+    /// the library answers `osdp_CAP` directly, without involving the
+    /// [`CommandHandler`].
+    ///
+    /// Three function codes are RESERVED: the library computes them itself
+    /// and rejects them here — 8 (Check Character Support, always
+    /// `0x01`/`0x00`), 9 (Communication Security — compliance always
+    /// `0x01`; `num_objects` reports whether a unique operational SCBK is
+    /// set), 10 (Receive BufferSize, derived from the bound plaintext
+    /// buffer). Every other record is checked against spec Annex B and, for
+    /// function code 11, against this PD's actual multi-part reassembly
+    /// binding (same rule [`Pd::check_pdcap`] applies).
+    ///
+    /// On failure applies nothing — this PD keeps whatever was bound
+    /// before, or falls through to the [`CommandHandler`] if nothing was.
+    /// Pass an empty slice to clear the binding and return `osdp_CAP` to
+    /// the handler.
+    pub fn set_pdcap(
+        &mut self,
+        records: &[crate::messages::PdcapRecord],
+    ) -> core::result::Result<(), PdcapProblem> {
+        let c_records: Vec<sys::osdp_pdcap_record_t> = records
+            .iter()
+            .map(|r| sys::osdp_pdcap_record_t {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect();
+
+        let mut bad_index: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_set_pdcap(
+                &mut *self.inner,
+                if c_records.is_empty() {
+                    ptr::null()
+                } else {
+                    c_records.as_ptr()
+                },
+                c_records.len(),
+                &mut bad_index,
+            )
+        };
+
+        match Error::from_status(rc) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(PdcapProblem {
+                index: bad_index,
+                error,
+            }),
+        }
+    }
+
+    /// Snapshot exactly what `osdp_CAP` would answer right now: the records
+    /// bound via [`Pd::set_pdcap`] PLUS the three reserved records (fn
+    /// 8/9/10), recomputed fresh from this PD's current state — not a
+    /// cached value, so this can change between two calls with nothing
+    /// else in between if, say, [`Pd::set_sc_scbk`] was called in the
+    /// meantime. Empty if nothing is bound, i.e. `osdp_CAP` still falls
+    /// through to the [`CommandHandler`].
+    pub fn pdcap(&self) -> Vec<crate::messages::PdcapRecord> {
+        let mut buf = [sys::osdp_pdcap_record_t::default();
+            sys::OSDP_PD_MAX_PDCAP_RECORDS + sys::OSDP_PDCAP_RESERVED_COUNT];
+        let mut count: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_get_pdcap(&*self.inner, buf.as_mut_ptr(), buf.len(), &mut count)
+        };
+        debug_assert_eq!(
+            rc,
+            sys::osdp_status_t::OSDP_OK,
+            "buf is sized from the same constants the C side checks against"
+        );
+        buf[..count]
+            .iter()
+            .map(|r| crate::messages::PdcapRecord {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect()
+    }
+
+    // ---- PDCAP consistency (advisory) ---------------------------------
+
+    /// Check capability records against what this PD can actually honour.
+    /// Call once at start-up with the same records the command handler will
+    /// return for `osdp_CAP`.
+    ///
+    /// PDCAP is a set of promises the ACU acts on, and over-advertising does
+    /// not fail loudly — the PD drops frames the ACU believes were delivered
+    /// and it surfaces much later as unexplained retries. Only the three
+    /// records describing the *library's* limits are checked (function codes
+    /// 9, 10 and 11); how many inputs the device has is your business.
+    ///
+    /// Purely advisory: nothing calls it automatically and no wire behaviour
+    /// depends on it.
+    pub fn check_pdcap(
+        &self,
+        records: &[crate::messages::PdcapRecord],
+    ) -> core::result::Result<(), PdcapProblem> {
+        let c_records: Vec<sys::osdp_pdcap_record_t> = records
+            .iter()
+            .map(|r| sys::osdp_pdcap_record_t {
+                function_code: r.function_code,
+                compliance_level: r.compliance_level,
+                num_objects: r.num_objects,
+            })
+            .collect();
+
+        let mut bad_index: usize = 0;
+        let rc = unsafe {
+            sys::osdp_pd_check_pdcap(
+                &*self.inner,
+                if c_records.is_empty() {
+                    ptr::null()
+                } else {
+                    c_records.as_ptr()
+                },
+                c_records.len(),
+                &mut bad_index,
+            )
+        };
+
+        match Error::from_status(rc) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(PdcapProblem {
+                index: bad_index,
+                error,
+            }),
+        }
+    }
+
+    // ---- Poll-response events -----------------------------------------
+
+    /// Bind `capacity` bytes of storage for the poll-response event queue —
+    /// the replies the spec generates from physical events rather than from a
+    /// command (`osdp_RAW` 7.10, `FMT` 7.11, `KEYPAD` 7.12, `MFGREP` 7.18).
+    /// Budget roughly `payload + 3` bytes per queued event.
+    ///
+    /// With a queue bound, the PD answers the next `osdp_POLL` from the head
+    /// of the queue instead of calling the [`CommandHandler`]; an empty queue
+    /// falls through to the handler exactly as before, so this is additive.
+    /// Replaces any previously-bound queue (discarding anything in it).
+    pub fn set_event_queue(&mut self, capacity: usize) {
+        let mut buffer: Vec<u8> = alloc::vec![0u8; capacity];
+        let buf_ptr = buffer.as_mut_ptr();
+        unsafe { sys::osdp_pd_set_event_queue(&mut *self.inner, buf_ptr, capacity) };
+        self.event_buffer = Some(buffer);
+    }
+
+    /// Queue one reply to be sent in answer to the next `osdp_POLL`.
+    /// `payload` is the already-encoded reply body — build it with the
+    /// matching [`crate::messages`] builder.
+    ///
+    /// Returns [`Error::BufferTooSmall`] when the queue is full. Whether a
+    /// dropped card read matters is the application's call, not the library's,
+    /// so this reports rather than silently discarding.
+    ///
+    /// Note the queue is emptied when the PD goes offline (spec 7.11/7.12):
+    /// a credential read from before an outage is never delivered late to an
+    /// ACU that has since reconnected.
+    pub fn enqueue_event(&mut self, reply_code: u8, payload: &[u8]) -> Result<()> {
+        let rc = unsafe {
+            sys::osdp_pd_enqueue_event(
+                &mut *self.inner,
+                reply_code,
+                if payload.is_empty() {
+                    ptr::null()
+                } else {
+                    payload.as_ptr()
+                },
+                payload.len(),
+            )
+        };
+        Error::from_status(rc)
+    }
+
+    /// True while at least one event is waiting for the next poll.
+    pub fn event_pending(&self) -> bool {
+        unsafe { sys::osdp_pd_event_pending(&*self.inner) }
+    }
+
+    /// Discard every queued event. Happens automatically on the offline
+    /// transition; call it yourself to drop stale events on a deliberate
+    /// reconnect.
+    pub fn clear_events(&mut self) {
+        unsafe { sys::osdp_pd_clear_events(&mut *self.inner) };
+    }
+
+    // ---- Miscellaneous command hooks ----------------------------------
+
+    /// Bind the `osdp_ABORT` hook. The library has already torn down any
+    /// in-flight file transfer and multi-part reassembly before this runs;
+    /// the hook is for application-side work the core cannot know about.
+    ///
+    /// Return `Ok(())` to ACK. Any error produces `osdp_NAK 0x03`, the spec's
+    /// "PD unable to abort" case. **With no hook the PD ACKs**, so bind one
+    /// only if aborting can actually fail.
+    pub fn set_abort_handler<F: FnMut() -> Result<()> + 'static>(&mut self, handler: F) {
+        let boxed: Box<AbortHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            sys::osdp_pd_set_abort_handler(&mut *self.inner, Some(abort_thunk), user_ptr);
+        }
+        self.abort_handler = Some(unsafe { Box::from_raw(user_ptr as *mut AbortHandlerBox) });
+    }
+
+    /// Bind the `osdp_ACURXSIZE` notification. This is a notification, **not
+    /// a veto** — the library stores the value and ACKs either way. Refusing
+    /// to believe the ACU about the size of its own buffer would only produce
+    /// replies it drops.
+    pub fn set_acurxsize_handler<F: FnMut(u16) + 'static>(&mut self, handler: F) {
+        let boxed: Box<AcuRxSizeHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            sys::osdp_pd_set_acurxsize_handler(&mut *self.inner, Some(acurxsize_thunk), user_ptr);
+        }
+        self.acurxsize_handler =
+            Some(unsafe { Box::from_raw(user_ptr as *mut AcuRxSizeHandlerBox) });
+    }
+
+    /// The largest reply the ACU has said it can receive, or
+    /// [`DEFAULT_ACU_RX_SIZE`] if it has not said.
+    ///
+    /// **This is the peer's limit.** Combine it with
+    /// [`max_reply_payload`](Pd::max_reply_payload), which is this PD's own,
+    /// and honour whichever is smaller.
+    pub fn acu_rx_size(&self) -> u16 {
+        unsafe { sys::osdp_pd_acu_rx_size(&*self.inner) }
+    }
+
+    /// Bind the `osdp_KEEPACTIVE` handler — hold reader operations open for
+    /// the given number of milliseconds (0 cancels a previous extension).
+    ///
+    /// Return `Ok(())` to ACK; any error produces `osdp_NAK 0x03`. Unlike the
+    /// other hooks, **with no handler bound the PD NAKs 0x03**: holding a
+    /// reader field energised is physical, so an ACK the PD cannot honour
+    /// would be a lie.
+    pub fn set_keepactive_handler<F: FnMut(u16) -> Result<()> + 'static>(&mut self, handler: F) {
+        let boxed: Box<KeepActiveHandlerBox> = Box::new(Box::new(handler));
+        let user_ptr = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            sys::osdp_pd_set_keepactive_handler(&mut *self.inner, Some(keepactive_thunk), user_ptr);
+        }
+        self.keepactive_handler =
+            Some(unsafe { Box::from_raw(user_ptr as *mut KeepActiveHandlerBox) });
     }
 
     // ---- Secure Channel configuration ---------------------------------
@@ -756,6 +1265,136 @@ unsafe extern "C" fn file_receiver_thunk(
     }
 }
 
+// The four status thunks share one `user` pointer — the boxed
+// `StatusProviders` — and each reaches for its own member. A thunk is only
+// ever installed alongside a `Some` member (see `set_status_providers`), so
+// the `else` arms are unreachable in practice; they answer defensively
+// rather than unwrapping.
+
+unsafe extern "C" fn status_local_thunk(user: *mut c_void, tamper: *mut u8, power: *mut u8) {
+    if user.is_null() {
+        return;
+    }
+    let providers = &mut *(user as *mut StatusProviders);
+    let (t, p) = match providers.local.as_mut() {
+        Some(f) => f(),
+        None => (0, 0),
+    };
+    if !tamper.is_null() {
+        *tamper = t;
+    }
+    if !power.is_null() {
+        *power = p;
+    }
+}
+
+/// Shared body for the three array-valued providers. `cap` is the C side's
+/// scratch capacity; the closure's return is clamped to it, so a provider
+/// that over-reports is truncated rather than trusted to write in bounds.
+unsafe fn status_array_thunk(
+    provider: Option<&mut StatusArrayFn>,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let (Some(f), false) = (provider, out.is_null()) else {
+        return 0;
+    };
+    let slice = slice::from_raw_parts_mut(out, cap);
+    f(slice).min(cap)
+}
+
+unsafe extern "C" fn status_inputs_thunk(user: *mut c_void, out: *mut u8, cap: usize) -> usize {
+    if user.is_null() {
+        return 0;
+    }
+    let providers = &mut *(user as *mut StatusProviders);
+    status_array_thunk(providers.inputs.as_mut(), out, cap)
+}
+
+unsafe extern "C" fn status_outputs_thunk(user: *mut c_void, out: *mut u8, cap: usize) -> usize {
+    if user.is_null() {
+        return 0;
+    }
+    let providers = &mut *(user as *mut StatusProviders);
+    status_array_thunk(providers.outputs.as_mut(), out, cap)
+}
+
+unsafe extern "C" fn status_readers_thunk(user: *mut c_void, out: *mut u8, cap: usize) -> usize {
+    if user.is_null() {
+        return 0;
+    }
+    let providers = &mut *(user as *mut StatusProviders);
+    status_array_thunk(providers.readers.as_mut(), out, cap)
+}
+
+unsafe extern "C" fn mfg_receiver_thunk(
+    user: *mut c_void,
+    vendor_code: *const u8,
+    data: *const u8,
+    data_len: usize,
+    reply: *mut sys::osdp_pd_reply_t,
+) -> sys::osdp_status_t {
+    if user.is_null() || vendor_code.is_null() {
+        return sys::osdp_status_t::OSDP_ERR_INVALID_ARG;
+    }
+    let storage = &mut *(user as *mut MfgReceiverBox);
+
+    let vendor: [u8; 3] = [*vendor_code, *vendor_code.add(1), *vendor_code.add(2)];
+    let data_slice = if data_len == 0 || data.is_null() {
+        &[][..]
+    } else {
+        slice::from_raw_parts(data, data_len)
+    };
+
+    match storage.on_message(&vendor, data_slice) {
+        // The C side pre-fills *reply as an ACK before calling us, so
+        // `Ok(None)` means "leave it alone" rather than "send nothing".
+        Ok(None) => sys::osdp_status_t::OSDP_OK,
+        Ok(Some(reply_value)) => {
+            let r = &mut *reply;
+            r.code = reply_value.code;
+            r.payload_len = reply_value.payload.len();
+            r.payload = if reply_value.payload.is_empty() {
+                ptr::null()
+            } else {
+                reply_value.payload.as_ptr()
+            };
+            sys::osdp_status_t::OSDP_OK
+        }
+        Err(e) => e.to_status(),
+    }
+}
+
+unsafe extern "C" fn abort_thunk(user: *mut c_void) -> sys::osdp_status_t {
+    if user.is_null() {
+        return sys::osdp_status_t::OSDP_OK;
+    }
+    let storage = &mut *(user as *mut AbortHandlerBox);
+    match storage() {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
+unsafe extern "C" fn acurxsize_thunk(user: *mut c_void, max_size: u16) {
+    if user.is_null() {
+        return;
+    }
+    let storage = &mut *(user as *mut AcuRxSizeHandlerBox);
+    storage(max_size);
+}
+
+unsafe extern "C" fn keepactive_thunk(user: *mut c_void, time_ms: u16) -> sys::osdp_status_t {
+    if user.is_null() {
+        return sys::osdp_status_t::OSDP_ERR_NOT_SUPPORTED;
+    }
+    let storage = &mut *(user as *mut KeepActiveHandlerBox);
+    match storage(time_ms) {
+        Ok(()) => sys::osdp_status_t::OSDP_OK,
+        Err(e) => e.to_status(),
+    }
+}
+
 // ---- Drop impl ---------------------------------------------------------
 
 impl Drop for Pd {
@@ -782,6 +1421,24 @@ impl Drop for Pd {
                 None,
                 ptr::null_mut(),
             );
+            // And the status providers (NULL vtable detaches all four).
+            sys::osdp_pd_set_status_provider(&mut *self.inner, ptr::null(), ptr::null_mut());
+            // And the multi-part MFG receiver — like the file receiver, this
+            // also clears the C-side reassembly pointer before the backing
+            // Vec is dropped.
+            sys::osdp_pd_set_mfg_receiver(
+                &mut *self.inner,
+                ptr::null_mut(),
+                0,
+                None,
+                ptr::null_mut(),
+            );
+            // And the event queue, whose buffer is likewise ours to free.
+            sys::osdp_pd_set_event_queue(&mut *self.inner, ptr::null_mut(), 0);
+            // And the three miscellaneous command hooks.
+            sys::osdp_pd_set_abort_handler(&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_pd_set_acurxsize_handler(&mut *self.inner, None, ptr::null_mut());
+            sys::osdp_pd_set_keepactive_handler(&mut *self.inner, None, ptr::null_mut());
             // Replace the transport with one whose callbacks are NULL
             // so future tick()s can't dereference our (about to be
             // dropped) trait objects. We still own the C struct; the

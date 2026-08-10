@@ -18,9 +18,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use osdp_embedded::messages::{
-    Keypad, Pdcap, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_LSTATR, OSDP_REPLY_RAW,
-};
+use osdp_embedded::messages::{Keypad, PdcapRecord, Pdid, Raw, OSDP_REPLY_KEYPAD, OSDP_REPLY_RAW};
+use osdp_embedded::pd::{Pd, PdcapTemplate};
 use osdp_mcp::crypto::Selector;
 use osdp_mcp::log::{LogEntry, LogFilter, LogPage, LogSummary, DEFAULT_CAPACITY};
 use osdp_mcp::overrides::OverrideReply;
@@ -457,23 +456,33 @@ struct PdcapView {
     records: Vec<PdcapRecordView>,
 }
 
-impl From<&Pdcap> for PdcapView {
-    fn from(p: &Pdcap) -> Self {
+impl From<&[PdcapRecord]> for PdcapView {
+    fn from(records: &[PdcapRecord]) -> Self {
         Self {
-            records: p.records.iter().map(PdcapRecordView::from).collect(),
+            records: records.iter().map(PdcapRecordView::from).collect(),
         }
     }
 }
+
+/// Function codes the C library computes for itself and never accepts —
+/// see `osdp_embedded::pd::Pd::set_pdcap`. `pd_set_capability` rejects any
+/// of these before it even reaches the library. (Function code 17 is not
+/// among them: it isn't a real Annex B function code in this project's
+/// reference spec text — Annex B's body ends at function code 16 — so it's
+/// simply rejected as unrecognised by `pdcap_spec::validate_record`, same
+/// as function code 18.)
+const RESERVED_PDCAP_FUNCTION_CODES: [u8; 3] = [8, 9, 10];
 
 /// Args for `pd_set_capability` — upsert or remove a single capability
 /// record, keyed by function code.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PdSetCapabilityArgs {
-    /// OSDP function code to edit (spec Annex B, 1..=17). Examples:
+    /// OSDP function code to edit (spec Annex B, 1..=16). Examples:
     /// 1 = Contact Status Monitoring, 2 = Output Control,
     /// 4 = Reader LED Control, 5 = Reader Audible Output,
-    /// 6 = Reader Text Output, 8 = Check Character Support,
-    /// 9 = Communication Security, 16 = OSDP Version.
+    /// 6 = Reader Text Output, 11 = Largest Combined Message,
+    /// 16 = OSDP Version. Function codes 8, 9, and 10 are computed by
+    /// the library itself (see `pd_get_pdcap`) and rejected here.
     function_code: u8,
     /// Compliance level for this function code. Required unless
     /// `remove` is true. Meaning is function-code-specific — see the
@@ -791,17 +800,23 @@ impl OsdpMcp {
     /// (`osdp_PDCAP`, 0x46). Each record is annotated with the spec
     /// (Annex B) meaning of its function code and both data bytes, so
     /// you can see what the PD advertises without consulting the spec.
-    /// Independent of whether a PD is running — the capability set is
-    /// process state that persists across `pd_stop` / `pd_configure`.
+    /// Includes the three records the C library computes for itself (fn
+    /// 8/9/10) — this is what actually goes out on the wire, live from
+    /// the running PD when one exists. Independent of whether a PD is
+    /// running — the capability set persists across `pd_stop` /
+    /// `pd_configure`.
     #[tool(
         title = "Get PDCAP",
         description = "Return the capability set reported in the osdp_PDCAP (0x46) reply: \
                        one record per function code (Annex B), each annotated with its name and \
-                       the meaning of its compliance-level and number-of-objects bytes. \
-                       Edit it with pd_set_capability or restore defaults with pd_reset_pdcap."
+                       the meaning of its compliance-level and number-of-objects bytes. Includes \
+                       the three records the library computes for itself (fn 8/9/10) — this is \
+                       what actually goes out on the wire. Edit the rest with pd_set_capability or \
+                       restore defaults with pd_reset_pdcap."
     )]
-    fn pd_get_pdcap(&self) -> Json<PdcapView> {
-        Json((&self.pd.get_pdcap()).into())
+    async fn pd_get_pdcap(&self) -> Json<PdcapView> {
+        let records = self.pd.get_pdcap().await;
+        Json((&records[..]).into())
     }
 
     /// Add, update, or remove a single capability record, keyed by
@@ -809,88 +824,120 @@ impl OsdpMcp {
     /// Annex B — an out-of-range compliance level, a non-zero
     /// "number of objects" where the spec requires zero, reserved
     /// bitmap bits, or an unknown function code are all rejected with a
-    /// message listing the valid values. Takes effect on the next
-    /// `osdp_CAP` command and persists across `pd_stop` /
-    /// `pd_configure`.
+    /// message listing the valid values. Function codes 8, 9, and 10
+    /// are computed by the library itself and rejected outright — see
+    /// `pd_get_pdcap`. Takes effect immediately if a PD is running, and
+    /// persists across `pd_stop` / `pd_configure` either way.
     #[tool(
         title = "Set Capability",
         description = "Add/update or remove one osdp_PDCAP capability record by function code \
-                       (spec Annex B, 1..=17). Pass compliance_level (required to add/update) and \
-                       optionally num_objects; or remove=true to delete the record. The record is \
-                       validated against the spec (valid compliance levels, required-zero fields, \
-                       bitmap masks) and rejected with the allowed values on a violation. Returns \
-                       the full resulting capability set."
+                       (spec Annex B). Pass compliance_level (required to add/update) and \
+                       optionally num_objects; or remove=true to delete the record. Function \
+                       codes 8, 9, and 10 are computed by the library itself and always \
+                       rejected. The record is validated against the spec (valid compliance \
+                       levels, required-zero fields, bitmap masks) and rejected with the allowed \
+                       values on a violation. Returns the full resulting capability set."
     )]
-    fn pd_set_capability(
+    async fn pd_set_capability(
         &self,
         Parameters(args): Parameters<PdSetCapabilityArgs>,
     ) -> Result<Json<PdcapView>, String> {
-        let mut pdcap = self.pd.get_pdcap();
+        if RESERVED_PDCAP_FUNCTION_CODES.contains(&args.function_code) {
+            return Err(format!(
+                "function code {} is computed by the library itself and cannot be set \
+                 (see pd_get_pdcap)",
+                args.function_code
+            ));
+        }
+
+        // The three reserved records are part of what get_pdcap returns (it's
+        // the live wire reply) but must never be fed back into set_pdcap —
+        // filter them out before editing.
+        let mut records: Vec<PdcapRecord> = self
+            .pd
+            .get_pdcap()
+            .await
+            .into_iter()
+            .filter(|r| !RESERVED_PDCAP_FUNCTION_CODES.contains(&r.function_code))
+            .collect();
 
         if args.remove {
-            let before = pdcap.records.len();
-            pdcap
-                .records
-                .retain(|r| r.function_code != args.function_code);
-            if pdcap.records.len() == before {
+            let before = records.len();
+            records.retain(|r| r.function_code != args.function_code);
+            if records.len() == before {
                 return Err(format!(
                     "no capability record with function code {} to remove",
                     args.function_code
                 ));
             }
-            self.pd.set_pdcap(pdcap.clone());
-            return Ok(Json((&pdcap).into()));
+        } else {
+            // Add/update path. compliance_level is required; num_objects
+            // defaults to 0 (the most common required value, and a safe
+            // default for count/bitmap fields).
+            let compliance_level = args.compliance_level.ok_or_else(|| {
+                "compliance_level is required when adding or updating a capability \
+                 (pass remove=true to delete instead)"
+                    .to_string()
+            })?;
+            // Reuse the existing num_objects when updating and the caller
+            // didn't supply one; otherwise default to 0.
+            let existing_num = records
+                .iter()
+                .find(|r| r.function_code == args.function_code)
+                .map(|r| r.num_objects);
+            let num_objects = args.num_objects.or(existing_num).unwrap_or(0);
+
+            // Validate against the spec before mutating anything — gives a
+            // descriptive error naming the allowed values, which the
+            // authoritative check below (the same one osdp_pd_set_pdcap
+            // itself runs) does not.
+            pdcap_spec::validate_record(args.function_code, compliance_level, num_objects)?;
+
+            let record = PdcapRecord {
+                function_code: args.function_code,
+                compliance_level,
+                num_objects,
+            };
+            match records
+                .iter_mut()
+                .find(|r| r.function_code == args.function_code)
+            {
+                Some(existing) => *existing = record,
+                None => records.push(record),
+            }
         }
 
-        // Add/update path. compliance_level is required; num_objects
-        // defaults to 0 (the most common required value, and a safe
-        // default for count/bitmap fields).
-        let compliance_level = args.compliance_level.ok_or_else(|| {
-            "compliance_level is required when adding or updating a capability \
-             (pass remove=true to delete instead)"
-                .to_string()
-        })?;
-        // Reuse the existing num_objects when updating and the caller
-        // didn't supply one; otherwise default to 0.
-        let existing_num = pdcap
-            .records
-            .iter()
-            .find(|r| r.function_code == args.function_code)
-            .map(|r| r.num_objects);
-        let num_objects = args.num_objects.or(existing_num).unwrap_or(0);
-
-        // Validate against the spec before mutating anything.
-        pdcap_spec::validate_record(args.function_code, compliance_level, num_objects)?;
-
-        let record = PdcapRecord {
-            function_code: args.function_code,
-            compliance_level,
-            num_objects,
-        };
-        match pdcap
-            .records
-            .iter_mut()
-            .find(|r| r.function_code == args.function_code)
-        {
-            Some(existing) => *existing = record,
-            None => pdcap.records.push(record),
-        }
-        self.pd.set_pdcap(pdcap.clone());
-        Ok(Json((&pdcap).into()))
+        self.pd
+            .set_pdcap(records)
+            .await
+            .map_err(|e| format!("pd_set_capability failed: {}", e))?
+            .map_err(|e| {
+                format!(
+                    "pd_set_capability rejected: record {}: {:?}",
+                    e.index, e.error
+                )
+            })?;
+        let updated = self.pd.get_pdcap().await;
+        Ok(Json((&updated[..]).into()))
     }
 
-    /// Restore the capability set to the built-in default (the same
-    /// spec-conformant set a freshly-configured PD reports). Useful to
-    /// undo experimentation. Returns the restored set.
+    /// Restore the capability set to the library's "Secure Reader" template
+    /// (the same spec-conformant set a freshly-configured PD reports).
+    /// Useful to undo experimentation. Returns the restored set.
     #[tool(
         title = "Reset PDCAP",
-        description = "Restore the osdp_PDCAP capability set to the built-in default \
-                       (vendor reference set, spec-conformant). Returns the restored set."
+        description = "Restore the osdp_PDCAP capability set to the library's built-in \
+                       \"Secure Reader\" template (vendor reference set, spec-conformant). \
+                       Returns the restored set."
     )]
-    fn pd_reset_pdcap(&self) -> Json<PdcapView> {
-        let pdcap = osdp_mcp::handler::default_pdcap();
-        self.pd.set_pdcap(pdcap.clone());
-        Json((&pdcap).into())
+    async fn pd_reset_pdcap(&self) -> Result<Json<PdcapView>, String> {
+        self.pd
+            .set_pdcap(Pd::pdcap_template(PdcapTemplate::SecureReader))
+            .await
+            .map_err(|e| format!("pd_reset_pdcap failed: {}", e))?
+            .map_err(|e| format!("pd_reset_pdcap rejected: record {}: {:?}", e.index, e.error))?;
+        let records = self.pd.get_pdcap().await;
+        Ok(Json((&records[..]).into()))
     }
 
     /// Read recent on-wire events (commands accepted, replies sent,
@@ -1145,26 +1192,24 @@ impl OsdpMcp {
     /// bytes: tamper_status (0/1), power_status (0/1).
     #[tool(
         title = "Inject Tamper / Power Status",
-        description = "Inject a tamper/power state change. The PD will reply LSTATR on its next POLL with the supplied flags."
+        description = "Inject a tamper/power state change. The PD reports it as LSTATR on its next POLL, and answers any later LSTAT query with the same flags."
     )]
     fn inject_local_status(
         &self,
         Parameters(args): Parameters<InjectLocalStatusArgs>,
     ) -> Result<String, String> {
-        // No typed builder in osdp-embedded for LSTATR; the payload
-        // is simply [tamper, power], each 0 or 1 per spec D.2.1.
+        // Spec D.2.1: the LSTATR payload is two bytes, each 0 or 1.
         if args.tamper > 1 || args.power > 1 {
             return Err(format!(
                 "tamper and power must be 0 or 1, got tamper={}, power={}",
                 args.tamper, args.power
             ));
         }
-        self.pd.enqueue_event(OverrideReply {
-            code: OSDP_REPLY_LSTATR,
-            payload: vec![args.tamper, args.power],
-        });
+        // Sets the standing condition *and* queues the report — see
+        // PdHandle::set_local_status for why both.
+        self.pd.set_local_status(args.tamper, args.power);
         Ok(format!(
-            "LSTATR queued: tamper={}, power={}",
+            "LSTATR queued and local status set: tamper={}, power={}",
             args.tamper, args.power
         ))
     }
