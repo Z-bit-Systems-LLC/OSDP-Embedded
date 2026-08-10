@@ -1,46 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
+/* The AES half now comes from ports/tiny — it was identical to the tests'
+ * copy, byte for byte. What stays here is this tool's RNG policy, which is
+ * the member a port deliberately does not supply. */
+
 #include "aes_adapter.h"
 
-#include "aes.h"   /* vendor/tiny-aes/aes.h */
+#include "osdp_sc_tiny.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 #include <time.h>
-
-static osdp_status_t adapter_encrypt(
-    void          *user,
-    const uint8_t  key[OSDP_AES_KEY_LEN],
-    const uint8_t  in [OSDP_AES_BLOCK_LEN],
-    uint8_t        out[OSDP_AES_BLOCK_LEN])
-{
-    (void)user;
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, key);
-    if (out != in) {
-        (void)memcpy(out, in, OSDP_AES_BLOCK_LEN);
-    }
-    AES_ECB_encrypt(&ctx, out);
-    return OSDP_OK;
-}
-
-static osdp_status_t adapter_decrypt(
-    void          *user,
-    const uint8_t  key[OSDP_AES_KEY_LEN],
-    const uint8_t  in [OSDP_AES_BLOCK_LEN],
-    uint8_t        out[OSDP_AES_BLOCK_LEN])
-{
-    (void)user;
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, key);
-    if (out != in) {
-        (void)memcpy(out, in, OSDP_AES_BLOCK_LEN);
-    }
-    AES_ECB_decrypt(&ctx, out);
-    return OSDP_OK;
-}
 
 static int g_seeded = 0;
 
@@ -72,14 +44,18 @@ void pd_mock_aes_seed_rand(uint32_t seed)
     g_seeded = 1;
 }
 
-static const osdp_sc_crypto_t k_vtable = {
-    .aes128_ecb_encrypt = adapter_encrypt,
-    .aes128_ecb_decrypt = adapter_decrypt,
-    .rand_bytes         = adapter_rand,
-    .user               = NULL,
-};
+/* Built once on first use rather than as a static initialiser, because the
+ * AES members come from a function call now. The tool is single-threaded. */
+static osdp_sc_crypto_t g_vtable;
+static bool             g_vtable_ready;
 
 const osdp_sc_crypto_t *pd_mock_aes_crypto(void)
 {
-    return &k_vtable;
+    if (!g_vtable_ready) {
+        osdp_sc_tiny_aes128(&g_vtable);
+        g_vtable.rand_bytes = adapter_rand;
+        g_vtable.user       = NULL;
+        g_vtable_ready      = true;
+    }
+    return &g_vtable;
 }
