@@ -23,11 +23,14 @@ else()
     message(FATAL_ERROR "osdp-pd-mock: no serial adapter for this platform")
 endif()
 
+# The AES primitives come from ports/tiny; aes_adapter.c keeps only this
+# tool's RNG policy. tiny_aes is reached through the port rather than linked
+# here, so the vendored headers stay out of this tool's include path.
 target_link_libraries(osdp-pd-mock PRIVATE
     osdp_core
     osdp_messages
     osdp_pd
-    tiny_aes
+    osdp_port_sc_tiny
 )
 
 target_include_directories(osdp-pd-mock PRIVATE

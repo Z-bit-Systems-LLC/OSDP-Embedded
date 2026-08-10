@@ -87,6 +87,9 @@ add_subdirectory(acu)
 # being built; embedded targets that bring their own AES never see it.
 if(OSDP_BUILD_TESTS OR OSDP_BUILD_TOOLS)
     add_subdirectory(vendor)
+    # ports/ binds that vendored code to the library's crypto HALs, so it is
+    # gated identically and must come after vendor/.
+    add_subdirectory(ports)
 endif()
 
 if(OSDP_BUILD_TOOLS)
