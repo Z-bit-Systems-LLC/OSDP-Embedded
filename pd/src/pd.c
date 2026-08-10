@@ -401,6 +401,44 @@ static void check_offline_timeout(osdp_pd_t *pd)
     }
 }
 
+/* Spec 5.8: abort a receive that has stalled mid-frame. Call after draining
+ * osdp_stream_next, so anything the decoder still holds is by definition an
+ * incomplete frame.
+ *
+ * The elapsed time is measured from the last change in the buffered count,
+ * not from the last tick — a frame arriving slowly but steadily keeps
+ * refreshing the deadline, while one that stops advancing trips it. Without a
+ * now_ms clock there is nothing to measure, so the abort never fires and the
+ * decoder behaves as it always did. */
+static void check_interchar_timeout(osdp_pd_t *pd)
+{
+    const size_t pending = osdp_stream_pending(&pd->rx);
+
+    if (pending == 0) {
+        pd->rx_partial_len = 0;
+        return;
+    }
+    if (pd->transport.now_ms == NULL) {
+        return;
+    }
+
+    const uint32_t now = pd->transport.now_ms(pd->transport.user);
+
+    if (pending != pd->rx_partial_len) {
+        /* Progress since the last look — restart the clock. */
+        pd->rx_partial_len = pending;
+        pd->rx_partial_ms  = now;
+        return;
+    }
+
+    /* Unsigned subtraction wraps cleanly modulo 2^32, as in the offline
+     * check, so a monotonic-clock wraparound cannot fake an expiry. */
+    if ((now - pd->rx_partial_ms) >= OSDP_PD_INTERCHAR_TIMEOUT_MS) {
+        osdp_stream_reset(&pd->rx);
+        pd->rx_partial_len = 0;
+    }
+}
+
 /* Clear-text (unsecured) commands a full-security PD still answers before a
  * Secure Channel session is established: the discovery and comms-config
  * commands the ACU legitimately needs to find the PD and bring SC up
@@ -1259,8 +1297,22 @@ void osdp_pd_tick(osdp_pd_t *pd)
      * check timing without expecting incoming traffic. */
     check_offline_timeout(pd);
 
-    /* Drain whatever the transport has now. */
+    /* Drain whatever the transport has now.
+     *
+     * Keep reading until the transport reports nothing left. A short read is
+     * not evidence that the transport is drained — on a UART it usually means
+     * only that the rest of the frame has yet to clock in, and treating it as
+     * "empty" leaves bytes sitting in the driver's queue for a whole tick.
+     * The loop ends on the read that returns 0, which is the only reliable
+     * signal, so the exit condition no longer depends on the chunk size.
+     *
+     * The drain is bounded at one stream buffer's worth per tick. Past that
+     * the decoder is overwriting its own oldest bytes, so further reading in
+     * this tick cannot produce a frame it has not already been given — and
+     * the bound is what stops a transport that never runs dry from spinning
+     * here forever. */
     uint8_t chunk[128];
+    size_t  drained = 0;
     for (;;) {
         const int n = pd->transport.read(pd->transport.user,
                                          chunk, sizeof(chunk));
@@ -1268,7 +1320,8 @@ void osdp_pd_tick(osdp_pd_t *pd)
             break;
         }
         (void)osdp_stream_feed(&pd->rx, chunk, (size_t)n);
-        if ((size_t)n < sizeof(chunk)) {
+        drained += (size_t)n;
+        if (drained >= OSDP_STREAM_BUFFER_LEN) {
             break;
         }
     }
@@ -1316,6 +1369,21 @@ void osdp_pd_tick(osdp_pd_t *pd)
 
         process_frame(pd, &cmd);
     }
+
+    /* Spec 5.8 inter-character timeout. Anything the decoder still holds at
+     * this point is an incomplete frame — the loop above ran until it said
+     * OSDP_ERR_TRUNCATED. If that residue stops growing for the timeout, the
+     * sender stopped mid-frame (a dropped byte on the line is the usual
+     * cause) and the receive is aborted so the decoder resynchronizes on the
+     * next SOM.
+     *
+     * Aborting is not merely tidy. The retained bytes sit in front of the
+     * sender's retransmission, which the decoder then counts toward the
+     * abandoned frame's length and decodes across the boundary — so a frame
+     * that arrived perfectly fails its CRC and earns a NAK 0x01. Every
+     * subsequent retry meets the same misalignment, so one lost byte takes
+     * the link down until something else resets it. */
+    check_interchar_timeout(pd);
 
     /* Re-resolve the LED and buzzer banks so time-driven changes (LED
      * timer expiry / flash edges, buzzer beep/silence edges and end-of-
