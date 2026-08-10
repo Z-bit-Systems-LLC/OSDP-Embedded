@@ -171,6 +171,26 @@ static size_t handle_msg1(osdp_pd_t *pd, osdp_pd_pair_t *p,
 
     size_t outlen = 0;
     bool   is_reject = false;
+
+    /* Re-pairing policy. Checked here rather than in the session because only
+     * the driver can see whether this PD is already keyed — the session is
+     * transport-free and knows nothing about pd->sc2.
+     *
+     * Deliberately before authentication: a PD that will not re-pair has no
+     * business spending an ML-DSA verify on the request first, and answering
+     * POLICY only after the credential passes would leak whether an arbitrary
+     * certificate is trusted. */
+    if (p->deny_repair && pd->sc2.scbk_set) {
+        p->active = false;
+        if (osdp_pair_result_encode(OSDP_PAIR_STATUS_POLICY, NULL, 0,
+                                    p->outbuf, sizeof(p->outbuf),
+                                    &outlen) != OSDP_OK) {
+            pair_reset(p);
+            return emit_nak(pd, cmd, OSDP_NAK_RECORD_INVALID);
+        }
+        return emit_single(pd, cmd, p->outbuf, outlen);
+    }
+
     if (osdp_pair_pd_process_msg1(&p->session, msg, msg_len,
                                   p->outbuf, sizeof(p->outbuf), &outlen,
                                   &is_reject) != OSDP_OK) {
@@ -311,6 +331,14 @@ void osdp_pd_pair_set_established_handler(osdp_pd_pair_t             *pair,
     }
     pair->cb      = cb;
     pair->cb_user = user;
+}
+
+void osdp_pd_pair_set_deny_repair(osdp_pd_pair_t *pair, bool deny)
+{
+    if (pair == NULL) {
+        return;
+    }
+    pair->deny_repair = deny;
 }
 
 void osdp_pd_attach_pair(osdp_pd_t *pd, osdp_pd_pair_t *pair)

@@ -157,10 +157,19 @@ osdp_status_t osdp_pair_pd_process_msg1(osdp_pair_pd_session_t *s,
                          is_rejection);
     }
 
-    /* Authenticate the ACU. */
+    /* Authenticate the ACU.
+     *
+     * AUTH_FAIL (0x01), not POLICY (0x03). The reference reserves 0x03 for a
+     * responder that declines on policy grounds — re-pairing disabled being
+     * its own example — while a credential the trust anchor will not accept
+     * is a signature failure on the responder side, which is what 0x01 names.
+     * Its PeerCertificateRejected (0x10) is documented local-only and never
+     * goes on the wire, so it is not the code to mirror here. Reporting a
+     * rejected certificate as a policy decline sends the ACU looking at its
+     * configuration instead of its credential. */
     if (validate_peer(c, &s->trust, m1.cred_type, m1.cred, m1.cred_len,
                       &s->peer) != OSDP_OK) {
-        return pd_reject(s, OSDP_PAIR_STATUS_POLICY, out, out_cap, out_len,
+        return pd_reject(s, OSDP_PAIR_STATUS_AUTH_FAIL, out, out_cap, out_len,
                          is_rejection);
     }
 

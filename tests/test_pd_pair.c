@@ -327,6 +327,133 @@ static void test_msg2_fragments_follow_the_acu_declared_size(void)
     TEST_ASSERT_TRUE(pd.sc2.scbk_set);
 }
 
+/* Run one full pairing exchange against the current PD. Returns the derived
+ * SCBK through `scbk` so a caller can check a later attempt left it alone. */
+static void run_pairing(uint8_t scbk[OSDP_PAIR_SCBK_LEN])
+{
+    static uint8_t msg1[8192], msg2[8192], msg3[8192];
+    size_t n1 = 0, n2 = 0, n3 = 0;
+    uint8_t code, pay[1024]; size_t plen = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
+    acu_send_message(msg1, n1, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, code);
+
+    n2 = acu_recv_message(msg2, sizeof(msg2));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_process_msg2(&acu, msg2, n2, msg3, sizeof(msg3), &n3));
+
+    acu_send_message(msg3, n3, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PAIRR, code);
+    osdp_mp_fragment_t frag;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_fragment_decode(pay, plen, &frag));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_process_result(&acu, frag.data, frag.frag_len, scbk));
+}
+
+/* Send a Message 1 and return the decoded Result the PD answered with.
+ * Only valid when the PD is expected to reject inline rather than queue a
+ * Message 2 for later polls. */
+static uint64_t send_msg1_expect_result(void)
+{
+    static uint8_t msg1[8192];
+    size_t n1 = 0;
+    uint8_t code, pay[1024]; size_t plen = 0;
+
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
+    acu_send_message(msg1, n1, &code, pay, sizeof(pay), &plen);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_PAIRR, code);
+
+    osdp_mp_fragment_t frag;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_mp_fragment_decode(pay, plen, &frag));
+    osdp_pair_result_t res;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        osdp_pair_result_decode(frag.data, frag.frag_len, &res));
+    return res.status;
+}
+
+/* Re-pairing is allowed by default: a second exchange against an already-keyed
+ * PD completes and installs the new key. */
+static void test_repairing_is_allowed_by_default(void)
+{
+    uint8_t first[OSDP_PAIR_SCBK_LEN], second[OSDP_PAIR_SCBK_LEN];
+
+    run_pairing(first);
+    TEST_ASSERT_TRUE(pd.sc2.scbk_set);
+    TEST_ASSERT_EQUAL_MEMORY(first, pd.sc2.scbk, OSDP_SC2_KEY_LEN);
+
+    /* Fresh ACU session — a new pairing, not a replay of the first. */
+    osdp_pair_local_t acu_local = { acu_cert, acu_cert_len };
+    osdp_pair_trust_t acu_trust = { .ca_pubkey = ca_ctx.dsa_pk };
+    osdp_pair_acu_init(&acu, &acu_crypto, &acu_local, &acu_trust);
+
+    run_pairing(second);
+    TEST_ASSERT_EQUAL_MEMORY(second, pd.sc2.scbk, OSDP_SC2_KEY_LEN);
+}
+
+/* With the policy set, an already-keyed PD answers POLICY (0x03) and keeps the
+ * key it has. The benchmark depends on the permissive default, so this is the
+ * behaviour that has to be asked for explicitly. */
+static void test_deny_repair_rejects_an_already_keyed_pd(void)
+{
+    uint8_t first[OSDP_PAIR_SCBK_LEN], keep[OSDP_SC2_KEY_LEN];
+
+    run_pairing(first);
+    TEST_ASSERT_TRUE(pd.sc2.scbk_set);
+    (void)memcpy(keep, pd.sc2.scbk, sizeof(keep));
+
+    osdp_pd_pair_set_deny_repair(&pair, true);
+
+    osdp_pair_local_t acu_local = { acu_cert, acu_cert_len };
+    osdp_pair_trust_t acu_trust = { .ca_pubkey = ca_ctx.dsa_pk };
+    osdp_pair_acu_init(&acu, &acu_crypto, &acu_local, &acu_trust);
+
+    TEST_ASSERT_EQUAL_UINT64(OSDP_PAIR_STATUS_POLICY, send_msg1_expect_result());
+    TEST_ASSERT_EQUAL_MEMORY(keep, pd.sc2.scbk, sizeof(keep));
+}
+
+/* The policy only bites once a key exists — setting it on a virgin PD must not
+ * block the first pairing, or a device could never be provisioned. */
+static void test_deny_repair_still_allows_the_first_pairing(void)
+{
+    uint8_t scbk[OSDP_PAIR_SCBK_LEN];
+
+    osdp_pd_pair_set_deny_repair(&pair, true);
+    TEST_ASSERT_FALSE(pd.sc2.scbk_set);
+
+    run_pairing(scbk);
+    TEST_ASSERT_TRUE(pd.sc2.scbk_set);
+    TEST_ASSERT_EQUAL_MEMORY(scbk, pd.sc2.scbk, OSDP_SC2_KEY_LEN);
+}
+
+/* A credential the trust anchor will not accept is AUTH_FAIL (0x01), not
+ * POLICY (0x03). The reference reserves 0x03 for policy declines such as the
+ * re-pairing refusal above, and reporting a bad certificate as one sends the
+ * ACU auditing its configuration instead of its credential. */
+static void test_untrusted_acu_is_rejected_as_auth_failure(void)
+{
+    /* An ACU whose cert is signed by a CA this PD does not trust. */
+    static osdp_pair_test_ctx_t rogue_ca_ctx;
+    static osdp_pair_crypto_t   rogue_ca_crypto;
+    static uint8_t              rogue_cert[4096];
+
+    osdp_pair_test_crypto_init(&rogue_ca_crypto, &rogue_ca_ctx);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&rogue_ca_ctx));
+    const size_t rogue_len = make_cert(&rogue_ca_crypto, acu_ctx.dsa_pk,
+                                       "ACME", "ACU-X", "SN-ROGUE",
+                                       rogue_cert, sizeof(rogue_cert));
+
+    osdp_pair_local_t rogue_local = { rogue_cert, rogue_len };
+    osdp_pair_trust_t acu_trust   = { .ca_pubkey = ca_ctx.dsa_pk };
+    osdp_pair_acu_init(&acu, &acu_crypto, &rogue_local, &acu_trust);
+
+    TEST_ASSERT_EQUAL_UINT64(OSDP_PAIR_STATUS_AUTH_FAIL,
+                             send_msg1_expect_result());
+    TEST_ASSERT_FALSE(pd.sc2.scbk_set);
+}
+
 /* An unconfigured PD (no pairing attached) NAKs osdp_PAIR. */
 static void test_pd_without_pairing_naks(void)
 {
@@ -360,6 +487,10 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_pd_completes_pairing_and_applies_scbk);
     RUN_TEST(test_msg2_fragments_follow_the_acu_declared_size);
+    RUN_TEST(test_repairing_is_allowed_by_default);
+    RUN_TEST(test_deny_repair_rejects_an_already_keyed_pd);
+    RUN_TEST(test_deny_repair_still_allows_the_first_pairing);
+    RUN_TEST(test_untrusted_acu_is_rejected_as_auth_failure);
     RUN_TEST(test_pd_without_pairing_naks);
     return UNITY_END();
 }

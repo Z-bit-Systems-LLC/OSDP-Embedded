@@ -74,6 +74,10 @@ typedef struct osdp_pd_pair {
 
     osdp_pd_pair_established_cb cb;
     void                      *cb_user;
+
+    /* Re-pairing policy; see osdp_pd_pair_set_deny_repair. Default false
+     * (allow), which is what osdp_pd_pair_init's zeroing gives. */
+    bool                       deny_repair;
 } osdp_pd_pair_t;
 
 /* Initialise pairing state with the PD's credential and the trust anchor
@@ -88,6 +92,26 @@ void osdp_pd_pair_init(osdp_pd_pair_t           *pair,
 void osdp_pd_pair_set_established_handler(osdp_pd_pair_t             *pair,
                                           osdp_pd_pair_established_cb cb,
                                           void                      *user);
+
+/* Refuse to pair again once this PD already holds an SC2 SCBK. A Message 1
+ * arriving in that state is answered with a Result of
+ * OSDP_PAIR_STATUS_POLICY (0x03) and the exchange goes no further; the
+ * existing key is untouched.
+ *
+ * Default is ALLOW (deny = false), which is the permissive choice and is
+ * deliberate: pairing is already gated by mutual certificate authentication,
+ * so an attacker who can re-pair could have paired in the first place. Denial
+ * protects against a *trusted* ACU displacing another trusted ACU's key,
+ * which is a fleet-management concern rather than an attack, and it is the
+ * kind of policy that should be switched on knowingly. Note that a PD which
+ * denies re-pairing and has persisted a key cannot be re-provisioned over
+ * OSDP at all — there is no unpair command in the protocol, so the key must
+ * be cleared by some out-of-band means.
+ *
+ * The check needs a key to see: it keys off pd->sc2.scbk_set, so a PD that
+ * derives an SCBK but does not persist it is pairable again after a reboot
+ * whatever this is set to. */
+void osdp_pd_pair_set_deny_repair(osdp_pd_pair_t *pair, bool deny);
 
 /* Attach the pairing driver to a PD (sets pd->pair). Pass a PD that already
  * has its SC2 crypto + cUID configured so the handoff can complete. */
