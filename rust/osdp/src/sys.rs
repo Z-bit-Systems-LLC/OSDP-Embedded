@@ -1509,6 +1509,10 @@ mod pd_ffi {
         pub online: bool,
         pub last_comm_ms: u32,
 
+        /* Inter-character timeout tracking (spec 5.8). */
+        pub rx_partial_len: usize,
+        pub rx_partial_ms: u32,
+
         pub sc: osdp_pd_sc_t,
 
         pub sc2: osdp_pd_sc2_t,

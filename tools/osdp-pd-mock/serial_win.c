@@ -25,6 +25,17 @@
 
 struct serial_ctx {
     HANDLE handle;
+
+    /* Driver-reported line errors. A frame that fails its CRC has either been
+     * corrupted on the wire (framing / parity) or lost bytes because this
+     * process did not drain the driver's receive queue fast enough (RXOVER) —
+     * two very different bugs that look identical from the OSDP layer, which
+     * only ever sees "bad check". */
+    unsigned long rx_over;
+    unsigned long overrun;
+    unsigned long framing;
+    unsigned long parity;
+    unsigned long brk;
 };
 
 /* ---- Transport callbacks --------------------------------------------- */
@@ -35,6 +46,32 @@ static int win_read(void *user, uint8_t *buf, size_t cap)
     if (ctx == NULL || ctx->handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
+    /* Ask the driver whether anything went wrong since the last read. This
+     * also clears the error state, which ReadFile needs before it will
+     * deliver further bytes after a hard error. */
+    DWORD    errors = 0;
+    COMSTAT  stat;
+    (void)memset(&stat, 0, sizeof(stat));
+    if (ClearCommError(ctx->handle, &errors, &stat) && errors != 0) {
+        if (errors & CE_RXOVER)   { ctx->rx_over++; }
+        if (errors & CE_OVERRUN)  { ctx->overrun++; }
+        if (errors & CE_FRAME)    { ctx->framing++; }
+        if (errors & CE_RXPARITY) { ctx->parity++; }
+        if (errors & CE_BREAK)    { ctx->brk++; }
+        fprintf(stderr,
+                "*** serial error 0x%lX:%s%s%s%s%s queued=%lu"
+                "  totals rxover=%lu overrun=%lu frame=%lu parity=%lu break=%lu\n",
+                (unsigned long)errors,
+                (errors & CE_RXOVER)   ? " RXOVER"  : "",
+                (errors & CE_OVERRUN)  ? " OVERRUN" : "",
+                (errors & CE_FRAME)    ? " FRAME"   : "",
+                (errors & CE_RXPARITY) ? " PARITY"  : "",
+                (errors & CE_BREAK)    ? " BREAK"   : "",
+                (unsigned long)stat.cbInQue,
+                ctx->rx_over, ctx->overrun, ctx->framing,
+                ctx->parity, ctx->brk);
+    }
+
     DWORD got = 0;
     /* SetCommTimeouts has been configured so this returns immediately
      * with whatever's available (0 if nothing). */
