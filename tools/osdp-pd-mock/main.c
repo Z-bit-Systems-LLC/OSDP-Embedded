@@ -227,6 +227,12 @@ static int write_tap(void *user, const uint8_t *buf, size_t len)
                         (unsigned)(h[0] | (h[1] << 8)),
                         (unsigned)(h[2] | (h[3] << 8)),
                         (unsigned)(h[4] | (h[5] << 8)));
+            } else if ((code == OSDP_REPLY_NAK) && (len - off >= 7)) {
+                /* The error code is the whole point of a NAK, and the pairing
+                 * driver has several NAK paths that are indistinguishable
+                 * without it. */
+                fprintf(stderr, "    tx[%zu] reply 0x%02X  nak=0x%02X\n",
+                        len, code, buf[off + 6]);
             } else {
                 fprintf(stderr, "    tx[%zu] reply 0x%02X\n", len, code);
             }
