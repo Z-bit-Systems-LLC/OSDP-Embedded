@@ -301,6 +301,52 @@ treat Deny as opt-in, the opposite of the safer-looking choice.
 `OSDP_KEYSET_KEY_TYPE_SCBK_AES256`. It re-installs the *same* SCBK rather than
 rotating, so no key-tracking work is implied. This retires the main risk in 4.0.
 
+## 5b. Live pairing bring-up — status 2026-08-10
+
+Benchmark `--mode both` against `osdp-pd-mock --pair`, COM3/COM7, 38400.
+
+**Works:** interrogation; the ACU sizes its fragments from our PDCAP fn 10
+(498 B); Message 1 transfers in 11 fragments; the PD **accepts** it — the
+ACU's demo-CA certificate validates, ML-KEM encapsulation runs, Message 2 is
+built and queued.
+
+**Fails:** the ACU never accepts our first `osdp_PAIRR` fragment. It re-sends
+a byte-identical POLL (same sequence), so our spec-5.9 retransmit cache
+correctly replays the cached reply, and the exchange sits on fragment 0 until
+the ACU times out in `AwaitingResponse`.
+
+```
+tx[512] reply 0x8A  mp total=7392 off=0 frag=497     <- repeated, offset never advances
+rx[9]   FF 53 00 08 00 05 60 DA 99                   <- identical POLL each time
+```
+
+Ruled out:
+
+- **Not the certificate.** `test_pair_interop` decodes and verifies a
+  certificate OSDP.Net actually emitted, and our regenerated demo CA public
+  key is byte-identical to `CertificateAuthority.Demo().PublicKey`
+  (SHA-256 `6C1C6507…3CB9`).
+- **Not our fragment iterator.** `osdp_mp_frag_iter_next` advances correctly
+  and is covered by tests; the repetition is the retransmit cache replaying,
+  which is the correct response to an identical command.
+- **Not reply size alone.** Forcing small replies via `--acu-receive-size 256`
+  fails the same way, just sooner.
+- **Not the reply layout.** `PairData.BuildData` is
+  `total(2) || offset(2) || fragLen(2) || fragment`, little-endian — what we
+  emit.
+
+Open leads, in the order worth trying:
+
+1. Whether the ACU accepts a `osdp_PAIRR` in reply to a plain `osdp_POLL` at
+   all. `ControlPanel` calls `SetReceivingMultipartMessaging(...)` around the
+   collection loop, and what that changes about the poll it issues has not
+   been read yet.
+2. Whether our reply frame is well-formed at 511 bytes specifically — the
+   largest reply this PD has ever sent. Dumping the full frame header rather
+   than just the reply code would settle it.
+3. Whether OSDP.Net's reply parser bounds a cleartext reply below what its
+   own `osdp_ACURXSIZE` advertised.
+
 ## 6. Open questions
 
 1. **Validity windows without an RTC (§2.1)** — is the optional-clock-hook
