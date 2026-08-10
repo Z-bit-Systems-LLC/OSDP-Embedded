@@ -331,20 +331,45 @@ osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
     return build_reply(pd, cmd, reply, out_len);
 }
 
-/* Send `len` bytes from `buf` via the bound transport. Short writes
- * are dropped on the floor for now; future iterations may queue or
- * report a transmission error.
+/* Send `len` bytes from `buf` via the bound transport, resuming until the
+ * whole frame is out or the transport stops accepting bytes.
  *
- * On a successful (non-empty) send, the PD is considered to have just
- * communicated: refresh last_comm_ms and set online = true so spec
- * 5.7's 8-second silence window starts over. */
+ * A transport `write()` is permitted to accept less than it was offered — a
+ * UART driver with a bounded TX FIFO, a non-blocking descriptor, a USB bridge
+ * mid-flush. This used to issue one call and discard the count, which
+ * truncated the frame and put a partial message on the wire. The failure that
+ * produces is unusually nasty: small replies always fit in one call so
+ * everything works, and only large ones break, where they present as the peer
+ * timing out waiting for a message it can never complete, followed by
+ * whatever bytes did land being mistaken for the start of the next frame.
+ *
+ * The loop is bounded by `len`: each iteration either advances `sent` or
+ * stops. A transport that can take nothing right now returns 0 and the frame
+ * is abandoned rather than spun on — the ACU's retry is the recovery path,
+ * and blocking a freestanding state machine here would be worse.
+ *
+ * On a non-empty send the PD is considered to have just communicated:
+ * refresh last_comm_ms and set online = true so spec 5.7's 8-second silence
+ * window starts over. */
 static void send_bytes(osdp_pd_t *pd, const uint8_t *buf, size_t len)
 {
     if (pd->transport.write == NULL || len == 0) {
         return;
     }
-    const int written = pd->transport.write(pd->transport.user, buf, len);
-    (void)written;
+
+    size_t sent = 0;
+    while (sent < len) {
+        const int n = pd->transport.write(pd->transport.user,
+                                          &buf[sent], len - sent);
+        if (n <= 0) {
+            break;
+        }
+        sent += (size_t)n;
+    }
+
+    if (sent == 0) {
+        return;   /* nothing reached the wire; not evidence of comms */
+    }
 
     if (pd->transport.now_ms != NULL) {
         pd->last_comm_ms = pd->transport.now_ms(pd->transport.user);
