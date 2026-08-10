@@ -17,6 +17,7 @@
 
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_frame.h"
+#include "osdp/osdp_multipart.h"
 #include "osdp/osdp_pd.h"
 #include "osdp/osdp_replies.h"
 #include "unity.h"
@@ -563,11 +564,148 @@ static void test_max_reply_payload_follows_the_bound_capacity(void)
     TEST_ASSERT_EQUAL_size_t(0, osdp_pd_max_reply_payload(NULL));
 }
 
+/* ---- Fragment sizing ----------------------------------------------------*/
+
+/* The fragment helper is the reply helper minus the multi-part header, so the
+ * relationship is exact rather than approximate — pinning it here means a
+ * change to either one that forgets the other fails loudly. Checked with a TX
+ * buffer far smaller than the ACU's default declared capacity, so this PD's
+ * own limit is the binding one. */
+static void test_max_fragment_payload_is_reply_payload_less_the_header(void)
+{
+    static uint8_t tx[64];
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
+    const size_t reply = osdp_pd_max_reply_payload(&pd);
+    TEST_ASSERT_GREATER_THAN_size_t(OSDP_MP_HEADER_BYTES, reply);
+
+    TEST_ASSERT_EQUAL_size_t(reply - OSDP_MP_HEADER_BYTES,
+                             osdp_pd_max_fragment_payload(&pd));
+    TEST_ASSERT_EQUAL_size_t(0, osdp_pd_max_fragment_payload(NULL));
+}
+
+/* The whole point of the helper: the ACU's declared receive size is a real
+ * constraint, not advisory. With a large TX buffer bound, the answer must
+ * track osdp_ACURXSIZE rather than this PD's own capacity — and a PD that has
+ * heard nothing must stay at the conservative spec-6.26 default rather than
+ * assuming the ACU can take a full frame. */
+static void test_max_fragment_payload_honours_the_acu_declared_size(void)
+{
+    static uint8_t tx[OSDP_FRAME_MAX_LEN];
+
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+    osdp_pd_set_transport(&pd, &t);
+
+    /* Before any osdp_ACURXSIZE: bounded by the 128-byte default, NOT by the
+     * 1440-byte buffer this PD happens to have bound. */
+    const size_t defaulted = osdp_pd_max_fragment_payload(&pd);
+    TEST_ASSERT_EQUAL_size_t(OSDP_PD_DEFAULT_ACU_RX_SIZE,
+                             osdp_pd_acu_rx_size(&pd));
+    TEST_ASSERT_LESS_THAN_size_t(OSDP_PD_DEFAULT_ACU_RX_SIZE, defaulted);
+
+    /* The ACU declares a larger buffer; the answer must grow. */
+    const uint8_t payload[2] = { 0xA0, 0x05 };   /* 1440, little-endian */
+    inject_command(&m, 0x05, OSDP_CMD_ACURXSIZE, payload, sizeof(payload), 1);
+    osdp_pd_tick(&pd);
+
+    TEST_ASSERT_EQUAL_UINT16(1440U, osdp_pd_acu_rx_size(&pd));
+    const size_t raised = osdp_pd_max_fragment_payload(&pd);
+    TEST_ASSERT_GREATER_THAN_size_t(defaulted, raised);
+
+    /* Now the PD's own TX buffer is the binding limit, so the fragment answer
+     * collapses back onto the reply answer less the header. */
+    TEST_ASSERT_EQUAL_size_t(osdp_pd_max_reply_payload(&pd) - OSDP_MP_HEADER_BYTES,
+                             raised);
+}
+
+/* A fragment sized by the helper must survive the round trip the helper
+ * exists to serve: header + fragment built by osdp_mp_fragment_build, framed
+ * as a reply, and back off the wire intact. One byte more must not fit. */
+static void test_max_fragment_payload_is_what_a_fragment_can_carry(void)
+{
+    static uint8_t tx[128];
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+
+    const size_t frag_len = osdp_pd_max_fragment_payload(&pd);
+    TEST_ASSERT_GREATER_THAN_size_t(0, frag_len);
+
+    fill_ramp(big_payload, frag_len);
+    const osdp_mp_fragment_t frag = {
+        .total_size = (uint16_t)frag_len,
+        .offset     = 0,
+        .data       = big_payload,
+        .frag_len   = frag_len,
+    };
+
+    static uint8_t fbuf[OSDP_FRAME_MAX_LEN];
+    size_t flen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_mp_fragment_build(&frag, fbuf, sizeof(fbuf), &flen));
+    TEST_ASSERT_EQUAL_size_t(OSDP_MP_HEADER_BYTES + frag_len, flen);
+
+    /* Exactly this much reaches the wire ... */
+    {
+        mock_transport_t    m;
+        osdp_pd_transport_t t;
+        mock_init(&m, &t);
+        osdp_pd_init(&pd, 0x05);
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+        osdp_pd_set_transport(&pd, &t);
+        osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+        big_payload_len = flen;
+        fill_ramp(big_payload, big_payload_len);
+
+        inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+        osdp_pd_tick(&pd);
+
+        osdp_frame_t reply;
+        decode_first_outgoing(&m, &reply);
+        TEST_ASSERT_EQUAL_size_t(flen, reply.payload_len);
+    }
+
+    /* ... and one byte more does not, so the helper is not under-reporting. */
+    {
+        mock_transport_t    m;
+        osdp_pd_transport_t t;
+        mock_init(&m, &t);
+        osdp_pd_init(&pd, 0x05);
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+        osdp_pd_set_transport(&pd, &t);
+        osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+        big_payload_len = flen + 1U;
+        fill_ramp(big_payload, big_payload_len);
+
+        inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+        osdp_pd_tick(&pd);
+        TEST_ASSERT_EQUAL_size_t(0, m.outgoing_len);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_max_reply_payload_is_what_actually_fits);
     RUN_TEST(test_max_reply_payload_follows_the_bound_capacity);
+    RUN_TEST(test_max_fragment_payload_is_reply_payload_less_the_header);
+    RUN_TEST(test_max_fragment_payload_honours_the_acu_declared_size);
+    RUN_TEST(test_max_fragment_payload_is_what_a_fragment_can_carry);
     RUN_TEST(test_sizing_constant_matches_the_embedded_arrays);
     RUN_TEST(test_init_binds_every_region_to_its_embedded_array);
     RUN_TEST(test_reply_too_large_for_the_bound_tx_buffer_is_dropped);
