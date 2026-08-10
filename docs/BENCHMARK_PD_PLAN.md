@@ -39,18 +39,32 @@ path — the benchmark is the ACU.
 These come from reading the overview against our code. None blocks a
 happy-path first pairing; all four are real divergences from the reference PD.
 
-### 2.1 Certificate validity windows are never checked
+### 2.1 Certificate validity windows are never checked — DEFERRED
+
+**Status: open, parked for a design discussion (2026-08-10). Not a blocker for
+benchmarking.**
 
 `not_before` / `not_after` are encoded and decoded (`cert.c:21-22`, `:106-107`)
 but nothing compares them to a clock. The overview says CA-based validation
 "verifies that the ACU's certificate is signed by that CA **and has valid
-timestamps**."
+timestamps**", so we are one check short of the reference on every pairing.
 
-This needs a design decision, not just code: many readers have no RTC. Proposal
-— an optional `osdp_pair_time_cb` on the trust anchor. Bound, the window is
-enforced; NULL, it is skipped and that fact is documented as a deliberate
-downgrade rather than an oversight. A PD that silently ignores expiry while
-claiming CA validation is the worse outcome.
+Parked rather than dropped because it needs a decision, not just code: many
+readers have no RTC, and the core has no time source of its own — pairing
+currently reaches a clock only through `osdp_pd_transport_t::now_ms`, which is
+a millisecond uptime counter, not a wall clock, and so cannot evaluate a Unix
+timestamp at all.
+
+Starting proposal for that discussion: an optional `osdp_pair_time_cb` on the
+trust anchor supplying Unix seconds. Bound, the window is enforced; NULL, it is
+skipped and that is *documented* as a deliberate downgrade rather than an
+oversight. Points to settle — whether NULL should instead be a hard refusal for
+a CA-anchored trust config, what a PD with only a monotonic counter is supposed
+to do, and whether an expired-but-otherwise-valid peer warrants its own wire
+status rather than folding into AUTH_FAIL (0x01).
+
+The benchmark is unaffected: its demo credentials are generated per run, so
+they are never outside their window.
 
 ### 2.2 Thumbprint-by-reference credentials are rejected
 
@@ -198,14 +212,23 @@ key-type risk is already retired on paper (§5) — this is the live check.
 
 **Done when:** a report exists with five SC2 sessions and no NAKs.
 
-### 4.1 — Close the conformance gaps (§2)
+### 4.1 — Close the conformance gaps (§2) — MOSTLY DONE
 
-Validity-window hook, thumbprint-by-reference validation, re-pairing policy,
-and the status-code reconciliation. Each gets a unit test alongside the
-existing seven pairing suites; §2.1 and §2.3 add public API, so both need
-sign-off before implementation.
+- ☑ **§2.4 outbound fragment sizing.** `osdp_pd_max_fragment_payload` resolved
+  once when Message 2 is queued, clamped to `OSDP_PAIR_MAX_FRAGMENT_SIZE`.
+  Was a correctness bug as well as a speed one: the old fixed 128-byte payload
+  overran a default-capacity ACU's declared 128-byte packet. Measured 66 polls
+  at 113 bytes → 15 at 497.
+- ☑ **§2.3 re-pairing policy.** `osdp_pd_pair_set_deny_repair`, default allow,
+  answering POLICY (0x03). In the driver, not the session, and checked before
+  authentication.
+- ☑ **§2.5 rejection status.** Refused credential is now AUTH_FAIL (0x01);
+  0x03 is reserved for policy declines per `PairingStatus`.
+- ☐ **§2.2 thumbprint-by-reference credentials.** Independent of the rest; no
+  decision needed, just implementation plus a cached-peer store.
+- ⏸ **§2.1 validity windows.** Parked for discussion — see §2.1.
 
-**Done when:** the C suite is green and the new behaviours are pinned by tests.
+**Done when:** §2.2 lands and the C suite is green.
 
 ### 4.2 — Make the backends shippable (§3.1)
 
