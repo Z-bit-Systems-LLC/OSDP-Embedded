@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
-#include "pair_test_crypto.h"
+#include "osdp_pair_pqclean.h"
 
 #include <string.h>
 
@@ -23,14 +23,36 @@ extern int PQCLEAN_MLDSA44_CLEAN_crypto_sign_verify(
 /* PQClean common SHA-256 one-shot. */
 extern void sha256(uint8_t *out, const uint8_t *in, size_t inlen);
 
-/* ---- Randomness: injectable fixed seed + reproducible PRNG fallback ----- */
+/* ---- Randomness ---------------------------------------------------------
+ *
+ * ML-KEM keygen, ML-DSA keygen and the pairing nonces all draw from
+ * PQCLEAN_randombytes, which PQClean leaves for the integrator to define. It
+ * is therefore the single point where this port's security actually lives,
+ * and it is deliberately NOT defaulted: with no source installed the hook
+ * FAILS rather than inventing bytes, so a consumer that forgets gets a loud
+ * crypto error instead of a quiet stream of predictable keys.
+ *
+ * OSDP_PAIR_PQCLEAN_DETERMINISTIC additionally compiles in the seed queue and
+ * a reproducible splitmix64 fallback, which is what lets a KAT reproduce a
+ * fixed-seed keypair. That is a testing facility and a hazard anywhere else,
+ * so it is opt-in at build time rather than at run time — a firmware or tool
+ * build simply cannot link a seedable RNG by mistake. */
+
+static osdp_pair_pqclean_rand_fn s_rand;
+
+void osdp_pair_pqclean_set_rand(osdp_pair_pqclean_rand_fn fn)
+{
+    s_rand = fn;
+}
+
+#ifdef OSDP_PAIR_PQCLEAN_DETERMINISTIC
 
 static uint8_t s_seed[128];
 static size_t  s_seed_len;
 static size_t  s_seed_pos;
 static uint64_t s_prng = 0x0123456789ABCDEFULL; /* fixed → reproducible */
 
-void osdp_pair_test_seed_push(const uint8_t *bytes, size_t len)
+void osdp_pair_pqclean_seed_push(const uint8_t *bytes, size_t len)
 {
     if (len > sizeof(s_seed)) {
         len = sizeof(s_seed);
@@ -40,18 +62,14 @@ void osdp_pair_test_seed_push(const uint8_t *bytes, size_t len)
     s_seed_pos = 0;
 }
 
-void osdp_pair_test_seed_clear(void)
+void osdp_pair_pqclean_seed_clear(void)
 {
     s_seed_len = 0;
     s_seed_pos = 0;
 }
 
-/* Definition of PQClean's randombytes hook (declared as PQCLEAN_randombytes
- * behind the randombytes macro in the vendored code). Serves queued seed
- * bytes first, then a splitmix64 stream so tests are hermetic and
- * reproducible without OS entropy. */
-int PQCLEAN_randombytes(uint8_t *out, size_t n);
-int PQCLEAN_randombytes(uint8_t *out, size_t n)
+/* Queued seed bytes first, then the reproducible stream. */
+static int deterministic_rand(uint8_t *out, size_t n)
 {
     size_t i = 0;
     while (i < n && s_seed_pos < s_seed_len) {
@@ -66,6 +84,45 @@ int PQCLEAN_randombytes(uint8_t *out, size_t n)
         out[i] = (uint8_t)z;
     }
     return 0;
+}
+
+#endif /* OSDP_PAIR_PQCLEAN_DETERMINISTIC */
+
+/* Sticky "the entropy hook could not deliver" flag.
+ *
+ * Needed because PQClean's schemes call randombytes() and DISCARD its return
+ * value — see mldsa44/sign.c and mlkem768/kem.c, which treat it as infallible.
+ * So crypto_sign_keypair reports success whatever happened underneath, and a
+ * failed draw would otherwise surface as a perfectly well-formed key derived
+ * from whatever was in the seed buffer. Zeroing on failure keeps that
+ * deterministic instead of uninitialised, and this flag is what the port's
+ * own entry points check afterwards to turn it into an error. */
+static bool s_rand_failed;
+
+static void rand_begin(void) { s_rand_failed = false; }
+static bool rand_ok(void)    { return !s_rand_failed; }
+
+/* Definition of PQClean's randombytes hook (declared as PQCLEAN_randombytes
+ * behind the randombytes macro in the vendored code). */
+int PQCLEAN_randombytes(uint8_t *out, size_t n);
+int PQCLEAN_randombytes(uint8_t *out, size_t n)
+{
+    if (s_rand != NULL) {
+        if (s_rand(out, n) == 0) {
+            return 0;
+        }
+        s_rand_failed = true;
+        (void)memset(out, 0, n);
+        return -1;
+    }
+#ifdef OSDP_PAIR_PQCLEAN_DETERMINISTIC
+    return deterministic_rand(out, n);
+#else
+    /* No entropy source installed — fail, do not improvise. */
+    s_rand_failed = true;
+    (void)memset(out, 0, n);
+    return -1;
+#endif
 }
 
 /* ---- HMAC-SHA256 / HKDF-SHA256 over the PQClean SHA-256 ------------------ */
@@ -162,8 +219,14 @@ static osdp_status_t hkdf_sha256_impl(const uint8_t *salt, size_t salt_len,
 
 static osdp_status_t cb_kem_keygen(void *user, uint8_t ek[OSDP_MLKEM768_EK_LEN])
 {
-    osdp_pair_test_ctx_t *c = (osdp_pair_test_ctx_t *)user;
-    if (PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair(ek, c->kem_sk) != 0) {
+    osdp_pair_pqclean_ctx_t *c = (osdp_pair_pqclean_ctx_t *)user;
+    rand_begin();
+    if (PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair(ek, c->kem_sk) != 0
+        || !rand_ok()) {
+        /* As in gen_dsa: the keypair call cannot report an entropy failure,
+         * so the flag is what stops a zero-seeded ephemeral key being used. */
+        (void)memset(c->kem_sk, 0, sizeof(c->kem_sk));
+        c->has_kem_sk = false;
         return OSDP_ERR_NOT_SUPPORTED;
     }
     c->has_kem_sk = true;
@@ -186,7 +249,7 @@ static osdp_status_t cb_kem_decaps(void *user,
                                    const uint8_t ct[OSDP_MLKEM768_CT_LEN],
                                    uint8_t ss[OSDP_MLKEM_SS_LEN])
 {
-    osdp_pair_test_ctx_t *c = (osdp_pair_test_ctx_t *)user;
+    osdp_pair_pqclean_ctx_t *c = (osdp_pair_pqclean_ctx_t *)user;
     if (!c->has_kem_sk) {
         return OSDP_ERR_INVALID_ARG;
     }
@@ -199,7 +262,7 @@ static osdp_status_t cb_kem_decaps(void *user,
 static osdp_status_t cb_dsa_sign(void *user, const uint8_t *msg, size_t msg_len,
                                  uint8_t sig[OSDP_MLDSA44_SIG_LEN])
 {
-    osdp_pair_test_ctx_t *c = (osdp_pair_test_ctx_t *)user;
+    osdp_pair_pqclean_ctx_t *c = (osdp_pair_pqclean_ctx_t *)user;
     if (!c->has_dsa) {
         return OSDP_ERR_INVALID_ARG;
     }
@@ -256,12 +319,14 @@ static osdp_status_t cb_hkdf(void *user,
 static osdp_status_t cb_rand(void *user, uint8_t *out, size_t len)
 {
     (void)user;
-    (void)PQCLEAN_randombytes(out, len);
+    if (PQCLEAN_randombytes(out, len) != 0) {
+        return OSDP_ERR_NOT_SUPPORTED;
+    }
     return OSDP_OK;
 }
 
-void osdp_pair_test_crypto_init(osdp_pair_crypto_t *crypto,
-                                osdp_pair_test_ctx_t *ctx)
+void osdp_pair_pqclean_crypto_init(osdp_pair_crypto_t *crypto,
+                                osdp_pair_pqclean_ctx_t *ctx)
 {
     (void)memset(ctx, 0, sizeof(*ctx));
     crypto->ml_kem768_keygen = cb_kem_keygen;
@@ -276,12 +341,19 @@ void osdp_pair_test_crypto_init(osdp_pair_crypto_t *crypto,
     crypto->user             = ctx;
 }
 
-osdp_status_t osdp_pair_test_gen_dsa(osdp_pair_test_ctx_t *ctx)
+osdp_status_t osdp_pair_pqclean_gen_dsa(osdp_pair_pqclean_ctx_t *ctx)
 {
     extern int PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(uint8_t *pk,
                                                          uint8_t *sk);
+    rand_begin();
     if (PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(ctx->dsa_pk, ctx->dsa_sk)
-        != 0) {
+        != 0 || !rand_ok()) {
+        /* rand_ok() is the load-bearing half: the keypair call cannot report
+         * an entropy failure, so without it a key derived from a zeroed seed
+         * would be accepted as valid. */
+        (void)memset(ctx->dsa_pk, 0, sizeof(ctx->dsa_pk));
+        (void)memset(ctx->dsa_sk, 0, sizeof(ctx->dsa_sk));
+        ctx->has_dsa = false;
         return OSDP_ERR_NOT_SUPPORTED;
     }
     ctx->has_dsa = true;

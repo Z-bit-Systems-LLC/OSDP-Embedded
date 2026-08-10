@@ -43,3 +43,49 @@ target_link_libraries(osdp_port_sc_tiny
 target_compile_features(osdp_port_sc_tiny PUBLIC c_std_11)
 
 add_library(osdp::port_sc_tiny ALIAS osdp_port_sc_tiny)
+
+# osdp_port_pair_pqclean — ML-KEM-768 / ML-DSA-44 / SHA-256 for SC2 asymmetric
+# pairing, over the vendored PQClean. Shared by the pairing KATs and the
+# interop tools; a product binds WolfSSL or another PQC library instead.
+#
+# Note this one links its vendored dependencies PUBLIC rather than PRIVATE.
+# PQClean leaves PQCLEAN_randombytes for the integrator to define and this
+# port defines it, so the symbol has to stay resolvable to whatever links the
+# schemes — making them private here would leave that hook dangling.
+add_library(osdp_port_pair_pqclean STATIC
+    pqclean/osdp_pair_pqclean.c
+)
+
+target_include_directories(osdp_port_pair_pqclean
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pqclean
+)
+
+target_link_libraries(osdp_port_pair_pqclean
+    PUBLIC osdp_core osdp_pair pqclean_mlkem768 pqclean_mldsa44
+)
+
+target_compile_features(osdp_port_pair_pqclean PUBLIC c_std_11)
+
+add_library(osdp::port_pair_pqclean ALIAS osdp_port_pair_pqclean)
+
+# Deterministic variant for the KATs: same sources, plus the seed queue and
+# the reproducible PRNG fallback. A separate target rather than a switch on
+# the one above, so a tool linking the plain target cannot pick up a seedable
+# RNG through a transitive dependency.
+add_library(osdp_port_pair_pqclean_kat STATIC
+    pqclean/osdp_pair_pqclean.c
+)
+
+target_include_directories(osdp_port_pair_pqclean_kat
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pqclean
+)
+
+target_compile_definitions(osdp_port_pair_pqclean_kat
+    PUBLIC OSDP_PAIR_PQCLEAN_DETERMINISTIC=1
+)
+
+target_link_libraries(osdp_port_pair_pqclean_kat
+    PUBLIC osdp_core osdp_pair pqclean_mlkem768 pqclean_mldsa44
+)
+
+target_compile_features(osdp_port_pair_pqclean_kat PUBLIC c_std_11)

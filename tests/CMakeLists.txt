@@ -57,13 +57,20 @@ add_executable(test_pair_messages test_pair_messages.c)
 target_link_libraries(test_pair_messages PRIVATE osdp_pair unity)
 add_test(NAME test_pair_messages COMMAND test_pair_messages)
 
-# Pairing crypto test backend: osdp_pair_crypto_t over vendored PQClean
-# (ML-KEM-768 + ML-DSA-44 + SHA-256) with HMAC/HKDF on top. Host-only, never
-# in a production core. Mirrors sc2_test_crypto.
-add_library(pair_test_crypto STATIC pair_test_crypto.c)
-target_include_directories(pair_test_crypto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pair_test_crypto
-    PUBLIC osdp_pair pqclean_mlkem768 pqclean_mldsa44)
+# The pairing crypto backend moved to ports/pqclean so the interop tools can
+# link it too. Tests use the _kat variant, which adds the seed queue and the
+# reproducible PRNG the fixed-seed vectors depend on.
+add_library(pair_test_crypto INTERFACE)
+target_link_libraries(pair_test_crypto INTERFACE osdp_port_pair_pqclean_kat)
+
+# The port's entropy contract, against the PLAIN target — the variant a tool
+# links. Deliberately NOT pair_test_crypto: with the seed queue compiled in
+# there is always a fallback, so the "no source installed" case it asserts
+# could not exist.
+add_executable(test_pair_pqclean_rng test_pair_pqclean_rng.c)
+target_link_libraries(test_pair_pqclean_rng PRIVATE
+    osdp_port_pair_pqclean unity)
+add_test(NAME test_pair_pqclean_rng COMMAND test_pair_pqclean_rng)
 
 # SC2 asymmetric pairing — Phase 1 crypto KATs (thumbprint, cert verify,
 # SHA-256/HKDF vectors, ML-KEM/ML-DSA fixed-seed pubkey cross-checks).

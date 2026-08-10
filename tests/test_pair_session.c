@@ -7,14 +7,14 @@
  * CA public key. Plus untrusted-CA and tampered-message negatives. */
 
 #include "osdp/osdp_pair.h"
-#include "pair_test_crypto.h"
+#include "osdp_pair_pqclean.h"
 #include "unity.h"
 
 #include <string.h>
 
 /* Three crypto contexts: a CA (signs device certs), the ACU, and the PD. */
 static osdp_pair_crypto_t   ca_crypto,  acu_crypto,  pd_crypto;
-static osdp_pair_test_ctx_t ca_ctx,     acu_ctx,     pd_ctx;
+static osdp_pair_pqclean_ctx_t ca_ctx,     acu_ctx,     pd_ctx;
 
 /* Device certificates (CA-signed) presented during the handshake. */
 static uint8_t acu_cert[4096]; static size_t acu_cert_len;
@@ -71,14 +71,14 @@ static size_t make_cert(osdp_pair_crypto_t *ca,
 
 void setUp(void)
 {
-    osdp_pair_test_crypto_init(&ca_crypto,  &ca_ctx);
-    osdp_pair_test_crypto_init(&acu_crypto, &acu_ctx);
-    osdp_pair_test_crypto_init(&pd_crypto,  &pd_ctx);
-    osdp_pair_test_seed_clear();
+    osdp_pair_pqclean_crypto_init(&ca_crypto,  &ca_ctx);
+    osdp_pair_pqclean_crypto_init(&acu_crypto, &acu_ctx);
+    osdp_pair_pqclean_crypto_init(&pd_crypto,  &pd_ctx);
+    osdp_pair_pqclean_seed_clear();
 
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&ca_ctx));
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&acu_ctx));
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&pd_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&ca_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&acu_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&pd_ctx));
 
     acu_cert_len = make_cert(&ca_crypto, acu_ctx.dsa_pk, "ACME", "ACU-1",
                              "SN-ACU", acu_cert, sizeof(acu_cert));

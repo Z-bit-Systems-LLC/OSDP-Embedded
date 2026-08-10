@@ -12,7 +12,7 @@
 #include "osdp/osdp_frame.h"
 #include "osdp/osdp_commands.h"
 #include "osdp/osdp_replies.h"
-#include "pair_test_crypto.h"
+#include "osdp_pair_pqclean.h"
 #include "unity.h"
 
 #include <string.h>
@@ -46,7 +46,7 @@ static uint32_t pd_now(void *u) { (void)u; return g_clock; }
 /* ---- Crypto contexts, certs (CA-signed, mutual) ------------------------- */
 
 static osdp_pair_crypto_t   ca_crypto, acu_crypto, pd_crypto;
-static osdp_pair_test_ctx_t ca_ctx, acu_ctx, pd_ctx;
+static osdp_pair_pqclean_ctx_t ca_ctx, acu_ctx, pd_ctx;
 static uint8_t acu_cert[4096]; static size_t acu_cert_len;
 static uint8_t pd_cert[4096];  static size_t pd_cert_len;
 
@@ -109,13 +109,13 @@ void setUp(void)
     g_established = false;
     g_peer_serial_len = 0;
 
-    osdp_pair_test_crypto_init(&ca_crypto, &ca_ctx);
-    osdp_pair_test_crypto_init(&acu_crypto, &acu_ctx);
-    osdp_pair_test_crypto_init(&pd_crypto, &pd_ctx);
-    osdp_pair_test_seed_clear();
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&ca_ctx));
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&acu_ctx));
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&pd_ctx));
+    osdp_pair_pqclean_crypto_init(&ca_crypto, &ca_ctx);
+    osdp_pair_pqclean_crypto_init(&acu_crypto, &acu_ctx);
+    osdp_pair_pqclean_crypto_init(&pd_crypto, &pd_ctx);
+    osdp_pair_pqclean_seed_clear();
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&ca_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&acu_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&pd_ctx));
     acu_cert_len = make_cert(&ca_crypto, acu_ctx.dsa_pk, "ACME", "ACU-1", "SN-ACU",
                              acu_cert, sizeof(acu_cert));
     pd_cert_len = make_cert(&ca_crypto, pd_ctx.dsa_pk, "ACME", "PD-1", "SN-PD",
@@ -435,12 +435,12 @@ static void test_deny_repair_still_allows_the_first_pairing(void)
 static void test_untrusted_acu_is_rejected_as_auth_failure(void)
 {
     /* An ACU whose cert is signed by a CA this PD does not trust. */
-    static osdp_pair_test_ctx_t rogue_ca_ctx;
+    static osdp_pair_pqclean_ctx_t rogue_ca_ctx;
     static osdp_pair_crypto_t   rogue_ca_crypto;
     static uint8_t              rogue_cert[4096];
 
-    osdp_pair_test_crypto_init(&rogue_ca_crypto, &rogue_ca_ctx);
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&rogue_ca_ctx));
+    osdp_pair_pqclean_crypto_init(&rogue_ca_crypto, &rogue_ca_ctx);
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&rogue_ca_ctx));
     const size_t rogue_len = make_cert(&rogue_ca_crypto, acu_ctx.dsa_pk,
                                        "ACME", "ACU-X", "SN-ROGUE",
                                        rogue_cert, sizeof(rogue_cert));

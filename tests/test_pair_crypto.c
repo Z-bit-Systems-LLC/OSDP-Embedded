@@ -7,18 +7,18 @@
  * against the OSDP.Net reference constants. */
 
 #include "osdp/osdp_pair.h"
-#include "pair_test_crypto.h"
+#include "osdp_pair_pqclean.h"
 #include "unity.h"
 
 #include <string.h>
 
 static osdp_pair_crypto_t   s_crypto;
-static osdp_pair_test_ctx_t s_ctx;
+static osdp_pair_pqclean_ctx_t s_ctx;
 
 void setUp(void)
 {
-    osdp_pair_test_crypto_init(&s_crypto, &s_ctx);
-    osdp_pair_test_seed_clear();
+    osdp_pair_pqclean_crypto_init(&s_crypto, &s_ctx);
+    osdp_pair_pqclean_seed_clear();
 }
 void tearDown(void) {}
 
@@ -75,8 +75,8 @@ static void test_mldsa_demo_ca_pubkey_hash(void)
      * ML-DSA-44 public key is the published demo-CA thumbprint. */
     uint8_t seed[32];
     fill_iota(seed, sizeof(seed), 0x40);
-    osdp_pair_test_seed_push(seed, sizeof(seed));
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&s_ctx));
+    osdp_pair_pqclean_seed_push(seed, sizeof(seed));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&s_ctx));
 
     uint8_t hash[32];
     TEST_ASSERT_EQUAL(OSDP_OK,
@@ -96,7 +96,7 @@ static void test_mlkem_seed_pubkey_hash(void)
      * encapsulation (public) key matches the published constant. */
     uint8_t seed[64];
     fill_iota(seed, sizeof(seed), 0x00);
-    osdp_pair_test_seed_push(seed, sizeof(seed));
+    osdp_pair_pqclean_seed_push(seed, sizeof(seed));
 
     uint8_t ek[OSDP_MLKEM768_EK_LEN];
     TEST_ASSERT_EQUAL(OSDP_OK, s_crypto.ml_kem768_keygen(s_crypto.user, ek));
@@ -120,8 +120,8 @@ static void test_kem_round_trip(void)
     /* ACU generates the ephemeral keypair; PD encapsulates to it; ACU
      * decapsulates — both must agree on the shared secret. */
     osdp_pair_crypto_t   acu_crypto;
-    osdp_pair_test_ctx_t acu_ctx;
-    osdp_pair_test_crypto_init(&acu_crypto, &acu_ctx);
+    osdp_pair_pqclean_ctx_t acu_ctx;
+    osdp_pair_pqclean_crypto_init(&acu_crypto, &acu_ctx);
 
     uint8_t ek[OSDP_MLKEM768_EK_LEN];
     TEST_ASSERT_EQUAL(OSDP_OK, acu_crypto.ml_kem768_keygen(acu_crypto.user, ek));
@@ -143,7 +143,7 @@ static void test_kem_round_trip(void)
 /* Build a self-signed cert into `buf`; return its encoded length. */
 static size_t build_self_signed(uint8_t *buf, size_t cap)
 {
-    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_test_gen_dsa(&s_ctx));
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pair_pqclean_gen_dsa(&s_ctx));
 
     static const uint8_t serial[OSDP_C509_SERIAL_LEN] = {
         1, 2, 3, 4, 5, 6, 7, 8,
