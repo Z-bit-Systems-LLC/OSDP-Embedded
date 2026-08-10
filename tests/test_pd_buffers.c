@@ -38,6 +38,12 @@ typedef struct mock_transport {
     uint8_t  outgoing[MOCK_BUF_LEN];
     size_t   outgoing_len;
     uint32_t now_ms;
+
+    /* Bytes mock_write will accept per call; 0 means "whatever it is
+     * offered". Models a UART driver with a bounded TX FIFO or a
+     * non-blocking descriptor, which is permitted to take less than asked. */
+    size_t   write_chunk;
+    size_t   write_calls;
 } mock_transport_t;
 
 static int mock_read(void *user, uint8_t *buf, size_t cap)
@@ -58,8 +64,12 @@ static int mock_read(void *user, uint8_t *buf, size_t cap)
 static int mock_write(void *user, const uint8_t *buf, size_t len)
 {
     mock_transport_t *m = (mock_transport_t *)user;
+    m->write_calls++;
     const size_t free_room = MOCK_BUF_LEN - m->outgoing_len;
-    const size_t n = (len < free_room) ? len : free_room;
+    size_t n = (len < free_room) ? len : free_room;
+    if (m->write_chunk > 0 && n > m->write_chunk) {
+        n = m->write_chunk;
+    }
     if (n > 0) {
         (void)memcpy(&m->outgoing[m->outgoing_len], buf, n);
         m->outgoing_len += n;
@@ -698,9 +708,91 @@ static void test_max_fragment_payload_is_what_a_fragment_can_carry(void)
     }
 }
 
+/* ---- Short writes --------------------------------------------------------*/
+
+/* A transport write() may accept less than it is offered — a UART with a
+ * bounded TX FIFO, a non-blocking descriptor, a USB bridge mid-flush. The PD
+ * must resume until the whole frame is out.
+ *
+ * This is a regression test for a real interop failure. send_bytes used to
+ * issue one write() and discard the count, so a short write truncated the
+ * frame on the wire. It hid for a long time because every small reply fits in
+ * one call: only large ones broke, and they presented as the peer timing out
+ * waiting for a message that could never complete, then mistaking the bytes
+ * that did land for the start of the next frame. Found against OSDP.Net when
+ * a ~500-byte pairing fragment would not go through while a ~128-byte one
+ * always did. */
+static void test_a_short_writing_transport_still_gets_the_whole_frame(void)
+{
+    static uint8_t tx[300];
+
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+    /* Deliberately mean: 7 bytes a call, which divides nothing evenly. */
+    m.write_chunk = 7;
+
+    const size_t max = osdp_pd_max_reply_payload(&pd);
+    big_payload_len = max;
+    fill_ramp(big_payload, big_payload_len);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+    osdp_pd_tick(&pd);
+
+    /* The whole frame is on the wire and decodes, despite the dribble. */
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_RAW, reply.code);
+    TEST_ASSERT_EQUAL_size_t(max, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(big_payload, reply.payload, max);
+
+    /* And it genuinely took several calls, so the test is exercising the
+     * resume path rather than a transport that quietly accepted everything. */
+    TEST_ASSERT_GREATER_THAN_size_t(1, m.write_calls);
+}
+
+/* A transport that can take nothing must not spin the state machine. The
+ * frame is abandoned; the ACU's retry is the recovery path. */
+static void test_a_transport_accepting_nothing_does_not_hang(void)
+{
+    static uint8_t tx[300];
+
+    mock_transport_t    m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    const osdp_pd_buffers_t bufs = { .tx = tx, .tx_cap = sizeof(tx) };
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_pd_set_buffers(&pd, &bufs));
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, big_reply_handler, NULL);
+
+    /* MOCK_BUF_LEN worth of room already used → every write returns 0. */
+    m.outgoing_len = MOCK_BUF_LEN;
+
+    big_payload_len = 8;
+    fill_ramp(big_payload, big_payload_len);
+
+    inject_command(&m, 0x05, OSDP_CMD_POLL, NULL, 0, 1);
+    osdp_pd_tick(&pd);   /* must return rather than loop forever */
+
+    TEST_ASSERT_EQUAL_size_t(MOCK_BUF_LEN, m.outgoing_len);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_a_short_writing_transport_still_gets_the_whole_frame);
+    RUN_TEST(test_a_transport_accepting_nothing_does_not_hang);
     RUN_TEST(test_max_reply_payload_is_what_actually_fits);
     RUN_TEST(test_max_reply_payload_follows_the_bound_capacity);
     RUN_TEST(test_max_fragment_payload_is_reply_payload_less_the_header);
