@@ -154,7 +154,7 @@ static void send_cmd(uint8_t code, const uint8_t *payload, size_t plen,
     c.payload = payload; c.payload_len = plen;
     g_seq = (uint8_t)((g_seq % 3u) + 1u);
 
-    static uint8_t fbuf[1024]; size_t flen = 0;
+    static uint8_t fbuf[OSDP_FRAME_MAX_LEN]; size_t flen = 0;
     TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&c, fbuf, sizeof(fbuf), &flen));
     (void)memcpy(&a2p.buf[a2p.len], fbuf, flen); a2p.len += flen;
 
@@ -209,7 +209,7 @@ static size_t acu_recv_message(uint8_t *out, size_t out_cap)
     g_msg2_frag_count = 0;
     g_msg2_frag_max   = 0;
     while (state != OSDP_MP_COMPLETE && guard++ < 300) {
-        uint8_t code, pay[1024]; size_t plen = 0;
+        uint8_t code, pay[OSDP_FRAME_MAX_LEN]; size_t plen = 0;
         send_cmd(OSDP_CMD_POLL, NULL, 0, &code, pay, sizeof(pay), &plen);
         if (code != OSDP_REPLY_PAIRR) { continue; }
         osdp_mp_fragment_t frag;
@@ -281,7 +281,7 @@ static void test_msg2_fragments_follow_the_acu_declared_size(void)
 {
     static uint8_t msg1[8192], msg2[8192], msg3[8192];
     size_t n1 = 0, n3 = 0;
-    uint8_t code, pay[1024]; size_t plen = 0;
+    uint8_t code, pay[OSDP_FRAME_MAX_LEN]; size_t plen = 0;
 
     /* --- Default peer limit: every fragment must fit a 128-byte packet. --- */
     TEST_ASSERT_EQUAL_UINT16(OSDP_PD_DEFAULT_ACU_RX_SIZE,
@@ -333,7 +333,7 @@ static void run_pairing(uint8_t scbk[OSDP_PAIR_SCBK_LEN])
 {
     static uint8_t msg1[8192], msg2[8192], msg3[8192];
     size_t n1 = 0, n2 = 0, n3 = 0;
-    uint8_t code, pay[1024]; size_t plen = 0;
+    uint8_t code, pay[OSDP_FRAME_MAX_LEN]; size_t plen = 0;
 
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
@@ -359,7 +359,7 @@ static uint64_t send_msg1_expect_result(void)
 {
     static uint8_t msg1[8192];
     size_t n1 = 0;
-    uint8_t code, pay[1024]; size_t plen = 0;
+    uint8_t code, pay[OSDP_FRAME_MAX_LEN]; size_t plen = 0;
 
     TEST_ASSERT_EQUAL(OSDP_OK,
         osdp_pair_acu_create_msg1(&acu, msg1, sizeof(msg1), &n1));
