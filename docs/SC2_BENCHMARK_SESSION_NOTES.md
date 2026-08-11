@@ -14,9 +14,9 @@ overall plan; this file is the record of a specific debugging arc.
 
 | Branch | Head | Remote |
 | --- | --- | --- |
-| `main` | `7e7ec0a` fix(pd): size the spec 5.8 timeout for transports that batch their RX | **ahead by 1, NOT pushed** |
-| `feature/osdp-sc2` | `afe14fd` Merge branch 'main' into feature/osdp-sc2 | **ahead by 1, NOT pushed** |
-| `pair-conformance` | `262f99c` Merge branch 'feature/osdp-sc2' into pair-conformance | **ahead by 1, NOT pushed** |
+| `main` | `7e7ec0a` fix(pd): size the spec 5.8 timeout for transports that batch their RX | pushed, in sync |
+| `feature/osdp-sc2` | `afe14fd` Merge branch 'main' into feature/osdp-sc2 | pushed, in sync |
+| `pair-conformance` | `94d3347` debug(pd-mock): measure RX delivery gaps and spec-5.8 aborts | pushed, in sync |
 
 `fix-short-write` was verified merged into `main` and deleted.
 
@@ -24,12 +24,10 @@ All three merges were clean — the fix touches `osdp_types.h`, `core/CMakeLists
 and the `osdp_pd.h` timeout block, none of which the SC2/pairing branches had
 diverged in.
 
-**Uncommitted, on `pair-conformance`:** `tests/test_pd_pair.c` — four scratch
-buffers resized from a hardcoded `1024` to `OSDP_FRAME_MAX_LEN`. Needed because
-the test harness could not hold a fragment from a PD built with
-`OSDP_PD_BUF_LEN=1440`. Test-only. (It does **not** belong on `main` — the file
-does not exist there; the earlier note saying otherwise was wrong.) Plus the
-diagnostic tooling in §7 item 4 and this document.
+Nothing uncommitted. The `tests/test_pd_pair.c` scratch-buffer resize that had
+been carried loose since 2026-08-10 went in as `fe1a738`; note it does **not**
+belong on `main` — the file does not exist there, so the earlier note saying
+otherwise was wrong.
 
 ---
 
@@ -411,14 +409,18 @@ fragment sizes.
 3. **Commit the `test_pd_pair.c` buffer resize.** Note it is NOT on `main` —
    the file only exists on the pairing branches, so the earlier note that it
    "belongs on main" was wrong.
-4. **Decide what to keep of the 2026-08-11 diagnostic tooling.** Uncommitted in
-   `tools/osdp-pd-mock/`: `--rx-gap-stats` (gap histogram + exact spec-5.8
-   abort count), `--run-ms` (exit through the normal shutdown path so an
-   unattended trial prints its summary), a timestamp on the `-vv` RX tap, and
-   the opt-in `OSDP_PD_MOCK_SLEEP=hires` sleep. Note the `-vv` observer effect
-   recorded there: per-byte hex to unbuffered stderr costs enough time to
-   change the gaps it is measuring, and on its own turns a passing 57600 link
-   into a failing one — use `--rx-gap-stats` for timing questions, not `-vv`.
+4. **Consider documenting `OSDP_BUFFERED_TRANSPORT` in `CLAUDE.md`.** It is a
+   build knob a cold start would want alongside the buffer-sizing constants,
+   and it is currently only in `osdp_types.h` and here. Left alone because
+   `CLAUDE.md` differs per branch and this was not worth a fourth cross-branch
+   commit.
+
+   *(The 2026-08-11 diagnostic tooling — `--rx-gap-stats`, `--run-ms`, the
+   `-vv` timestamp, `OSDP_PD_MOCK_SLEEP=hires` — was kept, committed as
+   `94d3347`. The `-vv` observer effect is documented in that commit and in
+   the source: per-byte hex to unbuffered stderr costs enough time to change
+   the gaps it is measuring, and on its own turns a passing 57600 link into a
+   failing one. Use `--rx-gap-stats` for timing questions, not `-vv`.)*
 5. **Re-run the OSDP.Net control PD on the good link.** Its 2/3 is from the
    faulty adapter only. The claim "our PD is more robust than the reference
    because of the 5.8 fix" rests on that comparison and deserves a clean-link
