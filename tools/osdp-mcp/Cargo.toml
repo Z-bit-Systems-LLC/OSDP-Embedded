@@ -44,7 +44,17 @@ crypto-rustcrypto = ["dep:aes", "dep:aes-gcm", "dep:tiny-keccak", "dep:getrandom
 crypto-tiny-aes   = ["dep:getrandom"]
 
 [dependencies]
-osdp-embedded = { path = "../../rust/osdp", default-features = false, features = ["std", "pd"] }
+# `buffered-transport`: this server drives a real serial port, in practice a
+# USB adapter, which hands the PD its RX in clumps rather than byte by byte.
+# Without it the C core keeps the spec's 20 ms inter-character timeout and
+# aborts receives of frames that are arriving normally — a failure that
+# presents as certain baud rates simply not working (57600 was the worst on
+# the SC2 bench). Not a default of the library crate, so it is asked for here.
+osdp-embedded = { path = "../../rust/osdp", default-features = false, features = [
+    "std",
+    "pd",
+    "buffered-transport",
+] }
 
 # Optional crypto backend deps — compiled in only when the matching
 # feature is active.

@@ -70,6 +70,18 @@ pd  = []
 # Adds acu/src/*.c to the build.
 acu = []
 
+# The transport batches its RX — USB-serial, TCP, a DMA/FIFO receive path —
+# rather than delivering bytes as they arrive on the wire. Compiles the C core
+# with -DOSDP_BUFFERED_TRANSPORT, which widens the spec-5.8 inter-character
+# timeout from 20 ms to 150 ms. See osdp_types.h for the measurements.
+#
+# NOT a default feature, matching the CMake option of the same name. This crate
+# is a no_std-capable wrapper whose canonical target is a microcontroller with a
+# real UART, and silently widening a spec timing value underneath an embedded
+# consumer is the more surprising failure. A host application on a USB adapter
+# must ask for it — see tools/osdp-mcp, which does.
+buffered-transport = []
+
 [dependencies]
 
 # Examples and integration tests use a real AES backend so the loopback
