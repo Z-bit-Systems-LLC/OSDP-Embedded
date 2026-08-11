@@ -184,17 +184,76 @@ static void hex_dump(FILE *f, const uint8_t *buf, size_t len)
  * is even attempting SC, -vv wraps the transport read callback and dumps
  * every inbound byte chunk as it arrives off the wire. Tools may use
  * globals; the core library never does. */
+/* Silent variant of the tap above. -vv hex-dumps every byte to unbuffered
+ * stderr, which costs enough time per chunk to change the very inter-delivery
+ * gaps it is being used to measure — an observer effect large enough to turn a
+ * passing link into a failing one. --rx-gap-stats records (gap, size) pairs
+ * into memory and prints a histogram at shutdown instead. */
+#define RX_GAP_SAMPLES 8192
+
 static struct {
     int (*real_read)(void *user, uint8_t *buf, size_t cap);
     int (*real_write)(void *user, const uint8_t *buf, size_t len);
+    uint32_t (*now_ms)(void *user);
+    uint32_t last_rx_ms;   /* clock at the last non-empty read */
     int verbose;
+    bool     gap_stats;
+    const osdp_pd_t *pd;   /* to sample osdp_stream_pending at read time */
+    uint32_t gaps[RX_GAP_SAMPLES];
+    uint16_t sizes[RX_GAP_SAMPLES];
+    uint16_t held[RX_GAP_SAMPLES];  /* partial-frame bytes held going in */
+    size_t   n_gaps;
+    size_t   bytes_this_tick;
+    /* Set by the tick loop when it sees a spec-5.8 abort. The gap that caused
+     * it cannot be read off the histogram — the abort zeroes the residue, so
+     * by the next read there is no partial frame to attribute it to. Instead
+     * the flag is carried forward and the NEXT delivery records how long the
+     * line was actually quiet, which is the number a candidate timeout has to
+     * clear. */
+    bool     abort_pending;
+    uint32_t abort_gaps[RX_GAP_SAMPLES];
+    size_t   n_abort_gaps;
 } g_tap;
 
 static int read_tap(void *user, uint8_t *buf, size_t cap)
 {
+    /* Sampled before the read: this is the residue the decoder was still
+     * holding while the gap elapsed. A gap can only abort a receive if there
+     * was a receive in progress, so the two have to be recorded together. */
+    const size_t pending = (g_tap.pd != NULL)
+                               ? osdp_stream_pending(&g_tap.pd->rx) : 0U;
     const int n = g_tap.real_read(user, buf, cap);
+    if (n > 0) {
+        g_tap.bytes_this_tick += (size_t)n;
+    }
+    if (n > 0 && g_tap.gap_stats && g_tap.now_ms != NULL) {
+        const uint32_t now = g_tap.now_ms(user);
+        if (g_tap.abort_pending) {
+            g_tap.abort_pending = false;
+            if (g_tap.n_abort_gaps < RX_GAP_SAMPLES) {
+                g_tap.abort_gaps[g_tap.n_abort_gaps++] = now - g_tap.last_rx_ms;
+            }
+        }
+        if (g_tap.n_gaps < RX_GAP_SAMPLES) {
+            g_tap.gaps[g_tap.n_gaps]  = now - g_tap.last_rx_ms;
+            g_tap.sizes[g_tap.n_gaps] = (uint16_t)n;
+            g_tap.held[g_tap.n_gaps]  = (uint16_t)pending;
+            g_tap.n_gaps++;
+        }
+        g_tap.last_rx_ms = now;
+    }
     if (n > 0 && g_tap.verbose >= 2) {
-        fprintf(stderr, "    rx[%d] ", n);
+        /* The gap since the previous delivery is the number that matters for
+         * spec 5.8: it is what the PD's inter-character timeout measures, and
+         * on a USB-serial adapter it is set by the adapter's latency timer,
+         * not by the wire. */
+        uint32_t now = 0, gap = 0;
+        if (g_tap.now_ms != NULL) {
+            now = g_tap.now_ms(user);
+            gap = now - g_tap.last_rx_ms;
+            g_tap.last_rx_ms = now;
+        }
+        fprintf(stderr, "    [%ums +%ums] rx[%d] ", now, gap, n);
         hex_dump(stderr, buf, (size_t)n);
         fputc('\n', stderr);
     }
@@ -459,6 +518,8 @@ typedef struct cli {
     int          verbose;
     bool         tamper;        /* report tamper in osdp_LSTATR */
     unsigned int card_every_ms; /* 0 = off; queue an osdp_RAW this often */
+    bool         rx_gap_stats;  /* histogram of inter-delivery RX gaps */
+    unsigned int run_ms;        /* 0 = until Ctrl-C; else exit after this long */
 } cli_t;
 
 static void usage(const char *prog)
@@ -469,6 +530,11 @@ static void usage(const char *prog)
         "                       Win32 examples: COM3, \\\\\\\\.\\\\COM23\n"
         "                       POSIX examples: /dev/ttyUSB0, /dev/cu.usbserial-XXX\n"
         "  --address N        7-bit PD address (0x00..0x7E, default 0x00)\n"
+        "  --rx-gap-stats     histogram of RX inter-delivery gaps + a count\n"
+        "                       of spec-5.8 inter-character aborts, printed\n"
+        "                       at shutdown (unlike -vv, does not perturb\n"
+        "                       the timing it measures)\n"
+        "  --run-ms N         exit after N ms via the normal shutdown path\n"
         "  --baud N           baud rate (default 9600)\n"
         "  --sc=MODE          Secure Channel: 'off' (default), 'scbkd' (SCBK-D),\n"
         "                                     'scbk:HEX32' (SC1 custom 16-byte key),\n"
@@ -517,6 +583,10 @@ static bool parse_args(int argc, char **argv, cli_t *out)
             out->verbose = 1;
         } else if (strcmp(a, "-vv") == 0) {
             out->verbose = 2;
+        } else if (strcmp(a, "--rx-gap-stats") == 0) {
+            out->rx_gap_stats = true;
+        } else if (strcmp(a, "--run-ms") == 0 && i + 1 < argc) {
+            out->run_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--tamper") == 0) {
             out->tamper = true;
         } else if (strcmp(a, "--pair") == 0) {
@@ -704,13 +774,16 @@ int main(int argc, char **argv)
      * callback before the PD copies the vtable. */
     g_tap.real_read  = transport.read;
     g_tap.real_write = transport.write;
+    g_tap.now_ms     = transport.now_ms;
     g_tap.verbose    = cli.verbose;
+    g_tap.gap_stats  = cli.rx_gap_stats;
     transport.read   = read_tap;
     transport.write  = write_tap;
 
     /* Initialise the PD. */
     osdp_pd_t pd;
     osdp_pd_init(&pd, cli.address);
+    g_tap.pd = &pd;
     osdp_pd_set_transport(&pd, &transport);
     osdp_pd_set_command_handler(&pd, app_handler, &app);
 
@@ -836,8 +909,36 @@ int main(int argc, char **argv)
     bool     sc_was_up    = false;
     uint32_t last_card_ms = 0;   /* clock at the last synthetic card read */
     uint32_t card_serial  = 0;
+    /* --run-ms exists so an unattended trial ends through the normal shutdown
+     * path: killing the process skips it, and with it the --rx-gap-stats
+     * summary. */
+    const uint32_t start_ms = (transport.now_ms != NULL)
+                                  ? transport.now_ms(transport.user) : 0U;
+    /* Counts spec-5.8 aborts exactly. Nothing else can empty the decoder on a
+     * tick that read no bytes: osdp_stream_next only retires a frame when new
+     * input completes one. So "no bytes read, residue went from >0 to 0" is
+     * the inter-character timeout firing, and the residue is how much of a
+     * frame it threw away. */
+    size_t prev_pending = 0, aborts = 0, aborted_bytes = 0;
     while (!g_should_exit) {
+        g_tap.bytes_this_tick = 0;
         osdp_pd_tick(&pd);
+        if (cli.rx_gap_stats) {
+            const size_t now_pending = osdp_stream_pending(&pd.rx);
+            if (g_tap.bytes_this_tick == 0U && prev_pending > 0U &&
+                now_pending == 0U) {
+                aborts++;
+                aborted_bytes += prev_pending;
+                g_tap.abort_pending = true;
+            }
+            prev_pending = now_pending;
+        }
+
+        if (cli.run_ms > 0U && transport.now_ms != NULL &&
+            (uint32_t)(transport.now_ms(transport.user) - start_ms) >=
+                cli.run_ms) {
+            break;
+        }
 
         if (cli.sc_mode != SC_NONE) {
             const bool sc_now = (cli.sc_mode == SC_SCBK2)
@@ -907,6 +1008,81 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "\nosdp-pd-mock: shutting down\n");
+
+    if (g_tap.gap_stats) {
+        /* Buckets chosen around OSDP_PD_INTERCHAR_TIMEOUT_MS: anything at or
+         * past it is a gap that aborts a receive in progress. */
+        static const uint32_t edge[] = { 1, 5, 10, 15, 20, 30, 50, 100 };
+        size_t   bucket[9] = { 0 };
+        size_t   over = 0, mid_frame = 0, fatal = 0;
+        uint32_t worst = 0, worst_mid = 0;
+        for (size_t i = 1; i < g_tap.n_gaps; i++) {   /* skip the first, no predecessor */
+            const uint32_t g = g_tap.gaps[i];
+            size_t b = 0;
+            while (b < 8U && g >= edge[b]) { b++; }
+            bucket[b]++;
+            if (g >= OSDP_PD_INTERCHAR_TIMEOUT_MS) { over++; }
+            if (g > worst) { worst = g; }
+            if (g_tap.held[i] > 0U) {
+                mid_frame++;
+                if (g > worst_mid) { worst_mid = g; }
+                /* The abort needs the residue to sit unchanged across two
+                 * consecutive ticks, so the deadline is measured from the
+                 * previous look, not this one. */
+                if (g >= OSDP_PD_INTERCHAR_TIMEOUT_MS) { fatal++; }
+            }
+        }
+        fprintf(stderr, "\nRX inter-delivery gaps (%zu reads):\n", g_tap.n_gaps);
+        for (size_t b = 0; b < 9U; b++) {
+            if (bucket[b] == 0) { continue; }
+            if (b == 0) {
+                fprintf(stderr, "    <   1 ms : %zu\n", bucket[0]);
+            } else if (b == 8U) {
+                fprintf(stderr, "  >= 100 ms : %zu\n", bucket[8]);
+            } else {
+                fprintf(stderr, "  >=%4u ms : %zu\n",
+                        (unsigned)edge[b - 1], bucket[b]);
+            }
+        }
+        fprintf(stderr,
+                "  worst %u ms; %zu gap(s) >= the %u ms inter-character "
+                "timeout\n",
+                (unsigned)worst, over, (unsigned)OSDP_PD_INTERCHAR_TIMEOUT_MS);
+        fprintf(stderr,
+                "  mid-frame (decoder holding a partial frame): %zu gap(s), "
+                "worst %u ms, %zu >= the timeout\n",
+                mid_frame, (unsigned)worst_mid, fatal);
+        fprintf(stderr,
+                "  spec-5.8 aborts: %zu, discarding %zu byte(s) of "
+                "partially-received frames\n",
+                aborts, aborted_bytes);
+        if (g_tap.n_abort_gaps > 0U) {
+            /* Insertion sort — a few dozen entries at most. */
+            for (size_t i = 1; i < g_tap.n_abort_gaps; i++) {
+                const uint32_t v = g_tap.abort_gaps[i];
+                size_t j = i;
+                while (j > 0U && g_tap.abort_gaps[j - 1U] > v) {
+                    g_tap.abort_gaps[j] = g_tap.abort_gaps[j - 1U];
+                    j--;
+                }
+                g_tap.abort_gaps[j] = v;
+            }
+            fprintf(stderr,
+                    "  quiet interval that caused each abort: min %u ms, "
+                    "median %u ms, max %u ms (n=%zu)\n",
+                    (unsigned)g_tap.abort_gaps[0],
+                    (unsigned)g_tap.abort_gaps[g_tap.n_abort_gaps / 2U],
+                    (unsigned)g_tap.abort_gaps[g_tap.n_abort_gaps - 1U],
+                    g_tap.n_abort_gaps);
+            fprintf(stderr, "  all: ");
+            for (size_t i = 0; i < g_tap.n_abort_gaps; i++) {
+                fprintf(stderr, "%s%u", i ? " " : "",
+                        (unsigned)g_tap.abort_gaps[i]);
+            }
+            fputc('\n', stderr);
+        }
+    }
+
     serial_close(serial);
     return 0;
 }

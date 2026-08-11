@@ -269,7 +269,43 @@ void serial_close(serial_ctx_t *ctx)
     free(ctx);
 }
 
+/* Sleep(2) does not sleep for 2 ms. Windows rounds a sleep up to the system
+ * timer quantum, 15.6 ms by default, so the PD loop actually looks at the
+ * serial port about every 15.6 ms.
+ *
+ * OSDP_PD_MOCK_SLEEP=hires swaps in a high-resolution waitable timer
+ * (Win10 1803+) that honours the 2 ms, without timeBeginPeriod's process-wide
+ * side effects. It is opt-in and NOT the default, which is counter-intuitive
+ * enough to be worth recording: polling faster makes the spec-5.8
+ * inter-character abort fire MORE often, not less. A USB-serial adapter
+ * delivers received bytes in clumps spaced by its latency timer (16 ms on
+ * FTDI), so a fast loop just collects more consecutive empty reads inside one
+ * delivery interval, and the deadline expires between two clumps. On the SC2
+ * pairing benchmark, switching this on took 38400 baud from 2/2 passing to
+ * 0/2 against the spec's 20 ms. */
 void serial_sleep_ms(unsigned int ms)
 {
+    static HANDLE timer  = NULL;
+    static int    inited = 0;
+
+    if (!inited) {
+        inited = 1;
+        const char *mode = getenv("OSDP_PD_MOCK_SLEEP");
+        if (mode != NULL && strcmp(mode, "hires") == 0) {
+            timer = CreateWaitableTimerExW(
+                NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS);
+        }
+    }
+
+    if (timer != NULL) {
+        LARGE_INTEGER due;
+        /* Negative = relative, in 100 ns units. */
+        due.QuadPart = -(LONGLONG)ms * 10000;
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
     Sleep((DWORD)ms);
 }
