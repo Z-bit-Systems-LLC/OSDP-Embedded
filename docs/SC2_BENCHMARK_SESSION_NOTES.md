@@ -15,14 +15,20 @@ overall plan; this file is the record of a specific debugging arc.
 | Branch | Head | Remote |
 | --- | --- | --- |
 | `main` | `7e7ec0a` fix(pd): size the spec 5.8 timeout for transports that batch their RX | pushed, in sync |
-| `feature/osdp-sc2` | `afe14fd` Merge branch 'main' into feature/osdp-sc2 | pushed, in sync |
-| `pair-conformance` | `94d3347` debug(pd-mock): measure RX delivery gaps and spec-5.8 aborts | pushed, in sync |
+| `feature/osdp-sc2` | `3e535b5` docs: bring the SC2 benchmark notes' repo-state section up to date | pushed, in sync |
 
 `fix-short-write` was verified merged into `main` and deleted.
 
-All three merges were clean — the fix touches `osdp_types.h`, `core/CMakeLists.txt`
-and the `osdp_pd.h` timeout block, none of which the SC2/pairing branches had
-diverged in.
+**`pair-conformance` is gone** (2026-08-11). It was a strict superset of
+`feature/osdp-sc2` — it had absorbed that branch three times and sc2 had
+nothing it lacked — so consolidating was a fast-forward, not a merge, and the
+two heads were byte-identical before the branch was deleted. All pairing,
+tooling and benchmark work now lives on `feature/osdp-sc2`, which is where
+performance testing runs.
+
+The `main` → sc2 merge of the 5.8 fix was clean: it touches `osdp_types.h`,
+`core/CMakeLists.txt` and the `osdp_pd.h` timeout block, none of which the
+pairing work had diverged in.
 
 Nothing uncommitted. The `tests/test_pd_pair.c` scratch-buffer resize that had
 been carried loose since 2026-08-10 went in as `fe1a738`; note it does **not**
@@ -278,7 +284,8 @@ and on a USB bridge those are within 2× of each other.
 ### 5.6 Fixed — `OSDP_BUFFERED_TRANSPORT`
 
 Committed to `main` as `7e7ec0a` and merged forward through
-`feature/osdp-sc2` into `pair-conformance` (all three merges clean).
+`feature/osdp-sc2` (clean). The now-deleted `pair-conformance` branch carried it
+too, and was folded back into sc2 by fast-forward the same day.
 
 A compile-time flag selects between the two defaults:
 
@@ -308,7 +315,7 @@ Three decisions worth recording:
   spec 5.8's 20 ms is written for.
 
 Verified: 12/12 pairing trials across 38400/57600/115200/230400 with zero
-aborts; tests 44/44 on `pair-conformance` and 31/31 on `main`, each with the
+aborts; tests 44/44 on the sc2 tree and 31/31 on `main`, each with the
 flag and without.
 
 **Still wanted: a regression test for a batching transport** — feed one frame
