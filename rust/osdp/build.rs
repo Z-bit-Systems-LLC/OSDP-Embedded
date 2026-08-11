@@ -167,6 +167,42 @@ fn main() {
         build.flag_if_supported("-Wno-unused-parameter");
     }
 
+    // ---- C build configuration ---------------------------------------
+    //
+    // These have to reach the C compiler, not just Rust: the constants
+    // they select are `#ifndef`-guarded defaults inside the C headers,
+    // and a `cfg!` in Rust would not change a single compiled byte.
+    //
+    // `buffered-transport` mirrors the CMake option of the same name.
+    // Without it a USB-serial or TCP consumer inherits the spec's 20 ms
+    // inter-character timeout, which is shorter than such a transport's
+    // delivery interval, so the PD aborts receives of frames that are
+    // arriving perfectly normally. That failure looks like a baud-rate
+    // problem rather than a timeout, which is why it is called out here.
+    if std::env::var_os("CARGO_FEATURE_BUFFERED_TRANSPORT").is_some() {
+        build.define("OSDP_BUFFERED_TRANSPORT", None);
+    }
+
+    // Numeric escape hatch, overriding whichever default the feature
+    // selected. Mainly for bisecting a link whose delivery gaps are not
+    // yet known — the value wants to sit above the transport's worst
+    // mid-frame gap and below the peer's retransmission delay.
+    println!("cargo:rerun-if-env-changed=OSDP_PD_INTERCHAR_TIMEOUT_MS");
+    if let Some(ms) = std::env::var_os("OSDP_PD_INTERCHAR_TIMEOUT_MS") {
+        let ms = ms
+            .to_str()
+            .expect("OSDP_PD_INTERCHAR_TIMEOUT_MS must be valid UTF-8");
+        assert!(
+            ms.parse::<u32>().is_ok(),
+            "OSDP_PD_INTERCHAR_TIMEOUT_MS must be a positive integer \
+             number of milliseconds, got {ms:?}"
+        );
+        // The C header spells the constant unsigned; match it, or the
+        // comparison against a size_t difference is a signedness warning
+        // on every translation unit that reads it.
+        build.define("OSDP_PD_INTERCHAR_TIMEOUT_MS", format!("{ms}U").as_str());
+    }
+
     for src in &sources {
         let path = source_root.join(src);
         assert!(
