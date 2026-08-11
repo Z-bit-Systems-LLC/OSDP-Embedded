@@ -501,12 +501,40 @@ typedef struct osdp_pd_buz_slot {
  * with a transport that supplies now_ms; without a clock the abort never
  * fires and the old behaviour stands.
  *
- * Raise it if the link interleaves long pauses inside a frame (a slow bridge,
- * a busy USB adapter). It must stay well under the ACU's reply timeout, or
- * the PD is still holding stale bytes when the retransmission arrives, which
- * is the situation it exists to prevent. */
+ * TWO BOUNDS SIZE THIS, and on a batching transport they are closer together
+ * than they look:
+ *
+ *   Above the transport's worst mid-frame delivery gap. Not the adapter's
+ *   nominal latency — measure it. On the SC2 pairing bench (FTDI, LatencyTimer
+ *   16 ms, ~513-byte frames) the worst gap while the decoder held a partial
+ *   frame was 47 ms at 38400, 94-110 ms at 57600, 62 ms at 115200 and 32 ms at
+ *   230400. It is not monotonic in baud, so the fastest link is not the safe
+ *   one to size against. 20 ms sits below all of them: the PD discards frames
+ *   that were arriving perfectly normally, which at 57600 was enough to stop
+ *   SC2 pairing from ever completing.
+ *
+ *   Below the peer's retransmission delay, or the PD is still holding stale
+ *   bytes when the retry arrives — the exact desync this exists to prevent.
+ *   The budget is how long the ACU stays silent after giving up on a reply.
+ *   For OSDP.Net that is its 200 ms ReplyTimeout, which is a per-read
+ *   inter-byte timeout restarted by every byte (Bus.TimeOutReadAsync builds a
+ *   fresh CancellationTokenSource per read), plus a bus-loop iteration; its
+ *   clock starts at about the same instant as this one, when the command's
+ *   last byte lands.
+ *
+ * 150 ms clears the first bound at every rate measured and leaves >=50 ms of
+ * the second. Worth noting that 200 ms is OSDP.Net's own equivalent of this
+ * timeout, so a batching PD sitting near it is in the same class as the peer
+ * it talks to, not an outlier.
+ *
+ * OSDP_BUFFERED_TRANSPORT (osdp_types.h) picks between the two defaults;
+ * setting this constant explicitly overrides both. */
 #ifndef OSDP_PD_INTERCHAR_TIMEOUT_MS
-#define OSDP_PD_INTERCHAR_TIMEOUT_MS 20U
+#  ifdef OSDP_BUFFERED_TRANSPORT
+#    define OSDP_PD_INTERCHAR_TIMEOUT_MS 150U
+#  else
+#    define OSDP_PD_INTERCHAR_TIMEOUT_MS 20U
+#  endif
 #endif
 
 /* ---- Secure Channel state (embedded in osdp_pd_t) ----------------------

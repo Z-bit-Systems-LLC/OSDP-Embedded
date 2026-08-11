@@ -12,6 +12,28 @@
 extern "C" {
 #endif
 
+/* ---- Build configuration ------------------------------------------------
+ *
+ * OSDP_BUFFERED_TRANSPORT — define for a transport that does NOT hand the
+ * library bytes as they arrive on the wire, but batches them and delivers in
+ * clumps. A USB-serial bridge is the common case (the adapter's latency timer
+ * decides when a clump ships), as is OSDP-over-TCP, as is any driver whose RX
+ * path is a DMA or FIFO threshold rather than a per-byte interrupt.
+ *
+ * Leave it undefined for a directly-attached UART. That is what the spec's
+ * timing values are written for, and where a fast abort is genuinely wanted.
+ *
+ * It describes the wire, not the role, so it lives here rather than in
+ * osdp_pd.h / osdp_acu.h and a build sets it once for both. It is a
+ * whole-build switch for the same reason: a device is attached one way or the
+ * other, and a build that mixed them would be describing two devices.
+ *
+ * Today it selects only OSDP_PD_INTERCHAR_TIMEOUT_MS (osdp_pd.h), which is
+ * where the batching bites — see that comment for the measurements. Any other
+ * timing that has to tolerate a delivery clump belongs behind this same flag
+ * rather than a second one. */
+/* #define OSDP_BUFFERED_TRANSPORT */
+
 /* Status / error codes returned from any OSDP function that can fail.
  * OSDP_OK is the only success value; everything else is an error. */
 typedef enum osdp_status {

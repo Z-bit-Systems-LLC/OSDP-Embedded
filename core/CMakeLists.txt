@@ -26,6 +26,20 @@ target_include_directories(osdp_core
 
 target_compile_features(osdp_core PUBLIC c_std_11)
 
+# See the OSDP_BUFFERED_TRANSPORT comment in osdp_types.h. It describes the
+# wire rather than the role, so it lives on osdp_core and PUBLIC: every target
+# that links core — pd, acu, tools, tests — must agree on it, and the timing
+# constants it selects are read both inside those libraries and by consumers
+# that reason about them.
+option(OSDP_BUFFERED_TRANSPORT
+       "Transport batches its RX (USB-serial, TCP, DMA/FIFO) rather than \
+delivering bytes as they arrive; widens the timing that has to tolerate a \
+delivery clump" OFF)
+
+if(OSDP_BUFFERED_TRANSPORT)
+    target_compile_definitions(osdp_core PUBLIC OSDP_BUFFERED_TRANSPORT)
+endif()
+
 add_library(osdp::core ALIAS osdp_core)
 
 # osdp::messages — per-message codecs (model + decoder + builder per
