@@ -471,8 +471,12 @@ in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
    burned on crates.io forever, `cargo yank` only hides it.
 4. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
    from the commits since the previous tag and creates the GitHub
-   Release. Use `-NotesFile` for a release that deserves written prose,
-   and `-Draft` to hand-edit before it goes public.
+   Release. `-Draft` to hand-edit before it goes public.
+
+   **Generated notes are the default**, matching OSDP.Net: no
+   `CHANGELOG.md`, nothing written between releases, commit subjects
+   *are* the notes. `-NotesFile` is the exception for a release a commit
+   list would misrepresent — v1.0.0 is the only one so far.
 
 Rules that are easy to get wrong:
 
@@ -482,6 +486,10 @@ Rules that are easy to get wrong:
 - **Step 4 comes after step 3**, not before: a GitHub Release is an
   announcement, and the crate should exist before people try to install
   it.
+- **Step 4 is manual and has been missed before.** v1.0.0 reached
+  crates.io with no GitHub Release because the tooling only prompted for
+  steps 2 and 3. `New-Release.ps1` now prints the step-4 command when it
+  finishes; do not treat a cut tag as a finished release.
 - **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
   have no GitHub Releases and are deliberately not backfilled. crates.io
   holds only 0.1.0 from that era.

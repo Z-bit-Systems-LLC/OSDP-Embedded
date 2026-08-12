@@ -260,11 +260,27 @@ try {
     Invoke-Git push origin $tag | Out-Null
     Write-Ok "  pushed:    origin $tag"
 
+    # The release is NOT finished here. This script only cuts the tag; two
+    # steps remain and neither is automated, so spell both out. Printing
+    # only the crates.io half is how v1.0.0 shipped without a GitHub
+    # Release — the four-step process was documented but the tooling
+    # reminded you about three of them.
     Write-Host ''
-    Write-Ok "Release $newVersion cut."
-    Write-Info 'The Azure pipeline is now building the tagged artifacts. Approve the'
-    Write-Info 'Release pipeline to publish the crate to crates.io and upload the'
-    Write-Info 'tool binaries.'
+    Write-Ok "Release $newVersion cut. Two steps remain:"
+    Write-Host ''
+    Write-Info '  2/3  Wait for the Azure build pipeline on the tag to go green,'
+    Write-Info '       then approve the Release pipeline. That publishes the crate'
+    Write-Info '       to crates.io (irreversible) and uploads the tool binaries.'
+    Write-Host ''
+    Write-Info '  3/3  Publish the GitHub Release, AFTER the crate is live:'
+    Write-Host ''
+    Write-Host "         ./scripts/Publish-GitHubRelease.ps1 -Tag $tag" -ForegroundColor White
+    Write-Host ''
+    Write-Info '       Notes are generated from the commits since the last tag.'
+    Write-Info '       Add -Draft to hand-edit first, or -NotesFile <path> to'
+    Write-Info '       supply written prose instead (see docs/PUBLISHING.md).'
+    Write-Host ''
+    Write-Warn '  Until 3/3 runs, the release is invisible to anyone watching the repo.'
 }
 finally {
     Pop-Location

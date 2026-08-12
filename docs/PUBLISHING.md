@@ -57,22 +57,36 @@ the version number is burned on crates.io forever, even if you later
 ### 4. Publish the GitHub Release
 
 ```pwsh
-./scripts/Publish-GitHubRelease.ps1 -Tag v1.0.0 -DryRun   # preview notes
-./scripts/Publish-GitHubRelease.ps1 -Tag v1.0.0 -Draft    # stage to edit
-./scripts/Publish-GitHubRelease.ps1 -Tag v1.0.0           # publish
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3 -DryRun   # preview notes
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3 -Draft    # stage to edit
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3           # publish
 ```
 
 This is what makes the release visible to anyone watching the repo. The
-script builds notes from the commits since the previous tag, grouped by
-Conventional Commit type, and refuses to run if the tag isn't on origin
-or a release already exists for it. `-NotesFile <path>` replaces the
-generated notes entirely when a release deserves written prose — which a
-major release generally does. `-Draft` stages it for hand-editing in the
-GitHub UI first.
+script refuses to run if the tag isn't on origin or a release already
+exists for it.
+
+**Notes are generated from the commits since the previous tag**, grouped
+by Conventional Commit type — the same approach OSDP.Net uses. This is
+the default and the norm; there is no `CHANGELOG.md` to maintain, and
+nothing needs writing between releases. It does mean commit subjects are
+the release notes, so write them accordingly.
+
+`-NotesFile <path>` replaces the generated notes with written prose. This
+is the exception, reserved for a release whose significance a commit list
+would misrepresent — v1.0.0 used it
+([docs/release-notes/v1.0.0.md](release-notes/v1.0.0.md)), because
+generating from `v0.1.28..v1.0.0` would have produced a handful of fix
+commits for what was really the story of 147 commits since 0.1.0. Do not
+reach for it routinely.
 
 Do this *after* step 3, not before: a GitHub Release announces a version
 that people will immediately try to `cargo add`, so the crate should
 already be on crates.io when the notification goes out.
+
+**This step is manual and easy to forget** — v1.0.0 shipped to crates.io
+without a GitHub Release for exactly that reason. `New-Release.ps1` now
+prints the command at the end of step 1 as a backstop.
 
 ### Version history note
 
