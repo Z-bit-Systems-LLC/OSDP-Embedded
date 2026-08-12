@@ -118,6 +118,38 @@ extern "C" {
  * perspective right now?". */
 #define OSDP_ACU_OFFLINE_TIMEOUT_MS  8000U
 
+/* Spec 5.8's inter-character abort, applied to the reply direction.
+ *
+ * Same mechanism and same reasoning as OSDP_PD_INTERCHAR_TIMEOUT_MS — see
+ * that comment in osdp_pd.h for the measured delivery gaps that size it, and
+ * for OSDP_BUFFERED_TRANSPORT, which selects between the two defaults here
+ * too. What differs is the upper bound.
+ *
+ * The PD's ceiling is the ACU's retransmission delay. The ACU's ceiling is its
+ * OWN reply timeout: a truncated reply has to be discarded before the
+ * application retries the command and the PD's fresh reply arrives, or the
+ * decoder splices the two and fails the CRC on a reply that was transmitted
+ * perfectly. So this must stay strictly below OSDP_ACU_REPLY_TIMEOUT_MS, which
+ * both defaults do (20 ms and 150 ms against 200 ms) — the assert below keeps
+ * that true for an override.
+ *
+ * A separate constant from the PD's rather than one shared value, because the
+ * two are bounded by different things and a build that retunes one has no
+ * reason to be retuning the other. */
+#ifndef OSDP_ACU_INTERCHAR_TIMEOUT_MS
+#  ifdef OSDP_BUFFERED_TRANSPORT
+#    define OSDP_ACU_INTERCHAR_TIMEOUT_MS 150U
+#  else
+#    define OSDP_ACU_INTERCHAR_TIMEOUT_MS 20U
+#  endif
+#endif
+
+_Static_assert(OSDP_ACU_INTERCHAR_TIMEOUT_MS < OSDP_ACU_REPLY_TIMEOUT_MS,
+               "OSDP_ACU_INTERCHAR_TIMEOUT_MS must be below "
+               "OSDP_ACU_REPLY_TIMEOUT_MS: a stalled reply has to be "
+               "discarded before the application retries the command, or "
+               "the retry's reply is decoded onto the stale prefix");
+
 /* The ACU's maximum message size, and the size of its working buffers.
  * Overridable at build time, exactly like the PD's OSDP_PD_BUF_LEN.
  *
@@ -332,6 +364,17 @@ typedef struct osdp_acu {
     osdp_acu_timeout_cb         timeout_cb;
     void                       *timeout_user;
     osdp_stream_t               rx;
+
+    /* Inter-character timeout tracking (spec 5.8), mirroring the PD's.
+     * `rx_partial_len` is how many bytes the stream decoder was holding at
+     * the end of the last tick; `rx_partial_ms` is when that count last
+     * changed. A count that stops growing means the PD stopped mid-reply,
+     * and once the gap reaches OSDP_ACU_INTERCHAR_TIMEOUT_MS the receive is
+     * aborted. Comparing the count rather than just its presence is what
+     * distinguishes a stalled reply from one still legitimately arriving. */
+    size_t                      rx_partial_len;
+    uint32_t                    rx_partial_ms;
+
     uint8_t                     tx_buf[OSDP_ACU_BUF_LEN];
     osdp_integrity_t            integrity; /* CRC by default; CKSUM legacy */
 

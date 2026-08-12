@@ -1781,6 +1781,10 @@ mod acu_ffi {
         pub timeout_cb: osdp_acu_timeout_cb,
         pub timeout_user: *mut c_void,
         pub rx: osdp_stream_t,
+        /* Inter-character timeout tracking (spec 5.8) — must sit between `rx`
+         * and `tx_buf`, exactly as in osdp_acu.h. */
+        pub rx_partial_len: usize,
+        pub rx_partial_ms: u32,
         pub tx_buf: [u8; OSDP_ACU_BUF_LEN],
         pub integrity: osdp_integrity_t,
         pub sc_crypto: osdp_sc_crypto_t,
