@@ -522,6 +522,201 @@ static void test_pd_offline_after_eight_seconds_silence(void)
     TEST_ASSERT_FALSE(osdp_acu_is_pd_online(&acu, 0x10));
 }
 
+/* ---- Inter-character timeout (spec 5.8), reply direction ----------------
+ *
+ * The ACU twin of the PD-side tests in test_pd.c. The failure it guards
+ * against is a truncated reply's bytes sitting in the decoder forever: the
+ * reply timeout clears slot->waiting but nothing empties acu->rx, so the
+ * application's retry gets decoded onto the stale prefix and fails its CRC.
+ */
+
+/* Build a large reply, then hand over only its first `keep` bytes.
+ *
+ * The size matters. A reply cut one byte short is harmless: the decoder finds
+ * the CRC bad, drops a byte, resyncs to the next SOM and recovers on its own.
+ * The trap is a stale prefix that declares a LEN far bigger than what arrived
+ * — the decoder is then not wrong, it is *waiting*, and it goes on waiting
+ * while every subsequent reply is swallowed into the phantom frame. That is
+ * what nothing but the inter-character abort can clear. */
+static void inject_truncated_reply(mock_transport_t *m, uint8_t pd_address,
+                                   uint8_t reply_code, uint8_t sequence,
+                                   size_t keep)
+{
+    uint8_t payload[64];
+    (void)memset(payload, 0xA5, sizeof(payload));
+
+    osdp_frame_t f = {0};
+    f.address     = pd_address;
+    f.reply       = true;
+    f.sequence    = sequence;
+    f.integrity   = OSDP_INTEGRITY_CRC;
+    f.code        = reply_code;
+    f.payload     = payload;
+    f.payload_len = sizeof(payload);
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &built));
+    TEST_ASSERT_TRUE(keep < built);
+    (void)memcpy(&m->incoming[m->incoming_len], buf, keep);
+    m->incoming_len += keep;
+}
+
+static void test_a_truncated_reply_does_not_poison_the_retry(void)
+{
+    osdp_acu_pd_slot_t  slots[1];
+    osdp_acu_t          acu;
+    mock_transport_t    m;
+    osdp_acu_transport_t t;
+    acu_test_ctx_t      ctx = {0};
+
+    mock_init(&m, &t);
+    osdp_acu_init(&acu, slots, 1);
+    osdp_acu_set_transport(&acu, &t);
+    wire_callbacks(&acu, &ctx);
+    osdp_acu_register_pd(&acu, 0, 0x10);
+
+    m.now_ms = 1000;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&acu, 0x10, OSDP_CMD_POLL,
+                                            NULL, 0));
+
+    /* The PD starts a ~73-byte reply and the line dies after 12 bytes. The
+     * header is intact, so the decoder is correctly waiting for the other
+     * 61 — it has no way to know they are never coming. */
+    inject_truncated_reply(&m, 0x10, OSDP_REPLY_MFGREP, 0, 12);
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_EQUAL_UINT(0, ctx.reply.call_count);
+
+    /* The line goes quiet past the inter-character timeout, so the receive
+     * is aborted. The reply timeout then fires as usual. */
+    m.now_ms = 1000 + OSDP_ACU_REPLY_TIMEOUT_MS + 1;
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_EQUAL_UINT(1, ctx.timeout.call_count);
+
+    /* The application retries at the same SQN and the PD answers cleanly.
+     * Without the abort the 12 stale bytes are still in front of it, the
+     * decoder counts this reply toward the phantom frame's outstanding 61,
+     * and it never surfaces — the link stays down while both ends behave
+     * perfectly. */
+    m.outgoing_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&acu, 0x10, OSDP_CMD_POLL,
+                                            NULL, 0));
+    inject_reply(&m, 0x10, OSDP_REPLY_ACK, 0, NULL, 0, OSDP_INTEGRITY_CRC);
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_EQUAL_UINT(1, ctx.reply.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, ctx.reply.last.reply_code);
+}
+
+/* The timeout must not fire on a reply that is merely arriving slowly, or a
+ * batching transport would never complete a large reply at all.
+ *
+ * Exactly ONE over-timeout gap, unlike the PD-side twin which walks a byte at
+ * a time. The ACU has its own reply timeout and this has to stay inside it,
+ * and at the OSDP_BUFFERED_TRANSPORT default only one such gap fits: 150+1 is
+ * under 200, two of them are not. Two chunks with one gap is also the shape a
+ * batching transport actually delivers in, which is the case that motivated
+ * the timeout being widened at all. */
+_Static_assert(OSDP_ACU_INTERCHAR_TIMEOUT_MS + 1U < OSDP_ACU_REPLY_TIMEOUT_MS,
+               "the slow-arrival test needs one over-timeout gap to fit "
+               "inside the reply timeout");
+
+static void test_a_reply_still_arriving_is_not_aborted(void)
+{
+    osdp_acu_pd_slot_t  slots[1];
+    osdp_acu_t          acu;
+    mock_transport_t    m;
+    osdp_acu_transport_t t;
+    acu_test_ctx_t      ctx = {0};
+
+    mock_init(&m, &t);
+    osdp_acu_init(&acu, slots, 1);
+    osdp_acu_set_transport(&acu, &t);
+    wire_callbacks(&acu, &ctx);
+    osdp_acu_register_pd(&acu, 0, 0x10);
+
+    m.now_ms = 1000;
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&acu, 0x10, OSDP_CMD_POLL,
+                                            NULL, 0));
+
+    osdp_frame_t f = {0};
+    f.address   = 0x10;
+    f.reply     = true;
+    f.sequence  = 0;
+    f.integrity = OSDP_INTEGRITY_CRC;
+    f.code      = OSDP_REPLY_ACK;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &built));
+
+    /* First chunk: everything but the last two bytes. */
+    TEST_ASSERT_TRUE(built > 2);
+    (void)memcpy(&m.incoming[m.incoming_len], buf, built - 2);
+    m.incoming_len += built - 2;
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_EQUAL_UINT(0, ctx.reply.call_count);
+
+    /* A gap longer than the inter-character timeout, then the rest. The
+     * buffered count grows on this tick, so the receive is still making
+     * progress and must not have been aborted. */
+    m.now_ms += OSDP_ACU_INTERCHAR_TIMEOUT_MS + 1;
+    (void)memcpy(&m.incoming[m.incoming_len], buf + (built - 2), 2);
+    m.incoming_len += 2;
+    osdp_acu_tick(&acu);
+
+    TEST_ASSERT_EQUAL_UINT(1, ctx.reply.call_count);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, ctx.reply.last.reply_code);
+    TEST_ASSERT_EQUAL_UINT(0, ctx.timeout.call_count);
+}
+
+/* Without a clock there is nothing to time, so the abort must not fire — and
+ * must not discard a reply that is simply still arriving. */
+static void test_acu_no_clock_leaves_a_partial_reply_alone(void)
+{
+    osdp_acu_pd_slot_t  slots[1];
+    osdp_acu_t          acu;
+    mock_transport_t    m;
+    osdp_acu_transport_t t;
+    acu_test_ctx_t      ctx = {0};
+
+    mock_init(&m, &t);
+    t.now_ms = NULL;              /* no clock */
+    osdp_acu_init(&acu, slots, 1);
+    osdp_acu_set_transport(&acu, &t);
+    wire_callbacks(&acu, &ctx);
+    osdp_acu_register_pd(&acu, 0, 0x10);
+    TEST_ASSERT_EQUAL(OSDP_OK,
+                      osdp_acu_send_command(&acu, 0x10, OSDP_CMD_POLL,
+                                            NULL, 0));
+
+    osdp_frame_t f = {0};
+    f.address   = 0x10;
+    f.reply     = true;
+    f.sequence  = 0;
+    f.integrity = OSDP_INTEGRITY_CRC;
+    f.code      = OSDP_REPLY_ACK;
+
+    uint8_t buf[OSDP_FRAME_MAX_LEN];
+    size_t  built = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_frame_build(&f, buf, sizeof(buf), &built));
+
+    /* Deliver all but the last byte, tick a few times, then finish it. With
+     * no clock the residue must still be there to complete. */
+    (void)memcpy(&m.incoming[m.incoming_len], buf, built - 1);
+    m.incoming_len += built - 1;
+    osdp_acu_tick(&acu);
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_EQUAL_UINT(0, ctx.reply.call_count);
+
+    m.incoming[m.incoming_len++] = buf[built - 1];
+    osdp_acu_tick(&acu);
+    TEST_ASSERT_EQUAL_UINT(1, ctx.reply.call_count);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -538,5 +733,8 @@ int main(void)
     RUN_TEST(test_timeout_then_retry_reuses_same_sqn);
     RUN_TEST(test_multi_pd_isolated_state);
     RUN_TEST(test_pd_offline_after_eight_seconds_silence);
+    RUN_TEST(test_a_truncated_reply_does_not_poison_the_retry);
+    RUN_TEST(test_a_reply_still_arriving_is_not_aborted);
+    RUN_TEST(test_acu_no_clock_leaves_a_partial_reply_alone);
     return UNITY_END();
 }

@@ -502,6 +502,52 @@ osdp_status_t osdp_acu_send_command(osdp_acu_t    *acu,
     return OSDP_OK;
 }
 
+/* Spec 5.8: abort a receive that has stalled mid-frame. Call after draining
+ * osdp_stream_next, so anything the decoder still holds is by definition an
+ * incomplete frame. The PD-side twin is check_interchar_timeout in pd/src/pd.c
+ * and the reasoning is identical; only the direction differs — here it is a
+ * PD's reply that stopped arriving.
+ *
+ * Without this, a truncated reply's bytes sit in the decoder indefinitely: the
+ * reply timeout fires and clears slot->waiting, but nothing empties acu->rx,
+ * so the application's retry produces a reply that gets decoded onto the stale
+ * prefix and fails its CRC. Every subsequent retry meets the same
+ * misalignment, which is the same trap the PD side had.
+ *
+ * The elapsed time is measured from the last change in the buffered count, not
+ * from the last tick — a reply arriving slowly but steadily keeps refreshing
+ * the deadline, while one that stops advancing trips it. Without a now_ms
+ * clock there is nothing to measure, so the abort never fires and the decoder
+ * behaves as it always did. */
+static void check_interchar_timeout(osdp_acu_t *acu)
+{
+    const size_t pending = osdp_stream_pending(&acu->rx);
+
+    if (pending == 0) {
+        acu->rx_partial_len = 0;
+        return;
+    }
+    if (acu->transport.now_ms == NULL) {
+        return;
+    }
+
+    const uint32_t now = acu->transport.now_ms(acu->transport.user);
+
+    if (pending != acu->rx_partial_len) {
+        /* Progress since the last look — restart the clock. */
+        acu->rx_partial_len = pending;
+        acu->rx_partial_ms  = now;
+        return;
+    }
+
+    /* Unsigned subtraction wraps cleanly modulo 2^32, as in the offline
+     * check, so a monotonic-clock wraparound cannot fake an expiry. */
+    if ((now - acu->rx_partial_ms) >= OSDP_ACU_INTERCHAR_TIMEOUT_MS) {
+        osdp_stream_reset(&acu->rx);
+        acu->rx_partial_len = 0;
+    }
+}
+
 void osdp_acu_tick(osdp_acu_t *acu)
 {
     if (acu == NULL || acu->transport.read == NULL) {
@@ -513,7 +559,19 @@ void osdp_acu_tick(osdp_acu_t *acu)
      * already missed the deadline). */
     scan_timeouts_and_offline(acu);
 
+    /* Keep reading until the transport reports nothing left. A short read is
+     * not evidence that the transport is drained — on a UART it usually means
+     * only that the rest of the frame has yet to clock in, and on a batching
+     * transport it is the normal shape of a delivery. Stopping there leaves
+     * bytes in the driver's queue for a whole tick, which the inter-character
+     * check below would then read as a stalled receive.
+     *
+     * Bounded at one stream buffer's worth per tick: past that the decoder is
+     * overwriting its own oldest bytes, so further reading in this tick cannot
+     * produce a frame it has not already been given — and the bound is what
+     * stops a transport that never runs dry from spinning here forever. */
     uint8_t chunk[128];
+    size_t  drained = 0;
     for (;;) {
         const int n = acu->transport.read(acu->transport.user,
                                           chunk, sizeof(chunk));
@@ -521,7 +579,8 @@ void osdp_acu_tick(osdp_acu_t *acu)
             break;
         }
         (void)osdp_stream_feed(&acu->rx, chunk, (size_t)n);
-        if ((size_t)n < sizeof(chunk)) {
+        drained += (size_t)n;
+        if (drained >= OSDP_STREAM_BUFFER_LEN) {
             break;
         }
     }
@@ -590,6 +649,13 @@ void osdp_acu_tick(osdp_acu_t *acu)
         }
         process_reply(acu, &frame);
     }
+
+    /* Spec 5.8. Anything the decoder still holds at this point is an
+     * incomplete frame — the loop above ran until it said OSDP_ERR_TRUNCATED.
+     * If that residue stops growing for the timeout, the PD stopped mid-reply
+     * and the receive is aborted so the decoder resynchronizes on the next
+     * SOM instead of decoding the retry across the boundary. */
+    check_interchar_timeout(acu);
 
     /* Re-resolve the LED + buzzer banks so time-driven changes (LED timer
      * expiry / flash, buzzer beep/silence edges) reach the change callbacks
