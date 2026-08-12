@@ -527,6 +527,56 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   add at least one round-trip test (decode → re-build → byte-compare) and
   at least one negative test (truncated, bad CRC, bad command code).
 
+## Releasing
+
+**"release the code"** / **"cut a release"** → run the four-step process
+in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
+
+1. `./scripts/New-Release.ps1 -IncrementType <Patch|Minor|Major>` — bumps
+   `rust/Cargo.toml` + `CMakeLists.txt` in lockstep, runs the
+   `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main` and
+   the tag.
+2. Wait for the Azure build pipeline on the tag to go green. It packages
+   the `.crate` and the tool binaries; it publishes nothing.
+3. Approve the Classic **Release pipeline** in Azure DevOps. This runs
+   `Publish-Crate.ps1` and is the **irreversible** step — the version is
+   burned on crates.io forever, `cargo yank` only hides it.
+4. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
+   from the commits since the previous tag and creates the GitHub
+   Release. `-Draft` to hand-edit before it goes public.
+
+   **Generated notes are the default**, matching OSDP.Net: no
+   `CHANGELOG.md`, nothing written between releases, commit subjects
+   *are* the notes. `-NotesFile` is the exception for a release a commit
+   list would misrepresent — v1.0.0 is the only one so far.
+
+Rules that are easy to get wrong:
+
+- **Never re-tag or re-publish a version.** If a tagged build fails, fix
+  forward and cut the next patch. crates.io will not accept the same
+  version twice with different bytes.
+- **Step 4 comes after step 3**, not before: a GitHub Release is an
+  announcement, and the crate should exist before people try to install
+  it.
+- **Step 4 is manual and has been missed before.** v1.0.0 reached
+  crates.io with no GitHub Release because the tooling only prompted for
+  steps 2 and 3. `New-Release.ps1` now prints the step-4 command when it
+  finishes; do not treat a cut tag as a finished release.
+- **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
+  have no GitHub Releases and are deliberately not backfilled. crates.io
+  holds only 0.1.0 from that era.
+- **The repo-root `README.md` is the crates.io front page** —
+  `Stage-Crate.ps1` copies it into the crate verbatim, with no link
+  rewriting. Every in-repo link in it must therefore be an absolute
+  `https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/...` URL, or it
+  will 404 for crates.io readers. The README follows the
+  [Z-bit README guidelines](https://github.com/Z-bit-Systems-LLC/Guidelines/blob/main/docs/readme-template.md);
+  keep its structure when editing.
+- **1.0.0 makes the public API a promise.** See "What 1.0.0 commits us
+  to" in PUBLISHING.md before changing a public header — adding a member
+  to a public struct is a breaking change, because consumers embed those
+  structs by value.
+
 ## Secure Channel conventions
 
 Secure Channel (osdp_CHLNG / osdp_SCRYPT / osdp_CCRYPT / osdp_RMAC_I,

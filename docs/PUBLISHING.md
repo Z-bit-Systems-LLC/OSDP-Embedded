@@ -17,26 +17,86 @@ crates.io token. See
 [The Release pipeline (Classic)](#the-release-pipeline-classic) for the
 one-time UI setup.
 
-## Cutting a release (scripted)
+## The release process
 
-The normal path is one command:
+Four steps, in order. Steps 1 and 4 are local commands; steps 2 and 3
+happen in Azure DevOps.
+
+### 1. Cut the release locally
 
 ```pwsh
-./scripts/New-Release.ps1            # patch bump (e.g. 0.1.0 -> 0.1.1)
-./scripts/New-Release.ps1 -IncrementType Minor   # 0.1.0 -> 0.2.0
-./scripts/New-Release.ps1 -Version 0.2.0-alpha.1 # explicit
-./scripts/New-Release.ps1 -DryRun    # preview the whole flow, no writes
+./scripts/New-Release.ps1                        # patch bump (1.0.0 -> 1.0.1)
+./scripts/New-Release.ps1 -IncrementType Minor   # 1.0.0 -> 1.1.0
+./scripts/New-Release.ps1 -IncrementType Major   # 1.0.0 -> 2.0.0
+./scripts/New-Release.ps1 -Version 1.1.0-rc.1    # explicit
+./scripts/New-Release.ps1 -DryRun                # preview, no writes
 ```
 
 `New-Release.ps1` validates the repo (on `main`, clean tree, synced with
 origin), resolves the new version, bumps it via `Set-Version.ps1`, runs
 the `Check-Code.ps1` verification gates so the tagged commit is
 known-green, then commits, tags `v<version>`, and pushes `main` + the
-tag. Pushing the tag triggers the build pipeline (which packages the
-`.crate`); approving the Release pipeline then does the irreversible
-publish of that artifact to crates.io.
+tag.
 
-The manual recipe below is what that automation does under the hood —
+### 2. Let the build pipeline package the tag
+
+Pushing the tag triggers `ci/azure-pipelines.yml`, which runs the full
+test suite and then `ci/package.yml` to produce the
+`osdp-embedded-X.Y.Z.crate` plus the Windows tool binaries. Nothing is
+published yet. Wait for it to go green — if it fails, fix forward and cut
+a new patch version rather than re-tagging.
+
+### 3. Approve the Release pipeline (publishes to crates.io)
+
+The Classic Release pipeline picks up that build's artifact and waits on
+your approval. Approving it runs `scripts/Publish-Crate.ps1`, which
+uploads the exact `.crate` CI built. **This is the irreversible step** —
+the version number is burned on crates.io forever, even if you later
+`cargo yank` it.
+
+### 4. Publish the GitHub Release
+
+```pwsh
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3 -DryRun   # preview notes
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3 -Draft    # stage to edit
+./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3           # publish
+```
+
+This is what makes the release visible to anyone watching the repo. The
+script refuses to run if the tag isn't on origin or a release already
+exists for it.
+
+**Notes are generated from the commits since the previous tag**, grouped
+by Conventional Commit type — the same approach OSDP.Net uses. This is
+the default and the norm; there is no `CHANGELOG.md` to maintain, and
+nothing needs writing between releases. It does mean commit subjects are
+the release notes, so write them accordingly.
+
+`-NotesFile <path>` replaces the generated notes with written prose. This
+is the exception, reserved for a release whose significance a commit list
+would misrepresent — v1.0.0 used it
+([docs/release-notes/v1.0.0.md](release-notes/v1.0.0.md)), because
+generating from `v0.1.28..v1.0.0` would have produced a handful of fix
+commits for what was really the story of 147 commits since 0.1.0. Do not
+reach for it routinely.
+
+Do this *after* step 3, not before: a GitHub Release announces a version
+that people will immediately try to `cargo add`, so the crate should
+already be on crates.io when the notification goes out.
+
+**This step is manual and easy to forget** — v1.0.0 shipped to crates.io
+without a GitHub Release for exactly that reason. `New-Release.ps1` now
+prints the command at the end of step 1 as a backstop.
+
+### Version history note
+
+`osdp-embedded` 0.1.0 was published to crates.io on 2026-05-07 to secure
+the name, then publishing went quiet while the PD-completion work landed.
+The repo reached 0.1.28 in the meantime, so **v1.0.0 publishes 0.1.0 →
+1.0.0 in a single step** — the intermediate 0.1.x versions were never
+released and never will be.
+
+The manual recipe below is what the automation does under the hood —
 follow it directly only when you need to deviate (e.g. a local dry-run of
 `cargo package`, or publishing from a workstation outside CI).
 
@@ -231,14 +291,28 @@ cargo publish --manifest-path rust/osdp/Cargo.toml --allow-dirty
 ./scripts/Stage-Crate.ps1 -Clean
 ```
 
-## After the first stable (`0.1.0`) release
+## What 1.0.0 commits us to
 
-A few things change once we drop the pre-release suffix:
+From 1.0.0 on, standard SemVer applies and the public API is a promise:
 
-- `Cargo.toml` description should mention production-readiness.
-- Consider adding a `[badges]` section pointing at the CI build
-  status.
-- Bump rust-version if we start using newer language features.
+- **A breaking change to the public C or Rust API means 2.0.0.** That
+  covers the headers under `core/include/osdp/`, `pd/include/osdp/`, and
+  `acu/include/osdp/`, and everything the crate re-exports. Renaming a
+  struct member, changing a callback signature, or tightening an
+  argument's accepted range all qualify.
+- **New backwards-compatible surface means 1.x.0**; fixes mean 1.0.x.
+- **Adding a member to a public struct is breaking** for C consumers who
+  brace-initialize it positionally, and for anyone who embeds it by
+  value — which, given `osdp_pd_t` is meant to live in static storage, is
+  everyone. Treat struct layout as part of the contract.
+- **`rust-version` is part of the contract too.** Raising the MSRV is a
+  minor bump at minimum; do it deliberately, not as a side effect of
+  using a newer language feature.
+
+The things that are explicitly *not* covered: internal helpers declared
+`static`, anything under `core/src/`, the tools, and the build-time
+constants a consumer is invited to override (`OSDP_PD_BUF_LEN` and
+friends) — those are knobs, not API.
 
 ## Yanking a bad release
 
