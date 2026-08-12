@@ -29,7 +29,7 @@ members  = [
 # applies: the public API is stable, so a breaking change to it means
 # 2.0.0, new backwards-compatible surface means 1.x.0, and fixes mean
 # 1.0.x.
-version       = "0.1.28"
+version       = "1.0.0"
 edition       = "2021"
 license       = "GPL-3.0-or-later"
 authors       = ["Z-bit Systems, LLC"]
