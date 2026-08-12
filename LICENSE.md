@@ -26,7 +26,7 @@ proprietary product, or wanting indemnification — Z-bit Systems offers a
 paid commercial license that grants the same code under terms compatible
 with proprietary distribution.
 
-Inquiries: see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+Inquiries: see [LICENSING](LICENSING).
 
 A signed commercial license supersedes the GPL terms **for the licensee
 only**, for the use cases covered by their agreement. The public source

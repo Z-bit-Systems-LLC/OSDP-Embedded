@@ -78,16 +78,21 @@ typed message structs. Foundation for both PD and ACU work later.
 - ☑ **PD peer tree** (`pd/`). Role-specific state machine, transport HAL,
   application command handler, sequence number management, online/
   offline tracking, address filtering. Builds on top of `osdp::core`.
-  *Remaining nice-to-haves: inter-character timeout policing (spec 5.8)
-  and multi-record reply convenience helpers.*
+  Inter-character timeout policing (spec 5.8) landed later — a stalled
+  receive is now aborted rather than left holding a partial frame, sized
+  to tolerate transports that batch their RX.
+  *Remaining nice-to-have: multi-record reply convenience helpers.*
 - ☑ **ACU peer tree** (`acu/`). Multi-PD registration via caller-allocated
   slots, explicit `osdp_acu_send_command` API with one outstanding
   command per PD, sequence-number progression (0 → 1 → 2 → 3 → 1 → ...),
   per-PD reply timeout (200 ms) with retry-friendly SQN retention, per-PD
   online tracking. *Remaining nice-to-haves: auto-poll scheduling, in-
   process PD↔ACU integration tests.*
-- ☐ First end-to-end PD example on host (loopback) and on a target MCU
-  (TBD — likely STM32 or Nordic).
+- ☑ First end-to-end PD example **on host**: `tests/test_loopback.c` and
+  `rust/osdp/examples/loopback.rs` drive a real PD against a real ACU
+  in-process, and `tools/osdp-pd-mock` runs one on a serial port.
+- ☐ First end-to-end PD example **on a target MCU** (TBD — likely STM32
+  or Nordic). The host side is covered; nothing has been flashed yet.
 - ☐ Extend `osdp-parser` (or add a sibling tool) to drive synthetic
   capture playback for testing PD/ACU state machines.
 
@@ -189,7 +194,7 @@ typed message structs. Foundation for both PD and ACU work later.
   our PD and our ACU on cryptogram inputs, key derivation, frame layout,
   or MAC chain advancement shows up here.
 
-## Iteration 4 — Rust adapter (in progress)
+## Iteration 4 — Rust adapter (done)
 
 - ☑ **Single-crate Rust wrapper, `osdp-embedded`.** The C library is
   exposed through one published crate at `rust/osdp/`, no companion
@@ -252,7 +257,13 @@ typed message structs. Foundation for both PD and ACU work later.
   archive. CI verifies this via `cargo package` (with verify) on
   every tagged build. See [PUBLISHING.md](PUBLISHING.md) for the
   manual `cargo publish` recipe.
-- ☐ **Publishing** to crates.io. Pending the first release tag.
+- ☑ **Publishing** to crates.io. `osdp-embedded` 0.1.0 went up on
+  2026-05-07, which secured the name (the bare `osdp` belongs to
+  libosdp's binding). Publishing then went quiet while the PD-completion
+  work landed, so crates.io sat at 0.1.0 while the repo reached 0.1.28 —
+  v1.0.0 is the first release cut under the formal process in
+  [PUBLISHING.md](PUBLISHING.md), and it publishes 0.1.0 → 1.0.0 in one
+  step.
 
 ## Iteration 5 — osdp-mcp virtual reader web UI (planned)
 
@@ -472,7 +483,6 @@ rules each one settled are written up in
 - Multi-record messages; multi-record reply convenience helpers.
 - ACU-side file transfer (a file-send driver); auto-poll scheduling on the
   ACU.
-- Inter-character timeout policing (spec 5.8).
 - The deferred halves of file transfer: the "finishing" (status 3)
   idle-fragment protocol and `FtUpdateMsgMax` throttling, both of which
   need the app callback to stop being synchronous.

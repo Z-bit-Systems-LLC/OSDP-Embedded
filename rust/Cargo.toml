@@ -25,9 +25,10 @@ members  = [
 [workspace.package]
 # Single source of truth for the published crate's version. Bump via
 # scripts/Set-Version.ps1, which keeps CMakeLists.txt's project()
-# VERSION in sync with this value. Pre-1.0 SemVer applies: 0.1.x for
-# bug-fix releases on the same line, 0.2.0 for breaking changes
-# pre-1.0, then 1.0.0 once the public API is stable.
+# VERSION in sync with this value. From 1.0.0 on, standard SemVer
+# applies: the public API is stable, so a breaking change to it means
+# 2.0.0, new backwards-compatible surface means 1.x.0, and fixes mean
+# 1.0.x.
 version       = "0.1.28"
 edition       = "2021"
 license       = "GPL-3.0-or-later"
