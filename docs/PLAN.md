@@ -315,8 +315,11 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   observation: because the command was decoded and applied before the
   reply is settled, a handler returning `OSDP_ERR_NOT_SUPPORTED` for
   `osdp_LED` / `osdp_BUZ` leaves the default ACK in place instead of
-  claiming NAK 0x03 for a command just carried out — while a payload that
-  failed to decode, and so changed nothing, gets NAK 0x02. Deliberate
+  claiming NAK 0x03 for a command just carried out — while a command the PD
+  could not apply answers for itself: NAK 0x02 if the payload did not
+  decode, NAK 0x09 if the bank has no room to track the LEDs named (refused
+  whole, nothing applied; `OSDP_PD_MAX_LEDS` / `OSDP_PD_MAX_BUZZERS` are
+  `#ifndef`-guarded so a reader with more LEDs sizes them up). Deliberate
   refusals (a specific status, or an app-set `reply->code`) still stand.
   The PD path covers Secure Channel too (folds the unwrapped plaintext). Two
   PD↔ACU loopback tests in `tests/test_loopback.c` drive a real LED

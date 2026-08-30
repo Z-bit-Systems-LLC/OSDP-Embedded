@@ -412,12 +412,31 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   which is invisible on a bench. So the dispatch reads `NOT_SUPPORTED` as
   "no opinion" for these and lets the default ACK stand; a handler that
   means to refuse one still can, via a status that maps to a specific NAK or
-  by setting `reply->code` itself. The condition is
-  **`observe_command` returned true**, not the command code: a payload that
-  did not decode left the bank untouched and earns `NAK 0x02`, because
-  ACKing it would claim success for a command dropped on the floor.
+  by setting `reply->code` itself. The condition is **what
+  `observe_command` returned**, not the command code — it reports an
+  `osdp_status_t` that the dispatch forwards to the same Table 47 mapping an
+  application's return goes through: `OSDP_OK` → ACK, `_BAD_PAYLOAD` → NAK
+  0x02 (did not decode), `_INVALID_ARG` → NAK 0x09 (bank full).
   `osdp_pd_internal_is_observed_command` lives next to the decoder in pd.c
   precisely so the two lists cannot drift.
+
+  **`OSDP_PD_MAX_LEDS` / `OSDP_PD_MAX_BUZZERS` bound tracked devices, not
+  command size**, and both are `#ifndef`-guarded like every other sizing
+  knob. Two traps, both found the hard way:
+  - Decoding the whole record array at once against an
+    `OSDP_PD_MAX_LEDS`-sized buffer conflates the two limits —
+    `osdp_led_decode` rejects a payload it cannot fit, so a legal
+    nine-record command became a decode failure on an eight-LED PD.
+    `pd_led_record_at` decodes one record at a time instead, which also
+    drops the stack frame from `OSDP_PD_MAX_LEDS` records to one.
+  - An LED the bank cannot track is an LED whose callback never fires, so
+    the physical light never moves. That is `NAK 0x09`, not an ACK. The
+    capacity check (`pd_led_bank_can_fit`) runs *before* anything is
+    applied and claims no slots, so an oversized command is refused whole
+    rather than lighting eight of nine — and a rejection leaves the bank
+    exactly as it was, so the next command that does fit still works.
+    Records naming an already-tracked LED, or repeating one within the same
+    command, cost no capacity.
 
 ## Coding rules
 

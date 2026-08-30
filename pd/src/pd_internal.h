@@ -126,14 +126,20 @@ bool osdp_pd_internal_is_observed_command(uint8_t cmd_code);
  * Secure Channel operational path (pd_sc.c) funnel through, so state tracks
  * identically on either channel. Defined in pd.c.
  *
- * Returns true only if the command was decoded and applied — false both for
- * a command this does not observe and for an observed one whose payload did
- * not decode. The dispatch relies on that second case to tell an osdp_LED it
- * carried out from one it dropped, and answer each honestly. */
-bool osdp_pd_internal_observe_command(osdp_pd_t     *pd,
-                                      uint8_t        cmd_code,
-                                      const uint8_t *payload,
-                                      size_t         payload_len);
+ * The result is how the dispatch answers an ACU when the application had no
+ * opinion, so it separates the ways this can decline to act:
+ *
+ *   OSDP_OK                 decoded, and every record reached its slot
+ *   OSDP_ERR_BAD_PAYLOAD    the payload did not decode      -> NAK 0x02
+ *   OSDP_ERR_INVALID_ARG    decoded, but the bank is full   -> NAK 0x09
+ *   OSDP_ERR_NOT_SUPPORTED  not an observed command (not consulted)
+ *
+ * Each maps straight onto apply_app_status(), so the dispatch forwards the
+ * status rather than re-deciding what it meant. */
+osdp_status_t osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+                                               uint8_t        cmd_code,
+                                               const uint8_t *payload,
+                                               size_t         payload_len);
 
 /* Decode a KEYSET payload and, if it carries a valid 16-byte SCBK,
  * copy the new key into pd->sc.scbk (and set the `scbk_set` flag).

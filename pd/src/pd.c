@@ -999,30 +999,57 @@ static uint32_t pd_now_ms(const osdp_pd_t *pd)
     return 0U;
 }
 
-/* Find the bank slot tracking (reader_no, led_no), claiming a free one on
- * first sighting. Returns NULL only when every slot is already in use by
- * other LEDs (oversized deployment — the extra LED is ACK'd but untracked). */
-static osdp_pd_led_slot_t *pd_led_slot(osdp_pd_t *pd,
-                                       uint8_t reader_no, uint8_t led_no)
+/* Find the bank slot already tracking (reader_no, led_no), or NULL if this
+ * LED has not been seen. Claims nothing — the capacity pre-check below
+ * needs to ask about a slot without consuming one. */
+static osdp_pd_led_slot_t *pd_led_slot_find(const osdp_pd_t *pd,
+                                            uint8_t reader_no, uint8_t led_no)
 {
-    osdp_pd_led_slot_t *free_slot = NULL;
     for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
-        osdp_pd_led_slot_t *s = &pd->leds[i];
+        /* Cast: the bank is logically mutable, the search is not. */
+        osdp_pd_led_slot_t *s = (osdp_pd_led_slot_t *)&pd->leds[i];
         if (s->used && s->reader_no == reader_no && s->led_no == led_no) {
             return s;
         }
-        if (!s->used && free_slot == NULL) {
-            free_slot = s;
+    }
+    return NULL;
+}
+
+/* How many slots are still unclaimed. */
+static size_t pd_led_slots_free(const osdp_pd_t *pd)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
+        if (!pd->leds[i].used) {
+            n++;
         }
     }
-    if (free_slot != NULL) {
-        free_slot->used       = true;
-        free_slot->reader_no  = reader_no;
-        free_slot->led_no     = led_no;
-        free_slot->last_color = OSDP_LED_BLACK;
-        osdp_led_init(&free_slot->state);
+    return n;
+}
+
+/* Find the bank slot tracking (reader_no, led_no), claiming a free one on
+ * first sighting. Returns NULL only when every slot is already in use by
+ * other LEDs — which the caller has ruled out in advance, so a NULL here
+ * is a bug rather than a deployment size. */
+static osdp_pd_led_slot_t *pd_led_slot(osdp_pd_t *pd,
+                                       uint8_t reader_no, uint8_t led_no)
+{
+    osdp_pd_led_slot_t *s = pd_led_slot_find(pd, reader_no, led_no);
+    if (s != NULL) {
+        return s;
     }
-    return free_slot;
+    for (size_t i = 0; i < OSDP_PD_MAX_LEDS; i++) {
+        osdp_pd_led_slot_t *free_slot = &pd->leds[i];
+        if (!free_slot->used) {
+            free_slot->used       = true;
+            free_slot->reader_no  = reader_no;
+            free_slot->led_no     = led_no;
+            free_slot->last_color = OSDP_LED_BLACK;
+            osdp_led_init(&free_slot->state);
+            return free_slot;
+        }
+    }
+    return NULL;
 }
 
 /* Recompute every tracked LED's displayed colour at `now` and fire the
@@ -1105,6 +1132,57 @@ bool osdp_pd_internal_is_observed_command(uint8_t cmd_code)
     return cmd_code == OSDP_CMD_LED || cmd_code == OSDP_CMD_BUZ;
 }
 
+/* Decode one LED record out of a multi-record osdp_LED payload. Goes back
+ * through the codec per record rather than decoding the whole array at once
+ * so the bank's capacity never limits how many records a *command* may
+ * carry: osdp_led_decode fails a payload it cannot fit in the destination
+ * array, and sizing that array by OSDP_PD_MAX_LEDS would turn a legal
+ * nine-record command into a decode failure on an eight-LED PD. Costs one
+ * record of stack instead of OSDP_PD_MAX_LEDS of it, too. */
+static osdp_status_t pd_led_record_at(const uint8_t     *payload,
+                                      size_t             index,
+                                      osdp_led_record_t *out)
+{
+    size_t n = 0;
+    return osdp_led_decode(&payload[index * OSDP_LED_RECORD_BYTES],
+                           OSDP_LED_RECORD_BYTES, out, 1, &n);
+}
+
+/* Can the bank take every LED this command addresses?
+ *
+ * Answered before anything is applied, so a command that does not fit is
+ * refused whole rather than lighting the first eight LEDs of nine and then
+ * NAKing — the ACU would have no way to tell which half happened. Counts
+ * only the *new* (reader, led) pairs: one already tracked needs no slot,
+ * and a pair repeated within the same command needs one slot, not two. */
+static bool pd_led_bank_can_fit(const osdp_pd_t *pd,
+                                const uint8_t   *payload,
+                                size_t           count)
+{
+    size_t needed = 0;
+    for (size_t i = 0; i < count; i++) {
+        osdp_led_record_t rec;
+        if (pd_led_record_at(payload, i, &rec) != OSDP_OK) {
+            return false;
+        }
+        if (pd_led_slot_find(pd, rec.reader_no, rec.led_no) != NULL) {
+            continue;  /* already tracked */
+        }
+        bool seen_earlier = false;
+        for (size_t j = 0; j < i && !seen_earlier; j++) {
+            osdp_led_record_t prev;
+            if (pd_led_record_at(payload, j, &prev) == OSDP_OK) {
+                seen_earlier = (prev.reader_no == rec.reader_no &&
+                                prev.led_no == rec.led_no);
+            }
+        }
+        if (!seen_earlier) {
+            needed++;
+        }
+    }
+    return needed <= pd_led_slots_free(pd);
+}
+
 /* Transparently fold an inbound command into the reader-LED / -buzzer banks.
  * A no-op for everything except osdp_LED and osdp_BUZ; for those it decodes
  * the command, applies it to the matching slot, then re-resolves state so
@@ -1112,53 +1190,78 @@ bool osdp_pd_internal_is_observed_command(uint8_t cmd_code)
  * osdp_pd_internal_dispatch, which both the plaintext and Secure Channel
  * paths funnel through, so it always sees plaintext bytes.
  *
- * Returns true only when the command was decoded and applied. The dispatch
- * needs that distinction rather than just the command code: it is what lets
- * a malformed osdp_LED be NAKed for its length instead of being ACKed for a
- * command this function silently declined to act on. */
-bool osdp_pd_internal_observe_command(osdp_pd_t     *pd,
-                                      uint8_t        cmd_code,
-                                      const uint8_t *payload,
-                                      size_t         payload_len)
+ * The return value is what the dispatch answers the ACU with when the
+ * application expressed no opinion, so it distinguishes the ways this can
+ * decline to act:
+ *
+ *   OSDP_OK                 decoded, and every record reached its slot
+ *   OSDP_ERR_BAD_PAYLOAD    the payload did not decode      -> NAK 0x02
+ *   OSDP_ERR_INVALID_ARG    decoded, but the bank is full   -> NAK 0x09
+ *   OSDP_ERR_NOT_SUPPORTED  not a command this observes (the dispatch does
+ *                           not consult the result in that case)
+ *
+ * The bank-full case is the one worth stating plainly: an LED this PD has
+ * no room to track is an LED whose callback never fires, so the physical
+ * light never moves. ACKing that would promise the ACU something the
+ * hardware will not do. Raise OSDP_PD_MAX_LEDS for a reader with more
+ * LEDs than the default bank holds. */
+osdp_status_t osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+                                               uint8_t        cmd_code,
+                                               const uint8_t *payload,
+                                               size_t         payload_len)
 {
     if (pd == NULL || !osdp_pd_internal_is_observed_command(cmd_code)) {
-        return false;
+        return OSDP_ERR_NOT_SUPPORTED;
     }
 
     if (cmd_code == OSDP_CMD_LED) {
-        osdp_led_record_t recs[OSDP_PD_MAX_LEDS];
-        size_t n = 0;
-        if (osdp_led_decode(payload, payload_len, recs,
-                            OSDP_PD_MAX_LEDS, &n) != OSDP_OK) {
-            return false;  /* malformed LED payload — bank left untouched */
+        /* The record split is checked here rather than inferred from a
+         * whole-array decode, so "too many records for my bank" stays
+         * distinct from "not a well-formed payload". */
+        if (payload == NULL || payload_len == 0 ||
+            (payload_len % OSDP_LED_RECORD_BYTES) != 0) {
+            return OSDP_ERR_BAD_PAYLOAD;
         }
+        const size_t count = payload_len / OSDP_LED_RECORD_BYTES;
+
+        if (!pd_led_bank_can_fit(pd, payload, count)) {
+            return OSDP_ERR_INVALID_ARG;
+        }
+
         const uint32_t now = pd_now_ms(pd);
-        for (size_t i = 0; i < n; i++) {
-            osdp_pd_led_slot_t *s =
-                pd_led_slot(pd, recs[i].reader_no, recs[i].led_no);
-            if (s != NULL) {
-                osdp_led_apply(&s->state, &recs[i], now);
+        for (size_t i = 0; i < count; i++) {
+            osdp_led_record_t rec;
+            if (pd_led_record_at(payload, i, &rec) != OSDP_OK) {
+                return OSDP_ERR_BAD_PAYLOAD;
             }
+            osdp_pd_led_slot_t *s =
+                pd_led_slot(pd, rec.reader_no, rec.led_no);
+            if (s == NULL) {
+                /* pd_led_bank_can_fit said otherwise. */
+                return OSDP_ERR_INVALID_ARG;
+            }
+            osdp_led_apply(&s->state, &rec, now);
         }
         pd_led_refresh(pd, now);
-        return true;
+        return OSDP_OK;
     }
 
     if (cmd_code == OSDP_CMD_BUZ) {
         osdp_buz_cmd_t buz;
         if (osdp_buz_decode(payload, payload_len, &buz) != OSDP_OK) {
-            return false;  /* malformed BUZ payload — ignore */
+            return OSDP_ERR_BAD_PAYLOAD;
         }
         const uint32_t now = pd_now_ms(pd);
         osdp_pd_buz_slot_t *s = pd_buz_slot(pd, buz.reader_no);
-        if (s != NULL) {
-            osdp_buz_apply(&s->state, &buz, now);
+        if (s == NULL) {
+            return OSDP_ERR_INVALID_ARG;  /* no room to track this reader */
         }
+        osdp_buz_apply(&s->state, &buz, now);
         pd_buz_refresh(pd, now);
-        return true;
+        return OSDP_OK;
     }
 
-    return false;
+    return OSDP_ERR_NOT_SUPPORTED;
 }
 
 void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user)

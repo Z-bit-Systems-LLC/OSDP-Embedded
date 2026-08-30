@@ -172,9 +172,11 @@ typedef osdp_status_t (*osdp_pd_command_cb)(
  * refuse one deliberately, return a status that maps to a specific NAK or
  * set reply->code yourself and return OSDP_OK.
  *
- * That ACK is earned per command, not per command code: a payload the PD
- * could not decode never reached the bank, so an unhandled malformed
- * osdp_LED answers NAK 0x02 (bad length) instead. */
+ * That ACK is earned per command, not per command code — it means the PD
+ * applied what it was sent. A payload it could not decode answers NAK 0x02
+ * (bad length) instead, and an osdp_LED naming more distinct LEDs than the
+ * bank holds answers NAK 0x09 (unable to process record) with nothing
+ * applied: see OSDP_PD_MAX_LEDS, which is yours to size. */
 
 /* Fired whenever a reader LED's *displayed* colour changes — on a new LED
  * command, when a temporary override's timer expires, and on each flash
@@ -400,11 +402,25 @@ typedef osdp_status_t (*osdp_pd_mfg_cb)(void *user,
 /* ---- Context ------------------------------------------------------------*/
 
 /* Reader LED bank capacity: the number of distinct (reader_no, led_no)
- * LEDs the PD tracks. Records beyond this (after all slots are claimed by
- * earlier addresses) are still ACK'd on the wire but not reflected in the
- * bank. Sized for the common case (one or two LEDs on a handful of
- * readers); bump if a deployment needs more. */
+ * LEDs the PD tracks. Sized for the common case (one or two LEDs on a
+ * handful of readers).
+ *
+ * This is a hardware fact about the device, so raise it — with -D or CMake
+ * target_compile_definitions, like the other sizing knobs — to match the
+ * reader rather than living with the default. An osdp_LED command naming
+ * more distinct LEDs than the bank can hold is answered NAK 0x09, not
+ * ACKed: an untracked LED is one whose change callback never fires, so the
+ * physical light never moves, and ACKing would promise the ACU something
+ * the hardware will not do. (An application that answers osdp_LED from its
+ * own command handler is unaffected — this applies only where the PD is
+ * the one acting.)
+ *
+ * It bounds *tracked LEDs*, not the size of a command: an osdp_LED payload
+ * may carry any number of records, and repeats of an already-tracked LED
+ * cost no capacity at all. */
+#ifndef OSDP_PD_MAX_LEDS
 #define OSDP_PD_MAX_LEDS 8U
+#endif
 
 /* One tracked physical LED: its (reader_no, led_no) identity, the resolved
  * timer/flash state, and the last colour reported through the callback (so
@@ -418,8 +434,12 @@ typedef struct osdp_pd_led_slot {
 } osdp_pd_led_slot_t;
 
 /* Reader buzzer bank capacity: the number of distinct readers whose buzzer
- * the PD tracks. One buzzer per reader. */
+ * the PD tracks. One buzzer per reader. Overridable and enforced exactly
+ * like OSDP_PD_MAX_LEDS above — an osdp_BUZ for a reader beyond the bank
+ * NAKs 0x09 rather than claiming a beep that will not sound. */
+#ifndef OSDP_PD_MAX_BUZZERS
 #define OSDP_PD_MAX_BUZZERS 4U
+#endif
 
 /* osdp_PDCAP record bank capacity for osdp_pd_set_pdcap: OSDP v2.2.2
  * Annex B defines function codes 1..16 in the spec text this project was
@@ -813,15 +833,16 @@ osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd,
  * osdp_LED and osdp_BUZ do arrive here, but the PD has already decoded and
  * applied them by the time the reply is settled, so returning
  * OSDP_ERR_NOT_SUPPORTED for them leaves the default ACK in place instead of
- * producing NAK 0x03 — unless the payload failed to decode, in which case
- * the PD applied nothing and answers NAK 0x02. Everything else the handler
- * does not recognise NAKs with 0x03, which is the correct answer for a
- * command the PD really does not implement.
+ * producing NAK 0x03 — unless the PD could not apply the command after all,
+ * in which case it answers for itself: NAK 0x02 if the payload did not
+ * decode, NAK 0x09 if its LED/buzzer bank has no room for what was asked.
+ * Everything else the handler does not recognise NAKs with 0x03, which is
+ * the correct answer for a command the PD really does not implement.
  *
  * May be called with cb=NULL to detach. Every command then takes the default
  * path, which is NAK 0x03 for all of them except osdp_LED and osdp_BUZ —
- * those are still decoded, still fire their callbacks, and ACK when they
- * decode (NAK 0x02 when they do not). */
+ * those are still decoded, still fire their callbacks, and answer on the
+ * PD's own terms as above. */
 void osdp_pd_set_command_handler(osdp_pd_t *pd,
                                  osdp_pd_command_cb cb, void *user);
 

@@ -346,10 +346,19 @@ correct — you get working LEDs and an honest wire without listing 0x69 and
 0x6A. To refuse one deliberately, return a status from a different row, or
 set `reply->code` yourself and return `OSDP_OK`.
 
-The ACK is earned per command, not per command code. A payload the PD
-could not decode never reached the LED/buzzer bank, so an unhandled
-malformed `osdp_LED` answers `NAK 0x02` rather than claiming success for a
-command it dropped.
+The ACK is earned per command, not per command code — it means the PD
+actually applied what it was sent. When it could not, it says which way it
+failed:
+
+| The PD… | Unhandled `osdp_LED` / `osdp_BUZ` answers |
+| --- | --- |
+| decoded and applied every record | `ACK` |
+| could not decode the payload | `NAK 0x02` (bad length / format) |
+| has no room left in its LED / buzzer bank | `NAK 0x09` (unable to process record) |
+
+The last row is a sizing problem, not a protocol one: raise
+`OSDP_PD_MAX_LEDS` / `OSDP_PD_MAX_BUZZERS` to match your reader. See
+[LED observation](#led-observation--osdp_pd_set_led_handler--osdp_pd_led_color).
 
 The reply is a code plus an optional payload buffer:
 
@@ -808,9 +817,21 @@ uint8_t c = osdp_pd_led_color(&pd, /*reader*/0, /*led*/0);
   supplies `now_ms`. Command-driven changes fire immediately regardless.
 - `osdp_pd_led_color` returns `OSDP_LED_BLACK` for an LED no command has
   ever addressed.
-- The bank holds `OSDP_PD_MAX_LEDS` (8) distinct `(reader, led)` pairs.
-  LEDs beyond capacity are still ACKed on the wire, just not tracked. Bump
-  the `#define` if you need more.
+- The bank holds `OSDP_PD_MAX_LEDS` (8) distinct `(reader, led)` pairs, and
+  `OSDP_PD_MAX_BUZZERS` (4) buzzers. Both are `#ifndef`-guarded — override
+  them with `-D` or CMake `target_compile_definitions` to match your reader,
+  the same way you size `OSDP_PD_BUF_LEN`.
+- **Size the bank to your hardware.** An `osdp_LED` naming more distinct
+  LEDs than the bank holds is answered `NAK 0x09` (unable to process
+  record), and nothing is applied — not even the records that would have
+  fit, so the ACU never has to guess which half happened. An untracked LED
+  is one whose callback never fires, so the physical light never moves;
+  ACKing it would promise the ACU something the hardware will not do. This
+  applies only where the PD is the one acting — if your handler answers
+  `osdp_LED` itself and returns `OSDP_OK`, your reply stands.
+- The bank bounds *tracked LEDs*, not command length. An `osdp_LED` may
+  carry any number of records, and records naming an already-tracked LED
+  cost no capacity — a 20-record command driving 2 LEDs is fine on any PD.
 - Registering a handler reports changes from that point on; it does not
   replay current colours. The callback **must not** re-enter the PD API.
 

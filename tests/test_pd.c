@@ -1664,6 +1664,158 @@ static void test_malformed_buz_naks_rather_than_acking(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_CMD_LENGTH, reply.payload[0]);
 }
 
+/* ---- LED bank capacity vs. command size --------------------------------
+ *
+ * These are two different limits and must not be confused. The bank bounds
+ * how many distinct (reader, led) pairs the PD *tracks*; nothing bounds how
+ * many records a legal osdp_LED may *carry*. Decoding the whole array into
+ * an OSDP_PD_MAX_LEDS-sized buffer conflated them, so a perfectly legal
+ * command with more records than the PD has LEDs failed to decode and was
+ * answered as a bad payload. */
+
+static void fill_led_record(osdp_led_record_t *rec,
+                            uint8_t reader_no, uint8_t led_no, uint8_t color)
+{
+    memset(rec, 0, sizeof(*rec));
+    rec->reader_no         = reader_no;
+    rec->led_no            = led_no;
+    rec->temp_control_code = OSDP_LED_TEMP_NOP;
+    rec->perm_control_code = OSDP_LED_PERM_SET;
+    rec->perm_on_color     = color;
+    rec->perm_off_color    = color;
+}
+
+/* Many records, one LED: the bank needs a single slot however long the
+ * command is, so this ACKs on a PD with any capacity at all. */
+static void test_led_command_longer_than_the_bank_is_still_legal(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    enum { N = OSDP_PD_MAX_LEDS * 2 };
+    osdp_led_record_t recs[N];
+    for (size_t i = 0; i < N; i++) {
+        /* Same LED every time; the last record wins. */
+        fill_led_record(&recs[i], 0, 0,
+                        (i + 1 == N) ? OSDP_LED_GREEN : OSDP_LED_RED);
+    }
+
+    uint8_t payload[N * OSDP_LED_RECORD_BYTES];
+    size_t  plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_led_build(recs, N, payload,
+                                              sizeof(payload), &plen));
+
+    inject_command(&m, 0x05, OSDP_CMD_LED, payload, plen,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, osdp_pd_led_color(&pd, 0, 0));
+}
+
+/* More distinct LEDs than the bank can hold: the PD cannot drive what it
+ * cannot track, so it says so (0x09, unable to process record) instead of
+ * ACKing lights that will never move — and applies nothing, rather than
+ * lighting the first eight of nine and leaving the ACU to guess which. */
+static void test_led_beyond_bank_capacity_naks_and_applies_nothing(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    enum { N = OSDP_PD_MAX_LEDS + 1 };
+    osdp_led_record_t recs[N];
+    for (size_t i = 0; i < N; i++) {
+        fill_led_record(&recs[i], 0, (uint8_t)i, OSDP_LED_RED);
+    }
+
+    uint8_t payload[N * OSDP_LED_RECORD_BYTES];
+    size_t  plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_led_build(recs, N, payload,
+                                              sizeof(payload), &plen));
+
+    inject_command(&m, 0x05, OSDP_CMD_LED, payload, plen,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+
+    /* All or nothing: not even the records that would have fit landed. */
+    for (uint8_t led = 0; led < OSDP_PD_MAX_LEDS; led++) {
+        TEST_ASSERT_EQUAL_HEX8(OSDP_LED_BLACK,
+                               osdp_pd_led_color(&pd, 0, led));
+    }
+
+    /* And the bank is not left poisoned — a command that does fit still
+     * works afterwards, so the rejection consumed no slots. */
+    osdp_led_record_t ok_rec;
+    fill_led_record(&ok_rec, 0, 0, OSDP_LED_GREEN);
+    uint8_t ok_payload[OSDP_LED_RECORD_BYTES];
+    size_t  ok_len = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_led_build(&ok_rec, 1, ok_payload,
+                                              sizeof(ok_payload), &ok_len));
+    inject_command(&m, 0x05, OSDP_CMD_LED, ok_payload, ok_len,
+                   OSDP_INTEGRITY_CRC, 2);
+    osdp_pd_tick(&pd);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, osdp_pd_led_color(&pd, 0, 0));
+}
+
+/* The buzzer bank enforces its capacity the same way. */
+static void test_buz_beyond_bank_capacity_naks(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* Claim every buzzer slot, one reader at a time, then ask for one more. */
+    for (uint8_t reader = 0; reader <= OSDP_PD_MAX_BUZZERS; reader++) {
+        const osdp_buz_cmd_t buz = {
+            .reader_no      = reader,
+            .tone_code      = 0x02,
+            .on_time_100ms  = 1,
+            .off_time_100ms = 1,
+            .count          = 1,
+        };
+        uint8_t payload[OSDP_BUZ_PAYLOAD_BYTES];
+        size_t  plen = 0;
+        TEST_ASSERT_EQUAL(OSDP_OK, osdp_buz_build(&buz, payload,
+                                                  sizeof(payload), &plen));
+
+        m.outgoing_len = 0;
+        inject_command(&m, 0x05, OSDP_CMD_BUZ, payload, plen,
+                       OSDP_INTEGRITY_CRC, (uint8_t)((reader % 3) + 1));
+        osdp_pd_tick(&pd);
+
+        osdp_frame_t reply;
+        decode_first_outgoing(&m, &reply);
+        if (reader < OSDP_PD_MAX_BUZZERS) {
+            TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+        } else {
+            TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+            TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+        }
+    }
+}
+
 /* A command the PD genuinely does not implement still NAKs 0x03. The
  * promotion above must not have widened into "ACK everything". */
 static void test_unobserved_command_still_naks_unknown(void)
@@ -1737,6 +1889,9 @@ int main(void)
     RUN_TEST(test_handler_can_still_refuse_an_led_deliberately);
     RUN_TEST(test_malformed_led_naks_rather_than_acking);
     RUN_TEST(test_malformed_buz_naks_rather_than_acking);
+    RUN_TEST(test_led_command_longer_than_the_bank_is_still_legal);
+    RUN_TEST(test_led_beyond_bank_capacity_naks_and_applies_nothing);
+    RUN_TEST(test_buz_beyond_bank_capacity_naks);
     RUN_TEST(test_unobserved_command_still_naks_unknown);
 
     RUN_TEST(test_a_truncated_frame_does_not_poison_the_retransmission);
