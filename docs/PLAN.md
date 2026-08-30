@@ -311,9 +311,14 @@ just the MCP tool. The Rust/MCP visual is a thin consumer of that C API.
   command, on temporary-timer expiry, and on each flash transition (the
   time-driven ones detected inside `tick()`, so they need a `now_ms`
   transport clock). Direct query via `osdp_pd_led_color` /
-  `osdp_acu_led_color`. The wire reply is unchanged (the app still
-  ACKs LED), so this is observe-only with zero interop impact. The PD
-  path covers Secure Channel too (folds the unwrapped plaintext). Two
+  `osdp_acu_led_color`. On the PD the wire reply now follows from the
+  observation: because the command was decoded and applied before the
+  reply is settled, a handler returning `OSDP_ERR_NOT_SUPPORTED` for
+  `osdp_LED` / `osdp_BUZ` leaves the default ACK in place instead of
+  claiming NAK 0x03 for a command just carried out — while a payload that
+  failed to decode, and so changed nothing, gets NAK 0x02. Deliberate
+  refusals (a specific status, or an app-set `reply->code`) still stand.
+  The PD path covers Secure Channel too (folds the unwrapped plaintext). Two
   PD↔ACU loopback tests in `tests/test_loopback.c` drive a real LED
   command end to end (steady colour mirrored on both peers; temporary
   timer expiring back to permanent purely from the wire clock).

@@ -161,9 +161,20 @@ typedef osdp_status_t (*osdp_pd_command_cb)(
  * The PD transparently decodes inbound osdp_LED (0x69) commands and folds
  * each record into an internal bank of osdp_led_t resolvers, so the
  * application never has to parse the LED command itself: it just registers
- * a callback and/or queries the current colour. This runs alongside the
- * normal command handler — the LED command still flows to cmd_cb (which
- * typically ACKs it) and the wire behaviour is unchanged. */
+ * a callback and/or queries the current colour.
+ *
+ * This runs alongside the normal command handler: the LED command is still
+ * passed to cmd_cb, which may shape the reply. It does not have to. The
+ * reply defaults to ACK, and because the PD has already acted on the
+ * command, a handler returning OSDP_ERR_NOT_SUPPORTED for it is read as
+ * "no opinion" and the ACK stands rather than becoming NAK 0x03 — the PD
+ * will not call a command unknown when it has just carried it out. To
+ * refuse one deliberately, return a status that maps to a specific NAK or
+ * set reply->code yourself and return OSDP_OK.
+ *
+ * That ACK is earned per command, not per command code: a payload the PD
+ * could not decode never reached the bank, so an unhandled malformed
+ * osdp_LED answers NAK 0x02 (bad length) instead. */
 
 /* Fired whenever a reader LED's *displayed* colour changes — on a new LED
  * command, when a temporary override's timer expires, and on each flash
@@ -180,8 +191,9 @@ typedef void (*osdp_pd_led_cb)(void   *user,
 /* ---- Reader buzzer observation -----------------------------------------
  *
  * The PD decodes inbound osdp_BUZ (0x6A) commands and folds each into a
- * resolver (osdp_buz_t) keyed by reader, so — exactly like the LED — the
- * application just registers a change callback and/or queries the current
+ * resolver (osdp_buz_t) keyed by reader, so — exactly like the LED, and
+ * with the same reply behaviour described above — the application just
+ * registers a change callback and/or queries the current
  * state instead of parsing the command. The buzzer's `on_time`/`off_time`/
  * `count` pattern is resolved over time: the callback fires when the buzzer
  * starts sounding, on each beep/silence edge of the pattern, and once more
@@ -789,8 +801,27 @@ void osdp_pd_set_transport(osdp_pd_t *pd,
 osdp_status_t osdp_pd_set_buffers(osdp_pd_t *pd,
                                   const osdp_pd_buffers_t *bufs);
 
-/* Bind the application's command handler. May be called with cb=NULL
- * to detach (every command will then NAK with code 0x03). */
+/* Bind the application's command handler.
+ *
+ * Not every accepted command reaches it. The PD answers osdp_CAP, osdp_COMSET,
+ * osdp_FILETRANSFER, osdp_ABORT, osdp_ACURXSIZE, osdp_KEEPACTIVE and the
+ * osdp_LSTAT / osdp_ISTAT / osdp_OSTAT / osdp_RSTAT status requests entirely
+ * on its own once the relevant provider is bound, and answers an osdp_POLL
+ * from the event queue when something is waiting there. Those never arrive
+ * here.
+ *
+ * osdp_LED and osdp_BUZ do arrive here, but the PD has already decoded and
+ * applied them by the time the reply is settled, so returning
+ * OSDP_ERR_NOT_SUPPORTED for them leaves the default ACK in place instead of
+ * producing NAK 0x03 — unless the payload failed to decode, in which case
+ * the PD applied nothing and answers NAK 0x02. Everything else the handler
+ * does not recognise NAKs with 0x03, which is the correct answer for a
+ * command the PD really does not implement.
+ *
+ * May be called with cb=NULL to detach. Every command then takes the default
+ * path, which is NAK 0x03 for all of them except osdp_LED and osdp_BUZ —
+ * those are still decoded, still fire their callbacks, and ACK when they
+ * decode (NAK 0x02 when they do not). */
 void osdp_pd_set_command_handler(osdp_pd_t *pd,
                                  osdp_pd_command_cb cb, void *user);
 
@@ -851,7 +882,13 @@ bool osdp_pd_is_online(const osdp_pd_t *pd);
 /* Bind the reader-LED change handler. `cb` fires whenever a tracked LED's
  * displayed colour changes (see osdp_pd_led_cb). Pass cb=NULL to detach.
  * Registering a handler does not retroactively replay current colours —
- * it reports changes from this point on. */
+ * it reports changes from this point on.
+ *
+ * This binds the callback, not the reply: osdp_LED is still passed to the
+ * command handler afterwards. You do not have to answer it there (an
+ * unhandled osdp_LED ACKs — see "Reader LED observation" above), but if
+ * your handler NAKs by some route other than OSDP_ERR_NOT_SUPPORTED, that
+ * NAK is what goes on the wire while this callback still fires. */
 void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user);
 
 /* Current displayed colour of the given reader LED as an osdp_led_color_t
@@ -863,7 +900,9 @@ uint8_t osdp_pd_led_color(const osdp_pd_t *pd,
                           uint8_t reader_no, uint8_t led_no);
 
 /* Bind the reader-buzzer handler. `cb` fires whenever a tracked buzzer's
- * sounding state changes (see osdp_pd_buzzer_cb). Pass cb=NULL to detach. */
+ * sounding state changes (see osdp_pd_buzzer_cb). Pass cb=NULL to detach.
+ * As with the LED handler above, this binds the callback and not the reply;
+ * an osdp_BUZ the command handler does not answer ACKs. */
 void osdp_pd_set_buzzer_handler(osdp_pd_t *pd, osdp_pd_buzzer_cb cb,
                                 void *user);
 

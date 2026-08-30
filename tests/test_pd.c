@@ -481,8 +481,13 @@ static void test_retransmit_replays_nak_too(void)
      * Use the default_handler instead, which only knows POLL. */
     osdp_pd_set_command_handler(&pd, default_handler, NULL);
 
-    static const uint8_t buz[] = { 0, 2, 1, 1, 3 };
-    inject_command(&m, 0x05, OSDP_CMD_BUZ, buz, sizeof(buz),
+    /* The command has to be one the PD does not act on itself. This test
+     * used osdp_BUZ until observed commands started ACKing on an unhandled
+     * NOT_SUPPORTED, which left nothing to cache. osdp_TEXT still NAKs. */
+    static const uint8_t text[] = {
+        0, OSDP_TEXT_PERM_NO_WRAP, 0, 1, 1, 0
+    };
+    inject_command(&m, 0x05, OSDP_CMD_TEXT, text, sizeof(text),
                    OSDP_INTEGRITY_CRC, 2);
     osdp_pd_tick(&pd);
 
@@ -492,7 +497,7 @@ static void test_retransmit_replays_nak_too(void)
     const size_t len_first = m.outgoing_len;
 
     /* Retransmit. */
-    inject_command(&m, 0x05, OSDP_CMD_BUZ, buz, sizeof(buz),
+    inject_command(&m, 0x05, OSDP_CMD_TEXT, text, sizeof(text),
                    OSDP_INTEGRITY_CRC, 2);
     osdp_pd_tick(&pd);
 
@@ -1478,6 +1483,210 @@ static void test_no_clock_leaves_a_partial_frame_alone(void)
     TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
 }
 
+/* ---- Observed commands are never "unknown" ------------------------------
+ *
+ * osdp_LED and osdp_BUZ are the only commands the PD both acts on itself
+ * and still routes to the application for a reply. A handler written the
+ * obvious way — switch on the codes it knows, OSDP_ERR_NOT_SUPPORTED for
+ * the rest — must not turn that into NAK 0x03, because by the time the
+ * reply is settled the PD has already decoded the command and driven its
+ * LED/buzzer bank. Saying "unknown command code" for something just
+ * carried out is a lie the ACU acts on, and it is invisible on a bench:
+ * the light behaves perfectly while the wire disagrees.
+ *
+ * default_handler above is exactly that naive shape, which is what makes
+ * it the right handler for these tests. */
+
+static void test_led_acks_even_when_the_handler_ignores_it(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    osdp_led_record_t rec = {0};
+    rec.reader_no         = 0;
+    rec.led_no            = 0;
+    rec.temp_control_code = OSDP_LED_TEMP_NOP;
+    rec.perm_control_code = OSDP_LED_PERM_SET;
+    rec.perm_on_color     = OSDP_LED_GREEN;
+    rec.perm_off_color    = OSDP_LED_GREEN;
+
+    uint8_t payload[OSDP_LED_RECORD_BYTES];
+    size_t  plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_led_build(&rec, 1, payload,
+                                              sizeof(payload), &plen));
+
+    inject_command(&m, 0x05, OSDP_CMD_LED, payload, plen,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+
+    /* And the command really was applied, not merely tolerated. */
+    TEST_ASSERT_EQUAL_HEX8(OSDP_LED_GREEN, osdp_pd_led_color(&pd, 0, 0));
+}
+
+static void test_buz_acks_even_when_the_handler_ignores_it(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    const osdp_buz_cmd_t buz = {
+        .reader_no      = 0,
+        .tone_code      = 0x02,
+        .on_time_100ms  = 2,
+        .off_time_100ms = 2,
+        .count          = 1,
+    };
+    uint8_t payload[OSDP_BUZ_PAYLOAD_BYTES];
+    size_t  plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_buz_build(&buz, payload,
+                                              sizeof(payload), &plen));
+
+    inject_command(&m, 0x05, OSDP_CMD_BUZ, payload, plen,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_ACK, reply.code);
+}
+
+/* The promotion is narrow: it reads a vague "not supported" as "no
+ * opinion", and must not disarm a handler that refuses on purpose. A
+ * specific status still produces its specific NAK. */
+static osdp_status_t led_refusing_handler(void *user,
+                                          uint8_t cmd_code,
+                                          const uint8_t *payload,
+                                          size_t payload_len,
+                                          osdp_pd_reply_t *reply)
+{
+    (void)user; (void)payload; (void)payload_len; (void)reply;
+    if (cmd_code == OSDP_CMD_LED) {
+        return OSDP_ERR_INVALID_ARG;   /* -> NAK 0x09 */
+    }
+    return OSDP_ERR_NOT_SUPPORTED;
+}
+
+static void test_handler_can_still_refuse_an_led_deliberately(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, led_refusing_handler, NULL);
+
+    osdp_led_record_t rec = {0};
+    rec.perm_control_code = OSDP_LED_PERM_SET;
+    rec.perm_on_color     = OSDP_LED_RED;
+    rec.perm_off_color    = OSDP_LED_RED;
+
+    uint8_t payload[OSDP_LED_RECORD_BYTES];
+    size_t  plen = 0;
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_led_build(&rec, 1, payload,
+                                              sizeof(payload), &plen));
+
+    inject_command(&m, 0x05, OSDP_CMD_LED, payload, plen,
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_RECORD_INVALID, reply.payload[0]);
+}
+
+/* The ACK is earned per command, not per command code. A payload the PD
+ * could not decode never reached the LED bank, so ACKing it would claim
+ * success for a command dropped on the floor. It gets the length complaint
+ * its payload earned — not the 0x03 that would call osdp_LED itself
+ * unknown, and not an ACK. */
+static void test_malformed_led_naks_rather_than_acking(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    /* One byte short of a single LED record. */
+    uint8_t truncated[OSDP_LED_RECORD_BYTES - 1];
+    memset(truncated, 0, sizeof(truncated));
+
+    inject_command(&m, 0x05, OSDP_CMD_LED, truncated, sizeof(truncated),
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_CMD_LENGTH, reply.payload[0]);
+}
+
+static void test_malformed_buz_naks_rather_than_acking(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    uint8_t truncated[OSDP_BUZ_PAYLOAD_BYTES - 1];
+    memset(truncated, 0, sizeof(truncated));
+
+    inject_command(&m, 0x05, OSDP_CMD_BUZ, truncated, sizeof(truncated),
+                   OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_size_t(1, reply.payload_len);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_CMD_LENGTH, reply.payload[0]);
+}
+
+/* A command the PD genuinely does not implement still NAKs 0x03. The
+ * promotion above must not have widened into "ACK everything". */
+static void test_unobserved_command_still_naks_unknown(void)
+{
+    mock_transport_t m;
+    osdp_pd_transport_t t;
+    mock_init(&m, &t);
+    osdp_pd_t pd;
+    osdp_pd_init(&pd, 0x05);
+    osdp_pd_set_transport(&pd, &t);
+    osdp_pd_set_command_handler(&pd, default_handler, NULL);
+
+    static const uint8_t out_payload[] = { 0x00, 0x01, 0x00, 0x00 };
+    inject_command(&m, 0x05, OSDP_CMD_OUT, out_payload,
+                   sizeof(out_payload), OSDP_INTEGRITY_CRC, 1);
+    osdp_pd_tick(&pd);
+
+    osdp_frame_t reply;
+    decode_first_outgoing(&m, &reply);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_REPLY_NAK, reply.code);
+    TEST_ASSERT_EQUAL_HEX8(OSDP_NAK_UNKNOWN_CMD, reply.payload[0]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1522,6 +1731,13 @@ int main(void)
     RUN_TEST(test_filetransfer_streaming_no_buffer);
     RUN_TEST(test_filetransfer_streaming_gap_aborts);
     RUN_TEST(test_filetransfer_malformed_payload_naks);
+
+    RUN_TEST(test_led_acks_even_when_the_handler_ignores_it);
+    RUN_TEST(test_buz_acks_even_when_the_handler_ignores_it);
+    RUN_TEST(test_handler_can_still_refuse_an_led_deliberately);
+    RUN_TEST(test_malformed_led_naks_rather_than_acking);
+    RUN_TEST(test_malformed_buz_naks_rather_than_acking);
+    RUN_TEST(test_unobserved_command_still_naks_unknown);
 
     RUN_TEST(test_a_truncated_frame_does_not_poison_the_retransmission);
     RUN_TEST(test_a_frame_still_arriving_is_not_aborted);

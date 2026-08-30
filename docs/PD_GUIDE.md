@@ -210,6 +210,12 @@ static osdp_status_t handler(void *user, uint8_t code,
 }
 ```
 
+That `default` is the honest answer for a command this PD really does not
+implement. `osdp_LED` and `osdp_BUZ` are the exception: the PD decodes and
+applies them itself before your reply is settled, so they ACK from here
+rather than being called unknown — see
+[the return-value table](#osdp_pd_set_command_handler--your-device-logic).
+
 ### 3. Wire up and run the tick loop
 
 ```c
@@ -325,8 +331,25 @@ Fill in `*reply` and return one of three policies:
 | Return value             | Wire result                                            |
 | ------------------------ | ------------------------------------------------------ |
 | `OSDP_OK`                | The PD frames and transmits the reply you filled in.   |
-| `OSDP_ERR_NOT_SUPPORTED` | The PD sends `NAK` with code `0x03` (Unknown Command). |
+| `OSDP_ERR_NOT_SUPPORTED` | The PD sends `NAK` with code `0x03` (Unknown Command) — except for `osdp_LED` / `osdp_BUZ`, see below. |
+| `OSDP_ERR_BAD_PAYLOAD` / `OSDP_ERR_BAD_LENGTH` | `NAK` with code `0x02` (Bad Length / format). |
+| `OSDP_ERR_INVALID_ARG`   | `NAK` with code `0x09` (Unable to Process Record). |
+| `OSDP_ERR_BUSY`          | The PD sends `osdp_BUSY`. |
 | any other `osdp_status_t`| Treated as an internal error; the command is dropped silently (no reply). |
+
+`osdp_LED` and `osdp_BUZ` are the exception to the `NOT_SUPPORTED` row.
+The PD has already decoded and applied them by the time your reply is
+settled, so it will not tell the ACU a command it just carried out was
+unknown: `OSDP_ERR_NOT_SUPPORTED` there is read as "no opinion" and the
+default ACK stands. This is what lets the naive `switch` handler above be
+correct — you get working LEDs and an honest wire without listing 0x69 and
+0x6A. To refuse one deliberately, return a status from a different row, or
+set `reply->code` yourself and return `OSDP_OK`.
+
+The ACK is earned per command, not per command code. A payload the PD
+could not decode never reached the LED/buzzer bank, so an unhandled
+malformed `osdp_LED` answers `NAK 0x02` rather than claiming success for a
+command it dropped.
 
 The reply is a code plus an optional payload buffer:
 
@@ -378,7 +401,10 @@ you still just ACK them, and the PD does the right thing on the wire:
 
 - **`osdp_LED` / `osdp_BUZ`** — the PD transparently decodes these into
   its internal reader-state banks (see the LED/buzzer sections)
-  *regardless* of what your handler replies. ACK them.
+  *regardless* of what your handler replies. You do not have to answer
+  them: an unhandled one ACKs (and a malformed one NAKs 0x02) instead of
+  claiming the code is unknown. See
+  [the handler's return values](#osdp_pd_set_command_handler--your-device-logic).
 - **`osdp_KEYSET`** — ACK it and the PD rotates the stored Secure Channel
   Base Key for you; NAK it (or leave it unhandled) and nothing rotates.
   The rotation happens in RAM only — persisting the new key across a reboot
@@ -755,7 +781,12 @@ When the ACU drives a reader's LED you usually want to *act* on it (light
 a physical LED) rather than parse the `osdp_LED` (0x69) command yourself.
 The PD folds every inbound LED command into internal resolver banks and
 hands you an already-resolved view. The command still flows to your
-handler (ACK it as normal); the wire behaviour is unchanged.
+handler, but you do not have to answer it: an `osdp_LED` your handler
+leaves unhandled ACKs on the wire, because the PD has already carried it
+out (a malformed one NAKs 0x02). Binding the callback below binds the
+callback, not the reply — if your handler NAKs by some route other than
+`OSDP_ERR_NOT_SUPPORTED`, that NAK is what the ACU sees while the callback
+still fires.
 
 Consume it with a change callback, by polling, or both:
 

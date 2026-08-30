@@ -211,6 +211,10 @@ silently and the ACU spent a full reply timeout learning nothing:
 | `OSDP_ERR_BUSY` | `osdp_BUSY` (appended to `osdp_status_t` as 11) |
 | anything else | nothing — silent drop survives as an escape hatch |
 
+The one exception to the `NOT_SUPPORTED` row is `osdp_LED` / `osdp_BUZ`,
+which the PD has already carried out by then — see the half-intercepted
+entry under "Library-handled commands" below.
+
 **`osdp_BUSY` is the one reply that leaves its channel.** Spec 7.19 puts three
 rules on it, all centralised in `pd.c::osdp_pd_internal_build_busy`: sequence
 number **always 0**; **plaintext even during an established Secure Channel**,
@@ -397,6 +401,23 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   is bound. The content is vendor-defined, so it flows to `cmd_cb`, which
   returns `reply.code = OSDP_REPLY_MFGREP` with a body built by
   `osdp_mfgrep_build`.
+- **`osdp_LED` / `osdp_BUZ` are half-intercepted** — the only commands the
+  library both acts on *and* still routes to `cmd_cb` for a reply.
+  `osdp_pd_internal_observe_command` (pd.c) decodes each into the reader-LED
+  / -buzzer banks and fires the app's change callbacks, whatever the handler
+  then replies. That combination had a silent failure mode: the ordinary
+  handler shape — switch on the known codes, `OSDP_ERR_NOT_SUPPORTED` for
+  the rest — drove the LED correctly while telling the ACU the command was
+  not understood. The light did the right thing and the wire disagreed,
+  which is invisible on a bench. So the dispatch reads `NOT_SUPPORTED` as
+  "no opinion" for these and lets the default ACK stand; a handler that
+  means to refuse one still can, via a status that maps to a specific NAK or
+  by setting `reply->code` itself. The condition is
+  **`observe_command` returned true**, not the command code: a payload that
+  did not decode left the bank untouched and earns `NAK 0x02`, because
+  ACKing it would claim success for a command dropped on the floor.
+  `osdp_pd_internal_is_observed_command` lives next to the decoder in pd.c
+  precisely so the two lists cannot drift.
 
 ## Coding rules
 

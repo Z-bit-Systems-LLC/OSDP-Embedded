@@ -1093,19 +1093,36 @@ static void pd_buz_refresh(osdp_pd_t *pd, uint32_t now)
     }
 }
 
+/* The commands the PD decodes and acts on without the application's help.
+ *
+ * This is the list the dispatch consults to decide that a command cannot
+ * honestly be NAKed as "unknown", so it lives here next to the code that
+ * does the decoding rather than in the dispatch — adding a command to
+ * observe_command() below without adding it here would leave the PD
+ * refusing a command it had just carried out. */
+bool osdp_pd_internal_is_observed_command(uint8_t cmd_code)
+{
+    return cmd_code == OSDP_CMD_LED || cmd_code == OSDP_CMD_BUZ;
+}
+
 /* Transparently fold an inbound command into the reader-LED / -buzzer banks.
  * A no-op for everything except osdp_LED and osdp_BUZ; for those it decodes
  * the command, applies it to the matching slot, then re-resolves state so
- * any change fires the callback. Declared in pd_internal.h so both the
- * plaintext (pd.c) and Secure Channel (pd_sc.c) dispatch paths can call it
- * with plaintext bytes. */
-void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+ * any change fires the callback. Declared in pd_internal.h and called from
+ * osdp_pd_internal_dispatch, which both the plaintext and Secure Channel
+ * paths funnel through, so it always sees plaintext bytes.
+ *
+ * Returns true only when the command was decoded and applied. The dispatch
+ * needs that distinction rather than just the command code: it is what lets
+ * a malformed osdp_LED be NAKed for its length instead of being ACKed for a
+ * command this function silently declined to act on. */
+bool osdp_pd_internal_observe_command(osdp_pd_t     *pd,
                                       uint8_t        cmd_code,
                                       const uint8_t *payload,
                                       size_t         payload_len)
 {
-    if (pd == NULL) {
-        return;
+    if (pd == NULL || !osdp_pd_internal_is_observed_command(cmd_code)) {
+        return false;
     }
 
     if (cmd_code == OSDP_CMD_LED) {
@@ -1113,7 +1130,7 @@ void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
         size_t n = 0;
         if (osdp_led_decode(payload, payload_len, recs,
                             OSDP_PD_MAX_LEDS, &n) != OSDP_OK) {
-            return;  /* malformed LED payload — leave the bank untouched */
+            return false;  /* malformed LED payload — bank left untouched */
         }
         const uint32_t now = pd_now_ms(pd);
         for (size_t i = 0; i < n; i++) {
@@ -1124,13 +1141,13 @@ void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
             }
         }
         pd_led_refresh(pd, now);
-        return;
+        return true;
     }
 
     if (cmd_code == OSDP_CMD_BUZ) {
         osdp_buz_cmd_t buz;
         if (osdp_buz_decode(payload, payload_len, &buz) != OSDP_OK) {
-            return;  /* malformed BUZ payload — ignore */
+            return false;  /* malformed BUZ payload — ignore */
         }
         const uint32_t now = pd_now_ms(pd);
         osdp_pd_buz_slot_t *s = pd_buz_slot(pd, buz.reader_no);
@@ -1138,8 +1155,10 @@ void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
             osdp_buz_apply(&s->state, &buz, now);
         }
         pd_buz_refresh(pd, now);
-        return;
+        return true;
     }
+
+    return false;
 }
 
 void osdp_pd_set_led_handler(osdp_pd_t *pd, osdp_pd_led_cb cb, void *user)
