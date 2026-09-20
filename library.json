@@ -1,0 +1,33 @@
+{
+  "name": "osdp-embedded",
+  "version": "1.0.0",
+  "description": "SIA OSDP v2.2 protocol library for embedded systems: frame codec, per-message command/reply codecs, PD and ACU state machines, and Secure Channel. Freestanding C11 -- no malloc, no globals, no I/O of its own; the application supplies the transport and (for Secure Channel) the AES + RNG primitives.",
+  "keywords": "osdp, access-control, rs-485, sia, acu, pd, secure-channel, security",
+  "license": "GPL-3.0-or-later",
+  "homepage": "https://github.com/Z-bit-Systems-LLC/OSDP-Embedded",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git"
+  },
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": [
+    "osdp/osdp_acu.h",
+    "osdp/osdp_pd.h"
+  ],
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "-<*>",
+      "+<core/src/>",
+      "+<acu/src/>",
+      "+<pd/src/>"
+    ],
+    "flags": [
+      "-I core/include",
+      "-I acu/include",
+      "-I pd/include",
+      "-I core/src"
+    ]
+  }
+}

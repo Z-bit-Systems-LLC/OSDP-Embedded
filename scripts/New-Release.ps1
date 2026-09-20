@@ -23,7 +23,8 @@
          -Version.
       4. Show the current -> new version and the commits since the last
          tag, then confirm (unless -AutoConfirm).
-      5. Bump (Set-Version.ps1 — updates rust/Cargo.toml + CMakeLists.txt).
+      5. Bump (Set-Version.ps1 — updates rust/Cargo.toml, CMakeLists.txt
+         and library.json).
       6. Verify (Check-Code.ps1) so the tagged commit is known-green,
          unless -SkipChecks.
       7. Commit "Bump version to X.Y.Z", create annotated tag vX.Y.Z,
@@ -231,14 +232,14 @@ try {
             throw ("Verification failed. The version bump is staged in your working " +
                    "tree but nothing was committed — fix the failures (or re-run with " +
                    "-SkipChecks) and try again. 'git checkout -- rust/Cargo.toml " +
-                   "CMakeLists.txt' reverts the bump.")
+                   "CMakeLists.txt library.json' reverts the bump.")
         }
     }
 
     # ---- 7. commit, tag, push ----------------------------------------
     Write-Step 'Committing, tagging, and pushing'
     if ($DryRun) {
-        Write-Info "  [dry-run] git add rust/Cargo.toml CMakeLists.txt"
+        Write-Info "  [dry-run] git add rust/Cargo.toml CMakeLists.txt library.json"
         Write-Info "  [dry-run] git commit -m 'Bump version to $newVersion'"
         Write-Info "  [dry-run] git tag -a $tag -m 'Release $newVersion'"
         Write-Info "  [dry-run] git push origin main"
@@ -248,7 +249,7 @@ try {
         return
     }
 
-    Invoke-Git add rust/Cargo.toml CMakeLists.txt | Out-Null
+    Invoke-Git add rust/Cargo.toml CMakeLists.txt library.json | Out-Null
     Invoke-Git commit -m "Bump version to $newVersion" | Out-Null
     Write-Ok "  committed: Bump version to $newVersion"
 
