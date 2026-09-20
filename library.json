@@ -15,6 +15,21 @@
     "osdp/osdp_acu.h",
     "osdp/osdp_pd.h"
   ],
+  "export": {
+    "include": [
+      "core/include/**",
+      "core/src/**",
+      "pd/include/**",
+      "pd/src/**",
+      "acu/include/**",
+      "acu/src/**",
+      "README.md",
+      "LICENSE.md",
+      "LICENSE-GPL-3.0.txt",
+      "LICENSING",
+      "COPYING"
+    ]
+  },
   "build": {
     "srcDir": ".",
     "srcFilter": [

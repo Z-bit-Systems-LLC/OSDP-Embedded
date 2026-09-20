@@ -102,9 +102,7 @@ cmake -S . -B build -DOSDP_BUILD_TESTS=OFF -DOSDP_BUILD_TOOLS=OFF
 
 ### PlatformIO
 
-Pin a tagged revision in `platformio.ini`. The repository ships a `library.json`
-manifest that selects only `core/`, `pd/` and `acu/`, so the tools, tests, Rust
-crate and vendored code are never handed to your compiler:
+Pin a tagged revision in `platformio.ini`:
 
 ```ini
 [env:esp32dev]
@@ -113,6 +111,10 @@ board     = esp32dev
 framework = arduino
 lib_deps  = https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git#v1.0.0
 ```
+
+The repository ships a `library.json` manifest, so only `core/`, `pd/` and
+`acu/` reach your compiler — the tools, tests, Rust crate and vendored code are
+never handed to it.
 
 The manifest exports the public include directories, so `#include "osdp/osdp_pd.h"`
 (or `osdp/osdp_acu.h`) works with no extra `build_flags`. Both role state machines

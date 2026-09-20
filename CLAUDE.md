@@ -522,7 +522,7 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
 
 ## Releasing
 
-**"release the code"** / **"cut a release"** → run the four-step process
+**"release the code"** / **"cut a release"** → run the five-step process
 in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
 
 1. `./scripts/New-Release.ps1 -IncrementType <Patch|Minor|Major>` — bumps
@@ -542,12 +542,25 @@ in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
    `CHANGELOG.md`, nothing written between releases, commit subjects
    *are* the notes. `-NotesFile` is the exception for a release a commit
    list would misrepresent — v1.0.0 is the only one so far.
+5. `pio pkg pack -o dist/` then `pio pkg publish dist/<tarball>` —
+   ships the **C library** to the PlatformIO registry, the firmware
+   audience. Separate registry, separate account, not in any pipeline.
+   Inspect the tarball (`tar -tzf`) before publishing: its contents come
+   from `export.include` in `library.json`, a whitelist.
 
 Rules that are easy to get wrong:
 
 - **Never re-tag or re-publish a version.** If a tagged build fails, fix
   forward and cut the next patch. crates.io will not accept the same
-  version twice with different bytes.
+  version twice with different bytes. The PlatformIO registry does allow
+  `pio pkg unpublish` (and `--undo`), but that is damage control, not a
+  workflow — anyone who installed the version already has it cached.
+- **The two registries can drift.** Step 3 (crates.io) is gated in Azure;
+  step 5 (PlatformIO) is a local command with no pipeline behind it, so
+  it is the one that gets skipped. A version on crates.io but not on the
+  PlatformIO registry means firmware consumers pinning `#v<tag>` are fine
+  (git works off the tag) while `lib_deps = osdp-embedded@<version>`
+  resolves to nothing.
 - **Step 4 comes after step 3**, not before: a GitHub Release is an
   announcement, and the crate should exist before people try to install
   it.
