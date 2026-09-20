@@ -8,20 +8,26 @@
     Run every pre-push quality gate locally — the same checks CI enforces.
 .DESCRIPTION
     Mirrors ci/build.yml so a clean run here means the Azure pipeline's
-    `build` job should pass. Two stacks are verified:
+    `build` job should pass. Three stacks are verified:
+
+      PlatformIO manifest
+        1. Test-Manifest.ps1 (library.json vs. the tree it describes)
 
       C library + tools (CMake / CTest)
-        1. configure   (Release, tests + tools ON)
-        2. build
-        3. ctest
+        2. configure   (Release, tests + tools ON)
+        3. build
+        4. ctest
 
       Rust workspace (cargo)
-        4. cargo fmt   --check        (formatting gate)
-        5. cargo clippy -D warnings   (lint gate; warnings are errors)
-        6. cargo build  --release     (workspace)
-        7. cargo test   --release     (workspace)
-        8. cargo run    --example loopback
-        9. cargo run    --example loopback_sc
+        5. cargo fmt   --check        (formatting gate)
+        6. cargo clippy -D warnings   (lint gate; warnings are errors)
+        7. cargo build  --release     (workspace)
+        8. cargo test   --release     (workspace)
+        9. cargo run    --example loopback
+       10. cargo run    --example loopback_sc
+
+    The manifest gate runs first and unconditionally: it needs no
+    toolchain, so -SkipC / -SkipRust still leave it enforced.
 
     Every gate runs even if an earlier one fails (dependent steps are
     skipped, not silently passed), so a single invocation surfaces all
@@ -226,6 +232,16 @@ function Skip-Gate {
 
 Push-Location $repoRoot
 try {
+    # ---- PlatformIO manifest -----------------------------------------
+    #
+    # Runs first: it needs no toolchain, takes milliseconds, and guards
+    # the one build description nothing else here compiles. A consumer
+    # resolves library.json from a git tag, so a mistake would surface in
+    # their firmware build after the tag is immutable.
+    Invoke-Gate 'PlatformIO manifest (library.json)' {
+        & (Join-Path $PSScriptRoot 'Test-Manifest.ps1')
+    } | Out-Null
+
     # ---- C library + tools (CMake / CTest) ---------------------------
     #
     # Uses the `release` preset, which sets CMAKE_BUILD_TYPE=Release with

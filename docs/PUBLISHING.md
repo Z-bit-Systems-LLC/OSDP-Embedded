@@ -187,9 +187,11 @@ beta, rc) work the same way; cargo accepts SemVer pre-release suffixes
 
 ### 1. Bump the version
 
-Use the helper script — it updates both `rust/Cargo.toml`
-(`[workspace.package].version`) and `CMakeLists.txt`
-(`project(... VERSION ...)`) in lockstep:
+Use the helper script — it updates all three places that carry the version
+in lockstep: `rust/Cargo.toml` (`[workspace.package].version`),
+`CMakeLists.txt` (`project(... VERSION ...)`, numeric prefix only) and
+`library.json` (the PlatformIO manifest consumers pin with
+`lib_deps = <repo>.git#v<version>`, full SemVer):
 
 ```pwsh
 ./scripts/Set-Version.ps1 -Version 0.1.0-alpha.2 -DryRun   # preview
@@ -274,7 +276,7 @@ git state — the override is correct here.
 ### 5. Tag, publish, push
 
 ```pwsh
-git add rust/Cargo.toml CMakeLists.txt
+git add rust/Cargo.toml CMakeLists.txt library.json
 git commit -m "Bump version to 0.1.0-alpha.2"
 git tag v0.1.0-alpha.2
 git push origin main

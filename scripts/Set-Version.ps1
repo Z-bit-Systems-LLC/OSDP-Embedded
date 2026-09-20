@@ -7,11 +7,13 @@
 .SYNOPSIS
     Bump the OSDP-Embedded version, syncing both Rust and C sources.
 .DESCRIPTION
-    Updates two places that reference the project version:
+    Updates three places that reference the project version:
       * rust/Cargo.toml - [workspace.package].version (the
         osdp-embedded crate inherits via `version.workspace = true`)
       * CMakeLists.txt - project(... VERSION x.y.z) (numeric portion
         only; CMake doesn't accept pre-release suffixes)
+      * library.json - the PlatformIO manifest consumers pin with
+        `lib_deps = <repo>.git#v<version>`
     The Rust version is the source of truth for publishing; the C side
     mirrors only the numeric prefix.
 .PARAMETER Version
@@ -130,13 +132,27 @@ Update-Lines `
         [regex]::Replace($line, '(VERSION\s+)\d+\.\d+\.\d+', ('${1}' + $numericPrefix))
     } `
     -Description 'project() VERSION (numeric prefix)'
+# 3. library.json - PlatformIO manifest version (full SemVer; PlatformIO
+#    accepts pre-release suffixes, so this one is not truncated).
+Update-Lines `
+    -Path 'library.json' `
+    -LineMatches {
+        param($line)
+        return ($line -match '^\s*"version"\s*:\s*"[^"]+"\s*,?\s*$')
+    } `
+    -Replacement {
+        param($line)
+        [regex]::Replace($line, '("version"\s*:\s*")[^"]+(")', ('${1}' + $Version + '${2}'))
+    } `
+    -Description 'PlatformIO manifest version'
+
 
 if ($DryRun) {
     Write-Host "`nDry run complete. Re-run without -DryRun to apply." -ForegroundColor Cyan
 }
 else {
     Write-Host "`nVersion bumped to $Version. Next steps:" -ForegroundColor Yellow
-    Write-Host '  git add rust/Cargo.toml rust/osdp/Cargo.toml CMakeLists.txt'
+    Write-Host '  git add rust/Cargo.toml rust/osdp/Cargo.toml CMakeLists.txt library.json'
     Write-Host "  git commit -m `"Bump version to $Version`""
     Write-Host "  git tag v$Version"
     Write-Host "  git push origin main && git push origin v$Version"

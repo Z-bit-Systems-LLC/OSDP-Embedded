@@ -99,7 +99,32 @@ tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
                       # configure time and registers a CTest entry per
                       # capture, all backed by the test_captures
                       # executable. Re-run cmake after adding a file.
+
+library.json          # PlatformIO manifest (repo root). Its srcFilter
+                      # selects core/src, pd/src and acu/src and nothing
+                      # else, and its build.flags export the three public
+                      # include dirs plus -I core/src (internal headers
+                      # such as "shared/pack.h"). A new top-level source
+                      # directory is silently EXCLUDED until added here —
+                      # scripts/Test-Manifest.ps1 is what catches that.
 ```
+
+**`library.json` is the only build description nothing in CI compiles.** A
+PlatformIO consumer resolves it from a git tag, so a mistake surfaces in
+*their* firmware build, after the tag is immutable.
+`scripts/Test-Manifest.ps1` stands in for that missing compile: it checks
+the manifest against the tree it describes (directories exist and hold
+sources, exported `-I` paths exist, advertised headers resolve, version
+matches CMake) and — the check that matters most — that its source
+directories are the same set `rust/osdp/build.rs` compiles. `build.rs` is
+the repo's other answer to "which directories are the library", so the two
+lists disagreeing is the drift signal. It runs first in `Check-Code.ps1`
+(no toolchain needed, so `-SkipC` / `-SkipRust` leave it enforced) and as
+an unconditional step in `ci/build-c.yml`.
+
+Note what the glob does and does not protect: `+<core/src/>` is recursive,
+so a new *subdirectory* of `core/src` is picked up for free. A new
+*top-level* directory is not — that is exactly the `ports/` shape.
 
 ## CMake targets
 
@@ -501,9 +526,9 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
 in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
 
 1. `./scripts/New-Release.ps1 -IncrementType <Patch|Minor|Major>` — bumps
-   `rust/Cargo.toml` + `CMakeLists.txt` in lockstep, runs the
-   `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main` and
-   the tag.
+   `rust/Cargo.toml` + `CMakeLists.txt` + `library.json` in lockstep, runs
+   the `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main`
+   and the tag.
 2. Wait for the Azure build pipeline on the tag to go green. It packages
    the `.crate` and the tool binaries; it publishes nothing.
 3. Approve the Classic **Release pipeline** in Azure DevOps. This runs
