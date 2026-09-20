@@ -29,6 +29,21 @@ steps:
       fi
     displayName: 'Detect redundant release-bump build'
 
+  # library.json is the one build description in this repo that nothing
+  # here compiles — a PlatformIO consumer resolves it from a git tag, so a
+  # mistake lands in their firmware build after the tag is immutable. The
+  # check is pure PowerShell (pwsh is preinstalled on the hosted agent),
+  # takes milliseconds, and deliberately carries no skipRedundant
+  # condition: the release-bump commit is precisely the one that rewrites
+  # the manifest's version, so that is when the drift check matters most.
+  - task: PowerShell@2
+    displayName: 'Validate PlatformIO manifest'
+    inputs:
+      targetType: 'filePath'
+      filePath: 'scripts/Test-Manifest.ps1'
+      pwsh: true
+      failOnStderr: false
+
   # On Linux CMake defaults to the single-config "Unix Makefiles" generator,
   # so the build type is fixed at configure time via CMAKE_BUILD_TYPE; there
   # is no per-build `--config` (that's a multi-config / MSVC concept).

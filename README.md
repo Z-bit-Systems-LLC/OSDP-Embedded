@@ -448,9 +448,10 @@ cargo test --manifest-path rust/Cargo.toml
 cargo run  --manifest-path rust/Cargo.toml --example loopback_sc
 ```
 
-Before pushing, `./scripts/Check-Code.ps1` runs every gate CI enforces — CMake
-configure/build/`ctest`, then `cargo fmt`, `clippy -D warnings`, workspace
-build/test, and the loopback examples — in one invocation.
+Before pushing, `./scripts/Check-Code.ps1` runs every gate CI enforces — the
+PlatformIO manifest check, CMake configure/build/`ctest`, then `cargo fmt`,
+`clippy -D warnings`, workspace build/test, and the loopback examples — in one
+invocation.
 
 Tests use the vendored [Unity](https://github.com/ThrowTheSwitch/Unity) framework
 under `tests/`. Dropping an OSDPCAP capture into `tests/captures/` registers it as a
