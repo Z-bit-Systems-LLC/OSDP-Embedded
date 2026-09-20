@@ -66,6 +66,11 @@ What continuous integration verifies:
 Windows builds with clang and MinGW are supported by the CMake presets and used
 during development, but are not part of the automated matrix.
 
+Embedded toolchains consume the library through PlatformIO (see
+[Installation](#platformio) below). An ESP32 Arduino build (`esp32dev`) is
+verified by hand against the published manifest; it is not part of the automated
+matrix either.
+
 The Rust crate requires **Rust 1.70 or later** and is `no_std`-compatible; it needs
 `alloc` for its trait-object callbacks. It compiles the C sources through the
 [`cc` crate](https://crates.io/crates/cc) at build time, so `cargo build --target …`
@@ -94,6 +99,29 @@ the host-side extras off:
 ```sh
 cmake -S . -B build -DOSDP_BUILD_TESTS=OFF -DOSDP_BUILD_TOOLS=OFF
 ```
+
+### PlatformIO
+
+Pin a tagged revision in `platformio.ini`. The repository ships a `library.json`
+manifest that selects only `core/`, `pd/` and `acu/`, so the tools, tests, Rust
+crate and vendored code are never handed to your compiler:
+
+```ini
+[env:esp32dev]
+platform  = espressif32
+board     = esp32dev
+framework = arduino
+lib_deps  = https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git#v1.0.0
+```
+
+The manifest exports the public include directories, so `#include "osdp/osdp_pd.h"`
+(or `osdp/osdp_acu.h`) works with no extra `build_flags`. Both role state machines
+are compiled into the library archive and the linker keeps only the one your
+firmware actually references.
+
+Secure Channel needs an AES + RNG binding that the manifest deliberately does not
+ship — see **Enabling Secure Channel** below. On ESP32 the mbedTLS that already
+comes with the framework is the usual choice.
 
 ### Cargo (Rust)
 

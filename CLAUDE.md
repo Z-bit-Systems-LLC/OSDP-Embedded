@@ -99,6 +99,13 @@ tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
                       # configure time and registers a CTest entry per
                       # capture, all backed by the test_captures
                       # executable. Re-run cmake after adding a file.
+
+library.json          # PlatformIO manifest (repo root). Its srcFilter
+                      # selects core/src, pd/src and acu/src and nothing
+                      # else, and its build.flags export the three public
+                      # include dirs plus -I core/src (internal headers
+                      # such as "shared/pack.h"). A new top-level source
+                      # directory is silently EXCLUDED until added here.
 ```
 
 ## CMake targets
@@ -501,9 +508,9 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
 in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
 
 1. `./scripts/New-Release.ps1 -IncrementType <Patch|Minor|Major>` — bumps
-   `rust/Cargo.toml` + `CMakeLists.txt` in lockstep, runs the
-   `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main` and
-   the tag.
+   `rust/Cargo.toml` + `CMakeLists.txt` + `library.json` in lockstep, runs
+   the `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main`
+   and the tag.
 2. Wait for the Azure build pipeline on the tag to go green. It packages
    the `.crate` and the tool binaries; it publishes nothing.
 3. Approve the Classic **Release pipeline** in Azure DevOps. This runs
