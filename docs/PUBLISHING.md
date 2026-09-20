@@ -103,6 +103,36 @@ registry as well as crates.io. It is a separate registry with its own
 account, and nothing in the Azure pipeline pushes to it — this step is
 local and deliberate.
 
+**Prerequisite: PlatformIO Core on PATH.** It is not a build dependency
+of this repo and is not installed by `Check-Code.ps1`, so a maintainer
+machine may not have it:
+
+```pwsh
+python -m pip install platformio
+
+# pip's scripts dir is not necessarily on PATH, and its location varies
+# with how Python itself was installed — ask Python rather than guess:
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+# add that directory to your USER PATH, then:
+pio --version
+```
+
+Two traps worth knowing:
+
+- **Do not append with `setx PATH "%PATH%;..."`.** `%PATH%` expands to
+  system + user merged, so that writes the whole system PATH into your
+  user PATH, and `setx` silently truncates at 1024 characters. Use
+  `[Environment]::SetEnvironmentVariable('PATH', $new, 'User')` with only
+  the user portion read back via `GetEnvironmentVariable('PATH','User')`.
+- **Keep exactly one PlatformIO Core.** All installs share the state
+  directory `~/.platformio`, so a second copy (a venv, a VS Code bundled
+  Core) at a different version makes `pio` warn that an obsolete Core is
+  in use, because the older one downgrades state the newer one wrote.
+
+`Test-Manifest.ps1` deliberately does **not** need it — the manifest gate
+is pure PowerShell so CI can run it without installing a toolchain. Only
+this publishing step needs the real tool.
+
 ```pwsh
 pio pkg pack -o dist/                       # build the tarball
 tar -tzf dist/osdp-embedded-1.2.3.tar.gz    # READ IT before publishing
@@ -112,6 +142,10 @@ pio pkg publish dist/osdp-embedded-1.2.3.tar.gz
 Authenticate once with `pio account login`, or set `PLATFORMIO_AUTH_TOKEN`
 in the environment for a non-interactive run (`--no-interactive`). Publish
 under the organization with `--owner` if the account defaults elsewhere.
+
+`pio account login` prompts for credentials, so it has to be run in your
+own terminal — in a Claude Code session, prefix it with `!` to run it
+in the session rather than asking the agent to.
 
 **Inspect the tarball before every publish.** What it contains is decided
 by `export.include` in `library.json`, which is a *whitelist*: it ships
