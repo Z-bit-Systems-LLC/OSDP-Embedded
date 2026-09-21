@@ -267,13 +267,13 @@ try {
     # Release — the four-step process was documented but the tooling
     # reminded you about three of them.
     Write-Host ''
-    Write-Ok "Release $newVersion cut. Two steps remain:"
+    Write-Ok "Release $newVersion cut. Four steps remain:"
     Write-Host ''
-    Write-Info '  2/3  Wait for the Azure build pipeline on the tag to go green,'
-    Write-Info '       then approve the Release pipeline. That publishes the crate'
-    Write-Info '       to crates.io (irreversible) and uploads the tool binaries.'
+    Write-Info '  2/5  Wait for the Azure build pipeline on the tag to go green.'
+    Write-Info '       It packages the .crate and the tool binaries and publishes'
+    Write-Info '       nothing.'
     Write-Host ''
-    Write-Info '  3/3  Publish the GitHub Release, AFTER the crate is live:'
+    Write-Info '  3/5  Publish the GitHub Release:'
     Write-Host ''
     Write-Host "         ./scripts/Publish-GitHubRelease.ps1 -Tag $tag" -ForegroundColor White
     Write-Host ''
@@ -281,7 +281,19 @@ try {
     Write-Info '       Add -Draft to hand-edit first, or -NotesFile <path> to'
     Write-Info '       supply written prose instead (see docs/PUBLISHING.md).'
     Write-Host ''
-    Write-Warn '  Until 3/3 runs, the release is invisible to anyone watching the repo.'
+    Write-Info '  4/5  Publish the C library to the PlatformIO registry:'
+    Write-Host ''
+    Write-Host '         mkdir dist -Force' -ForegroundColor White
+    Write-Host '         pio pkg pack -o dist/' -ForegroundColor White
+    Write-Host "         tar -tzf dist/osdp-embedded-$newVersion.tar.gz   # read it" -ForegroundColor White
+    Write-Host "         pio pkg publish dist/osdp-embedded-$newVersion.tar.gz --owner z-bit-systems" -ForegroundColor White
+    Write-Host ''
+    Write-Info '  5/5  Approve the Release pipeline in Azure DevOps. That publishes'
+    Write-Info '       the crate to crates.io and is IRREVERSIBLE, which is why it'
+    Write-Info '       is last: everything above can be retracted, this cannot.'
+    Write-Host ''
+    Write-Warn '  Until 3/5 runs, the release is invisible to anyone watching the repo.'
+    Write-Warn '  Between 3/5 and 5/5, the Release is public but `cargo add` fails.'
 }
 finally {
     Pop-Location

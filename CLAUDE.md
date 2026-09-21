@@ -531,22 +531,34 @@ in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
    and the tag.
 2. Wait for the Azure build pipeline on the tag to go green. It packages
    the `.crate` and the tool binaries; it publishes nothing.
-3. Approve the Classic **Release pipeline** in Azure DevOps. This runs
-   `Publish-Crate.ps1` and is the **irreversible** step — the version is
-   burned on crates.io forever, `cargo yank` only hides it.
-4. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
+3. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
    from the commits since the previous tag and creates the GitHub
-   Release. `-Draft` to hand-edit before it goes public.
+   Release. `-Draft` to hand-edit before it goes public; `-AutoConfirm`
+   to skip the type-the-tag prompt (it is `Read-Host`, so a
+   non-interactive shell fails without it).
 
    **Generated notes are the default**, matching OSDP.Net: no
    `CHANGELOG.md`, nothing written between releases, commit subjects
    *are* the notes. `-NotesFile` is the exception for a release a commit
    list would misrepresent — v1.0.0 is the only one so far.
-5. `pio pkg pack -o dist/` then `pio pkg publish dist/<tarball>` —
-   ships the **C library** to the PlatformIO registry, the firmware
-   audience. Separate registry, separate account, not in any pipeline.
-   Inspect the tarball (`tar -tzf`) before publishing: its contents come
-   from `export.include` in `library.json`, a whitelist.
+4. `mkdir dist -Force`, `pio pkg pack -o dist/`, then `pio pkg publish
+   dist/<tarball> --owner z-bit-systems` — ships the **C library** to the
+   PlatformIO registry, the firmware audience. Separate registry,
+   separate account, not in any pipeline. Inspect the tarball
+   (`tar -tzf`) first: its contents come from `export.include` in
+   `library.json`, a whitelist. `-o` needs the directory to already
+   exist, and without `--owner` it publishes under the personal account
+   rather than the org.
+5. Approve the Classic **Release pipeline** in Azure DevOps. This runs
+   `Publish-Crate.ps1` and is the **irreversible** step — the version is
+   burned on crates.io forever, `cargo yank` only hides it.
+
+**Why crates.io is last:** every earlier step is reversible — delete the
+GitHub Release, `pio pkg unpublish` the PlatformIO version — and
+crates.io is not. The one-way door goes at the end, so a late discovery
+costs a retraction rather than a spent version number. The cost of the
+order is a window where the Release is public but `cargo add` still
+fails, so step 5 should not sit for days.
 
 Rules that are easy to get wrong:
 
@@ -561,13 +573,14 @@ Rules that are easy to get wrong:
   PlatformIO registry means firmware consumers pinning `#v<tag>` are fine
   (git works off the tag) while `lib_deps = osdp-embedded@<version>`
   resolves to nothing.
-- **Step 4 comes after step 3**, not before: a GitHub Release is an
-  announcement, and the crate should exist before people try to install
-  it.
-- **Step 4 is manual and has been missed before.** v1.0.0 reached
+- **Step 3 is manual and has been missed before.** v1.0.0 reached
   crates.io with no GitHub Release because the tooling only prompted for
-  steps 2 and 3. `New-Release.ps1` now prints the step-4 command when it
-  finishes; do not treat a cut tag as a finished release.
+  the pipeline steps. `New-Release.ps1` now prints every remaining step
+  when it finishes; do not treat a cut tag as a finished release.
+- **Steps 3 and 4 need non-interactive flags when an agent runs them.**
+  `Publish-GitHubRelease.ps1` confirms via `Read-Host` (type the tag),
+  which throws outright in a non-interactive shell — pass `-AutoConfirm`.
+  `pio pkg publish` takes `--no-interactive` for the same reason.
 - **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
   have no GitHub Releases and are deliberately not backfilled. crates.io
   holds only 0.1.0 from that era.

@@ -2,9 +2,9 @@
 
 This documents how a Z-bit Systems maintainer ships a new release. There
 are two registries, because there are two audiences: the
-`osdp-embedded` **Rust crate** goes to crates.io (steps 1–4 below), and
+`osdp-embedded` **Rust crate** goes to crates.io (step 5 below), and
 the **C library** goes to the PlatformIO registry for firmware
-developers (step 5). They share a version number — `Set-Version.ps1`
+developers (step 4). They share a version number — `Set-Version.ps1`
 keeps `rust/Cargo.toml`, `CMakeLists.txt` and `library.json` in lockstep
 — but they are published separately, by different commands, to different
 accounts.
@@ -27,8 +27,13 @@ one-time UI setup.
 
 ## The release process
 
-Five steps, in order. Steps 1, 4 and 5 are local commands; steps 2 and 3
+Five steps, in order. Steps 1, 3 and 4 are local commands; steps 2 and 5
 happen in Azure DevOps.
+
+**crates.io is deliberately last.** Every earlier step can be undone — a
+GitHub Release deleted, a PlatformIO version withdrawn — and crates.io
+cannot. Doing the one-way door last means a late discovery costs a
+retraction instead of a permanently spent version number.
 
 ### 1. Cut the release locally
 
@@ -54,15 +59,7 @@ test suite and then `ci/package.yml` to produce the
 published yet. Wait for it to go green — if it fails, fix forward and cut
 a new patch version rather than re-tagging.
 
-### 3. Approve the Release pipeline (publishes to crates.io)
-
-The Classic Release pipeline picks up that build's artifact and waits on
-your approval. Approving it runs `scripts/Publish-Crate.ps1`, which
-uploads the exact `.crate` CI built. **This is the irreversible step** —
-the version number is burned on crates.io forever, even if you later
-`cargo yank` it.
-
-### 4. Publish the GitHub Release
+### 3. Publish the GitHub Release
 
 ```pwsh
 ./scripts/Publish-GitHubRelease.ps1 -Tag v1.2.3 -DryRun   # preview notes
@@ -88,15 +85,19 @@ generating from `v0.1.28..v1.0.0` would have produced a handful of fix
 commits for what was really the story of 147 commits since 0.1.0. Do not
 reach for it routinely.
 
-Do this *after* step 3, not before: a GitHub Release announces a version
-that people will immediately try to `cargo add`, so the crate should
-already be on crates.io when the notification goes out.
-
 **This step is manual and easy to forget** — v1.0.0 shipped to crates.io
 without a GitHub Release for exactly that reason. `New-Release.ps1` now
 prints the command at the end of step 1 as a backstop.
 
-### 5. Publish to the PlatformIO registry
+Note the consequence of crates.io coming last: for the window between
+this step and step 5, the Release is public while `cargo add
+osdp-embedded@<version>` still fails. That is deliberate — the ordering
+puts the reversible announcements ahead of the irreversible publish, so
+a problem found late costs a deleted Release rather than a burned
+version number — but it does mean you should not leave step 5 sitting
+for days.
+
+### 4. Publish to the PlatformIO registry
 
 The C library ships to firmware developers through the PlatformIO
 registry as well as crates.io. It is a separate registry with its own
@@ -134,10 +135,16 @@ is pure PowerShell so CI can run it without installing a toolchain. Only
 this publishing step needs the real tool.
 
 ```pwsh
+mkdir dist -Force                           # -o needs an EXISTING dir
 pio pkg pack -o dist/                       # build the tarball
 tar -tzf dist/osdp-embedded-1.2.3.tar.gz    # READ IT before publishing
-pio pkg publish dist/osdp-embedded-1.2.3.tar.gz
+pio pkg publish dist/osdp-embedded-1.2.3.tar.gz --owner z-bit-systems
 ```
+
+`pio pkg pack -o` treats its argument as a *filename* when the directory
+does not exist, and fails with a bare `OSError: [Errno 22] Invalid
+argument: 'dist/'` inside a Python traceback — which reads like a tool
+bug rather than "create the directory first". Hence the `mkdir`.
 
 Authenticate once with `pio account login`, or set `PLATFORMIO_AUTH_TOKEN`
 in the environment for a non-interactive run (`--no-interactive`). Publish
@@ -146,6 +153,20 @@ under the organization with `--owner` if the account defaults elsewhere.
 `pio account login` prompts for credentials, so it has to be run in your
 own terminal — in a Claude Code session, prefix it with `!` to run it
 in the session rather than asking the agent to.
+
+**A GitHub-OAuth account cannot log the CLI in.** `pio account login`
+accepts only `--username` / `--password`; PlatformIO Core has no OAuth or
+device-code flow, and `pio account token` needs the password too. If the
+registry account was created by signing in with GitHub it has no
+password, so the CLI is locked out until one is set — and `pio account
+password` is *change*, which needs the current one. The way in is
+`pio account forgot --username <user-or-email>`, then log in normally.
+
+The publishing owner is the **organization**, not the account:
+`z-bit-systems`, with `bytedreamer` as its owner. `pio org list` shows
+it. Without `--owner` the package publishes under the personal account
+instead, which changes the `lib_deps` string consumers write and cannot
+be renamed afterward.
 
 **Inspect the tarball before every publish.** What it contains is decided
 by `export.include` in `library.json`, which is a *whitelist*: it ships
@@ -163,9 +184,29 @@ Treat that as damage control, not a workflow — anyone who installed it
 in the meantime has it cached. **Never publish different bytes under a
 version that already existed.**
 
-Do this after step 3 for the same reason step 4 comes after it: the
-version should exist everywhere it is advertised before the announcement
-goes out.
+### 5. Approve the Release pipeline (publishes to crates.io)
+
+The Classic Release pipeline picks up the tag build's artifact and waits
+on your approval. Approving it runs `scripts/Publish-Crate.ps1`, which
+uploads the exact `.crate` CI built. **This is the irreversible step** —
+the version number is burned on crates.io forever, even if you later
+`cargo yank` it.
+
+It is deliberately last. Everything before it can be undone: a GitHub
+Release can be deleted, and a PlatformIO version can be withdrawn with
+`pio pkg unpublish`. crates.io cannot. Putting the one-way door at the
+end means a late discovery costs a retraction, not a permanently spent
+version number.
+
+Before approving, it is worth exercising the packaged crate rather than
+the working tree — `cargo package` (without `--no-verify`) extracts the
+`.crate` and compiles it, which is the only thing that runs `build.rs`'s
+vendored branch, the one a crates.io consumer hits. The extracted copy
+under `rust/target/package/<name>-<version>/` also ships the integration
+tests and examples, so `cargo test` and `cargo run --example loopback_sc`
+can be run from inside it. That last one is the cheap way to catch a
+`sys.rs` struct mirror that has drifted from the C header: a layout
+mismatch links cleanly and only misbehaves at run time.
 
 ### Version history note
 
