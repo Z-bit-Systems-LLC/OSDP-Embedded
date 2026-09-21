@@ -4,6 +4,8 @@ A freestanding C11 implementation of SIA OSDP v2.2.2 for access control readers 
 
 [![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status%2FOSDP%20Embedded-CI?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
 [![crates.io](https://img.shields.io/crates/v/osdp-embedded.svg)](https://crates.io/crates/osdp-embedded)
+[![docs.rs](https://img.shields.io/docsrs/osdp-embedded)](https://docs.rs/osdp-embedded)
+[![PlatformIO Registry](https://badges.registry.platformio.org/packages/z-bit-systems/library/osdp-embedded.svg)](https://registry.platformio.org/libraries/z-bit-systems/osdp-embedded)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later%20OR%20Commercial-blue.svg)](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/LICENSE.md)
 
 ## Overview
