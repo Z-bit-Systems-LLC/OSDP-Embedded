@@ -101,6 +101,14 @@ tools/
                       # POSIX adapters). Used for interop validation
                       # against external ACUs (OSDP.Net, hardware).
 
+ports/                # reference bindings of the crypto HALs to concrete
+  tiny/               # implementations: AES-128 ECB over tiny-AES-c, and
+  pqclean/            # ML-KEM-768 / ML-DSA-44 / SHA-256 over PQClean for
+                      # SC2 pairing. Same standing as vendor/: built only
+                      # with tests or tools, never linked into
+                      # osdp_core / osdp_pd / osdp_acu, and deliberately
+                      # NOT in library.json — a product binds its own.
+
 vendor/               # 3rd-party code shared between tools and tests.
   tiny-aes/           # tiny-AES-c (Unlicense / public domain).
                       # Only built when OSDP_BUILD_TESTS=ON or
@@ -110,7 +118,32 @@ tests/captures/       # drop OSDPCAP files here. CMake globs *.osdpcap at
                       # configure time and registers a CTest entry per
                       # capture, all backed by the test_captures
                       # executable. Re-run cmake after adding a file.
+
+library.json          # PlatformIO manifest (repo root). Its srcFilter
+                      # selects core/src, pd/src and acu/src and nothing
+                      # else, and its build.flags export the three public
+                      # include dirs plus -I core/src (internal headers
+                      # such as "shared/pack.h"). A new top-level source
+                      # directory is silently EXCLUDED until added here —
+                      # scripts/Test-Manifest.ps1 is what catches that.
 ```
+
+**`library.json` is the only build description nothing in CI compiles.** A
+PlatformIO consumer resolves it from a git tag, so a mistake surfaces in
+*their* firmware build, after the tag is immutable.
+`scripts/Test-Manifest.ps1` stands in for that missing compile: it checks
+the manifest against the tree it describes (directories exist and hold
+sources, exported `-I` paths exist, advertised headers resolve, version
+matches CMake) and — the check that matters most — that its source
+directories are the same set `rust/osdp/build.rs` compiles. `build.rs` is
+the repo's other answer to "which directories are the library", so the two
+lists disagreeing is the drift signal. It runs first in `Check-Code.ps1`
+(no toolchain needed, so `-SkipC` / `-SkipRust` leave it enforced) and as
+an unconditional step in `ci/build-c.yml`.
+
+Note what the glob does and does not protect: `+<core/src/>` is recursive,
+so a new *subdirectory* of `core/src` is picked up for free. A new
+*top-level* directory is not — that is exactly the `ports/` shape.
 
 ## CMake targets
 
@@ -254,6 +287,10 @@ silently and the ACU spent a full reply timeout learning nothing:
 | `OSDP_ERR_INVALID_ARG` | `osdp_NAK` 0x09 unable to process record |
 | `OSDP_ERR_BUSY` | `osdp_BUSY` (appended to `osdp_status_t` as 11) |
 | anything else | nothing — silent drop survives as an escape hatch |
+
+The one exception to the `NOT_SUPPORTED` row is `osdp_LED` / `osdp_BUZ`,
+which the PD has already carried out by then — see the half-intercepted
+entry under "Library-handled commands" below.
 
 **`osdp_BUSY` is the one reply that leaves its channel.** Spec 7.19 puts
 three rules on it, all exceptions, all centralised in
@@ -469,6 +506,42 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
   is bound. The content is vendor-defined, so it flows to `cmd_cb`, which
   returns `reply.code = OSDP_REPLY_MFGREP` with a body built by
   `osdp_mfgrep_build`. See `docs/PD_GUIDE.md` for the pattern.
+- **`osdp_LED` / `osdp_BUZ` are half-intercepted** — the only commands the
+  library both acts on *and* still routes to `cmd_cb` for a reply.
+  `osdp_pd_internal_observe_command` (pd.c) decodes each into the reader-LED
+  / -buzzer banks and fires the app's change callbacks, whatever the handler
+  then replies. That combination had a silent failure mode: the ordinary
+  handler shape — switch on the known codes, `OSDP_ERR_NOT_SUPPORTED` for
+  the rest — drove the LED correctly while telling the ACU the command was
+  not understood. The light did the right thing and the wire disagreed,
+  which is invisible on a bench. So the dispatch reads `NOT_SUPPORTED` as
+  "no opinion" for these and lets the default ACK stand; a handler that
+  means to refuse one still can, via a status that maps to a specific NAK or
+  by setting `reply->code` itself. The condition is **what
+  `observe_command` returned**, not the command code — it reports an
+  `osdp_status_t` that the dispatch forwards to the same Table 47 mapping an
+  application's return goes through: `OSDP_OK` → ACK, `_BAD_PAYLOAD` → NAK
+  0x02 (did not decode), `_INVALID_ARG` → NAK 0x09 (bank full).
+  `osdp_pd_internal_is_observed_command` lives next to the decoder in pd.c
+  precisely so the two lists cannot drift.
+
+  **`OSDP_PD_MAX_LEDS` / `OSDP_PD_MAX_BUZZERS` bound tracked devices, not
+  command size**, and both are `#ifndef`-guarded like every other sizing
+  knob. Two traps, both found the hard way:
+  - Decoding the whole record array at once against an
+    `OSDP_PD_MAX_LEDS`-sized buffer conflates the two limits —
+    `osdp_led_decode` rejects a payload it cannot fit, so a legal
+    nine-record command became a decode failure on an eight-LED PD.
+    `pd_led_record_at` decodes one record at a time instead, which also
+    drops the stack frame from `OSDP_PD_MAX_LEDS` records to one.
+  - An LED the bank cannot track is an LED whose callback never fires, so
+    the physical light never moves. That is `NAK 0x09`, not an ACK. The
+    capacity check (`pd_led_bank_can_fit`) runs *before* anything is
+    applied and claims no slots, so an oversized command is refused whole
+    rather than lighting eight of nine — and a rejection leaves the bank
+    exactly as it was, so the next command that does fit still works.
+    Records naming an already-tracked LED, or repeating one within the same
+    command, cost no capacity.
 
 ## Coding rules
 
@@ -529,39 +602,65 @@ have to synthesize. Both the plaintext (`pd/src/pd.c`) and Secure Channel
 
 ## Releasing
 
-**"release the code"** / **"cut a release"** → run the four-step process
+**"release the code"** / **"cut a release"** → run the five-step process
 in [docs/PUBLISHING.md](docs/PUBLISHING.md), in order:
 
 1. `./scripts/New-Release.ps1 -IncrementType <Patch|Minor|Major>` — bumps
-   `rust/Cargo.toml` + `CMakeLists.txt` in lockstep, runs the
-   `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main` and
-   the tag.
+   `rust/Cargo.toml` + `CMakeLists.txt` + `library.json` in lockstep, runs
+   the `Check-Code.ps1` gates, commits, tags `v<version>`, pushes `main`
+   and the tag.
 2. Wait for the Azure build pipeline on the tag to go green. It packages
    the `.crate` and the tool binaries; it publishes nothing.
-3. Approve the Classic **Release pipeline** in Azure DevOps. This runs
-   `Publish-Crate.ps1` and is the **irreversible** step — the version is
-   burned on crates.io forever, `cargo yank` only hides it.
-4. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
+3. `./scripts/Publish-GitHubRelease.ps1 -Tag v<version>` — builds notes
    from the commits since the previous tag and creates the GitHub
-   Release. `-Draft` to hand-edit before it goes public.
+   Release. `-Draft` to hand-edit before it goes public; `-AutoConfirm`
+   to skip the type-the-tag prompt (it is `Read-Host`, so a
+   non-interactive shell fails without it).
 
    **Generated notes are the default**, matching OSDP.Net: no
    `CHANGELOG.md`, nothing written between releases, commit subjects
    *are* the notes. `-NotesFile` is the exception for a release a commit
    list would misrepresent — v1.0.0 is the only one so far.
+4. `mkdir dist -Force`, `pio pkg pack -o dist/`, then `pio pkg publish
+   dist/<tarball> --owner z-bit-systems` — ships the **C library** to the
+   PlatformIO registry, the firmware audience. Separate registry,
+   separate account, not in any pipeline. Inspect the tarball
+   (`tar -tzf`) first: its contents come from `export.include` in
+   `library.json`, a whitelist. `-o` needs the directory to already
+   exist, and without `--owner` it publishes under the personal account
+   rather than the org.
+5. Approve the Classic **Release pipeline** in Azure DevOps. This runs
+   `Publish-Crate.ps1` and is the **irreversible** step — the version is
+   burned on crates.io forever, `cargo yank` only hides it.
+
+**Why crates.io is last:** every earlier step is reversible — delete the
+GitHub Release, `pio pkg unpublish` the PlatformIO version — and
+crates.io is not. The one-way door goes at the end, so a late discovery
+costs a retraction rather than a spent version number. The cost of the
+order is a window where the Release is public but `cargo add` still
+fails, so step 5 should not sit for days.
 
 Rules that are easy to get wrong:
 
 - **Never re-tag or re-publish a version.** If a tagged build fails, fix
   forward and cut the next patch. crates.io will not accept the same
-  version twice with different bytes.
-- **Step 4 comes after step 3**, not before: a GitHub Release is an
-  announcement, and the crate should exist before people try to install
-  it.
-- **Step 4 is manual and has been missed before.** v1.0.0 reached
+  version twice with different bytes. The PlatformIO registry does allow
+  `pio pkg unpublish` (and `--undo`), but that is damage control, not a
+  workflow — anyone who installed the version already has it cached.
+- **The two registries can drift.** Step 3 (crates.io) is gated in Azure;
+  step 5 (PlatformIO) is a local command with no pipeline behind it, so
+  it is the one that gets skipped. A version on crates.io but not on the
+  PlatformIO registry means firmware consumers pinning `#v<tag>` are fine
+  (git works off the tag) while `lib_deps = osdp-embedded@<version>`
+  resolves to nothing.
+- **Step 3 is manual and has been missed before.** v1.0.0 reached
   crates.io with no GitHub Release because the tooling only prompted for
-  steps 2 and 3. `New-Release.ps1` now prints the step-4 command when it
-  finishes; do not treat a cut tag as a finished release.
+  the pipeline steps. `New-Release.ps1` now prints every remaining step
+  when it finishes; do not treat a cut tag as a finished release.
+- **Steps 3 and 4 need non-interactive flags when an agent runs them.**
+  `Publish-GitHubRelease.ps1` confirms via `Read-Host` (type the tag),
+  which throws outright in a non-interactive shell — pass `-AutoConfirm`.
+  `pio pkg publish` takes `--no-interactive` for the same reason.
 - **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
   have no GitHub Releases and are deliberately not backfilled. crates.io
   holds only 0.1.0 from that era.

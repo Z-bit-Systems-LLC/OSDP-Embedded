@@ -4,6 +4,7 @@ A freestanding C11 implementation of SIA OSDP v2.2.2 for access control readers 
 
 [![Build Status](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_apis/build/status%2FOSDP%20Embedded-CI?branchName=main)](https://dev.azure.com/Z-bitSystems/OSDP%20Embedded/_build/latest?definitionId=6&branchName=main)
 [![crates.io](https://img.shields.io/crates/v/osdp-embedded.svg)](https://crates.io/crates/osdp-embedded)
+[![PlatformIO Registry](https://badges.registry.platformio.org/packages/z-bit-systems/library/osdp-embedded.svg)](https://registry.platformio.org/libraries/z-bit-systems/osdp-embedded)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later%20OR%20Commercial-blue.svg)](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/LICENSE.md)
 
 ## Overview
@@ -72,6 +73,17 @@ What continuous integration verifies:
 Windows builds with clang and MinGW are supported by the CMake presets and used
 during development, but are not part of the automated matrix.
 
+Embedded toolchains consume the library through PlatformIO (see
+[Installation](#platformio) below). Two targets are verified by hand against the
+published package — ESP32 Arduino (`esp32dev`, ACU) and STM32F103 bare-metal
+Cortex-M3 (`nucleo_f103rb`, `arm-none-eabi`, PD). Neither is part of the
+automated matrix; what CI does check on every commit is that the manifest still
+matches the tree it describes (`scripts/Test-Manifest.ps1`).
+
+For scale, the PD firmware in that Cortex-M3 build links at **10.7 KB of flash
+and 28 bytes of RAM** — both role state machines compile into the archive and
+the linker drops the one you don't reference.
+
 The Rust crate requires **Rust 1.70 or later** and is `no_std`-compatible; it needs
 `alloc` for its trait-object callbacks. It compiles the C sources through the
 [`cc` crate](https://crates.io/crates/cc) at build time, so `cargo build --target …`
@@ -100,6 +112,38 @@ the host-side extras off:
 ```sh
 cmake -S . -B build -DOSDP_BUILD_TESTS=OFF -DOSDP_BUILD_TOOLS=OFF
 ```
+
+### PlatformIO
+
+Published to the PlatformIO registry as
+[`z-bit-systems/osdp-embedded`](https://registry.platformio.org/libraries/z-bit-systems/osdp-embedded):
+
+```ini
+[env:esp32dev]
+platform  = espressif32
+board     = esp32dev
+framework = arduino
+lib_deps  = z-bit-systems/osdp-embedded@^1.0.1
+```
+
+To track the repository instead — an unreleased fix, or a branch — pin a git
+revision:
+
+```ini
+lib_deps = https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git#v1.0.1
+```
+
+Either way only `core/`, `pd/` and `acu/` reach your compiler; the tools, tests,
+Rust crate and vendored code are never handed to it.
+
+The manifest exports the public include directories, so `#include "osdp/osdp_pd.h"`
+(or `osdp/osdp_acu.h`) works with no extra `build_flags`. Both role state machines
+are compiled into the library archive and the linker keeps only the one your
+firmware actually references.
+
+Secure Channel needs an AES + RNG binding that the manifest deliberately does not
+ship — see **Enabling Secure Channel** below. On ESP32 the mbedTLS that already
+comes with the framework is the usual choice.
 
 ### Cargo (Rust)
 
@@ -441,9 +485,10 @@ cargo run  --manifest-path rust/Cargo.toml --example loopback_sc   # SC1
 cargo run  --manifest-path rust/Cargo.toml --example loopback_sc2  # SC2
 ```
 
-Before pushing, `./scripts/Check-Code.ps1` runs every gate CI enforces — CMake
-configure/build/`ctest`, then `cargo fmt`, `clippy -D warnings`, workspace
-build/test, and the loopback examples — in one invocation.
+Before pushing, `./scripts/Check-Code.ps1` runs every gate CI enforces — the
+PlatformIO manifest check, CMake configure/build/`ctest`, then `cargo fmt`,
+`clippy -D warnings`, workspace build/test, and the loopback examples — in one
+invocation.
 
 Tests use the vendored [Unity](https://github.com/ThrowTheSwitch/Unity) framework
 under `tests/`. Dropping an OSDPCAP capture into `tests/captures/` registers it as a

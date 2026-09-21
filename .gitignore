@@ -4,6 +4,11 @@ out/
 cmake-build-*/
 dist/
 
+# PlatformIO's per-project working dir (toolchains, resolved lib_deps,
+# firmware objects). Appears as soon as anything in-tree is built with
+# `pio run` — an examples/ project, or a manifest smoke test.
+.pio/
+
 *.obj
 *.o
 *.lib

@@ -536,7 +536,44 @@ osdp_pd_dispatch_outcome_t osdp_pd_internal_dispatch(
     /* Mirror reader-visible commands (osdp_LED / osdp_BUZ) into their banks
      * whatever the handler chose to reply, so the application's change
      * callbacks and colour/sounding queries stay current on every channel. */
-    osdp_pd_internal_observe_command(pd, cmd_code, payload, payload_len);
+    const osdp_status_t observed =
+        osdp_pd_internal_observe_command(pd, cmd_code, payload, payload_len);
+
+    /* A command the PD decoded and carried out itself is not an unknown
+     * command, whatever the application handler said about it.
+     *
+     * osdp_LED and osdp_BUZ are the only commands the library both acts on
+     * and still routes to the application for a reply, and that combination
+     * used to have a silent failure mode: a handler that switches on the
+     * codes it knows and returns OSDP_ERR_NOT_SUPPORTED for the rest would
+     * drive the LED correctly — the bank above is updated regardless — while
+     * telling the ACU the command was not understood. The light did the
+     * right thing and the wire disagreed, which is invisible on a bench and
+     * obvious only to whoever is watching the bus.
+     *
+     * So "not supported" from the application is read as "no opinion" for
+     * these, and the pre-filled ACK stands. A handler that means to refuse
+     * one can still say so precisely: return a status that maps to a
+     * specific NAK (OSDP_ERR_INVALID_ARG for a bad record, say), or set
+     * reply->code itself and return OSDP_OK. Only the vague answer is
+     * overridden, and only where the PD has already acted.
+     *
+     * "Has already acted" is the observe call's answer, not the command
+     * code. It reports why it declined when it did, and those statuses map
+     * onto Table 47 the same way an application's would: a payload that did
+     * not decode earns NAK 0x02, and an LED the bank has no room to track
+     * earns NAK 0x09 (unable to process record) — never the 0x03 that would
+     * call the code itself unknown, and never an ACK for a light that is
+     * not going to move. */
+    if (app_status == OSDP_ERR_NOT_SUPPORTED &&
+        osdp_pd_internal_is_observed_command(cmd_code)) {
+        if (observed == OSDP_OK) {
+            reply->code        = OSDP_REPLY_ACK;
+            reply->payload     = NULL;
+            reply->payload_len = 0;
+        }
+        app_status = observed;
+    }
 
     const osdp_pd_dispatch_outcome_t outcome =
         apply_app_status(pd, app_status, reply);

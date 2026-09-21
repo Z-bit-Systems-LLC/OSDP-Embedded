@@ -133,16 +133,34 @@ osdp_status_t osdp_pd_internal_build_reply(osdp_pd_t             *pd,
 size_t osdp_pd_internal_handle_sc_into_tx(osdp_pd_t          *pd,
                                           const osdp_frame_t *cmd);
 
-/* Fold a (plaintext) inbound command into the reader-LED bank. A no-op
- * for everything except osdp_LED; for that it decodes the records, applies
- * each to its (reader_no, led_no) slot, and re-resolves displayed colours
- * so any change fires the registered LED callback. Shared by the plaintext
- * dispatch (pd.c) and the Secure Channel operational dispatch (pd_sc.c) so
- * LED state tracks identically on either path. Defined in pd.c. */
-void osdp_pd_internal_observe_command(osdp_pd_t     *pd,
-                                      uint8_t        cmd_code,
-                                      const uint8_t *payload,
-                                      size_t         payload_len);
+/* True for the commands the PD decodes and acts on by itself — osdp_LED
+ * and osdp_BUZ. The dispatch uses this to refuse to answer NAK 0x03
+ * ("unknown command code") for a command the PD demonstrably understood.
+ * Defined in pd.c, beside observe_command() so the two cannot drift. */
+bool osdp_pd_internal_is_observed_command(uint8_t cmd_code);
+
+/* Fold a (plaintext) inbound command into the reader-LED / -buzzer banks.
+ * A no-op for anything osdp_pd_internal_is_observed_command() rejects; for
+ * the rest it decodes the records, applies each to its slot, and re-resolves
+ * displayed state so any change fires the registered callback. Called from
+ * osdp_pd_internal_dispatch, which both the plaintext path (pd.c) and the
+ * Secure Channel operational path (pd_sc.c) funnel through, so state tracks
+ * identically on either channel. Defined in pd.c.
+ *
+ * The result is how the dispatch answers an ACU when the application had no
+ * opinion, so it separates the ways this can decline to act:
+ *
+ *   OSDP_OK                 decoded, and every record reached its slot
+ *   OSDP_ERR_BAD_PAYLOAD    the payload did not decode      -> NAK 0x02
+ *   OSDP_ERR_INVALID_ARG    decoded, but the bank is full   -> NAK 0x09
+ *   OSDP_ERR_NOT_SUPPORTED  not an observed command (not consulted)
+ *
+ * Each maps straight onto apply_app_status(), so the dispatch forwards the
+ * status rather than re-deciding what it meant. */
+osdp_status_t osdp_pd_internal_observe_command(osdp_pd_t     *pd,
+                                               uint8_t        cmd_code,
+                                               const uint8_t *payload,
+                                               size_t         payload_len);
 
 /* Decode a KEYSET payload and, if it carries a valid 16-byte SCBK,
  * copy the new key into pd->sc.scbk (and set the `scbk_set` flag).

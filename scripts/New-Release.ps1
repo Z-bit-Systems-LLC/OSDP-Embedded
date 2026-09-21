@@ -23,7 +23,8 @@
          -Version.
       4. Show the current -> new version and the commits since the last
          tag, then confirm (unless -AutoConfirm).
-      5. Bump (Set-Version.ps1 — updates rust/Cargo.toml + CMakeLists.txt).
+      5. Bump (Set-Version.ps1 — updates rust/Cargo.toml, CMakeLists.txt
+         and library.json).
       6. Verify (Check-Code.ps1) so the tagged commit is known-green,
          unless -SkipChecks.
       7. Commit "Bump version to X.Y.Z", create annotated tag vX.Y.Z,
@@ -231,14 +232,14 @@ try {
             throw ("Verification failed. The version bump is staged in your working " +
                    "tree but nothing was committed — fix the failures (or re-run with " +
                    "-SkipChecks) and try again. 'git checkout -- rust/Cargo.toml " +
-                   "CMakeLists.txt' reverts the bump.")
+                   "CMakeLists.txt library.json' reverts the bump.")
         }
     }
 
     # ---- 7. commit, tag, push ----------------------------------------
     Write-Step 'Committing, tagging, and pushing'
     if ($DryRun) {
-        Write-Info "  [dry-run] git add rust/Cargo.toml CMakeLists.txt"
+        Write-Info "  [dry-run] git add rust/Cargo.toml CMakeLists.txt library.json"
         Write-Info "  [dry-run] git commit -m 'Bump version to $newVersion'"
         Write-Info "  [dry-run] git tag -a $tag -m 'Release $newVersion'"
         Write-Info "  [dry-run] git push origin main"
@@ -248,7 +249,7 @@ try {
         return
     }
 
-    Invoke-Git add rust/Cargo.toml CMakeLists.txt | Out-Null
+    Invoke-Git add rust/Cargo.toml CMakeLists.txt library.json | Out-Null
     Invoke-Git commit -m "Bump version to $newVersion" | Out-Null
     Write-Ok "  committed: Bump version to $newVersion"
 
@@ -266,13 +267,13 @@ try {
     # Release — the four-step process was documented but the tooling
     # reminded you about three of them.
     Write-Host ''
-    Write-Ok "Release $newVersion cut. Two steps remain:"
+    Write-Ok "Release $newVersion cut. Four steps remain:"
     Write-Host ''
-    Write-Info '  2/3  Wait for the Azure build pipeline on the tag to go green,'
-    Write-Info '       then approve the Release pipeline. That publishes the crate'
-    Write-Info '       to crates.io (irreversible) and uploads the tool binaries.'
+    Write-Info '  2/5  Wait for the Azure build pipeline on the tag to go green.'
+    Write-Info '       It packages the .crate and the tool binaries and publishes'
+    Write-Info '       nothing.'
     Write-Host ''
-    Write-Info '  3/3  Publish the GitHub Release, AFTER the crate is live:'
+    Write-Info '  3/5  Publish the GitHub Release:'
     Write-Host ''
     Write-Host "         ./scripts/Publish-GitHubRelease.ps1 -Tag $tag" -ForegroundColor White
     Write-Host ''
@@ -280,7 +281,19 @@ try {
     Write-Info '       Add -Draft to hand-edit first, or -NotesFile <path> to'
     Write-Info '       supply written prose instead (see docs/PUBLISHING.md).'
     Write-Host ''
-    Write-Warn '  Until 3/3 runs, the release is invisible to anyone watching the repo.'
+    Write-Info '  4/5  Publish the C library to the PlatformIO registry:'
+    Write-Host ''
+    Write-Host '         mkdir dist -Force' -ForegroundColor White
+    Write-Host '         pio pkg pack -o dist/' -ForegroundColor White
+    Write-Host "         tar -tzf dist/osdp-embedded-$newVersion.tar.gz   # read it" -ForegroundColor White
+    Write-Host "         pio pkg publish dist/osdp-embedded-$newVersion.tar.gz --owner z-bit-systems" -ForegroundColor White
+    Write-Host ''
+    Write-Info '  5/5  Approve the Release pipeline in Azure DevOps. That publishes'
+    Write-Info '       the crate to crates.io and is IRREVERSIBLE, which is why it'
+    Write-Info '       is last: everything above can be retracted, this cannot.'
+    Write-Host ''
+    Write-Warn '  Until 3/5 runs, the release is invisible to anyone watching the repo.'
+    Write-Warn '  Between 3/5 and 5/5, the Release is public but `cargo add` fails.'
 }
 finally {
     Pop-Location
