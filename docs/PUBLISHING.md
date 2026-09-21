@@ -1,7 +1,15 @@
-# Publishing `osdp-embedded` to crates.io
+# Publishing `osdp-embedded`
 
-This documents how a Z-bit Systems maintainer ships a new release of the
-`osdp-embedded` Rust crate. The Azure Pipelines build produces an
+This documents how a Z-bit Systems maintainer ships a new release. There
+are two registries, because there are two audiences: the
+`osdp-embedded` **Rust crate** goes to crates.io (steps 1–4 below), and
+the **C library** goes to the PlatformIO registry for firmware
+developers (step 5). They share a version number — `Set-Version.ps1`
+keeps `rust/Cargo.toml`, `CMakeLists.txt` and `library.json` in lockstep
+— but they are published separately, by different commands, to different
+accounts.
+
+The crates.io half is automated and gated. The Azure Pipelines build produces an
 `osdp-embedded-X.Y.Z.crate` artifact plus the Windows tool binaries on
 every tagged build (see `ci/package.yml`); the actual publish to
 crates.io runs in the downstream Azure DevOps **Release pipeline**
@@ -19,7 +27,7 @@ one-time UI setup.
 
 ## The release process
 
-Four steps, in order. Steps 1 and 4 are local commands; steps 2 and 3
+Five steps, in order. Steps 1, 4 and 5 are local commands; steps 2 and 3
 happen in Azure DevOps.
 
 ### 1. Cut the release locally
@@ -87,6 +95,77 @@ already be on crates.io when the notification goes out.
 **This step is manual and easy to forget** — v1.0.0 shipped to crates.io
 without a GitHub Release for exactly that reason. `New-Release.ps1` now
 prints the command at the end of step 1 as a backstop.
+
+### 5. Publish to the PlatformIO registry
+
+The C library ships to firmware developers through the PlatformIO
+registry as well as crates.io. It is a separate registry with its own
+account, and nothing in the Azure pipeline pushes to it — this step is
+local and deliberate.
+
+**Prerequisite: PlatformIO Core on PATH.** It is not a build dependency
+of this repo and is not installed by `Check-Code.ps1`, so a maintainer
+machine may not have it:
+
+```pwsh
+python -m pip install platformio
+
+# pip's scripts dir is not necessarily on PATH, and its location varies
+# with how Python itself was installed — ask Python rather than guess:
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+# add that directory to your USER PATH, then:
+pio --version
+```
+
+Two traps worth knowing:
+
+- **Do not append with `setx PATH "%PATH%;..."`.** `%PATH%` expands to
+  system + user merged, so that writes the whole system PATH into your
+  user PATH, and `setx` silently truncates at 1024 characters. Use
+  `[Environment]::SetEnvironmentVariable('PATH', $new, 'User')` with only
+  the user portion read back via `GetEnvironmentVariable('PATH','User')`.
+- **Keep exactly one PlatformIO Core.** All installs share the state
+  directory `~/.platformio`, so a second copy (a venv, a VS Code bundled
+  Core) at a different version makes `pio` warn that an obsolete Core is
+  in use, because the older one downgrades state the newer one wrote.
+
+`Test-Manifest.ps1` deliberately does **not** need it — the manifest gate
+is pure PowerShell so CI can run it without installing a toolchain. Only
+this publishing step needs the real tool.
+
+```pwsh
+pio pkg pack -o dist/                       # build the tarball
+tar -tzf dist/osdp-embedded-1.2.3.tar.gz    # READ IT before publishing
+pio pkg publish dist/osdp-embedded-1.2.3.tar.gz
+```
+
+Authenticate once with `pio account login`, or set `PLATFORMIO_AUTH_TOKEN`
+in the environment for a non-interactive run (`--no-interactive`). Publish
+under the organization with `--owner` if the account defaults elsewhere.
+
+`pio account login` prompts for credentials, so it has to be run in your
+own terminal — in a Claude Code session, prefix it with `!` to run it
+in the session rather than asking the agent to.
+
+**Inspect the tarball before every publish.** What it contains is decided
+by `export.include` in `library.json`, which is a *whitelist*: it ships
+`core/`, `pd/`, `acu/`, the README and the licence texts, and nothing
+else. A source directory added to the build but not to `export.include`
+produces a package that compiles fine from a git pin and fails from the
+registry — the git path keeps working, so the break is invisible until a
+consumer installs the published version. `scripts/Test-Manifest.ps1`
+checks exactly this and runs in CI, but the tarball listing is the last
+cheap look before the version is public.
+
+Unlike crates.io, a bad version can be withdrawn:
+`pio pkg unpublish osdp-embedded@1.2.3` (and `--undo` puts it back).
+Treat that as damage control, not a workflow — anyone who installed it
+in the meantime has it cached. **Never publish different bytes under a
+version that already existed.**
+
+Do this after step 3 for the same reason step 4 comes after it: the
+version should exist everywhere it is advertised before the announcement
+goes out.
 
 ### Version history note
 

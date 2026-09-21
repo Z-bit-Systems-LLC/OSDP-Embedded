@@ -37,6 +37,15 @@
       7. The manifest version matches CMakeLists.txt's project() VERSION.
          Set-Version.ps1 keeps them in lockstep; this catches a hand-edit
          that bypassed it, before a tag burns the mismatch in.
+      8. Every directory the build needs survives `export`. The registry
+         package is built from export.include, so a source or include
+         directory added to build.* and NOT added to export.include
+         produces a package that compiles from a git pin and fails from
+         the registry — the git path keeps working, so the break is
+         invisible until a consumer installs the published version. The
+         licence texts are checked too: this is GPL code, and stripping
+         them from the published tarball would be a compliance problem,
+         not a build one.
 
     Exits 0 when every check passes, 1 otherwise, printing one line per
     failure. No PlatformIO installation required.
@@ -188,6 +197,57 @@ if (Test-Path $cmakePath) {
                          "(numeric '$manifestNumeric') but CMakeLists.txt project() says " +
                          "'$cmakeVersion' — bump with scripts/Set-Version.ps1, not by hand")
         }
+    }
+}
+
+# ---- 8. export coverage (the published package) -----------------------
+#
+# Only meaningful when export.include is used as a whitelist; an absent
+# export block means "ship everything", which is a different (documented)
+# choice and nothing here can be missing.
+if ($manifest.PSObject.Properties.Name.Contains('export') -and
+    $manifest.export.PSObject.Properties.Name.Contains('include')) {
+
+    $includeGlobs = @($manifest.export.include)
+
+    # A whitelist entry covers a directory when it names that directory or
+    # an ancestor of it: 'core/src/**' covers 'core/src'.
+    function Test-Exported {
+        param([string]$Dir, [string[]]$Globs)
+        $needle = $Dir.TrimEnd('/', '*').TrimEnd('/')
+        foreach ($g in $Globs) {
+            $base = $g.TrimEnd('*').TrimEnd('/')
+            if ($base -eq '') { return $true }        # a bare '**' ships all
+            if ($needle -eq $base) { return $true }
+            if ($needle.StartsWith("$base/")) { return $true }
+        }
+        return $false
+    }
+
+    foreach ($dir in $includedDirs) {
+        if (-not (Test-Exported -Dir $dir -Globs $includeGlobs)) {
+            Add-Problem ("srcFilter compiles '$dir' but export.include does not ship it — " +
+                         "the published package would build from a git pin and fail from " +
+                         "the registry. Add '$($dir.TrimEnd('/'))/**' to export.include.")
+        }
+    }
+
+    foreach ($inc in $includePaths) {
+        if (-not (Test-Exported -Dir $inc -Globs $includeGlobs)) {
+            Add-Problem ("build.flags exports '-I $inc' but export.include does not ship that " +
+                         "directory — consumers of the published package could not include " +
+                         "the headers. Add '$($inc.TrimEnd('/'))/**' to export.include.")
+        }
+    }
+
+    # GPL: the licence texts must reach whoever installs the package.
+    $shipsLicence = $false
+    foreach ($g in $includeGlobs) {
+        if ($g -match '(?i)^(licen[cs]e|copying)') { $shipsLicence = $true; break }
+    }
+    if (-not $shipsLicence) {
+        Add-Problem ("export.include ships no LICENSE/COPYING file — this is GPL-3.0-or-later " +
+                     "code and the published package must carry its licence text")
     }
 }
 
