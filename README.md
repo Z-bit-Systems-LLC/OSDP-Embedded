@@ -67,9 +67,15 @@ Windows builds with clang and MinGW are supported by the CMake presets and used
 during development, but are not part of the automated matrix.
 
 Embedded toolchains consume the library through PlatformIO (see
-[Installation](#platformio) below). An ESP32 Arduino build (`esp32dev`) is
-verified by hand against the published manifest; it is not part of the automated
-matrix either.
+[Installation](#platformio) below). Two targets are verified by hand against the
+published package — ESP32 Arduino (`esp32dev`, ACU) and STM32F103 bare-metal
+Cortex-M3 (`nucleo_f103rb`, `arm-none-eabi`, PD). Neither is part of the
+automated matrix; what CI does check on every commit is that the manifest still
+matches the tree it describes (`scripts/Test-Manifest.ps1`).
+
+For scale, the PD firmware in that Cortex-M3 build links at **10.7 KB of flash
+and 28 bytes of RAM** — both role state machines compile into the archive and
+the linker drops the one you don't reference.
 
 The Rust crate requires **Rust 1.70 or later** and is `no_std`-compatible; it needs
 `alloc` for its trait-object callbacks. It compiles the C sources through the
@@ -102,19 +108,26 @@ cmake -S . -B build -DOSDP_BUILD_TESTS=OFF -DOSDP_BUILD_TOOLS=OFF
 
 ### PlatformIO
 
-Pin a tagged revision in `platformio.ini`:
+Published to the PlatformIO registry as
+[`z-bit-systems/osdp-embedded`](https://registry.platformio.org/libraries/z-bit-systems/osdp-embedded):
 
 ```ini
 [env:esp32dev]
 platform  = espressif32
 board     = esp32dev
 framework = arduino
-lib_deps  = https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git#v1.0.0
+lib_deps  = z-bit-systems/osdp-embedded@^1.0.1
 ```
 
-The repository ships a `library.json` manifest, so only `core/`, `pd/` and
-`acu/` reach your compiler — the tools, tests, Rust crate and vendored code are
-never handed to it.
+To track the repository instead — an unreleased fix, or a branch — pin a git
+revision:
+
+```ini
+lib_deps = https://github.com/Z-bit-Systems-LLC/OSDP-Embedded.git#v1.0.1
+```
+
+Either way only `core/`, `pd/` and `acu/` reach your compiler; the tools, tests,
+Rust crate and vendored code are never handed to it.
 
 The manifest exports the public include directories, so `#include "osdp/osdp_pd.h"`
 (or `osdp/osdp_acu.h`) works with no extra `build_flags`. Both role state machines
