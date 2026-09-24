@@ -16,6 +16,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(OSDP_BUILD_TESTS "Build unit tests" ON)
 option(OSDP_BUILD_TOOLS "Build host-side developer tools (osdp-parser, ...)" ON)
 option(OSDP_SANITIZE    "Build with AddressSanitizer (and UBSan on GCC/Clang)" OFF)
+# Opt-in: needs an installed wolfSSL (find_package(wolfssl)), so it stays off
+# unless asked for. When tests are on, the SC suite re-runs over wolfCrypt.
+option(OSDP_PORT_WOLFCRYPT "Build the wolfCrypt osdp_sc_crypto_t port (ports/wolfcrypt)" OFF)
 
 # Strict warnings + per-function/data sections so consumers can use
 # --gc-sections to drop any unused per-message codecs.
@@ -89,6 +92,10 @@ if(OSDP_BUILD_TESTS OR OSDP_BUILD_TOOLS)
     add_subdirectory(vendor)
     # ports/ binds that vendored code to the library's crypto HALs, so it is
     # gated identically and must come after vendor/.
+    add_subdirectory(ports)
+elseif(OSDP_PORT_WOLFCRYPT)
+    # The wolfCrypt port depends on nothing vendored, so it can be built for a
+    # consumer that wants it without the tests or tools.
     add_subdirectory(ports)
 endif()
 

@@ -9,10 +9,11 @@
 
 #include "osdp/osdp_sc_crypto.h"
 
-/* Adapter: presents tiny-AES-c (vendored under tests/vendor/tiny-aes)
- * as an osdp_sc_crypto_t vtable. Used in every SC test that needs a
- * working AES implementation. The vtable has no internal state, so a
- * single instance can be reused freely across tests. */
+/* Adapter: presents an AES-128 port (ports/tiny, or ports/wolfcrypt in
+ * the *_wolfcrypt test builds) as an osdp_sc_crypto_t vtable. Used in
+ * every SC test that needs a working AES implementation. A single
+ * instance can be reused freely across tests. The name predates the
+ * second backend and is kept so no test has to change. */
 const osdp_sc_crypto_t *sc_test_crypto_tiny_aes(void);
 
 /* Reset the deterministic PRNG used by the tiny-AES adapter's
