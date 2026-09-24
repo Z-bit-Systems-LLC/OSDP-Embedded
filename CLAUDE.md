@@ -90,6 +90,15 @@ tools/
                       # POSIX adapters). Used for interop validation
                       # against external ACUs (OSDP.Net, hardware).
 
+ports/                # bindings of osdp_sc_crypto_t to real crypto; never
+                      # linked into core/pd/acu.
+  tiny/               # tiny-AES-c; tests + tools only. No RNG.
+  wolfcrypt/          # wolfCrypt; opt-in OSDP_PORT_WOLFCRYPT=ON, needs an
+                      # installed wolfSSL built with -DWOLFSSL_AESECB=yes.
+                      # AES setter + separate opt-in DRBG setter. With tests
+                      # on, the SC suite re-runs as test_*_wolfcrypt. CI
+                      # builds a pinned wolfSSL (wolfsslRef, cached).
+
 vendor/               # 3rd-party code shared between tools and tests.
   tiny-aes/           # tiny-AES-c (Unlicense / public domain).
                       # Only built when OSDP_BUILD_TESTS=ON or

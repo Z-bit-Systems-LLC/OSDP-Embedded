@@ -55,6 +55,11 @@ pool:
 
 variables:
   buildConfiguration: 'Release'
+  # wolfSSL for ports/wolfcrypt (build-c.yml). A tag, never a branch: the
+  # cache key trusts it to mean the same bytes forever. Bump wolfsslCacheRev
+  # when the build flags in build-c.yml change without the tag changing.
+  wolfsslRef: 'v5.9.2-stable'
+  wolfsslCacheRev: '1'
 
 jobs:
   # C library + tools (CMake/ctest), runs on every push and PR. Native

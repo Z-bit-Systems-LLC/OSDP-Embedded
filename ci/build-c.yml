@@ -44,9 +44,48 @@ steps:
       pwsh: true
       failOnStderr: false
 
+  # wolfSSL for ports/wolfcrypt (OSDP_PORT_WOLFCRYPT). Pinned, crypto-only,
+  # static, installed outside the source tree and cached: it changes only when
+  # the pin or its flags do, so almost every run restores it instead of
+  # compiling. -DWOLFSSL_AESECB=yes is the flag that matters — wolfSSL's CMake
+  # build leaves AES-ECB off by default and the port #errors without it. To
+  # move the pin, change wolfsslRef; to change the flags, bump wolfsslCacheRev
+  # too, since the cache key cannot see inside the build script.
+  - task: Cache@2
+    displayName: 'Cache wolfSSL'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
+    inputs:
+      key: 'wolfssl | "$(Agent.OS)" | "$(wolfsslRef)" | "$(wolfsslCacheRev)"'
+      path: '$(Pipeline.Workspace)/wolfssl'
+      cacheHitVar: WOLFSSL_CACHE_RESTORED
+
+  - task: Bash@3
+    displayName: 'Build wolfSSL $(wolfsslRef)'
+    condition: and(succeeded(), ne(variables['skipRedundant'], 'true'), ne(variables['WOLFSSL_CACHE_RESTORED'], 'true'))
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -euo pipefail
+        src="$(Agent.TempDirectory)/wolfssl-src"
+        git clone --quiet --depth 1 --branch "$(wolfsslRef)" \
+          https://github.com/wolfSSL/wolfssl.git "$src"
+        cmake -S "$src" -B "$src/build" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DWOLFSSL_CRYPT_ONLY=yes \
+          -DWOLFSSL_AESECB=yes \
+          -DWOLFSSL_EXAMPLES=no \
+          -DWOLFSSL_CRYPT_TESTS=no \
+          -DCMAKE_INSTALL_PREFIX="$(Pipeline.Workspace)/wolfssl"
+        cmake --build "$src/build" --parallel
+        cmake --install "$src/build"
+
   # On Linux CMake defaults to the single-config "Unix Makefiles" generator,
   # so the build type is fixed at configure time via CMAKE_BUILD_TYPE; there
   # is no per-build `--config` (that's a multi-config / MSVC concept).
+  #
+  # OSDP_PORT_WOLFCRYPT adds ports/wolfcrypt, re-runs the SC suite over it as
+  # test_*_wolfcrypt, and adds test_port_wolfcrypt — all in the same ctest run.
   - task: Bash@3
     displayName: 'CMake configure (Release)'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
@@ -57,7 +96,9 @@ steps:
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=$(buildConfiguration) \
           -DOSDP_BUILD_TESTS=ON \
-          -DOSDP_BUILD_TOOLS=ON
+          -DOSDP_BUILD_TOOLS=ON \
+          -DOSDP_PORT_WOLFCRYPT=ON \
+          -DCMAKE_PREFIX_PATH="$(Pipeline.Workspace)/wolfssl"
 
   # --parallel keeps all agent cores busy compiling.
   - task: Bash@3
