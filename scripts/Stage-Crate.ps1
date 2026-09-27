@@ -38,22 +38,17 @@ $repoRoot     = Resolve-Path (Join-Path $PSScriptRoot '..')
 $rustDir      = Join-Path $repoRoot 'rust'
 $crateDir     = Join-Path $rustDir 'osdp'
 $vendorDir    = Join-Path $crateDir 'vendor-c'
-$readmeSrc    = Join-Path $repoRoot 'README.md'
-$readmeDst    = Join-Path $crateDir 'README.md'
+
+# The crate README (rust/osdp/README.md) is NOT staged: it is the
+# crate's own Rust-facing README, committed in place. -Clean must never
+# touch it.
 
 if ($Clean) {
-    $cleaned = $false
     if (Test-Path $vendorDir) {
         Write-Host "Removing $vendorDir" -ForegroundColor Yellow
         Remove-Item -Recurse -Force $vendorDir
-        $cleaned = $true
     }
-    if (Test-Path $readmeDst) {
-        Write-Host "Removing $readmeDst" -ForegroundColor Yellow
-        Remove-Item -Force $readmeDst
-        $cleaned = $true
-    }
-    if (-not $cleaned) {
+    else {
         Write-Host 'Nothing to clean.' -ForegroundColor DarkGray
     }
     return
@@ -98,18 +93,8 @@ foreach ($root in $roots) {
     }
 }
 
-# Copy the repo-root README into the crate dir so `readme = "README.md"`
-# in Cargo.toml resolves and crates.io renders the project overview on
-# the package page. The destination is gitignored; cleaned by -Clean.
-if (-not (Test-Path $readmeSrc)) {
-    throw "Repo README not found at: $readmeSrc"
-}
-Copy-Item -Path $readmeSrc -Destination $readmeDst -Force
-
 Write-Host "Staged $total C source/header files into:" -ForegroundColor Green
 Write-Host "  $vendorDir"
-Write-Host "Staged README.md into:" -ForegroundColor Green
-Write-Host "  $readmeDst"
 Write-Host ''
 Write-Host 'Next:' -ForegroundColor Yellow
 Write-Host '  cargo publish --manifest-path rust/osdp/Cargo.toml --dry-run --allow-dirty'

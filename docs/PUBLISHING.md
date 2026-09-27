@@ -345,24 +345,25 @@ foreach ($combo in @("", "--features pd", "--features acu", "--features pd,acu")
 }
 ```
 
-### 3. Stage the C source tree + README into the crate dir
+### 3. Stage the C source tree into the crate dir
 
 The `osdp-embedded` crate's `build.rs` references `<repo>/{core,pd,acu}/`
 during in-workspace dev builds, but `cargo publish` only packages files
-inside the crate directory. The stage script handles both the C
-source mirror and the README that crates.io renders on the package
-page:
+inside the crate directory. The stage script mirrors the C sources in:
 
 ```pwsh
 ./scripts/Stage-Crate.ps1
 ```
 
-This copies:
-- `<repo>/{core,pd,acu}/**/*.{c,h}` → `rust/osdp/vendor-c/...`
-- `<repo>/README.md` → `rust/osdp/README.md`
+This copies `<repo>/{core,pd,acu}/**/*.{c,h}` → `rust/osdp/vendor-c/...`.
+The destination is gitignored — it only exists during the publish
+window. `Stage-Crate.ps1 -Clean` removes it.
 
-Both destinations are gitignored — they only exist during the publish
-window. `Stage-Crate.ps1 -Clean` removes them.
+The README crates.io renders is **not** staged. It is
+`rust/osdp/README.md`, the crate's own Rust-facing README, committed in
+place. It is not the repo-root README, which leads with the C library.
+crates.io only picks up a README change with a new published version.
+A published version's README is as immutable as its code.
 
 ### 4. Run `cargo package` + dry-run publish
 

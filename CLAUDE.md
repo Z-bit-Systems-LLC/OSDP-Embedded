@@ -584,13 +584,19 @@ Rules that are easy to get wrong:
 - **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
   have no GitHub Releases and are deliberately not backfilled. crates.io
   holds only 0.1.0 from that era.
-- **The repo-root `README.md` is the crates.io front page** —
-  `Stage-Crate.ps1` copies it into the crate verbatim, with no link
-  rewriting. Every in-repo link in it must therefore be an absolute
-  `https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/...` URL, or it
-  will 404 for crates.io readers. The README follows the
+- **There are two READMEs, and crates.io shows the crate's one.** The
+  repo-root `README.md` is the GitHub front page and leads with the C
+  library. `rust/osdp/README.md` is the crates.io front page, Rust
+  throughout, committed in place (`Cargo.toml` `readme`); nothing
+  copies one over the other. Every code sample in the crate README is
+  mirrored verbatim in `rust/osdp/examples/quickstart.rs`, which CI
+  compiles — edit both together. A new public Rust API or a changed
+  one usually means touching both READMEs. crates.io renders links
+  unmodified, so every in-repo link in the crate README must be an
+  absolute `https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/...`
+  URL. Both follow the
   [Z-bit README guidelines](https://github.com/Z-bit-Systems-LLC/Guidelines/blob/main/docs/readme-template.md);
-  keep its structure when editing.
+  keep their structure when editing.
 - **1.0.0 makes the public API a promise.** See "What 1.0.0 commits us
   to" in PUBLISHING.md before changing a public header — adding a member
   to a public struct is a breaking change, because consumers embed those

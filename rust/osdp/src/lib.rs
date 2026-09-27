@@ -15,10 +15,10 @@
 //!
 //! ```toml
 //! # Pure PD device firmware:
-//! osdp-embedded = { version = "0.1", default-features = false, features = ["pd"] }
+//! osdp-embedded = { version = "1.0", default-features = false, features = ["pd"] }
 //!
 //! # ACU controller in a Linux app:
-//! osdp-embedded = { version = "0.1", features = ["acu"] }
+//! osdp-embedded = { version = "1.0", features = ["acu"] }
 //! ```
 //!
 //! Disabling a role-feature also drops the matching .c files from the
