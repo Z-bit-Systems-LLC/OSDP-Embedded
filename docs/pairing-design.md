@@ -455,11 +455,11 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
 - **Phase 7 — WolfSSL backend + live interop.** ☑ backend:
   `ports/wolfcrypt/osdp_pair_wolfcrypt.{h,c}` (wolfCrypt ML-KEM-768 +
   ML-DSA-44 + SHA-256/HMAC/HKDF) and `osdp_sc2_wolfcrypt.{h,c}` (AES-256-GCM
-  + block; KMAC256 stays the caller's, wolfCrypt has none). Draws randomness
+  + block, and KMAC256 on wolfSSL ≥ 5.9.4 with `WOLFSSL_KMAC`). Draws randomness
   in PQClean's exact sizes and order, so `test_port_pair_wolfcrypt` checks
   byte-identical keys / ct / ss / signatures against `ports/pqclean`, loads a
   provisioned PQClean key, and runs wolfCrypt↔PQClean handshakes both ways.
-  Tested on wolfSSL 5.9.2 (CMake) and 5.8.2 (`user_settings.h`); stack/heap
+  Tested on wolfSSL 5.9.4 / 5.9.2 (CMake) and 5.8.2 (`user_settings.h`); stack/heap
   figures in `docs/wolfssl-osp/README.md`. First consumer: OpenReader
   (ESP32-C6). ☐ still open: tools pairing mode over wolfCrypt and the live
   serial run vs OSDP.Net. Note `osdp_pair_crypto.h` and §10 speak of

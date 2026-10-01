@@ -9,6 +9,7 @@
  * lifecycle refusals. */
 
 #include "osdp_sc2_wolfcrypt.h"
+#include "kmac.h"   /* vendor/tiny-kmac: the reference for the KMAC cross-check */
 #include "unity.h"
 
 #include <string.h>
@@ -208,8 +209,79 @@ static void test_gcm_bad_tag_rejects_and_wipes(void)
     TEST_ASSERT_EACH_EQUAL_UINT8(0, pt, sizeof(pt));
 }
 
-/* The setter owns the three AES members and `user`; kmac256 and rand_bytes
- * are the caller's and must survive it whichever order they are bound in. */
+#if OSDP_SC2_WOLFCRYPT_HAS_KMAC
+
+/* NIST SP 800-185 KMAC256 Sample #5: the empty customization string is
+ * exactly the HAL's KMAC256, so this goes through the vtable. */
+static void test_kmac256_sp800_185_sample5(void)
+{
+    static const uint8_t expect[64] = {
+        0x75, 0x35, 0x8C, 0xF3, 0x9E, 0x41, 0x49, 0x4E,
+        0x94, 0x97, 0x07, 0x92, 0x7C, 0xEE, 0x0A, 0xF2,
+        0x0A, 0x3F, 0xF5, 0x53, 0x90, 0x4C, 0x86, 0xB0,
+        0x8F, 0x21, 0xCC, 0x41, 0x4B, 0xCF, 0xD6, 0x91,
+        0x58, 0x9D, 0x27, 0xCF, 0x5E, 0x15, 0x36, 0x9C,
+        0xBB, 0xFF, 0x8B, 0x9A, 0x4C, 0x2E, 0xB1, 0x78,
+        0x00, 0x85, 0x5D, 0x02, 0x35, 0xFF, 0x63, 0x5D,
+        0xA8, 0x25, 0x33, 0xEC, 0x6B, 0x75, 0x9B, 0x69,
+    };
+    uint8_t key[32], data[200], out[64];
+    for (size_t i = 0; i < sizeof(key); i++)  { key[i]  = (uint8_t)(0x40 + i); }
+    for (size_t i = 0; i < sizeof(data); i++) { data[i] = (uint8_t)i; }
+
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc2_wolfcrypt_aes256(&g_ctx, &g_vt));
+    TEST_ASSERT_EQUAL(OSDP_OK,
+        g_vt.kmac256(g_vt.user, key, sizeof(key), data, sizeof(data),
+                     out, sizeof(out)));
+    TEST_ASSERT_EQUAL_MEMORY(expect, out, sizeof(out));
+}
+
+/* Cross-check against vendor/tiny-kmac (the SC2 test backend) around the
+ * KMAC256 rate (136 bytes), with empty and long keys, at the 32-byte output
+ * SC2 asks for and a longer one. */
+static void test_kmac256_matches_tiny_kmac(void)
+{
+    static const size_t key_lens[]  = { 0, 16, 32, 135, 136, 200 };
+    static const size_t data_lens[] = { 0, 1, 32, 135, 136, 137, 300 };
+    static const size_t out_lens[]  = { 32, 64 };
+    uint8_t key[200], data[300], a[64], b[64];
+    for (size_t i = 0; i < sizeof(key); i++)  { key[i]  = (uint8_t)(i * 7 + 1); }
+    for (size_t i = 0; i < sizeof(data); i++) { data[i] = (uint8_t)(i * 13 + 5); }
+
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc2_wolfcrypt_aes256(&g_ctx, &g_vt));
+    for (size_t k = 0; k < sizeof(key_lens) / sizeof(key_lens[0]); k++) {
+        for (size_t d = 0; d < sizeof(data_lens) / sizeof(data_lens[0]); d++) {
+            for (size_t o = 0; o < sizeof(out_lens) / sizeof(out_lens[0]); o++) {
+                TEST_ASSERT_EQUAL(OSDP_OK,
+                    g_vt.kmac256(g_vt.user, key, key_lens[k],
+                                 data, data_lens[d], a, out_lens[o]));
+                tiny_kmac256(key, key_lens[k], data, data_lens[d],
+                             b, out_lens[o]);
+                TEST_ASSERT_EQUAL_MEMORY(b, a, out_lens[o]);
+            }
+        }
+    }
+}
+
+/* With KMAC the setter owns kmac256 as well as the AES members; rand_bytes
+ * is still the caller's. */
+static void test_setter_owns_kmac_leaves_rand_alone(void)
+{
+    g_vt.kmac256    = sentinel_kmac;
+    g_vt.rand_bytes = sentinel_rand;
+
+    TEST_ASSERT_EQUAL(OSDP_OK, osdp_sc2_wolfcrypt_aes256(&g_ctx, &g_vt));
+    TEST_ASSERT_NOT_NULL(g_vt.kmac256);
+    TEST_ASSERT_TRUE(g_vt.kmac256 != sentinel_kmac);
+    TEST_ASSERT_EQUAL_PTR(sentinel_rand, g_vt.rand_bytes);
+    TEST_ASSERT_EQUAL_PTR(&g_ctx, g_vt.user);
+}
+
+#else
+
+/* Without KMAC the setter owns the three AES members and `user`; kmac256 and
+ * rand_bytes are the caller's and must survive it whichever order they are
+ * bound in. */
 static void test_setter_leaves_kmac_and_rand_alone(void)
 {
     g_vt.kmac256    = sentinel_kmac;
@@ -223,6 +295,8 @@ static void test_setter_leaves_kmac_and_rand_alone(void)
     TEST_ASSERT_NOT_NULL(g_vt.aes256_ecb_encrypt);
     TEST_ASSERT_EQUAL_PTR(&g_ctx, g_vt.user);
 }
+
+#endif /* OSDP_SC2_WOLFCRYPT_HAS_KMAC */
 
 static void test_rng_is_opt_in_and_draws(void)
 {
@@ -267,6 +341,10 @@ static void test_refusals(void)
     osdp_sc2_wolfcrypt_free(&g_ctx);
     TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
         g_vt.aes256_ecb_encrypt(g_vt.user, k_aes_key, k_aes_pt, out));
+#if OSDP_SC2_WOLFCRYPT_HAS_KMAC
+    TEST_ASSERT_EQUAL(OSDP_ERR_INVALID_ARG,
+        g_vt.kmac256(g_vt.user, k_aes_key, 32, k_aes_pt, 16, out, 16));
+#endif
     osdp_sc2_wolfcrypt_free(&g_ctx);   /* twice is fine */
     osdp_sc2_wolfcrypt_free(NULL);
 }
@@ -279,7 +357,13 @@ int main(void)
     RUN_TEST(test_gcm_in_place_both_directions);
     RUN_TEST(test_gcm_empty_payload);
     RUN_TEST(test_gcm_bad_tag_rejects_and_wipes);
+#if OSDP_SC2_WOLFCRYPT_HAS_KMAC
+    RUN_TEST(test_kmac256_sp800_185_sample5);
+    RUN_TEST(test_kmac256_matches_tiny_kmac);
+    RUN_TEST(test_setter_owns_kmac_leaves_rand_alone);
+#else
     RUN_TEST(test_setter_leaves_kmac_and_rand_alone);
+#endif
     RUN_TEST(test_rng_is_opt_in_and_draws);
     RUN_TEST(test_refusals);
     return UNITY_END();

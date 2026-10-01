@@ -5,8 +5,9 @@
  * file twice when osdp_port_sc2_wolfcrypt exists — once over the vendored
  * tiny-AES/tiny-GCM, once with OSDP_SC2_TEST_WOLFCRYPT over ports/wolfcrypt —
  * and links the whole SC2 suite against each, so every SC2 test doubles as a
- * wolfCrypt conformance test. KMAC256 is tiny-kmac in both builds (wolfCrypt
- * has none), and the RNG stays the deterministic one below: the tests pin RND
+ * wolfCrypt conformance test. KMAC256 is the port's when wolfSSL has it
+ * (5.9.4+ with WOLFSSL_KMAC) and tiny-kmac otherwise, and the RNG stays the
+ * deterministic one below: the tests pin RND
  * values, and the port's DRBG has its own test in test_port_sc2_wolfcrypt.c. */
 
 #include "sc2_test_crypto.h"
@@ -71,6 +72,7 @@ static osdp_status_t adapter_gcm_decrypt(
 
 /* ---- KMAC256 -----------------------------------------------------------*/
 
+#if !defined(OSDP_SC2_TEST_WOLFCRYPT) || !OSDP_SC2_WOLFCRYPT_HAS_KMAC
 static osdp_status_t adapter_kmac(
     void *user,
     const uint8_t *key,  size_t key_len,
@@ -81,6 +83,7 @@ static osdp_status_t adapter_kmac(
     tiny_kmac256(key, key_len, data, data_len, out, out_len);
     return OSDP_OK;
 }
+#endif
 
 /* ---- RNG ---------------------------------------------------------------*/
 
@@ -133,7 +136,12 @@ const osdp_sc2_crypto_t *sc2_test_crypto(void)
                                       &g_sc2_vtable) != OSDP_OK) {
             return NULL;
         }
+#if !OSDP_SC2_WOLFCRYPT_HAS_KMAC
+        /* wolfSSL without KMAC (before 5.9.4, or WOLFSSL_KMAC off): the
+         * port leaves kmac256 to us. With it, the port's KMAC is what the
+         * suite exercises against the SC2 session-key vectors. */
         g_sc2_vtable.kmac256    = adapter_kmac;
+#endif
         g_sc2_vtable.rand_bytes = adapter_rand;
         g_sc2_ready             = true;
     }

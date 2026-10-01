@@ -241,8 +241,9 @@ endif()
 # renames on tiny_aes256 let a binary link both AES-128 and AES-256 builds.
 #
 # As with SC1: when osdp_port_sc2_wolfcrypt exists the adapter is built a
-# second time with its AES-256 / GCM over wolfCrypt (KMAC stays tiny-kmac),
-# and the SC2 suite is registered again with a _wolfcrypt suffix.
+# second time with its AES-256 / GCM over wolfCrypt — and KMAC too when the
+# wolfSSL has it (5.9.4+, WOLFSSL_KMAC), else tiny-kmac — and the SC2 suite
+# is registered again with a _wolfcrypt suffix.
 add_library(sc2_test_crypto STATIC
     sc2_test_crypto.c
 )
@@ -293,10 +294,11 @@ if(TARGET osdp_port_sc2_wolfcrypt)
     osdp_add_sc2_suite("_wolfcrypt" sc2_test_crypto_wolfcrypt)
 
     # The port's own contract: FIPS-197 and GCM vectors, the wipe on a bad
-    # tag, in-place operation, setter composition, and the opt-in DRBG.
+    # tag, in-place operation, setter composition, and the opt-in DRBG; with
+    # wolfSSL KMAC, the SP 800-185 sample and a cross-check against tiny-kmac.
     add_executable(test_port_sc2_wolfcrypt test_port_sc2_wolfcrypt.c)
     target_link_libraries(test_port_sc2_wolfcrypt PRIVATE
-        osdp_core osdp_port_sc2_wolfcrypt unity)
+        osdp_core osdp_port_sc2_wolfcrypt tiny_kmac unity)
     add_test(NAME test_port_sc2_wolfcrypt COMMAND test_port_sc2_wolfcrypt)
 endif()
 

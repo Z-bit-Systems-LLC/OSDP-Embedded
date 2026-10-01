@@ -4,14 +4,20 @@
 #ifndef OSDP_SC2_WOLFCRYPT_H
 #define OSDP_SC2_WOLFCRYPT_H
 
-/* osdp_sc2_crypto_t backend over wolfCrypt (wolfSSL): AES-256-GCM and the
- * raw AES-256 block, plus an opt-in DRBG. The SC2 sibling of
- * osdp_sc_wolfcrypt.h, with the same shape and the same rules.
+/* osdp_sc2_crypto_t backend over wolfCrypt (wolfSSL): AES-256-GCM, the raw
+ * AES-256 block and — when wolfSSL has it — KMAC256, plus an opt-in DRBG.
+ * The SC2 sibling of osdp_sc_wolfcrypt.h, with the same shape and the same
+ * rules.
  *
- * NOT supplied: kmac256. wolfCrypt has SHA-3 and SHAKE but no cSHAKE, so it
- * cannot express KMAC256 (checked against 5.8.2 and 5.9.2). The caller binds
- * kmac256 itself after the setter — vendor/tiny-kmac is what the tests and
- * OpenReader use:
+ * KMAC256 arrived in wolfSSL 5.9.4 (NIST SP 800-185, wc_Kmac256Hash; enable
+ * with WOLFSSL_KMAC, which needs WOLFSSL_SHAKE256). This header reports what
+ * the build has as OSDP_SC2_WOLFCRYPT_HAS_KMAC (1 or 0):
+ *
+ *   1  osdp_sc2_wolfcrypt_aes256() binds kmac256 too, and owns it. The vtable
+ *      is complete except for the RNG.
+ *   0  older wolfSSL (5.8.x, 5.9.2) or KMAC disabled: the setter leaves
+ *      kmac256 exactly as the caller had it, and the caller binds one — e.g.
+ *      vendor/tiny-kmac, which is what the tests use:
  *
  *     static osdp_status_t my_kmac(void *user, const uint8_t *k, size_t kl,
  *                                  const uint8_t *d, size_t dl,
@@ -24,10 +30,12 @@
  *
  *     osdp_sc2_wolfcrypt_aes256(&wc, &crypto2);
  *     osdp_sc2_wolfcrypt_rng(&wc, &crypto2);    // or bind your own RNG
+ *   #if !OSDP_SC2_WOLFCRYPT_HAS_KMAC
  *     crypto2.kmac256 = my_kmac;
+ *   #endif
  *
- * Both setters leave members they do not own exactly as the caller had them,
- * so kmac256 can be bound before or after.
+ * Otherwise both setters leave members they do not own exactly as the caller
+ * had them.
  *
  * wolfSSL requirements: HAVE_AESGCM, and for the single block either
  * HAVE_AES_ECB or WOLFSSL_AES_DIRECT (whichever is present is used). A
@@ -47,11 +55,19 @@
 #include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/random.h>
+#include <wolfssl/wolfcrypt/sha3.h>
 #include <wolfssl/wolfcrypt/wc_port.h>
 
 #include <stdbool.h>
 
 #include "osdp/osdp_sc2_crypto.h"
+
+/* sha3.h derives WOLFSSL_KMAC256 from WOLFSSL_KMAC + WOLFSSL_SHAKE256. */
+#if defined(WOLFSSL_KMAC256)
+#define OSDP_SC2_WOLFCRYPT_HAS_KMAC 1
+#else
+#define OSDP_SC2_WOLFCRYPT_HAS_KMAC 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,8 +82,9 @@ typedef struct osdp_sc2_wolfcrypt {
 } osdp_sc2_wolfcrypt_t;
 
 /* Initialise `ctx` and populate `out`'s aes256_gcm_encrypt,
- * aes256_gcm_decrypt and aes256_ecb_encrypt members, with out->user = ctx.
- * kmac256 and rand_bytes are left as the caller had them.
+ * aes256_gcm_decrypt and aes256_ecb_encrypt members — and kmac256 when
+ * OSDP_SC2_WOLFCRYPT_HAS_KMAC — with out->user = ctx. rand_bytes (and
+ * kmac256 without KMAC) are left as the caller had them.
  *
  * GCM decrypt honours the HAL's "plaintext only on a valid tag": wolfCrypt's
  * software GCM writes plaintext before it compares the tag, so on a mismatch

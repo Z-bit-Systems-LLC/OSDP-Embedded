@@ -136,6 +136,35 @@ static osdp_status_t sc2_ecb_encrypt(
     return (rc == 0) ? OSDP_OK : OSDP_ERR_INVALID_ARG;
 }
 
+#if OSDP_SC2_WOLFCRYPT_HAS_KMAC
+/* KMAC256 with an empty customization string S, as the HAL specifies.
+ * Stateless one-shot, so it needs no context — but it still refuses after
+ * free, like every other member, rather than outliving the binding. Empty
+ * key / data / S go in as a real pointer with length 0, which some wolfCrypt
+ * entry points require. */
+static osdp_status_t sc2_kmac256(
+    void          *user,
+    const uint8_t *key,  size_t key_len,
+    const uint8_t *data, size_t data_len,
+    uint8_t       *out,  size_t out_len)
+{
+    static const byte empty[1] = { 0 };
+    osdp_sc2_wolfcrypt_t *ctx = (osdp_sc2_wolfcrypt_t *)user;
+
+    if (ctx == NULL || !ctx->aes_ready || out == NULL || out_len == 0 ||
+        (key == NULL && key_len > 0) || (data == NULL && data_len > 0) ||
+        !fits_word32(key_len) || !fits_word32(data_len) ||
+        !fits_word32(out_len)) {
+        return OSDP_ERR_INVALID_ARG;
+    }
+    return (wc_Kmac256Hash(key != NULL ? key : empty, (word32)key_len,
+                           empty, 0,
+                           data != NULL ? data : empty, (word32)data_len,
+                           out, (word32)out_len) == 0)
+         ? OSDP_OK : OSDP_ERR_INVALID_ARG;
+}
+#endif /* OSDP_SC2_WOLFCRYPT_HAS_KMAC */
+
 static osdp_status_t sc2_rand(void *user, uint8_t *out, size_t len)
 {
     osdp_sc2_wolfcrypt_t *ctx = (osdp_sc2_wolfcrypt_t *)user;
@@ -175,6 +204,9 @@ osdp_status_t osdp_sc2_wolfcrypt_aes256(osdp_sc2_wolfcrypt_t *ctx,
     out->aes256_gcm_encrypt = sc2_gcm_encrypt;
     out->aes256_gcm_decrypt = sc2_gcm_decrypt;
     out->aes256_ecb_encrypt = sc2_ecb_encrypt;
+#if OSDP_SC2_WOLFCRYPT_HAS_KMAC
+    out->kmac256            = sc2_kmac256;
+#endif
     out->user               = ctx;
     return OSDP_OK;
 }

@@ -175,15 +175,20 @@ the SC2 key (see [`../pairing-design.md`](../pairing-design.md)).
 | `osdp_sc2_wolfcrypt` | `aes256_gcm_encrypt` / `_decrypt` | `wc_AesGcmSetKey` + `wc_AesGcmEncrypt` / `wc_AesGcmDecrypt` |
 | | `aes256_ecb_encrypt` | `wc_AesEcbEncrypt`, or `wc_AesEncryptDirect` without `HAVE_AES_ECB` |
 | | `rand_bytes` (opt-in) | `wc_RNG_GenerateBlock` |
-| | `kmac256` | **not supplied** — see below |
+| | `kmac256` | `wc_Kmac256Hash` (wolfSSL 5.9.4+ with `WOLFSSL_KMAC`), otherwise the caller's — see below |
 | `osdp_pair_wolfcrypt` | `ml_kem768_keygen` / `_encaps` / `_decaps` | `wc_MlKemKey_MakeKeyWithRandom` / `EncapsulateWithRandom` / `Decapsulate` |
 | | `ml_dsa44_sign` / `_verify` | `wc_dilithium_sign_ctx_msg_with_seed` / `wc_dilithium_verify_ctx_msg` |
 | | `sha256`, `hmac_sha256`, `hkdf_sha256` | `wc_Sha256Hash`, `wc_Hmac*`, `wc_HKDF` |
 | | `rand_bytes` | the context's entropy source (below) |
 
-**KMAC256 is not in wolfCrypt.** It has SHA-3 and SHAKE but no cSHAKE, and its
-Keccak permutation is internal, so the SC2 port leaves `kmac256` for the
-caller to bind after the setter. The tests use `vendor/tiny-kmac`.
+**KMAC256 needs wolfSSL 5.9.4 or later.** KMAC and cSHAKE (NIST SP 800-185)
+arrived in 5.9.4 (wolfSSL PR #10888), enabled with `WOLFSSL_KMAC`. When the
+build has it, the header defines `OSDP_SC2_WOLFCRYPT_HAS_KMAC` as 1 and
+`osdp_sc2_wolfcrypt_aes256()` binds `kmac256` along with the AES members.
+Against an older wolfSSL (5.8.x, 5.9.2), or with KMAC switched off, the macro
+is 0 and the setter leaves `kmac256` for the caller to bind. In that case the
+tests use `vendor/tiny-kmac`. The ESP-IDF component registry is at 5.8.2 as of
+this writing, so an ESP-IDF project needs wolfSSL from git to get KMAC.
 
 ### wolfSSL build for SC2 + pairing
 
@@ -193,6 +198,7 @@ wolfSSL 5.9 (CMake):
 cmake -S wolfssl -B wolfssl-build -DWOLFSSL_AESECB=yes -DWOLFSSL_AESGCM=yes \
       -DWOLFSSL_HKDF=yes -DWOLFSSL_SHA3=yes -DWOLFSSL_SHAKE256=yes \
       -DWOLFSSL_MLKEM=yes -DWOLFSSL_MLDSA=yes \
+      -DWOLFSSL_KMAC=yes \
       -DWOLFSSL_EXAMPLES=no -DWOLFSSL_CRYPT_TESTS=no -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_INSTALL_PREFIX=/opt/wolfssl
 ```
@@ -216,6 +222,7 @@ settings above:
 #define WOLFSSL_SHAKE256
 #define HAVE_AESGCM
 #define HAVE_HKDF
+#define WOLFSSL_KMAC        /* 5.9.4+: the port then supplies kmac256 */
 /* Optional, recommended on an MCU — see the memory table below: */
 #define WOLFSSL_NO_ML_DSA_65
 #define WOLFSSL_NO_ML_DSA_87
@@ -230,8 +237,9 @@ settings above:
 ```
 
 The port stops the compile with an `#error` naming whichever of ML-KEM-768,
-ML-DSA-44 signing and verification, HKDF or AES-GCM is missing. Tested
-against wolfSSL 5.8.2 (`user_settings.h`) and 5.9.2 (CMake).
+ML-DSA-44 signing and verification, HKDF or AES-GCM is missing. KMAC is
+optional, and its absence just means the caller supplies `kmac256`. Tested
+against wolfSSL 5.8.2 (`user_settings.h`), 5.9.2 and 5.9.4 (CMake).
 
 CMake targets: `osdp::port_sc2_wolfcrypt` always builds with the option.
 `osdp::port_pair_wolfcrypt` builds only when the installed wolfSSL's
@@ -250,10 +258,12 @@ static osdp_pair_wolfcrypt_t wcp;   /* ~21 KB: give it static storage */
 osdp_sc2_crypto_t  crypto2 = {0};
 osdp_pair_crypto_t pair    = {0};
 
-/* SC2: AES from wolfCrypt, KMAC from elsewhere, RNG opt-in. */
+/* SC2: AES (and KMAC, on 5.9.4+) from wolfCrypt, RNG opt-in. */
 osdp_sc2_wolfcrypt_aes256(&wc2, &crypto2);
 osdp_sc2_wolfcrypt_rng(&wc2, &crypto2);      /* or bind your own */
-crypto2.kmac256 = my_kmac256;
+#if !OSDP_SC2_WOLFCRYPT_HAS_KMAC
+crypto2.kmac256 = my_kmac256;                /* wolfSSL without KMAC */
+#endif
 
 /* Pairing: one entropy source for everything, then the device key exactly
  * as tools/osdp-pair-provision wrote it (1312-byte pk, 2560-byte sk). */
@@ -336,10 +346,15 @@ On the SC2 line the same switch also adds:
 
 - **The SC2 suite, re-run on wolfCrypt** (`test_sc2_primitives`,
   `test_sc2_wrap`, `test_pd_sc2` and `test_loopback_sc2`, each with the
-  `_wolfcrypt` suffix). In these runs KMAC stays on tiny-kmac.
+  `_wolfcrypt` suffix). With wolfSSL KMAC these runs use the port's
+  `kmac256`, so the SC2 session-key vectors check it too. Without it, KMAC
+  stays on tiny-kmac.
 - **`test_port_sc2_wolfcrypt`:** the FIPS-197 AES-256 vector, the GCM spec's
   test cases 13 and 16, in-place operation, the output wipe on a bad tag or
-  tampered AAD, setter composition, the DRBG, and refusals.
+  tampered AAD, setter composition, the DRBG, and refusals. With KMAC it
+  adds NIST SP 800-185 KMAC256 sample 5 (empty customization string, which
+  is what SC2 uses) and a cross-check against tiny-kmac at every key, data
+  and output length around the 136-byte rate.
 - **`test_port_pair_wolfcrypt`:** SHA-256, HMAC (RFC 4231) and HKDF
   (RFC 5869) vectors; the pairing-design §9 key schedule and the demo-CA and
   ML-KEM fixed-seed public-key hashes; byte-for-byte agreement with the
@@ -348,10 +363,11 @@ On the SC2 line the same switch also adds:
   wolfCrypt against PQClean in both directions and wolfCrypt against itself
   on the real DRBG; and the entropy-source contract.
 
-Verified on 2026-10-01: 61 of 61 tests passed against wolfSSL v5.9.2-stable
-(CMake, full static library) with both MSVC 19.37 x64 and GCC 13 on Linux. The
-two port test suites also passed against wolfSSL 5.8.2 built from a
-`user_settings.h`, with and without the small-memory options.
+Verified on 2026-10-01: 61 of 61 tests passed against wolfSSL v5.9.4-stable
+with KMAC and against v5.9.2-stable without it (CMake, full static library),
+with both MSVC 19.37 x64 and GCC 13 on Linux. The two port test suites also
+passed against wolfSSL 5.8.2 built from a `user_settings.h`, with and without
+the small-memory options.
 
 ## Licensing
 

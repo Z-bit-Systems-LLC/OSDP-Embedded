@@ -114,8 +114,10 @@ ports/                # bindings of the crypto HALs to real crypto; never
                       # AES setter + separate opt-in DRBG setter. With tests
                       # on, the SC suite re-runs as test_*_wolfcrypt. CI
                       # builds a pinned wolfSSL (wolfsslRef, cached).
-                      # Also osdp_sc2_wolfcrypt (GCM + AES-256 block; KMAC
-                      # stays the caller's — wolfCrypt has none) and
+                      # Also osdp_sc2_wolfcrypt (GCM + AES-256 block, plus
+                      # kmac256 via wc_Kmac256Hash when wolfSSL ≥ 5.9.4 has
+                      # WOLFSSL_KMAC — OSDP_SC2_WOLFCRYPT_HAS_KMAC; else the
+                      # caller binds it) and
                       # osdp_pair_wolfcrypt (ML-KEM/ML-DSA/HKDF; built only
                       # if wolfSSL has them; byte-identical to ports/pqclean
                       # on the same random stream). With ML-DSA on, wolfSSL
