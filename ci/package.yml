@@ -100,11 +100,12 @@ steps:
       pwsh: true
 
   # --allow-dirty: Stage-Crate.ps1 (above) writes the C source mirror to
-  # rust/osdp/vendor-c/ and the README to rust/osdp/README.md, both
-  # gitignored transient copies that the package `include` list pulls in.
-  # cargo counts those as uncommitted files and refuses to package without
-  # this override. They're byte-for-byte copies of the committed
-  # core/pd/acu tree at HEAD, so the .crate still snapshots the git state.
+  # rust/osdp/vendor-c/, a gitignored transient copy that the package
+  # `include` list pulls in. cargo counts it as uncommitted files and
+  # refuses to package without this override. It is a byte-for-byte copy
+  # of the committed core/pd/acu tree at HEAD, so the .crate still
+  # snapshots the git state. (The crate README is committed at
+  # rust/osdp/README.md, so it needs no staging.)
   # Matches docs/PUBLISHING.md.
   - task: CmdLine@2
     displayName: 'cargo package osdp-embedded (with verify)'

@@ -101,13 +101,19 @@ tools/
                       # POSIX adapters). Used for interop validation
                       # against external ACUs (OSDP.Net, hardware).
 
-ports/                # reference bindings of the crypto HALs to concrete
-  tiny/               # implementations: AES-128 ECB over tiny-AES-c, and
+ports/                # bindings of the crypto HALs to real crypto; never
+                      # linked into osdp_core / osdp_pd / osdp_acu, and
+                      # deliberately NOT in library.json.
+  tiny/               # AES-128 ECB over tiny-AES-c; tests + tools only.
+                      # No RNG.
   pqclean/            # ML-KEM-768 / ML-DSA-44 / SHA-256 over PQClean for
                       # SC2 pairing. Same standing as vendor/: built only
-                      # with tests or tools, never linked into
-                      # osdp_core / osdp_pd / osdp_acu, and deliberately
-                      # NOT in library.json — a product binds its own.
+                      # with tests or tools — a product binds its own.
+  wolfcrypt/          # wolfCrypt; opt-in OSDP_PORT_WOLFCRYPT=ON, needs an
+                      # installed wolfSSL built with -DWOLFSSL_AESECB=yes.
+                      # AES setter + separate opt-in DRBG setter. With tests
+                      # on, the SC suite re-runs as test_*_wolfcrypt. CI
+                      # builds a pinned wolfSSL (wolfsslRef, cached).
 
 vendor/               # 3rd-party code shared between tools and tests.
   tiny-aes/           # tiny-AES-c (Unlicense / public domain).
@@ -664,13 +670,19 @@ Rules that are easy to get wrong:
 - **Releases start at v1.0.0.** The pre-1.0 tags (`v0.1.2`..`v0.1.28`)
   have no GitHub Releases and are deliberately not backfilled. crates.io
   holds only 0.1.0 from that era.
-- **The repo-root `README.md` is the crates.io front page** —
-  `Stage-Crate.ps1` copies it into the crate verbatim, with no link
-  rewriting. Every in-repo link in it must therefore be an absolute
-  `https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/...` URL, or it
-  will 404 for crates.io readers. The README follows the
+- **There are two READMEs, and crates.io shows the crate's one.** The
+  repo-root `README.md` is the GitHub front page and leads with the C
+  library. `rust/osdp/README.md` is the crates.io front page, Rust
+  throughout, committed in place (`Cargo.toml` `readme`); nothing
+  copies one over the other. Every code sample in the crate README is
+  mirrored verbatim in `rust/osdp/examples/quickstart.rs`, which CI
+  compiles — edit both together. A new public Rust API or a changed
+  one usually means touching both READMEs. crates.io renders links
+  unmodified, so every in-repo link in the crate README must be an
+  absolute `https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/...`
+  URL. Both follow the
   [Z-bit README guidelines](https://github.com/Z-bit-Systems-LLC/Guidelines/blob/main/docs/readme-template.md);
-  keep its structure when editing.
+  keep their structure when editing.
 - **1.0.0 makes the public API a promise.** See "What 1.0.0 commits us
   to" in PUBLISHING.md before changing a public header — adding a member
   to a public struct is a breaking change, because consumers embed those
