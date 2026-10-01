@@ -297,6 +297,25 @@ osdp_pd_set_sc_crypto(&pd, &crypto);
 osdp_pd_set_sc_scbk(&pd, installation_key);   /* 16 bytes from secure storage */
 ```
 
+**Using wolfCrypt?** A ready-made binding ships in
+[`ports/wolfcrypt`](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/tree/main/ports/wolfcrypt).
+Configure with `-DOSDP_PORT_WOLFCRYPT=ON` (plus `CMAKE_PREFIX_PATH` pointing at a
+wolfSSL built with `-DWOLFSSL_AESECB=yes`) and link `osdp::port_sc_wolfcrypt`:
+
+```c
+static osdp_sc_wolfcrypt_t wc;         /* must outlive the PD */
+osdp_sc_crypto_t crypto = {0};
+
+osdp_sc_wolfcrypt_aes128(&wc, &crypto);   /* AES-128 encrypt + decrypt */
+osdp_sc_wolfcrypt_rng(&wc, &crypto);      /* opt-in: wolfCrypt's DRBG */
+osdp_pd_set_sc_crypto(&pd, &crypto);
+```
+
+The RNG is a separate call on purpose, so you can choose where RNG output comes
+from. See the
+[wolfCrypt port guide](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/docs/wolfssl-osp/README.md)
+for wolfSSL build settings and design notes.
+
 **Notes:** store the SCBK in a secure element or protected flash region, never in
 plain application flash. Use `osdp_pd_set_sc_scbk_d()` for the spec's well-known
 install-time key during commissioning only. A PD holding an operational SCBK refuses
@@ -473,6 +492,11 @@ Tests use the vendored [Unity](https://github.com/ThrowTheSwitch/Unity) framewor
 under `tests/`. Dropping an OSDPCAP capture into `tests/captures/` registers it as a
 CTest case automatically (re-run `cmake` after adding one).
 
+Configuring with `-DOSDP_PORT_WOLFCRYPT=ON` (and an installed wolfSSL on
+`CMAKE_PREFIX_PATH`) re-runs the entire Secure Channel suite against wolfCrypt as
+`test_*_wolfcrypt`, next to the default tiny-AES run. CI does this on every build
+against a pinned, cached wolfSSL.
+
 To chase a suspected memory bug, the `asan` preset builds with AddressSanitizer
 (and UBSan on GCC/clang) into its own `build/asan/` directory, kept apart so
 instrumented and plain objects never mix:
@@ -512,6 +536,9 @@ with `--help` for its full flag set.
 - **[MCP Guide](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/docs/MCP_GUIDE.md)** —
   driving a virtual PD from an AI agent to test an ACU: every tool, the transports,
   client configuration, and the browser reader view.
+- **[wolfCrypt port guide](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/docs/wolfssl-osp/README.md)** —
+  using wolfCrypt for Secure Channel: wolfSSL build settings, the `ports/wolfcrypt`
+  binding, and how it is tested.
 - **[Public headers](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/tree/main/core/include/osdp)** —
   each declaration carries the spec section it implements.
 - **[Architecture and coding rules](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded/blob/main/CLAUDE.md)** —
@@ -585,6 +612,8 @@ for the full explainer.
   whose captures validate our framing byte-for-byte.
 - **[tiny-AES-c](https://github.com/kokke/tiny-AES-c)** (Unlicense) — the AES-128
   primitive used by tests and host tools. Production builds bind their own.
+- **[wolfSSL](https://github.com/wolfSSL/wolfssl)** — wolfCrypt backs the optional
+  `ports/wolfcrypt` binding. It is not vendored here.
 - **[Unity](https://github.com/ThrowTheSwitch/Unity)** — the vendored test framework.
 
 ## Support

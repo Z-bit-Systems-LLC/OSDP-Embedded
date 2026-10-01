@@ -82,66 +82,88 @@ target_link_libraries(test_loopback PRIVATE
 add_test(NAME test_loopback COMMAND test_loopback)
 
 # ---- Secure Channel tests --------------------------------------------------
-# A small test-side AES adapter wraps tiny-AES-c (vendored at the
-# top-level vendor/tiny-aes/) and exposes it as osdp_sc_crypto_t.
-# The same tiny_aes static lib is shared with osdp-pd-mock so we don't
-# compile aes.c twice into the same build.
-add_library(sc_test_aes STATIC
-    sc_test_aes.c
-)
-target_include_directories(sc_test_aes
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-)
-# The AES primitives come from ports/tiny; only the deterministic test RNG
-# lives in sc_test_aes.c now. tiny_aes is reached through the port rather than
-# linked here, so the vendored headers stay out of the tests' include path.
-target_link_libraries(sc_test_aes PUBLIC osdp_core osdp_port_sc_tiny)
-
-function(osdp_add_sc_test test_name)
-    add_executable(${test_name} ${test_name}.c)
-    target_link_libraries(${test_name} PRIVATE
-        osdp_core sc_test_aes unity)
-    add_test(NAME ${test_name} COMMAND ${test_name})
+# A small test-side adapter exposes an AES port as osdp_sc_crypto_t, paired
+# with a deterministic RNG (see sc_test_aes.c). The default backend is
+# ports/tiny over the vendored tiny-AES-c, which is shared with osdp-pd-mock so
+# aes.c is compiled once per build.
+#
+# With OSDP_PORT_WOLFCRYPT=ON the adapter is built a second time over
+# ports/wolfcrypt and the whole SC suite below is registered again with a
+# _wolfcrypt suffix. Every KAT, the PD/ACU handshakes, the loopback and the
+# capture replay then pass or fail on wolfCrypt's AES exactly as on tiny-AES.
+function(osdp_add_sc_adapter lib_name port_lib)
+    add_library(${lib_name} STATIC sc_test_aes.c)
+    target_include_directories(${lib_name}
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    # The AES primitives come from the port; only the deterministic test RNG
+    # lives in sc_test_aes.c. tiny_aes is reached through its port rather than
+    # linked here, so the vendored headers stay out of the tests' include path.
+    target_link_libraries(${lib_name} PUBLIC osdp_core ${port_lib})
 endfunction()
 
-osdp_add_sc_test(test_sc_aes)
-osdp_add_sc_test(test_sc_keys)
-osdp_add_sc_test(test_sc_cbc)
-osdp_add_sc_test(test_sc_mac)
-osdp_add_sc_test(test_sc_payload)
-osdp_add_sc_test(test_sc_wrap)
+# osdp_add_sc_suite(<suffix> <adapter>) — one CTest entry per SC test,
+# named <test><suffix>, each linked against <adapter>.
+function(osdp_add_sc_suite suffix adapter)
+    # Primitive-level tests: core SC only.
+    foreach(_t test_sc_aes test_sc_keys test_sc_cbc test_sc_mac
+               test_sc_payload test_sc_wrap)
+        add_executable(${_t}${suffix} ${_t}.c)
+        target_link_libraries(${_t}${suffix} PRIVATE
+            osdp_core ${adapter} unity)
+        add_test(NAME ${_t}${suffix} COMMAND ${_t}${suffix})
+    endforeach()
 
-# PD-side SC handshake test needs both osdp_pd and the SC test
-# crypto adapter.
-add_executable(test_pd_sc test_pd_sc.c)
-target_link_libraries(test_pd_sc PRIVATE
-    osdp_core osdp_messages osdp_pd sc_test_aes unity)
-add_test(NAME test_pd_sc COMMAND test_pd_sc)
+    # PD-side SC handshake test needs both osdp_pd and the SC test
+    # crypto adapter.
+    add_executable(test_pd_sc${suffix} test_pd_sc.c)
+    target_link_libraries(test_pd_sc${suffix} PRIVATE
+        osdp_core osdp_messages osdp_pd ${adapter} unity)
+    add_test(NAME test_pd_sc${suffix} COMMAND test_pd_sc${suffix})
 
-# ACU-side SC handshake test (phase 5a). Mirrors test_pd_sc but
-# drives the ACU state machine.
-add_executable(test_acu_sc test_acu_sc.c)
-target_link_libraries(test_acu_sc PRIVATE
-    osdp_core osdp_messages osdp_acu sc_test_aes unity)
-add_test(NAME test_acu_sc COMMAND test_acu_sc)
+    # ACU-side SC handshake test (phase 5a). Mirrors test_pd_sc but
+    # drives the ACU state machine.
+    add_executable(test_acu_sc${suffix} test_acu_sc.c)
+    target_link_libraries(test_acu_sc${suffix} PRIVATE
+        osdp_core osdp_messages osdp_acu ${adapter} unity)
+    add_test(NAME test_acu_sc${suffix} COMMAND test_acu_sc${suffix})
 
-# PD↔ACU SC loopback (phase 6). Both real state machines wired through
-# a shared in-memory wire, full handshake plus operational SCS_15..18
-# traffic in-process. Strongest correctness check we have for SC: any
-# disagreement on cryptogram inputs, key derivation, frame layout or
-# MAC chain advancement shows up here.
-add_executable(test_loopback_sc test_loopback_sc.c)
-target_link_libraries(test_loopback_sc PRIVATE
-    osdp_core osdp_messages osdp_pd osdp_acu sc_test_aes unity)
-add_test(NAME test_loopback_sc COMMAND test_loopback_sc)
+    # PD↔ACU SC loopback (phase 6). Both real state machines wired through
+    # a shared in-memory wire, full handshake plus operational SCS_15..18
+    # traffic in-process. Strongest correctness check we have for SC: any
+    # disagreement on cryptogram inputs, key derivation, frame layout or
+    # MAC chain advancement shows up here.
+    add_executable(test_loopback_sc${suffix} test_loopback_sc.c)
+    target_link_libraries(test_loopback_sc${suffix} PRIVATE
+        osdp_core osdp_messages osdp_pd osdp_acu ${adapter} unity)
+    add_test(NAME test_loopback_sc${suffix} COMMAND test_loopback_sc${suffix})
 
-# Capture-replay regression: drive our PD with frames extracted from a
-# real RS-485 SC capture (libosdp-conformance 1.38-4) and require
-# byte-identical responses. Independent-implementation cross-check.
-add_executable(test_capture_replay test_capture_replay.c)
-target_link_libraries(test_capture_replay PRIVATE
-    osdp_core osdp_messages osdp_pd sc_test_aes unity)
-add_test(NAME test_capture_replay COMMAND test_capture_replay)
+    # Capture-replay regression: drive our PD with frames extracted from a
+    # real RS-485 SC capture (libosdp-conformance 1.38-4) and require
+    # byte-identical responses. Independent-implementation cross-check.
+    add_executable(test_capture_replay${suffix} test_capture_replay.c)
+    target_link_libraries(test_capture_replay${suffix} PRIVATE
+        osdp_core osdp_messages osdp_pd ${adapter} unity)
+    add_test(NAME test_capture_replay${suffix}
+             COMMAND test_capture_replay${suffix})
+endfunction()
+
+osdp_add_sc_adapter(sc_test_aes osdp_port_sc_tiny)
+osdp_add_sc_suite("" sc_test_aes)
+
+if(TARGET osdp_port_sc_wolfcrypt)
+    osdp_add_sc_adapter(sc_test_aes_wolfcrypt osdp_port_sc_wolfcrypt)
+    target_compile_definitions(sc_test_aes_wolfcrypt
+        PRIVATE OSDP_SC_TEST_WOLFCRYPT)
+    osdp_add_sc_suite("_wolfcrypt" sc_test_aes_wolfcrypt)
+
+    # The port's own contract: FIPS-197 / SP 800-38A vectors, in-place
+    # operation, setter composition, and the opt-in DRBG.
+    add_executable(test_port_wolfcrypt test_port_wolfcrypt.c)
+    target_link_libraries(test_port_wolfcrypt PRIVATE
+        osdp_core osdp_port_sc_wolfcrypt unity)
+    add_test(NAME test_port_wolfcrypt COMMAND test_port_wolfcrypt)
+endif()
 
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.

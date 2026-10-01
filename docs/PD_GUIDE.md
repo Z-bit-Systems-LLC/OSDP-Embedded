@@ -1076,6 +1076,14 @@ RNG). The PD needs all three: `encrypt` and `decrypt` (it receives
 encrypted SCS_17 payloads) and `rand_bytes` (it generates the 8-byte
 RND.B).
 
+For wolfCrypt there is a ready-made binding in
+[`ports/wolfcrypt`](../ports/wolfcrypt/osdp_sc_wolfcrypt.h):
+`osdp_sc_wolfcrypt_aes128()` fills in the two AES members, and
+`osdp_sc_wolfcrypt_rng()` adds wolfCrypt's DRBG as `rand_bytes`. The DRBG is a
+separate call, so you can use your own RNG instead. Use one
+`osdp_sc_wolfcrypt_t` context per PD. The
+[wolfCrypt port guide](wolfssl-osp/README.md) covers the wolfSSL build flags.
+
 ### Configure keys and identity
 
 Bind the crypto, the cUID, and at least one key before the first inbound

@@ -4,11 +4,22 @@
 /* The AES half of this adapter now comes from ports/tiny — it was identical
  * to osdp-pd-mock's copy, byte for byte. What stays here is the part that is
  * genuinely test-specific: an RNG that replays a fixed sequence so a KAT or a
- * captured session reproduces exactly. */
+ * captured session reproduces exactly.
+ *
+ * The AES backend is chosen at compile time. tests/CMakeLists.txt builds this
+ * file twice when OSDP_PORT_WOLFCRYPT is on — once over ports/tiny, once with
+ * OSDP_SC_TEST_WOLFCRYPT over ports/wolfcrypt — and links the whole SC suite
+ * against each, so every SC test doubles as a wolfCrypt conformance test. The
+ * RNG stays this deterministic one in both builds: the tests pin RND values,
+ * and the wolfCrypt DRBG has its own test in test_port_wolfcrypt.c. */
 
 #include "sc_test_aes.h"
 
+#ifdef OSDP_SC_TEST_WOLFCRYPT
+#include "osdp_sc_wolfcrypt.h"
+#else
 #include "osdp_sc_tiny.h"
+#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -56,12 +67,26 @@ void sc_test_crypto_set_fixed_rand(const uint8_t *buf, size_t len)
 static osdp_sc_crypto_t g_tiny_aes_vtable;
 static bool             g_tiny_aes_ready;
 
+#ifdef OSDP_SC_TEST_WOLFCRYPT
+/* The wolfCrypt callbacks need their context through `user`; adapter_rand
+ * ignores `user`, so the two coexist. Never freed — it lives as long as the
+ * test process. */
+static osdp_sc_wolfcrypt_t g_wolfcrypt_ctx;
+#endif
+
 const osdp_sc_crypto_t *sc_test_crypto_tiny_aes(void)
 {
     if (!g_tiny_aes_ready) {
+#ifdef OSDP_SC_TEST_WOLFCRYPT
+        if (osdp_sc_wolfcrypt_aes128(&g_wolfcrypt_ctx,
+                                     &g_tiny_aes_vtable) != OSDP_OK) {
+            return NULL;
+        }
+#else
         osdp_sc_tiny_aes128(&g_tiny_aes_vtable);
-        g_tiny_aes_vtable.rand_bytes = adapter_rand;
         g_tiny_aes_vtable.user       = NULL;
+#endif
+        g_tiny_aes_vtable.rand_bytes = adapter_rand;
         g_tiny_aes_ready             = true;
     }
     return &g_tiny_aes_vtable;
