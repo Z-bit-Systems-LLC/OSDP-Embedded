@@ -452,12 +452,20 @@ fixed vectors (§9) even though the full E2E SCBK is randomized.
   existing SC2 handshake + a POLL/ACK under SCS_27 — full provisioning-
   through-operation path in-process. Untrusted-CA, tampered Msg2/Msg3, and
   persist-fail negatives.
-- **Phase 7 — WolfSSL backend + live interop.** WolfSSL `osdp_pair_crypto_t`
-  binding (wolfCrypt ML-KEM-768 + ML-DSA-44 + SHA-256/HMAC/HKDF) in
-  `tools/` + `tests/`; tools gain a pairing mode; live-validate vs OSDP.Net
-  `feature/osdp-sc2` over a serial pair. The binding is one file behind the
-  HAL — swapping to mbedTLS+liboqs / OpenSSL / hardware later touches
-  nothing else.
+- **Phase 7 — WolfSSL backend + live interop.** ☑ backend:
+  `ports/wolfcrypt/osdp_pair_wolfcrypt.{h,c}` (wolfCrypt ML-KEM-768 +
+  ML-DSA-44 + SHA-256/HMAC/HKDF) and `osdp_sc2_wolfcrypt.{h,c}` (AES-256-GCM
+  + block; KMAC256 stays the caller's, wolfCrypt has none). Draws randomness
+  in PQClean's exact sizes and order, so `test_port_pair_wolfcrypt` checks
+  byte-identical keys / ct / ss / signatures against `ports/pqclean`, loads a
+  provisioned PQClean key, and runs wolfCrypt↔PQClean handshakes both ways.
+  Tested on wolfSSL 5.9.2 (CMake) and 5.8.2 (`user_settings.h`); stack/heap
+  figures in `docs/wolfssl-osp/README.md`. First consumer: OpenReader
+  (ESP32-C6). ☐ still open: tools pairing mode over wolfCrypt and the live
+  serial run vs OSDP.Net. Note `osdp_pair_crypto.h` and §10 speak of
+  deterministic ML-DSA signing; both backends actually sign in FIPS 204
+  hedged mode (32 fresh bytes per signature), which interoperates since only
+  verification must agree.
 - **Phase 8 — Rust + MCP + docs.** `PairCrypto` trait + pair APIs;
   `sys.rs`/`build.rs` grown; osdp-mcp pairing option; PLAN.md + CLAUDE.md.
 

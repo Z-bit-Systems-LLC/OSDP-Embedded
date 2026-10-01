@@ -239,6 +239,10 @@ endif()
 # Keccak/KMAC256) so tests and the SC2 interop tools use identical code.
 # sc2_test_crypto wires them into an osdp_sc2_crypto_t. The AES256 symbol
 # renames on tiny_aes256 let a binary link both AES-128 and AES-256 builds.
+#
+# As with SC1: when osdp_port_sc2_wolfcrypt exists the adapter is built a
+# second time with its AES-256 / GCM over wolfCrypt (KMAC stays tiny-kmac),
+# and the SC2 suite is registered again with a _wolfcrypt suffix.
 add_library(sc2_test_crypto STATIC
     sc2_test_crypto.c
 )
@@ -247,29 +251,65 @@ target_include_directories(sc2_test_crypto
 )
 target_link_libraries(sc2_test_crypto PUBLIC osdp_core tiny_gcm tiny_kmac)
 
-function(osdp_add_sc2_test test_name)
-    add_executable(${test_name} ${test_name}.c)
-    target_link_libraries(${test_name} PRIVATE
-        osdp_core sc2_test_crypto unity)
-    add_test(NAME ${test_name} COMMAND ${test_name})
+# osdp_add_sc2_suite(<suffix> <adapter>) — one CTest entry per SC2 test,
+# named <test><suffix>, each linked against <adapter>.
+function(osdp_add_sc2_suite suffix adapter)
+    foreach(_t test_sc2_primitives test_sc2_wrap)
+        add_executable(${_t}${suffix} ${_t}.c)
+        target_link_libraries(${_t}${suffix} PRIVATE
+            osdp_core ${adapter} unity)
+        add_test(NAME ${_t}${suffix} COMMAND ${_t}${suffix})
+    endforeach()
+
+    # PD-side SC2 handshake + operational test needs osdp_pd and the SC2
+    # crypto backend.
+    add_executable(test_pd_sc2${suffix} test_pd_sc2.c)
+    target_link_libraries(test_pd_sc2${suffix} PRIVATE
+        osdp_core osdp_messages osdp_pd ${adapter} unity)
+    add_test(NAME test_pd_sc2${suffix} COMMAND test_pd_sc2${suffix})
+
+    # PD↔ACU SC2 loopback: both real state machines through a shared wire,
+    # full handshake + operational SCS_25..28 + session-loss.
+    add_executable(test_loopback_sc2${suffix} test_loopback_sc2.c)
+    target_link_libraries(test_loopback_sc2${suffix} PRIVATE
+        osdp_core osdp_messages osdp_pd osdp_acu ${adapter} unity)
+    add_test(NAME test_loopback_sc2${suffix}
+             COMMAND test_loopback_sc2${suffix})
 endfunction()
 
-osdp_add_sc2_test(test_sc2_primitives)
-osdp_add_sc2_test(test_sc2_wrap)
+osdp_add_sc2_suite("" sc2_test_crypto)
 
-# PD-side SC2 handshake + operational test needs osdp_pd and the SC2
-# crypto backend.
-add_executable(test_pd_sc2 test_pd_sc2.c)
-target_link_libraries(test_pd_sc2 PRIVATE
-    osdp_core osdp_messages osdp_pd sc2_test_crypto unity)
-add_test(NAME test_pd_sc2 COMMAND test_pd_sc2)
+if(TARGET osdp_port_sc2_wolfcrypt)
+    add_library(sc2_test_crypto_wolfcrypt STATIC
+        sc2_test_crypto.c
+    )
+    target_include_directories(sc2_test_crypto_wolfcrypt
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(sc2_test_crypto_wolfcrypt
+        PRIVATE OSDP_SC2_TEST_WOLFCRYPT)
+    target_link_libraries(sc2_test_crypto_wolfcrypt
+        PUBLIC osdp_core osdp_port_sc2_wolfcrypt tiny_kmac)
+    osdp_add_sc2_suite("_wolfcrypt" sc2_test_crypto_wolfcrypt)
 
-# PD↔ACU SC2 loopback: both real state machines through a shared wire,
-# full handshake + operational SCS_25..28 + session-loss.
-add_executable(test_loopback_sc2 test_loopback_sc2.c)
-target_link_libraries(test_loopback_sc2 PRIVATE
-    osdp_core osdp_messages osdp_pd osdp_acu sc2_test_crypto unity)
-add_test(NAME test_loopback_sc2 COMMAND test_loopback_sc2)
+    # The port's own contract: FIPS-197 and GCM vectors, the wipe on a bad
+    # tag, in-place operation, setter composition, and the opt-in DRBG.
+    add_executable(test_port_sc2_wolfcrypt test_port_sc2_wolfcrypt.c)
+    target_link_libraries(test_port_sc2_wolfcrypt PRIVATE
+        osdp_core osdp_port_sc2_wolfcrypt unity)
+    add_test(NAME test_port_sc2_wolfcrypt COMMAND test_port_sc2_wolfcrypt)
+endif()
+
+if(TARGET osdp_port_pair_wolfcrypt)
+    # The pairing port: §9 vectors, byte-for-byte agreement with PQClean on
+    # the same random stream, loading a provisioned PQClean key, and full
+    # handshakes with wolfCrypt on one side and PQClean on the other. Links
+    # the deterministic PQClean variant as the reference.
+    add_executable(test_port_pair_wolfcrypt test_port_pair_wolfcrypt.c)
+    target_link_libraries(test_port_pair_wolfcrypt PRIVATE
+        osdp_port_pair_wolfcrypt osdp_port_pair_pqclean_kat unity)
+    add_test(NAME test_port_pair_wolfcrypt COMMAND test_port_pair_wolfcrypt)
+endif()
 
 # OSDPCAP-format reader tests. Requires OSDP_BUILD_TOOLS so the
 # osdpcap_reader library exists; skip silently otherwise.

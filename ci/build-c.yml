@@ -44,13 +44,22 @@ steps:
       pwsh: true
       failOnStderr: false
 
-  # wolfSSL for ports/wolfcrypt (OSDP_PORT_WOLFCRYPT). Pinned, crypto-only,
-  # static, installed outside the source tree and cached: it changes only when
-  # the pin or its flags do, so almost every run restores it instead of
-  # compiling. -DWOLFSSL_AESECB=yes is the flag that matters — wolfSSL's CMake
-  # build leaves AES-ECB off by default and the port #errors without it. To
+  # wolfSSL for ports/wolfcrypt (OSDP_PORT_WOLFCRYPT). Pinned, static,
+  # installed outside the source tree and cached: it changes only when the pin
+  # or its flags do, so almost every run restores it instead of compiling. To
   # move the pin, change wolfsslRef; to change the flags, bump wolfsslCacheRev
   # too, since the cache key cannot see inside the build script.
+  #
+  # The flags that matter: -DWOLFSSL_AESECB=yes (wolfSSL's CMake build leaves
+  # AES-ECB off and the SC1 port #errors without it), and ML-KEM + ML-DSA +
+  # HKDF + SHA-3/SHAKE for the SC2 pairing port. NOT crypto-only: with ML-DSA
+  # on, wolfSSL 5.9.2's crypto-only build fails to link anything that uses it
+  # (asn.c references GetCA / GetCAByName, which live in the TLS layer it
+  # leaves out).
+  #
+  # The SC2 port is tested here against 5.9.2; OpenReader ships 5.8.2, whose
+  # CMake build has no ML-DSA switch — that version is covered by a
+  # user_settings.h build (see docs/wolfssl-osp/README.md).
   - task: Cache@2
     displayName: 'Cache wolfSSL'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))
@@ -72,8 +81,13 @@ steps:
         cmake -S "$src" -B "$src/build" \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \
-          -DWOLFSSL_CRYPT_ONLY=yes \
           -DWOLFSSL_AESECB=yes \
+          -DWOLFSSL_AESGCM=yes \
+          -DWOLFSSL_HKDF=yes \
+          -DWOLFSSL_SHA3=yes \
+          -DWOLFSSL_SHAKE256=yes \
+          -DWOLFSSL_MLKEM=yes \
+          -DWOLFSSL_MLDSA=yes \
           -DWOLFSSL_EXAMPLES=no \
           -DWOLFSSL_CRYPT_TESTS=no \
           -DCMAKE_INSTALL_PREFIX="$(Pipeline.Workspace)/wolfssl"
@@ -84,8 +98,10 @@ steps:
   # so the build type is fixed at configure time via CMAKE_BUILD_TYPE; there
   # is no per-build `--config` (that's a multi-config / MSVC concept).
   #
-  # OSDP_PORT_WOLFCRYPT adds ports/wolfcrypt, re-runs the SC suite over it as
-  # test_*_wolfcrypt, and adds test_port_wolfcrypt — all in the same ctest run.
+  # OSDP_PORT_WOLFCRYPT adds ports/wolfcrypt, re-runs the SC and SC2 suites
+  # over it as test_*_wolfcrypt, and adds test_port_wolfcrypt,
+  # test_port_sc2_wolfcrypt and test_port_pair_wolfcrypt — all in the same
+  # ctest run.
   - task: Bash@3
     displayName: 'CMake configure (Release)'
     condition: and(succeeded(), ne(variables['skipRedundant'], 'true'))

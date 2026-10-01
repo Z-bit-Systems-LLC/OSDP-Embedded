@@ -59,7 +59,7 @@ variables:
   # cache key trusts it to mean the same bytes forever. Bump wolfsslCacheRev
   # when the build flags in build-c.yml change without the tag changing.
   wolfsslRef: 'v5.9.2-stable'
-  wolfsslCacheRev: '1'
+  wolfsslCacheRev: '2'   # 2: + ML-KEM/ML-DSA/HKDF/SHA-3, no longer crypt-only
 
 jobs:
   # C library + tools (CMake/ctest), runs on every push and PR. Native

@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Z-bit Systems, LLC
 
+/* The AES backend is chosen at compile time. tests/CMakeLists.txt builds this
+ * file twice when osdp_port_sc2_wolfcrypt exists — once over the vendored
+ * tiny-AES/tiny-GCM, once with OSDP_SC2_TEST_WOLFCRYPT over ports/wolfcrypt —
+ * and links the whole SC2 suite against each, so every SC2 test doubles as a
+ * wolfCrypt conformance test. KMAC256 is tiny-kmac in both builds (wolfCrypt
+ * has none), and the RNG stays the deterministic one below: the tests pin RND
+ * values, and the port's DRBG has its own test in test_port_sc2_wolfcrypt.c. */
+
 #include "sc2_test_crypto.h"
 
-#include "aes.h"    /* vendor/tiny-aes/aes.h, AES256 + renamed via tiny_aes256 */
-#include "gcm.h"    /* vendor/tiny-gcm */
 #include "kmac.h"   /* vendor/tiny-kmac */
 
+#ifdef OSDP_SC2_TEST_WOLFCRYPT
+#include "osdp_sc2_wolfcrypt.h"
+#else
+#include "aes.h"    /* vendor/tiny-aes/aes.h, AES256 + renamed via tiny_aes256 */
+#include "gcm.h"    /* vendor/tiny-gcm */
+#endif
+
+#include <stdbool.h>
 #include <string.h>
+
+#ifndef OSDP_SC2_TEST_WOLFCRYPT
 
 /* ---- AES-256 single block (ECB) ----------------------------------------*/
 
@@ -50,6 +66,8 @@ static osdp_status_t adapter_gcm_decrypt(
     }
     return OSDP_OK;
 }
+
+#endif /* !OSDP_SC2_TEST_WOLFCRYPT */
 
 /* ---- KMAC256 -----------------------------------------------------------*/
 
@@ -97,6 +115,33 @@ void sc2_test_crypto_set_fixed_rand(const uint8_t *buf, size_t len)
     g_fixed_rand_len = (buf != NULL) ? len : 0;
 }
 
+#ifdef OSDP_SC2_TEST_WOLFCRYPT
+
+/* Built once on first use: the AES members come from the port's setter, and
+ * its callbacks need their context through `user`. adapter_kmac and
+ * adapter_rand ignore `user`, so all three coexist. Never freed — it lives as
+ * long as the test process. Tests are single-threaded, so the flag is the
+ * only guard the lazy init needs. */
+static osdp_sc2_wolfcrypt_t g_wolfcrypt_ctx;
+static osdp_sc2_crypto_t    g_sc2_vtable;
+static bool                 g_sc2_ready;
+
+const osdp_sc2_crypto_t *sc2_test_crypto(void)
+{
+    if (!g_sc2_ready) {
+        if (osdp_sc2_wolfcrypt_aes256(&g_wolfcrypt_ctx,
+                                      &g_sc2_vtable) != OSDP_OK) {
+            return NULL;
+        }
+        g_sc2_vtable.kmac256    = adapter_kmac;
+        g_sc2_vtable.rand_bytes = adapter_rand;
+        g_sc2_ready             = true;
+    }
+    return &g_sc2_vtable;
+}
+
+#else
+
 static const osdp_sc2_crypto_t k_sc2_vtable = {
     .kmac256            = adapter_kmac,
     .aes256_gcm_encrypt = adapter_gcm_encrypt,
@@ -110,3 +155,5 @@ const osdp_sc2_crypto_t *sc2_test_crypto(void)
 {
     return &k_sc2_vtable;
 }
+
+#endif /* OSDP_SC2_TEST_WOLFCRYPT */

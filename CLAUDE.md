@@ -114,6 +114,13 @@ ports/                # bindings of the crypto HALs to real crypto; never
                       # AES setter + separate opt-in DRBG setter. With tests
                       # on, the SC suite re-runs as test_*_wolfcrypt. CI
                       # builds a pinned wolfSSL (wolfsslRef, cached).
+                      # Also osdp_sc2_wolfcrypt (GCM + AES-256 block; KMAC
+                      # stays the caller's — wolfCrypt has none) and
+                      # osdp_pair_wolfcrypt (ML-KEM/ML-DSA/HKDF; built only
+                      # if wolfSSL has them; byte-identical to ports/pqclean
+                      # on the same random stream). With ML-DSA on, wolfSSL
+                      # must NOT be crypt-only (asn.c → GetCA link error).
+                      # Kept flat: OpenReader globs ports/wolfcrypt/*.c.
 
 vendor/               # 3rd-party code shared between tools and tests.
   tiny-aes/           # tiny-AES-c (Unlicense / public domain).

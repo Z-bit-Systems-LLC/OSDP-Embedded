@@ -104,6 +104,7 @@ endif()
 # osdp_port_sc_wolfcrypt — AES-128 ECB (+ optional DRBG) over wolfCrypt.
 # Point CMAKE_PREFIX_PATH (or wolfssl_DIR) at a wolfSSL install built with
 # -DWOLFSSL_AESECB=yes; the port refuses to compile without HAVE_AES_ECB.
+# The SC2 and pairing ports below share the option and the wolfSSL install.
 if(OSDP_PORT_WOLFCRYPT)
     find_package(wolfssl CONFIG REQUIRED)
 
@@ -125,4 +126,65 @@ if(OSDP_PORT_WOLFCRYPT)
     target_compile_features(osdp_port_sc_wolfcrypt PUBLIC c_std_11)
 
     add_library(osdp::port_sc_wolfcrypt ALIAS osdp_port_sc_wolfcrypt)
+
+    # osdp_port_sc2_wolfcrypt — AES-256-GCM + AES-256 block (+ optional DRBG)
+    # for SC2. kmac256 is the caller's: wolfCrypt has no cSHAKE/KMAC. Needs
+    # HAVE_AESGCM, on in wolfSSL's default build.
+    add_library(osdp_port_sc2_wolfcrypt STATIC
+        wolfcrypt/osdp_sc2_wolfcrypt.c
+    )
+
+    target_include_directories(osdp_port_sc2_wolfcrypt
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/wolfcrypt
+    )
+
+    target_link_libraries(osdp_port_sc2_wolfcrypt
+        PUBLIC osdp_core wolfssl::wolfssl
+    )
+
+    target_compile_features(osdp_port_sc2_wolfcrypt PUBLIC c_std_11)
+
+    add_library(osdp::port_sc2_wolfcrypt ALIAS osdp_port_sc2_wolfcrypt)
+
+    # osdp_port_pair_wolfcrypt — ML-KEM-768 / ML-DSA-44 / SHA-256 / HMAC /
+    # HKDF for SC2 pairing. Only when the installed wolfSSL was built with
+    # the PQC schemes (CMake: -DWOLFSSL_MLKEM=yes -DWOLFSSL_MLDSA=yes, plus
+    # -DWOLFSSL_HKDF=yes), so a wolfSSL built for the SC1 port alone keeps
+    # configuring. Probed from its options.h rather than assumed.
+    include(CheckSymbolExists)
+    get_target_property(_osdp_wolfssl_inc wolfssl::wolfssl
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    set(CMAKE_REQUIRED_INCLUDES ${_osdp_wolfssl_inc})
+    set(_osdp_wolfssl_hdrs "wolfssl/options.h;wolfssl/wolfcrypt/settings.h")
+    check_symbol_exists(WOLFSSL_HAVE_MLKEM "${_osdp_wolfssl_hdrs}"
+                        OSDP_WOLFSSL_HAS_MLKEM)
+    check_symbol_exists(HAVE_DILITHIUM "${_osdp_wolfssl_hdrs}"
+                        OSDP_WOLFSSL_HAS_MLDSA)
+    check_symbol_exists(HAVE_HKDF "${_osdp_wolfssl_hdrs}"
+                        OSDP_WOLFSSL_HAS_HKDF)
+    unset(CMAKE_REQUIRED_INCLUDES)
+
+    if(OSDP_WOLFSSL_HAS_MLKEM AND OSDP_WOLFSSL_HAS_MLDSA AND
+       OSDP_WOLFSSL_HAS_HKDF)
+        add_library(osdp_port_pair_wolfcrypt STATIC
+            wolfcrypt/osdp_pair_wolfcrypt.c
+        )
+
+        target_include_directories(osdp_port_pair_wolfcrypt
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/wolfcrypt
+        )
+
+        # PUBLIC for the same reason as the SC port: the context embeds
+        # wolfCrypt's key objects by value.
+        target_link_libraries(osdp_port_pair_wolfcrypt
+            PUBLIC osdp_core osdp_pair wolfssl::wolfssl
+        )
+
+        target_compile_features(osdp_port_pair_wolfcrypt PUBLIC c_std_11)
+
+        add_library(osdp::port_pair_wolfcrypt ALIAS osdp_port_pair_wolfcrypt)
+    else()
+        message(STATUS "wolfSSL lacks ML-KEM / ML-DSA / HKDF: "
+                       "osdp_port_pair_wolfcrypt not built")
+    endif()
 endif()
