@@ -330,6 +330,26 @@ impl DefaultHandler {
             payload: reply_payload,
         })
     }
+
+    /// Consume one pending drop, if any: decrement `drop_remaining` when it
+    /// is non-zero and report whether it was. A hand-rolled CAS loop rather
+    /// than `fetch_update`, which newer toolchains deprecate in favour of
+    /// `try_update` — a name too new for the workspace's 1.70 MSRV.
+    fn take_drop_credit(&self) -> bool {
+        let mut n = self.drop_remaining.load(Ordering::Relaxed);
+        while n > 0 {
+            match self.drop_remaining.compare_exchange_weak(
+                n,
+                n - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => n = actual,
+            }
+        }
+        false
+    }
 }
 
 impl CommandHandler for DefaultHandler {
@@ -346,17 +366,7 @@ impl CommandHandler for DefaultHandler {
         // skip emitting a reply (see osdp_embedded::pd docs), which
         // is exactly the "PD went deaf" scenario for testing the
         // ACU's offline-detection path.
-        if self
-            .drop_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n > 0 {
-                    Some(n - 1)
-                } else {
-                    None
-                }
-            })
-            .is_ok()
-        {
+        if self.take_drop_credit() {
             if let Ok(mut s) = self.stats.lock() {
                 s.last_command_at_ms = Some(now);
                 s.last_cmd_code = Some(cmd_code);
